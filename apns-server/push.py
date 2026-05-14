@@ -2981,26 +2981,52 @@ class PushHandler(BaseHTTPRequestHandler):
                     injected = f"{injected}\n{text}"
         # set typing — Cc 收到 message 在 thinking
         self.state.typing_state = {"is_typing": True, "since": rec["ts"]}
-        # 调 bus_send.py 注入 active session (异步 不阻塞 response)
-        # 2026-05-14 — 之前没传 --target 永远走 OPIA_BUS_TARGET env 指向 "opia"
-        # 不响应 /chain/switch 设的 active_session. 现在显式传过去.
-        try:
-            target_session = (self.state.active_session or "opia").strip()
-            subprocess.Popen(
-                [
-                    "python3",
-                    self.state.bus_send_path,
-                    "--source", "ios-app",
-                    "--sender", "iphone",
-                    "--text", injected,
-                    "--target", target_session,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception as e:
-            logger.warning("bus_send fail: %s", e)
+        # 注入文本到 active tmux session
+        # 2026-05-14 build 200 — 不依赖 ~/scripts/bus_send.py (Opia 内部 file, ccc 公开版用户没有)
+        # 如果 bus_send.py 存在 用它走 bus dispatcher 路由 (Opia 内部多 agent 协调用)
+        # 不存在 fallback 直接 tmux paste-buffer + send-keys 注入 (ccc 公开版默认走这条)
+        target_session = (self.state.active_session or "opia").strip()
+        self._inject_to_session(target_session, injected, source="ios-app", sender="iphone")
         self._send_json(200, {"ok": True, "record": rec})
+
+    def _inject_to_session(self, session: str, text: str, source: str = "ios-app", sender: str = "iphone"):
+        """Inject text into target tmux session.
+
+        Prefer bus_send.py (Opia internal bus dispatcher routing for multi-agent coord)
+        if it exists at the configured path. Otherwise fall back to direct
+        tmux load-buffer + paste-buffer + send-keys, which is what ccc public
+        users get by default — no Opia internal daemon required.
+        """
+        import os
+        bus_path = self.state.bus_send_path
+        if bus_path and os.path.exists(bus_path):
+            try:
+                subprocess.Popen(
+                    [
+                        "python3",
+                        bus_path,
+                        "--source", source,
+                        "--sender", sender,
+                        "--text", text,
+                        "--target", session,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return
+            except Exception as e:
+                logger.warning("bus_send fail, falling back to tmux: %s", e)
+        # Fallback: direct tmux paste-buffer + send-keys (ccc public default)
+        try:
+            p = subprocess.Popen(
+                ["tmux", "load-buffer", "-"],
+                stdin=subprocess.PIPE,
+            )
+            p.communicate(input=text.encode("utf-8"))
+            subprocess.run(["tmux", "paste-buffer", "-t", session, "-p"], check=False)
+            subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=False)
+        except Exception as e:
+            logger.warning("tmux inject fail (session=%s): %s", session, e)
 
     def _handle_pet_state_get(self):
         """GET /pet/state — 当前 latest 状态."""
