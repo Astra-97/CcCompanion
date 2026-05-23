@@ -3487,14 +3487,32 @@ class PushHandler(BaseHTTPRequestHandler):
         if metadata and not isinstance(metadata, dict):
             metadata = None
 
+        thinking = body.get("thinking") or None
+        if thinking and not isinstance(thinking, str):
+            thinking = None
+        if thinking and len(thinking) > 5000:
+            thinking = thinking[:5000]
+
+        tools = body.get("tools") or None
+        if tools and not isinstance(tools, str):
+            tools = None
+        if tools and len(tools) > 5000:
+            tools = tools[:5000]
+
+        source = body.get("source", "ios-app")
+        if not isinstance(source, str) or not source:
+            source = "ios-app"
+
         rec = self.state.chat.append(
             role=role,
             text=text,
-            source="ios-app",
+            source=source,
             attachment_url=attachment_url,
             attachment_type=attachment_type,
             attachment_filename=attachment_filename,
             metadata=metadata,
+            thinking=thinking,
+            tools=tools,
         )
 
         # move 成功 append 后缓存 client_msg_id (LRU 100)

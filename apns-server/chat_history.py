@@ -80,6 +80,8 @@ class ChatHistory:
         attachment_filename: str | None = None,
         location: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
+        thinking: str | None = None,
+        tools: str | None = None,
     ) -> dict[str, Any]:
         rec: dict[str, Any] = {
             "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds"),
@@ -107,6 +109,10 @@ class ChatHistory:
                 rec["location"] = loc_clean
         if metadata and isinstance(metadata, dict):
             rec["metadata"] = metadata
+        if thinking and isinstance(thinking, str):
+            rec["thinking"] = thinking
+        if tools and isinstance(tools, str):
+            rec["tools"] = tools
         with self._lock:
             with self.path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
