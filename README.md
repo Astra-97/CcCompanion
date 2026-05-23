@@ -1,6 +1,6 @@
 # CcCompanion
 
-> Bring **Claude Code** to your iPhone. Open-source iOS client + tiny Python push server. Runs entirely on your own Mac and your own phone.
+> Bring **Claude Code** to your iPhone and Android. Open-source iOS + Android clients + tiny Python push server. Runs entirely on your own machine and your own phone.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -12,10 +12,11 @@
 
 ## What this is
 
-CcCompanion is two halves:
+CcCompanion is three parts:
 
 1. **`ios-app/`** — a SwiftUI iOS app (TestFlight + soon App Store) that gives you a chat, terminal, and slash-command interface to your Mac's Claude Code from anywhere your iPhone is online.
-2. **`apns-server/`** — a small Python HTTP server you run on your Mac. It forwards your chat messages to a local `tmux` session running `claude`, captures the reply, and pushes it back to your iPhone via Apple Push Notifications (or [Bark](https://github.com/Finb/Bark) as a zero-Apple-Developer-required fallback).
+2. **`android-app/`** — a Jetpack Compose Android app with chat, thinking chain folding, tool call display, customizable bubbles (color, font size, Markdown rendering), and text selection/copy. Connects to the same `apns-server` backend.
+3. **`apns-server/`** — a small Python HTTP server you run on your Mac (or Linux VPS). It forwards your chat messages to a local `tmux` session running `claude`, captures the reply, and pushes it back to your phone via Apple Push Notifications (or [Bark](https://github.com/Finb/Bark) as a zero-Apple-Developer-required fallback).
 
 The whole thing is **local-first** — your messages never go through our server. There is no "our server." Your Mac at home talks to your iPhone over Tailscale / ZeroTier / LAN.
 
