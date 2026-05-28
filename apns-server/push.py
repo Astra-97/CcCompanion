@@ -41,7 +41,10 @@ from datetime import datetime, timezone
 import sys
 import threading
 import time
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -341,6 +344,22 @@ class ServerState:
         # chat history 持久化跟 token 同目录
         chat_history_path = Path(self.token_store_path).parent / "chat_history.jsonl"
         self.chat = ChatHistory(chat_history_path)
+        contact_history_dir = Path(self.token_store_path).parent
+        self.contact_chats: dict[str, ChatHistory] = {
+            "xiaoke": self.chat,
+            "kairos": ChatHistory(contact_history_dir / "chat_history_kairos.jsonl"),
+            "hajiki": ChatHistory(contact_history_dir / "chat_history_hajiki.jsonl"),
+            "apples": ChatHistory(contact_history_dir / "chat_history_apples.jsonl"),
+        }
+        self.codex_bot_state_path: str = server_cfg.get(
+            "codex_bot_state_path",
+            "/root/Windows-Codex-TG/.runtime/bot_state.json",
+        )
+        self.codex_user_id: str = str(server_cfg.get("codex_user_id", "8715009653"))
+        self.codex_bin: str = server_cfg.get("codex_bin", "/usr/bin/codex")
+        self.codex_home: str = server_cfg.get("codex_home", "/root/.codex")
+        self.codex_model: str = server_cfg.get("codex_model", "gpt-5.5")
+        self.codex_reasoning_effort: str = server_cfg.get("codex_reasoning_effort", "high")
         group_chat_path = Path(self.token_store_path).parent / "group_chat.jsonl"
         group_state_path = Path(self.token_store_path).parent / "group_state.json"
         self.group_chat = GroupChatStore(group_chat_path, group_state_path)
@@ -357,6 +376,12 @@ class ServerState:
         self.pet_activity_bus = PetActivityBus()
         # typing indicator 状态 (内存 不持久化)
         self.typing_state: dict[str, Any] = {"is_typing": False, "since": None}
+        self.contact_typing_states: dict[str, dict[str, Any]] = {
+            "xiaoke": self.typing_state,
+            "kairos": {"is_typing": False, "since": None},
+            "hajiki": {"is_typing": False, "since": None},
+            "apples": {"is_typing": False, "since": None},
+        }
         # 书房 v1 (2026-05-09) — vault-aware project dashboard. read-only db (indexer 写)
         studyroom_db_path = HERE / "state" / "studyroom.db"
         self.studyroom = StudyroomDB(studyroom_db_path)
@@ -519,6 +544,38 @@ class PushHandler(BaseHTTPRequestHandler):
     def _is_public_get(self) -> bool:
         return self.path in {"/health", "/version"}
 
+    def _clean_contact_id(self, value: Any) -> str:
+        contact_id = str(value or "xiaoke").strip().lower()
+        if contact_id in self.state.contact_chats:
+            return contact_id
+        return "xiaoke"
+
+    def _query_params(self) -> dict[str, list[str]]:
+        from urllib.parse import urlparse, parse_qs
+        return parse_qs(urlparse(self.path).query)
+
+    def _contact_id_from_query(self) -> str:
+        qs = self._query_params()
+        return self._clean_contact_id(qs.get("contact_id", qs.get("contactId", ["xiaoke"]))[0])
+
+    def _contact_id_from_body(self, body: dict[str, Any]) -> str:
+        return self._clean_contact_id(body.get("contact_id") or body.get("contactId") or "xiaoke")
+
+    def _chat_for_contact(self, contact_id: str) -> ChatHistory:
+        return self.state.contact_chats.get(contact_id) or self.state.chat
+
+    def _typing_for_contact(self, contact_id: str) -> dict[str, Any]:
+        if contact_id == "xiaoke":
+            return self.state.typing_state
+        return self.state.contact_typing_states.setdefault(contact_id, {"is_typing": False, "since": None})
+
+    def _set_typing_for_contact(self, contact_id: str, value: dict[str, Any]) -> None:
+        if contact_id == "xiaoke":
+            self.state.typing_state = value
+            self.state.contact_typing_states["xiaoke"] = value
+        else:
+            self.state.contact_typing_states[contact_id] = value
+
     def _check_ip_allowed(self) -> bool:
         allowed = self.state.allowed_ips
         if not allowed:
@@ -658,17 +715,19 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/favorites/get"):
             self._handle_favorites_get()
             return
-        if self.path == "/chat/typing":
-            ts = self.state.typing_state
+        if self.path.startswith("/chat/typing"):
+            contact_id = self._contact_id_from_query()
+            ts = self._typing_for_contact(contact_id)
             if ts.get("is_typing") and ts.get("since"):
                 try:
                     since_dt = datetime.fromisoformat(ts["since"])
                     age = (datetime.now(timezone.utc).astimezone() - since_dt).total_seconds()
                     if age > 120:
-                        self.state.typing_state = {"is_typing": False, "since": None}
+                        self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
+                        ts = self._typing_for_contact(contact_id)
                 except Exception:
                     pass
-            self._send_json(200, {"ok": True, **self.state.typing_state})
+            self._send_json(200, {"ok": True, **ts})
             return
         if self.path == "/chat/status":
             self._handle_chat_status()
@@ -2619,8 +2678,8 @@ class PushHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _handle_chat_history(self):
-        from urllib.parse import urlparse, parse_qs
-        qs = parse_qs(urlparse(self.path).query)
+        qs = self._query_params()
+        contact_id = self._clean_contact_id(qs.get("contact_id", qs.get("contactId", ["xiaoke"]))[0])
         since = qs.get("since", [None])[0]
         before = qs.get("before", qs.get("before_ts", [None]))[0]  # 向上翻页 拉 before_ts 之前的旧消息
         around_ts = qs.get("around_ts", [None])[0]  # 2026-05-07 用户 push 跳原文 围绕 ts 前后取
@@ -2635,17 +2694,18 @@ class PushHandler(BaseHTTPRequestHandler):
         # iOS 本地 SwiftData 首次同步需要全量；UI 自己只渲染最近窗口。
         limit = min(max(limit, 1), 10000)
         n_around = min(max(n_around, 1), 200)
+        chat = self._chat_for_contact(contact_id)
         if around_ts:
-            chat_records = self.state.chat.read_around(ts=around_ts, n=n_around)
+            chat_records = chat.read_around(ts=around_ts, n=n_around)
         else:
-            chat_records = self.state.chat.read_since(since_ts=since, before_ts=before, limit=limit)
+            chat_records = chat.read_since(since_ts=since, before_ts=before, limit=limit)
         # task records 走 /chat/poll 不混入持久 history (prevents stale task injection causing scroll-jump)
         records = chat_records
-        self._send_json(200, {"ok": True, "records": records, "count": len(records)})
+        self._send_json(200, {"ok": True, "contact_id": contact_id, "records": records, "count": len(records)})
 
     def _handle_chat_search(self):
-        from urllib.parse import urlparse, parse_qs
-        qs = parse_qs(urlparse(self.path).query)
+        qs = self._query_params()
+        contact_id = self._clean_contact_id(qs.get("contact_id", qs.get("contactId", ["xiaoke"]))[0])
         keyword = qs.get("q", [None])[0]
         date_prefix = qs.get("date", [None])[0]
         role = qs.get("role", [None])[0]
@@ -2654,13 +2714,13 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception:
             limit = 5000
         limit = min(max(limit, 1), 10000)
-        records = self.state.chat.search(
+        records = self._chat_for_contact(contact_id).search(
             keyword=keyword,
             date_prefix=date_prefix,
             role=role,
             limit=limit,
         )
-        self._send_json(200, {"ok": True, "records": records, "count": len(records)})
+        self._send_json(200, {"ok": True, "contact_id": contact_id, "records": records, "count": len(records)})
 
     def _handle_chain_abort(self, body: dict[str, Any]):
         """2026-05-07 用户 push: 紧急停止 chain. tmux send-keys C-c 到目标 session.
@@ -2990,6 +3050,14 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _handle_chat_send(self, body: dict[str, Any]):
         """iPhone 发消息进来 → 写 user 条 + 调 bus_send.py 注入主 session"""
+        contact_id = self._contact_id_from_body(body)
+        if contact_id == "kairos":
+            self._handle_kairos_chat_send(body, contact_id)
+            return
+        if contact_id not in {"xiaoke"}:
+            self._send_json(501, {"ok": False, "error": f"contact not wired yet: {contact_id}"})
+            return
+
         text = body.get("text", "").strip()
         quoted_ts = body.get("quoted_ts") or None
         location = body.get("location") or None
@@ -2997,7 +3065,8 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "text or location required"})
             return
         # 写 user 历史
-        rec = self.state.chat.append(
+        chat = self._chat_for_contact(contact_id)
+        rec = chat.append(
             role="user",
             text=text,
             source="ios-app",
@@ -3026,7 +3095,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 if text:
                     injected = f"{injected}\n{text}"
         # set typing — Cc 收到 message 在 thinking
-        self.state.typing_state = {"is_typing": True, "since": rec["ts"]}
+        self._set_typing_for_contact(contact_id, {"is_typing": True, "since": rec["ts"]})
         # 注入文本到 active tmux session
         # 2026-05-14 build 200 — 不依赖 ~/scripts/bus_send.py (Opia 内部 file, ccc 公开版用户没有)
         # 如果 bus_send.py 存在 用它走 bus dispatcher 路由 (Opia 内部多 agent 协调用)
@@ -3043,6 +3112,119 @@ class PushHandler(BaseHTTPRequestHandler):
             })
             return
         self._send_json(200, {"ok": True, "record": rec})
+
+    def _load_codex_target(self) -> tuple[str | None, Path]:
+        state_path = Path(self.state.codex_bot_state_path).expanduser()
+        default_cwd = Path("/root/Windows-Codex-TG")
+        if not state_path.exists():
+            return None, default_cwd
+        try:
+            data = json.loads(state_path.read_text(encoding="utf-8"))
+            user = (data.get("users") or {}).get(self.state.codex_user_id) or {}
+            session_id = str(user.get("active_session_id") or "").strip() or None
+            cwd = Path(str(user.get("active_cwd") or default_cwd)).expanduser()
+            return session_id, cwd
+        except Exception as e:
+            logger.warning("load codex target failed: %s", e)
+            return None, default_cwd
+
+    def _codex_session_busy(self, session_id: str | None) -> bool:
+        if not session_id:
+            return False
+        try:
+            res = subprocess.run(
+                ["ps", "-eo", "pid=,args="],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except Exception:
+            return False
+        current_pid = os.getpid()
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            pid_text, _, args = line.partition(" ")
+            try:
+                pid = int(pid_text)
+            except Exception:
+                continue
+            if pid == current_pid:
+                continue
+            if "codex exec resume" in args and session_id in args:
+                return True
+        return False
+
+    def _handle_kairos_chat_send(self, body: dict[str, Any], contact_id: str):
+        text = body.get("text", "").strip()
+        quoted_ts = body.get("quoted_ts") or None
+        if not text:
+            self._send_json(400, {"error": "text required"})
+            return
+
+        chat = self._chat_for_contact(contact_id)
+        rec = chat.append(
+            role="user",
+            text=text,
+            source="cc-app:kairos",
+            quoted_ts=quoted_ts,
+        )
+        self._set_typing_for_contact(contact_id, {"is_typing": True, "since": rec["ts"]})
+
+        def _worker():
+            lock = getattr(type(self), "_kairos_codex_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                type(self)._kairos_codex_lock = lock
+            with lock:
+                try:
+                    session_id, cwd = self._load_codex_target()
+                    if self._codex_session_busy(session_id):
+                        chat.append(
+                            role="assistant",
+                            text="我正在处理另一边的消息，稍等一下再叫我。",
+                            source="codex:kairos",
+                        )
+                        return
+                    prompt = (
+                        "当前时间：" + datetime.now().astimezone().strftime("%Y-%m-%d %H:%M") + "\n"
+                        "Astra 正在通过 CcCompanion app 和 Kairos 对话。请直接回复她，不要提到后台路由。\n"
+                        f"对方说：{text}"
+                    )
+                    sys.path.insert(0, "/root/Windows-Codex-TG")
+                    from codex_common import CodexRunner
+
+                    runner = CodexRunner(
+                        codex_bin=self.state.codex_bin,
+                        sandbox_mode=None,
+                        approval_policy=None,
+                        dangerous_bypass_level=2,
+                        idle_timeout_sec=0,
+                    )
+                    env_overrides = {
+                        "CODEX_HOME": self.state.codex_home,
+                        "CODEX_MODEL": self.state.codex_model,
+                        "CODEX_REASONING_EFFORT": self.state.codex_reasoning_effort,
+                    }
+                    _, answer, stderr_text, return_code = runner.run_prompt(
+                        prompt=prompt,
+                        cwd=cwd,
+                        session_id=session_id,
+                        env_overrides=env_overrides,
+                    )
+                    if return_code != 0 and stderr_text:
+                        logger.warning("kairos codex return_code=%s stderr=%s", return_code, stderr_text[-800:])
+                    answer = (answer or "").strip() or "Kairos 没有返回可展示内容。"
+                    chat.append(role="assistant", text=answer, source="codex:kairos")
+                except Exception as e:
+                    logger.exception("kairos codex worker failed")
+                    chat.append(role="assistant", text=f"Kairos 接入出错：{e}", source="codex:kairos")
+                finally:
+                    self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
+
+        threading.Thread(target=_worker, daemon=True).start()
+        self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec})
 
     def _inject_to_session(self, session: str, text: str, source: str = "ios-app", sender: str = "iphone"):
         """Inject text into target tmux session. Returns (success, error_msg).
@@ -3385,6 +3567,8 @@ class PushHandler(BaseHTTPRequestHandler):
         if not self._check_auth():
             self._send_json(401, {"error": "auth required"})
             return
+        contact_id = self._contact_id_from_body(body)
+        chat = self._chat_for_contact(contact_id)
         text = body.get("text", "").strip()
         role = body.get("role", "assistant")
         if role == "task":
@@ -3417,8 +3601,22 @@ class PushHandler(BaseHTTPRequestHandler):
             if not attachment_filename:
                 attachment_filename = src.name
 
-        if not text and not attachment_url:
+        thinking = body.get("thinking") or ""
+        if isinstance(thinking, str) and len(thinking) > 5000:
+            thinking = thinking[:5000]
+        tools = body.get("tools") or ""
+        if isinstance(tools, str) and len(tools) > 5000:
+            tools = tools[:5000]
+        if not text and not attachment_url and not thinking and not tools:
             self._send_json(400, {"error": "text or attachment required"})
+            return
+
+        if not text and not attachment_url and (thinking or tools):
+            ok = chat.merge_thinking_to_last_assistant(thinking, tools)
+            if ok:
+                self._send_json(200, {"ok": True, "merged": True})
+            else:
+                self._send_json(200, {"ok": True, "merged": False, "reason": "no assistant record"})
             return
 
         # 通用 chat/append dedupe (非 move) 防 ios_reply 等客户端 retry 重复入库
@@ -3487,23 +3685,11 @@ class PushHandler(BaseHTTPRequestHandler):
         if metadata and not isinstance(metadata, dict):
             metadata = None
 
-        thinking = body.get("thinking") or None
-        if thinking and not isinstance(thinking, str):
-            thinking = None
-        if thinking and len(thinking) > 5000:
-            thinking = thinking[:5000]
-
-        tools = body.get("tools") or None
-        if tools and not isinstance(tools, str):
-            tools = None
-        if tools and len(tools) > 5000:
-            tools = tools[:5000]
-
         source = body.get("source", "ios-app")
         if not isinstance(source, str) or not source:
             source = "ios-app"
 
-        rec = self.state.chat.append(
+        rec = chat.append(
             role=role,
             text=text,
             source=source,
@@ -3530,7 +3716,7 @@ class PushHandler(BaseHTTPRequestHandler):
         # assistant text reply 后台异步生成 TTS mp3 — 不阻塞 hook (仅 settings.tts_enabled)
         if role == "assistant" and text and not attachment_url and self.state.settings.get("tts_enabled"):
             ts = rec["ts"]
-            chat = self.state.chat
+            chat_for_tts = chat
             attachments_dir = self.state.attachments_dir
             def _tts_async():
                 logger.info("tts multi thread start ts=%s len=%d", ts, len(text))
@@ -3548,12 +3734,12 @@ class PushHandler(BaseHTTPRequestHandler):
                 if not update_kwargs:
                     logger.warning("tts multi gen returned no audio")
                     return
-                ok = chat.update_audio(ts=ts, **update_kwargs)
+                ok = chat_for_tts.update_audio(ts=ts, **update_kwargs)
                 logger.info("tts multi attach %s langs=%s", "ok" if ok else "FAIL", ",".join(sorted(update_kwargs)))
             threading.Thread(target=_tts_async, daemon=True).start()
         # 我刚 reply 完 — typing = false
         if role == "assistant":
-            self.state.typing_state = {"is_typing": False, "since": None}
+            self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
 
         # 5-7 dedupe cache 回填真 rec
         if dedupe_cache_key is not None:
@@ -3631,6 +3817,7 @@ class PushHandler(BaseHTTPRequestHandler):
         from urllib.parse import urlparse, parse_qs, unquote
 
         qs = parse_qs(urlparse(self.path).query)
+        contact_id = self._clean_contact_id(qs.get("contact_id", qs.get("contactId", ["xiaoke"]))[0])
         filename = (qs.get("filename", [None])[0]
                     or self.headers.get("X-Filename")
                     or "upload.bin")
@@ -3695,10 +3882,11 @@ class PushHandler(BaseHTTPRequestHandler):
 
         attachment_url = f"/attachments/{stored_name}"
 
-        rec = self.state.chat.append(
+        chat = self._chat_for_contact(contact_id)
+        rec = chat.append(
             role=role,
             text=text,
-            source="ios-app",
+            source="ios-app" if contact_id == "xiaoke" else f"ios-app:{contact_id}",
             quoted_ts=quoted_ts,
             attachment_url=attachment_url,
             attachment_type=atype,
@@ -3707,7 +3895,7 @@ class PushHandler(BaseHTTPRequestHandler):
         )
 
         # 如果是 user 上传 也往主 session 注入一条 hint 让 chain 感知有附件
-        if role == "user":
+        if role == "user" and contact_id == "xiaoke":
             hint = f"[用户发了{'图片' if atype == 'image' else '文件'}: {filename}]"
             if rec.get("location"):
                 loc = rec["location"]
@@ -3730,7 +3918,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 })
                 return
 
-        self._send_json(200, {"ok": True, "record": rec})
+        self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec})
 
     def _handle_attachment_get(self):
         """静态服务 attachment 文件 — GET /attachments/<filename>"""

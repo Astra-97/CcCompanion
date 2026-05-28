@@ -186,6 +186,38 @@ class ChatHistory:
             logger.warning("update_audio fail: %s", e)
             return False
 
+    def merge_thinking_to_last_assistant(self, thinking: str, tools: str = "") -> bool:
+        """Merge thinking/tools into the most recent assistant record."""
+        if not self.path.exists():
+            return False
+        try:
+            with self._lock:
+                lines = self.path.read_text(encoding="utf-8").splitlines()
+                target_idx = -1
+                for i in range(len(lines) - 1, -1, -1):
+                    try:
+                        rec = json.loads(lines[i])
+                    except Exception:
+                        continue
+                    if rec.get("role") == "assistant":
+                        target_idx = i
+                        break
+                if target_idx < 0:
+                    return False
+                rec = json.loads(lines[target_idx])
+                if thinking:
+                    rec["thinking"] = thinking
+                if tools:
+                    rec["tools"] = tools
+                lines[target_idx] = json.dumps(rec, ensure_ascii=False)
+                tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+                tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                tmp.replace(self.path)
+                return True
+        except Exception as e:
+            logger.warning("merge_thinking fail: %s", e)
+            return False
+
     def update_audio_url(self, ts: str, audio_url: str) -> bool:
         """Backward-compatible single URL updater."""
         return self.update_audio(ts, audio_zh=audio_url)
