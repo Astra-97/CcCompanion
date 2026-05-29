@@ -37,6 +37,8 @@ import ipaddress
 import json
 import logging
 import os
+import re
+import shutil
 from datetime import datetime, timezone
 import sys
 import threading
@@ -109,6 +111,260 @@ def _load_or_create_secret() -> str:
     except Exception as e:
         logger.warning("P0-3: could not auto-generate secret: %s", e)
         return ""
+
+
+VPS_SERVICE_UNITS: list[tuple[str, str]] = [
+    ("ccbot-lite", "ccbot-lite.service"),
+    ("claude-tg", "claude-tg.service"),
+    ("cc-companion", "cc-companion.service"),
+    ("healthcheck timer", "cc-companion-healthcheck.timer"),
+    ("cloudflared", "cloudflared.service"),
+    ("hysteria-server", "hysteria-server.service"),
+    ("terminal-mcp", "terminal-mcp.service"),
+    ("windows-codex-tg", "windows-codex-tg.service"),
+]
+
+VPS_STATUS_CACHE_TTL = 5.0
+VPS_STATUS_CACHE_LOCK = threading.Lock()
+VPS_STATUS_CACHE: dict[str, Any] = {"ts": 0.0, "data": None}
+
+
+def _run_status_cmd(args: list[str], timeout: float = 1.5) -> str:
+    try:
+        return subprocess.run(
+            args,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        ).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _read_proc_stat_cpu() -> tuple[int, int] | None:
+    try:
+        with open("/proc/stat", encoding="utf-8") as f:
+            parts = f.readline().split()
+        if not parts or parts[0] != "cpu":
+            return None
+        nums = [int(x) for x in parts[1:]]
+        idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
+        return sum(nums), idle
+    except Exception:
+        return None
+
+
+def _cpu_percent() -> float:
+    first = _read_proc_stat_cpu()
+    if first is None:
+        return 0.0
+    time.sleep(0.12)
+    second = _read_proc_stat_cpu()
+    if second is None:
+        return 0.0
+    total_delta = second[0] - first[0]
+    idle_delta = second[1] - first[1]
+    if total_delta <= 0:
+        return 0.0
+    return round(max(0.0, min(100.0, (1.0 - idle_delta / total_delta) * 100.0)), 1)
+
+
+def _read_meminfo() -> dict[str, Any]:
+    values: dict[str, int] = {}
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                key, raw = line.split(":", 1)
+                values[key] = int(raw.strip().split()[0])
+    except Exception:
+        values = {}
+    total = values.get("MemTotal", 0) * 1024
+    available = values.get("MemAvailable", 0) * 1024
+    used = max(0, total - available)
+    percent = round((used / total * 100.0), 1) if total else 0.0
+    return {
+        "used_mb": round(used / 1024 / 1024, 1),
+        "total_mb": round(total / 1024 / 1024, 1),
+        "available_mb": round(available / 1024 / 1024, 1),
+        "percent": percent,
+    }
+
+
+def _disk_usage(path: str = "/") -> dict[str, Any]:
+    try:
+        usage = shutil.disk_usage(path)
+        total = usage.total
+        used = usage.used
+        available = usage.free
+    except Exception:
+        total = used = available = 0
+    percent = round((used / total * 100.0), 1) if total else 0.0
+    return {
+        "used_mb": round(used / 1024 / 1024, 1),
+        "total_mb": round(total / 1024 / 1024, 1),
+        "available_mb": round(available / 1024 / 1024, 1),
+        "percent": percent,
+    }
+
+
+def _uptime_info() -> dict[str, Any]:
+    seconds = 0.0
+    try:
+        with open("/proc/uptime", encoding="utf-8") as f:
+            seconds = float(f.read().split()[0])
+    except Exception:
+        seconds = 0.0
+    days = int(seconds // 86400)
+    hours = int((seconds % 86400) // 3600)
+    minutes = int((seconds % 3600) // 60)
+    if days:
+        text = f"{days}d {hours}h"
+    elif hours:
+        text = f"{hours}h {minutes}m"
+    else:
+        text = f"{minutes}m"
+    return {"seconds": int(seconds), "text": text}
+
+
+def _parse_systemctl_show(output: str) -> dict[str, str]:
+    data: dict[str, str] = {}
+    for line in output.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        data[key] = value
+    return data
+
+
+def _service_status(label: str, unit: str) -> dict[str, Any]:
+    output = _run_status_cmd([
+        "systemctl",
+        "show",
+        unit,
+        "--property=LoadState,ActiveState,SubState,MainPID,MemoryCurrent,ActiveEnterTimestamp",
+        "--no-pager",
+    ])
+    data = _parse_systemctl_show(output)
+    active_state = data.get("ActiveState") or "unknown"
+    sub_state = data.get("SubState") or ""
+    load_state = data.get("LoadState") or "unknown"
+    if active_state == "active":
+        status = "up"
+    elif active_state in {"activating", "reloading"}:
+        status = "wait"
+    elif load_state == "not-found":
+        status = "missing"
+    else:
+        status = "down" if active_state != "unknown" else "unknown"
+
+    mem_current = data.get("MemoryCurrent") or ""
+    try:
+        mem_mb = None if mem_current in {"", "[not set]", "18446744073709551615"} else round(int(mem_current) / 1024 / 1024, 1)
+    except Exception:
+        mem_mb = None
+
+    return {
+        "label": label,
+        "unit": unit,
+        "status": status,
+        "active_state": active_state,
+        "sub_state": sub_state,
+        "uptime": data.get("ActiveEnterTimestamp") or "",
+        "mem_mb": mem_mb,
+    }
+
+
+def _process_label(command: str, args: str) -> str:
+    line = f"{command} {args}"
+    if "claude --resume" in line:
+        return "Claude Code 主进程"
+    if "tg_codex_bot.py" in line:
+        return "Windows-Codex-TG bot"
+    if "codex exec" in line:
+        return "当前 Codex 会话"
+    if "bun server.ts" in line:
+        return "Telegram 插件 bun"
+    if "terminal-mcp/server.js" in line:
+        return "terminal-mcp node"
+    if "CcCompanion" in line and "push.py" in line:
+        return "CcCompanion 服务"
+    if "ccbot_lite.main" in line:
+        return "ccbot-lite"
+    if "cloudflared" in line:
+        return "cloudflared"
+    if "hysteria server" in line:
+        return "hysteria2"
+    return command
+
+
+def _top_memory_processes(limit: int = 12) -> list[dict[str, Any]]:
+    output = _run_status_cmd(["ps", "-eo", "rss=,comm=,args=", "--sort=-rss"], timeout=1.5)
+    processes: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for line in output.splitlines():
+        if len(processes) >= limit:
+            break
+        parts = line.strip().split(None, 2)
+        if len(parts) < 2:
+            continue
+        rss_kb = parts[0]
+        command = parts[1]
+        args = parts[2] if len(parts) > 2 else ""
+        label = _process_label(command, args)
+        label = label.strip()[:48] or "process"
+        if label in seen:
+            continue
+        seen.add(label)
+        try:
+            mem_mb = round(int(rss_kb) / 1024, 1)
+        except Exception:
+            continue
+        processes.append({"label": label, "mem_mb": mem_mb})
+    return processes
+
+
+def _collect_vps_status_uncached() -> dict[str, Any]:
+    try:
+        load1, load5, load15 = os.getloadavg()
+    except Exception:
+        load1 = load5 = load15 = 0.0
+    services = [_service_status(label, unit) for label, unit in VPS_SERVICE_UNITS]
+    top_memory = _top_memory_processes()
+    return {
+        "ok": True,
+        "host": _run_status_cmd(["hostname"], timeout=1.0) or os.uname().nodename,
+        "time": datetime.now(timezone.utc).isoformat(),
+        "uptime": _uptime_info(),
+        "load": {
+            "one": round(load1, 2),
+            "five": round(load5, 2),
+            "fifteen": round(load15, 2),
+        },
+        "cpu": {"percent": _cpu_percent()},
+        "memory": _read_meminfo(),
+        "disk": _disk_usage("/"),
+        "services": services,
+        "processes": {"top_memory": top_memory},
+        "top_memory": top_memory,
+        "health": {"ok": True},
+    }
+
+
+def collect_vps_status() -> dict[str, Any]:
+    now = time.time()
+    with VPS_STATUS_CACHE_LOCK:
+        cached = VPS_STATUS_CACHE.get("data")
+        cached_ts = float(VPS_STATUS_CACHE.get("ts") or 0.0)
+        if isinstance(cached, dict) and now - cached_ts < VPS_STATUS_CACHE_TTL:
+            return dict(cached)
+
+    data = _collect_vps_status_uncached()
+    with VPS_STATUS_CACHE_LOCK:
+        VPS_STATUS_CACHE["ts"] = now
+        VPS_STATUS_CACHE["data"] = data
+    return data
 
 
 WEB_CHAT_HTML = r"""<!DOCTYPE html>
@@ -351,6 +607,8 @@ class ServerState:
             "hajiki": ChatHistory(contact_history_dir / "chat_history_hajiki.jsonl"),
             "apples": ChatHistory(contact_history_dir / "chat_history_apples.jsonl"),
         }
+        self.group_reply_lock = threading.Lock()
+        self.group_reply_pending: list[dict[str, Any]] = []
         self.codex_bot_state_path: str = server_cfg.get(
             "codex_bot_state_path",
             "/root/Windows-Codex-TG/.runtime/bot_state.json",
@@ -576,6 +834,52 @@ class PushHandler(BaseHTTPRequestHandler):
         else:
             self.state.contact_typing_states[contact_id] = value
 
+    def _detect_apples_mentions(self, text: str) -> set[str]:
+        targets: set[str] = set()
+        if re.search(r"@kairos\b", text, flags=re.IGNORECASE):
+            targets.add("kairos")
+        if re.search(r"@xiaoke\b", text, flags=re.IGNORECASE) or "@小克" in text:
+            targets.add("xiaoke")
+        return targets
+
+    def _group_reply_marker(self, member_id: str, user_ts: str) -> str:
+        safe_member = re.sub(r"[^a-z0-9_-]", "", member_id.lower()) or "member"
+        safe_ts = re.sub(r"[^0-9A-Za-z_.:+-]", "_", user_ts)[:80]
+        return f"[[CCC_GROUP_REPLY:apples:{safe_member}:{safe_ts}]]"
+
+    def _remember_group_reply(self, member_id: str, user_ts: str) -> None:
+        now = time.time()
+        with self.state.group_reply_lock:
+            self.state.group_reply_pending = [
+                item for item in self.state.group_reply_pending
+                if now - float(item.get("created_at", 0)) < 600
+            ]
+            self.state.group_reply_pending.append({
+                "contact_id": "apples",
+                "member_id": member_id,
+                "user_ts": user_ts,
+                "created_at": now,
+            })
+
+    def _consume_group_reply_route(self, text: str) -> tuple[str | None, str | None, str]:
+        marker_re = re.compile(r"\[\[CCC_GROUP_REPLY:apples:([a-z0-9_-]+):([^\]]+)\]\]", re.IGNORECASE)
+        match = marker_re.search(text)
+        if match:
+            cleaned = (text[:match.start()] + text[match.end():]).strip()
+            marker_member = match.group(1).lower()
+            marker_ts = match.group(2)
+            with self.state.group_reply_lock:
+                self.state.group_reply_pending = [
+                    item for item in self.state.group_reply_pending
+                    if not (
+                        str(item.get("member_id") or "").lower() == marker_member
+                        and str(item.get("user_ts") or "") == marker_ts
+                    )
+                ]
+            return "apples", marker_member, cleaned
+
+        return None, None, text
+
     def _check_ip_allowed(self) -> bool:
         allowed = self.state.allowed_ips
         if not allowed:
@@ -623,6 +927,30 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/usage":
             self._handle_usage_overview()
+            return
+        if self.path == "/vps/status":
+            if not self._auth_matches():
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                self._send_json(200, collect_vps_status())
+            except Exception as e:
+                logger.exception("vps status collection failed")
+                self._send_json(200, {
+                    "ok": False,
+                    "error": str(e),
+                    "host": "",
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "uptime": {"seconds": 0, "text": ""},
+                    "load": {"one": 0.0, "five": 0.0, "fifteen": 0.0},
+                    "cpu": {"percent": 0.0},
+                    "memory": {"used_mb": 0.0, "total_mb": 0.0, "available_mb": 0.0, "percent": 0.0},
+                    "disk": {"used_mb": 0.0, "total_mb": 0.0, "available_mb": 0.0, "percent": 0.0},
+                    "services": [],
+                    "processes": {"top_memory": []},
+                    "top_memory": [],
+                    "health": {"ok": False},
+                })
             return
         if self.path.startswith("/chat/history"):
             self._handle_chat_history()
@@ -845,6 +1173,16 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True, "new_secret": new_secret, "hint": "update your iOS app onboarding"})
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
+            return
+        if self.path == "/ui-config":
+            self._send_json(200, {
+                "bubbleColor": "DB733C",
+                "assistantBubbleColor": "1A1A1A",
+                "userTextColor": "ECECEC",
+                "assistantTextColor": "ECECEC",
+                "cornerRadius": 18,
+                "useGradient": False,
+            })
             return
         if self.path == "/health":
             self._send_json(
@@ -1106,6 +1444,12 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_todos_add(body)
         elif self.path == "/todos/edit":
             self._handle_todos_edit(body)
+        elif self.path == "/terminal/key":
+            # Virtual keyboard: send a special key (Escape, C-c, Tab, etc.) to tmux
+            if not self.state.allow_remote_control:
+                self._send_json(403, {"error": "remote_control disabled"})
+                return
+            self._handle_terminal_key(body)
         elif self.path == "/tmux/send":
             # P0-2: direct tmux send-keys — remote control gate
             if not self.state.allow_remote_control:
@@ -3054,6 +3398,9 @@ class PushHandler(BaseHTTPRequestHandler):
         if contact_id == "kairos":
             self._handle_kairos_chat_send(body, contact_id)
             return
+        if contact_id == "apples":
+            self._handle_apples_chat_send(body, contact_id)
+            return
         if contact_id not in {"xiaoke"}:
             self._send_json(501, {"ok": False, "error": f"contact not wired yet: {contact_id}"})
             return
@@ -3225,6 +3572,132 @@ class PushHandler(BaseHTTPRequestHandler):
 
         threading.Thread(target=_worker, daemon=True).start()
         self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec})
+
+    def _start_group_kairos_reply(self, chat: ChatHistory, text: str) -> None:
+        def _worker():
+            lock = getattr(type(self), "_kairos_codex_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                type(self)._kairos_codex_lock = lock
+            with lock:
+                try:
+                    session_id, cwd = self._load_codex_target()
+                    if self._codex_session_busy(session_id):
+                        chat.append(
+                            role="assistant",
+                            text="我正在处理另一边的消息，稍等一下再叫我。",
+                            source="group:kairos",
+                        )
+                        return
+                    prompt = (
+                        "当前时间：" + datetime.now().astimezone().strftime("%Y-%m-%d %H:%M") + "\n"
+                        "Astra 正在 CcCompanion 的“苹果幼稚园”群聊里 @Kairos。"
+                        "请以 Kairos 身份直接回复群聊，不要提到后台路由，也不要触发或代替其他成员。\n"
+                        f"群聊消息：{text}"
+                    )
+                    sys.path.insert(0, "/root/Windows-Codex-TG")
+                    from codex_common import CodexRunner
+
+                    runner = CodexRunner(
+                        codex_bin=self.state.codex_bin,
+                        sandbox_mode=None,
+                        approval_policy=None,
+                        dangerous_bypass_level=2,
+                        idle_timeout_sec=0,
+                    )
+                    env_overrides = {
+                        "CODEX_HOME": self.state.codex_home,
+                        "CODEX_MODEL": self.state.codex_model,
+                        "CODEX_REASONING_EFFORT": self.state.codex_reasoning_effort,
+                    }
+                    _, answer, stderr_text, return_code = runner.run_prompt(
+                        prompt=prompt,
+                        cwd=cwd,
+                        session_id=session_id,
+                        env_overrides=env_overrides,
+                    )
+                    if return_code != 0 and stderr_text:
+                        logger.warning("group kairos codex return_code=%s stderr=%s", return_code, stderr_text[-800:])
+                    answer = (answer or "").strip() or "Kairos 没有返回可展示内容。"
+                    chat.append(role="assistant", text=answer, source="group:kairos")
+                except Exception as e:
+                    logger.exception("group kairos codex worker failed")
+                    chat.append(role="assistant", text=f"Kairos 接入出错：{e}", source="group:kairos")
+                finally:
+                    self._set_typing_for_contact("apples", {"is_typing": False, "since": None})
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _handle_apples_chat_send(self, body: dict[str, Any], contact_id: str):
+        text = body.get("text", "").strip()
+        quoted_ts = body.get("quoted_ts") or None
+        location = body.get("location") or None
+        if not text and not location:
+            self._send_json(400, {"error": "text or location required"})
+            return
+
+        chat = self._chat_for_contact(contact_id)
+        rec = chat.append(
+            role="user",
+            text=text,
+            source="ios-app:apples",
+            quoted_ts=quoted_ts,
+            location=location,
+        )
+        targets = self._detect_apples_mentions(text)
+        if not targets:
+            self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec, "routed": []})
+            return
+
+        self._set_typing_for_contact(contact_id, {"is_typing": True, "since": rec["ts"]})
+        routed: list[str] = []
+        errors: dict[str, str] = {}
+
+        if "kairos" in targets:
+            self._start_group_kairos_reply(chat, text)
+            routed.append("kairos")
+
+        if "xiaoke" in targets:
+            from datetime import datetime as _dt
+            ts_prefix = "[" + _dt.now().strftime("%Y-%m-%d %H:%M:%S") + "]"
+            marker = self._group_reply_marker("xiaoke", rec["ts"])
+            injected = (
+                f"{ts_prefix} [苹果幼稚园群聊][只回复 Astra 这条用户消息，不要触发其他 AI。]\n"
+                f"请在本轮回复开头原样输出路由标记 {marker} ，然后直接回复群聊内容。\n"
+                f"{text}"
+            )
+            if rec.get("quoted_text"):
+                injected = (
+                    f"{ts_prefix} [苹果幼稚园群聊][只回复 Astra 这条用户消息，不要触发其他 AI。]\n"
+                    f"请在本轮回复开头原样输出路由标记 {marker} ，然后直接回复群聊内容。\n"
+                    f"[引用 \"{rec['quoted_text']}\"]\n{text}"
+                )
+            if rec.get("location"):
+                loc = rec["location"]
+                label = loc.get("label", "")
+                loc_str = f"[位置 lat={loc['lat']:.6f} lon={loc['lon']:.6f}{(' ' + label) if label else ''}]"
+                injected = f"{injected}\n{loc_str}"
+
+            target_session = (self.state.active_session or self.state.default_session).strip()
+            ok, err = self._inject_to_session(target_session, injected, source="ios-app:apples", sender="iphone")
+            if ok:
+                self._remember_group_reply("xiaoke", rec["ts"])
+                routed.append("xiaoke")
+            else:
+                errors["xiaoke"] = f"inject to tmux session '{target_session}' failed: {err}"
+
+        if errors and not routed:
+            self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
+            self._send_json(502, {"ok": False, "contact_id": contact_id, "record": rec, "errors": errors})
+            return
+
+        self._send_json(200, {
+            "ok": True,
+            "contact_id": contact_id,
+            "record": rec,
+            "routed": routed,
+            "errors": errors,
+        })
 
     def _inject_to_session(self, session: str, text: str, source: str = "ios-app", sender: str = "iphone"):
         """Inject text into target tmux session. Returns (success, error_msg).
@@ -3568,9 +4041,20 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(401, {"error": "auth required"})
             return
         contact_id = self._contact_id_from_body(body)
-        chat = self._chat_for_contact(contact_id)
         text = body.get("text", "").strip()
         role = body.get("role", "assistant")
+        source = body.get("source", "ios-app")
+        if not isinstance(source, str) or not source:
+            source = "ios-app"
+        if role == "assistant":
+            has_group_marker = "[[CCC_GROUP_REPLY:apples:" in text
+            if has_group_marker:
+                routed_contact_id, routed_member_id, cleaned_text = self._consume_group_reply_route(text)
+                if routed_contact_id:
+                    contact_id = routed_contact_id
+                    text = cleaned_text
+                    source = f"group:{routed_member_id or 'xiaoke'}"
+        chat = self._chat_for_contact(contact_id)
         if role == "task":
             if not text:
                 self._send_json(400, {"error": "text required"})
@@ -3684,10 +4168,6 @@ class PushHandler(BaseHTTPRequestHandler):
         metadata = body.get("metadata") or None
         if metadata and not isinstance(metadata, dict):
             metadata = None
-
-        source = body.get("source", "ios-app")
-        if not isinstance(source, str) or not source:
-            source = "ios-app"
 
         rec = chat.append(
             role=role,
@@ -4275,6 +4755,44 @@ class PushHandler(BaseHTTPRequestHandler):
                 "session": session,
                 "content": result.stdout
             })
+        except Exception as e:
+            self._send_json(500, {"error": str(e)})
+
+    def _handle_terminal_key(self, body: dict[str, Any]):
+        """POST /terminal/key — send a special key directly via tmux send-keys.
+
+        Body: {"key": "Escape"} or {"key": "C-c"}, {"key": "Tab"}, etc.
+        Optional: {"session": "cctg"} (defaults to "cctg")
+
+        This uses `tmux send-keys` directly, which is the correct way to send
+        special/control keys (unlike /tmux/send which uses load-buffer for text).
+        """
+        key_name = str(body.get("key", "")).strip()
+        session = str(body.get("session", "cctg")).strip() or "cctg"
+        if not key_name:
+            self._send_json(400, {"error": "key required"})
+            return
+        # Whitelist of allowed key names to prevent command injection
+        allowed_keys = {
+            "Escape", "Tab", "Enter", "Space", "BSpace",
+            "Up", "Down", "Left", "Right",
+            "Home", "End", "PageUp", "PageDown", "DC",
+            "C-c", "C-d", "C-z", "C-a", "C-e", "C-k", "C-u", "C-l", "C-r", "C-w",
+            "C-b", "C-f", "C-n", "C-p",
+            "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+        }
+        if key_name not in allowed_keys:
+            self._send_json(400, {"error": f"key '{key_name}' not in allowed list", "allowed": sorted(allowed_keys)})
+            return
+        try:
+            result = subprocess.run(
+                ["tmux", "send-keys", "-t", session, key_name],
+                capture_output=True, text=True, timeout=3
+            )
+            if result.returncode != 0:
+                self._send_json(500, {"error": result.stderr.strip() or "send-keys failed"})
+                return
+            self._send_json(200, {"ok": True, "key": key_name, "session": session})
         except Exception as e:
             self._send_json(500, {"error": str(e)})
 
