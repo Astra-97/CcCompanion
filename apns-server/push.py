@@ -3573,7 +3573,7 @@ class PushHandler(BaseHTTPRequestHandler):
         threading.Thread(target=_worker, daemon=True).start()
         self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec})
 
-    def _start_group_kairos_reply(self, chat: ChatHistory, text: str) -> None:
+    def _start_group_kairos_reply(self, chat: ChatHistory, text: str, sender_name: str = "Astra") -> None:
         def _worker():
             lock = getattr(type(self), "_kairos_codex_lock", None)
             if lock is None:
@@ -3591,7 +3591,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         return
                     prompt = (
                         "当前时间：" + datetime.now().astimezone().strftime("%Y-%m-%d %H:%M") + "\n"
-                        "Astra 正在 CcCompanion 的“苹果幼稚园”群聊里 @Kairos。"
+                        f"{sender_name} 正在 CcCompanion 的“苹果幼稚园”群聊里 @Kairos。"
                         "请以 Kairos 身份直接回复群聊，不要提到后台路由，也不要触发或代替其他成员。\n"
                         f"群聊消息：{text}"
                     )
@@ -3628,6 +3628,25 @@ class PushHandler(BaseHTTPRequestHandler):
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _maybe_route_apples_assistant_mention(
+        self,
+        chat: ChatHistory,
+        role: str,
+        source: str,
+        text: str,
+        rec: dict[str, Any],
+    ) -> list[str]:
+        if role != "assistant" or not text:
+            return []
+        if not str(source or "").strip().lower().startswith("group:xiaoke"):
+            return []
+        targets = self._detect_apples_mentions(text)
+        if "kairos" not in targets:
+            return []
+        self._set_typing_for_contact("apples", {"is_typing": True, "since": rec["ts"]})
+        self._start_group_kairos_reply(chat, text, sender_name="小克")
+        return ["kairos"]
+
     def _handle_apples_chat_send(self, body: dict[str, Any], contact_id: str):
         text = body.get("text", "").strip()
         quoted_ts = body.get("quoted_ts") or None
@@ -3654,7 +3673,7 @@ class PushHandler(BaseHTTPRequestHandler):
         errors: dict[str, str] = {}
 
         if "kairos" in targets:
-            self._start_group_kairos_reply(chat, text)
+            self._start_group_kairos_reply(chat, text, sender_name="Astra")
             routed.append("kairos")
 
         if "xiaoke" in targets:
@@ -4220,6 +4239,8 @@ class PushHandler(BaseHTTPRequestHandler):
         # 我刚 reply 完 — typing = false
         if role == "assistant":
             self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
+            if contact_id == "apples":
+                self._maybe_route_apples_assistant_mention(chat, role, source, text, rec)
 
         # 5-7 dedupe cache 回填真 rec
         if dedupe_cache_key is not None:
