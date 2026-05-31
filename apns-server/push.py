@@ -1283,6 +1283,18 @@ class PushHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
             return
+        # --- Health Records GET ---
+        if self.path.startswith("/health-records"):
+            self._handle_health_records_get()
+            return
+        # --- User Settings GET ---
+        if self.path == "/user-settings":
+            self._handle_user_settings_get()
+            return
+        # --- Uploads static file serving ---
+        if self.path.startswith("/uploads/"):
+            self._handle_uploads_get()
+            return
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -1296,6 +1308,9 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/diary/upload":
             self._handle_diary_upload()
+            return
+        if self.path == "/upload":
+            self._handle_upload_multipart()
             return
 
         try:
@@ -1468,6 +1483,18 @@ class PushHandler(BaseHTTPRequestHandler):
             for k, v in body.items():
                 self.state.settings.set(k, v)
             self._send_json(200, {"ok": True, "settings": self.state.settings.snapshot()})
+            return
+        elif self.path == "/health-records":
+            self._handle_health_records_post(body)
+            return
+        elif self.path == "/user-settings":
+            self._handle_user_settings_post(body)
+            return
+        elif self.path == "/upload":
+            # multipart upload needs raw body, but we already parsed JSON above.
+            # Re-route: upload must be handled before JSON parsing. Add it above.
+            # This fallback handles the case where someone posts JSON to /upload by mistake.
+            self._send_json(400, {"error": "use multipart/form-data for /upload"})
             return
         else:
             self._send_json(404, {"error": "not found"})
@@ -4468,6 +4495,338 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.debug("attachment client disconnected path=%s err=%s", target.name, e)
         except Exception:
             logger.exception("attachment stream fail path=%s", target)
+
+    # ------------------------------------------------------------------
+    # Health Records API
+    # ------------------------------------------------------------------
+
+    _HEALTH_RECORDS_PATH = HERE / "state" / "health_records.json"
+    _HEALTH_RECORDS_LOCK = threading.Lock()
+
+    def _health_records_load(self) -> list[dict[str, Any]]:
+        """Load health records from JSON file. Returns list of records."""
+        path = self._HEALTH_RECORDS_PATH
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data
+            return []
+        except Exception:
+            return []
+
+    def _health_records_save(self, records: list[dict[str, Any]]) -> None:
+        """Atomically save health records to JSON file."""
+        path = self._HEALTH_RECORDS_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def _health_records_cleanup(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Remove records older than 30 days."""
+        cutoff_ms = (time.time() - 30 * 86400) * 1000
+        return [r for r in records if r.get("timestamp", 0) > cutoff_ms]
+
+    def _handle_health_records_post(self, body: dict[str, Any]):
+        """POST /health-records - add a health record (glucose or food)."""
+        import uuid as _uuid
+
+        record_type = str(body.get("type", "")).strip().lower()
+        if record_type not in ("glucose", "food"):
+            self._send_json(400, {"error": "type must be 'glucose' or 'food'"})
+            return
+
+        record: dict[str, Any] = {
+            "id": _uuid.uuid4().hex,
+            "type": record_type,
+            "note": str(body.get("note", "")),
+            "timestamp": int(body.get("timestamp", 0)) or int(time.time() * 1000),
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        }
+
+        if record_type == "glucose":
+            value = body.get("value")
+            if value is None:
+                self._send_json(400, {"error": "value required for glucose record"})
+                return
+            try:
+                record["value"] = float(value)
+            except (TypeError, ValueError):
+                self._send_json(400, {"error": "value must be a number"})
+                return
+        elif record_type == "food":
+            name = str(body.get("name", "")).strip()
+            if not name:
+                self._send_json(400, {"error": "name required for food record"})
+                return
+            record["name"] = name
+
+        try:
+            with self._HEALTH_RECORDS_LOCK:
+                records = self._health_records_load()
+                records = self._health_records_cleanup(records)
+                records.append(record)
+                self._health_records_save(records)
+            self._send_json(200, {"ok": True, "record": record})
+        except Exception as e:
+            logger.exception("health records post fail")
+            self._send_json(500, {"error": str(e)})
+
+    def _handle_health_records_get(self):
+        """GET /health-records?date=2026-05-31 - return records for a date."""
+        from urllib.parse import urlparse, parse_qs
+
+        qs = parse_qs(urlparse(self.path).query)
+        date_str = qs.get("date", [None])[0]
+
+        if date_str:
+            try:
+                target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            except ValueError:
+                self._send_json(400, {"error": "date must be YYYY-MM-DD format"})
+                return
+        else:
+            target_date = datetime.now(timezone.utc).date()
+
+        try:
+            with self._HEALTH_RECORDS_LOCK:
+                records = self._health_records_load()
+            # Filter records for the target date
+            day_records = []
+            for r in records:
+                ts_ms = r.get("timestamp", 0)
+                if ts_ms:
+                    record_date = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).date()
+                    if record_date == target_date:
+                        day_records.append(r)
+            self._send_json(200, {"ok": True, "date": str(target_date), "records": day_records})
+        except Exception as e:
+            logger.exception("health records get fail")
+            self._send_json(500, {"error": str(e)})
+
+    # ------------------------------------------------------------------
+    # Image Upload API (avatar / background)
+    # ------------------------------------------------------------------
+
+    _UPLOADS_DIR = HERE / "state" / "uploads"
+
+    def _handle_upload_multipart(self):
+        """POST /upload - accept multipart/form-data with file + type + user_id fields."""
+        allowed_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except Exception:
+            length = 0
+        max_size = 10 * 1024 * 1024  # 10MB
+
+        if length <= 0:
+            self._send_json(400, {"error": "empty upload"})
+            return
+        if length > max_size:
+            self._send_json(413, {"error": "file too large (max 10MB)"})
+            return
+
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in content_type or "boundary=" not in content_type:
+            self._send_json(400, {"error": "multipart/form-data required"})
+            return
+
+        try:
+            from email import policy
+            from email.parser import BytesParser
+
+            raw = self.rfile.read(length)
+            msg = BytesParser(policy=policy.default).parsebytes(
+                (
+                    f"Content-Type: {content_type}\r\n"
+                    "MIME-Version: 1.0\r\n\r\n"
+                ).encode("utf-8") + raw
+            )
+
+            # Extract fields from multipart
+            file_part = None
+            upload_type = "avatar"
+            user_id = "default"
+
+            for part in msg.iter_parts():
+                param_name = part.get_param("name", header="content-disposition")
+                if param_name == "file":
+                    file_part = part
+                elif param_name == "type":
+                    val = part.get_payload(decode=True)
+                    if val:
+                        upload_type = val.decode("utf-8", errors="replace").strip()
+                elif param_name == "user_id":
+                    val = part.get_payload(decode=True)
+                    if val:
+                        user_id = val.decode("utf-8", errors="replace").strip()
+
+            if file_part is None:
+                self._send_json(400, {"error": "file field required"})
+                return
+
+            # Validate type
+            if upload_type not in ("avatar", "background"):
+                self._send_json(400, {"error": "type must be 'avatar' or 'background'"})
+                return
+
+            # Sanitize user_id (alphanumeric + underscore + dash only)
+            user_id = re.sub(r"[^a-zA-Z0-9_-]", "_", user_id)[:64] or "default"
+
+            filename = file_part.get_filename() or "upload.bin"
+            ext = Path(filename).suffix.lower()
+            if ext not in allowed_exts:
+                self._send_json(400, {"error": f"unsupported extension, allowed: {', '.join(sorted(allowed_exts))}"})
+                return
+
+            payload = file_part.get_payload(decode=True) or b""
+            if not payload:
+                self._send_json(400, {"error": "empty file"})
+                return
+            if len(payload) > max_size:
+                self._send_json(413, {"error": "file too large"})
+                return
+
+            # Ensure uploads dir exists
+            uploads_dir = self._UPLOADS_DIR
+            uploads_dir.mkdir(parents=True, exist_ok=True)
+
+            # Filename: {type}_{user_id}.{ext} — overwrites previous
+            stored_name = f"{upload_type}_{user_id}{ext}"
+            stored_path = uploads_dir / stored_name
+
+            # Remove any old file with same prefix but different extension
+            for old in uploads_dir.glob(f"{upload_type}_{user_id}.*"):
+                if old != stored_path:
+                    try:
+                        old.unlink()
+                    except Exception:
+                        pass
+
+            # Atomic write
+            tmp_path = stored_path.with_suffix(".tmp")
+            tmp_path.write_bytes(payload)
+            tmp_path.replace(stored_path)
+
+            url = f"/uploads/{stored_name}"
+            self._send_json(200, {"ok": True, "url": url, "filename": stored_name})
+
+        except Exception as e:
+            logger.exception("upload multipart fail")
+            self._send_json(500, {"error": str(e)})
+
+    def _handle_uploads_get(self):
+        """GET /uploads/{filename} - serve uploaded file from state/uploads/."""
+        from urllib.parse import unquote
+
+        rel = self.path[len("/uploads/"):]
+        rel = unquote(rel.split("?", 1)[0])
+
+        # Prevent path traversal
+        if "/" in rel or ".." in rel or rel.startswith(".") or not rel:
+            self._send_json(400, {"error": "bad filename"})
+            return
+
+        target = self._UPLOADS_DIR / rel
+        if not target.exists() or not target.is_file():
+            self._send_json(404, {"error": "not found"})
+            return
+
+        ext = target.suffix.lower()
+        mime_map = {
+            ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+            ".gif": "image/gif", ".webp": "image/webp",
+            ".heic": "image/heic", ".heif": "image/heif",
+        }
+        mime = mime_map.get(ext, "application/octet-stream")
+
+        try:
+            file_size = target.stat().st_size
+        except Exception:
+            self._send_json(500, {"error": "read fail"})
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(file_size))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+
+        try:
+            with target.open("rb") as f:
+                while True:
+                    chunk = f.read(64 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError) as e:
+            logger.debug("uploads client disconnected path=%s err=%s", target.name, e)
+        except Exception:
+            logger.exception("uploads stream fail path=%s", target)
+
+    # ------------------------------------------------------------------
+    # User Settings Sync API
+    # ------------------------------------------------------------------
+
+    _USER_SETTINGS_PATH = HERE / "state" / "user_settings.json"
+    _USER_SETTINGS_LOCK = threading.Lock()
+
+    def _user_settings_load(self) -> dict[str, Any]:
+        """Load user settings from JSON file."""
+        path = self._USER_SETTINGS_PATH
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+            return {}
+        except Exception:
+            return {}
+
+    def _user_settings_save(self, settings: dict[str, Any]) -> None:
+        """Atomically save user settings to JSON file."""
+        path = self._USER_SETTINGS_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def _handle_user_settings_post(self, body: dict[str, Any]):
+        """POST /user-settings - merge provided fields into stored settings."""
+        allowed_keys = {
+            "avatar_url", "background_url", "font_size",
+            "bubble_color", "theme_color", "display_name", "bot_name",
+        }
+        updates = {k: v for k, v in body.items() if k in allowed_keys}
+        if not updates:
+            self._send_json(400, {"error": f"no valid fields provided. allowed: {', '.join(sorted(allowed_keys))}"})
+            return
+
+        try:
+            with self._USER_SETTINGS_LOCK:
+                settings = self._user_settings_load()
+                settings.update(updates)
+                self._user_settings_save(settings)
+            self._send_json(200, {"ok": True, "settings": settings})
+        except Exception as e:
+            logger.exception("user settings post fail")
+            self._send_json(500, {"error": str(e)})
+
+    def _handle_user_settings_get(self):
+        """GET /user-settings - return current user settings."""
+        try:
+            with self._USER_SETTINGS_LOCK:
+                settings = self._user_settings_load()
+            self._send_json(200, {"ok": True, "settings": settings})
+        except Exception as e:
+            logger.exception("user settings get fail")
+            self._send_json(500, {"error": str(e)})
+
+    # ------------------------------------------------------------------
 
     def _handle_chat_delete(self, body: dict[str, Any]):
         ts = body.get("ts", "").strip()
