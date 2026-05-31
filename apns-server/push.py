@@ -1295,6 +1295,10 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/uploads/"):
             self._handle_uploads_get()
             return
+        # --- Notion proxy GET ---
+        if self.path.startswith("/notion/page/"):
+            self._handle_notion_page_get()
+            return
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -1496,6 +1500,14 @@ class PushHandler(BaseHTTPRequestHandler):
             # This fallback handles the case where someone posts JSON to /upload by mistake.
             self._send_json(400, {"error": "use multipart/form-data for /upload"})
             return
+        elif self.path == "/notion/query":
+            self._handle_notion_query(body)
+        elif self.path == "/notion/create":
+            self._handle_notion_create(body)
+        elif self.path == "/notion/append":
+            self._handle_notion_append(body)
+        elif self.path == "/notion/search":
+            self._handle_notion_search(body)
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -4605,6 +4617,166 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception as e:
             logger.exception("health records get fail")
             self._send_json(500, {"error": str(e)})
+
+    # ------------------------------------------------------------------
+    # Notion Proxy API (Android app reads/writes Notion without token)
+    # ------------------------------------------------------------------
+
+    _NOTION_TOKEN_PATH = Path("/root/.notion_token")
+    _NOTION_API_VERSION = "2022-06-28"
+
+    def _notion_token(self) -> str | None:
+        """Read Notion API token from file. Returns None if not found."""
+        try:
+            if self._NOTION_TOKEN_PATH.exists():
+                return self._NOTION_TOKEN_PATH.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+        return None
+
+    def _notion_request(self, method: str, url: str, body: dict[str, Any] | None = None) -> tuple[int, dict[str, Any]]:
+        """Make a request to Notion API. Returns (status_code, response_json)."""
+        import urllib.request
+        import urllib.error
+
+        token = self._notion_token()
+        if not token:
+            return 500, {"error": "notion token not configured (missing /root/.notion_token)"}
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Notion-Version": self._NOTION_API_VERSION,
+            "Content-Type": "application/json",
+        }
+
+        data = json.dumps(body).encode("utf-8") if body else None
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp_data = resp.read()
+                return resp.status, json.loads(resp_data) if resp_data else {}
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = json.loads(e.read())
+            except Exception:
+                err_body = {"error": e.reason}
+            return e.code, err_body
+        except urllib.error.URLError as e:
+            return 502, {"error": f"notion api unreachable: {e.reason}"}
+        except Exception as e:
+            return 502, {"error": f"notion request failed: {e}"}
+
+    def _handle_notion_query(self, body: dict[str, Any]):
+        """POST /notion/query - query a Notion database."""
+        database_id = str(body.get("database_id", "")).strip()
+        if not database_id:
+            self._send_json(400, {"error": "database_id required"})
+            return
+
+        payload: dict[str, Any] = {}
+        if body.get("filter"):
+            payload["filter"] = body["filter"]
+        if body.get("sorts"):
+            payload["sorts"] = body["sorts"]
+        if body.get("page_size"):
+            payload["page_size"] = int(body["page_size"])
+        if body.get("start_cursor"):
+            payload["start_cursor"] = body["start_cursor"]
+
+        url = f"https://api.notion.com/v1/databases/{database_id}/query"
+        status, resp = self._notion_request("POST", url, payload)
+        self._send_json(status, resp)
+
+    def _handle_notion_create(self, body: dict[str, Any]):
+        """POST /notion/create - create a page in a Notion database."""
+        database_id = str(body.get("database_id", "")).strip()
+        if not database_id:
+            self._send_json(400, {"error": "database_id required"})
+            return
+
+        payload: dict[str, Any] = {
+            "parent": {"database_id": database_id},
+        }
+        if body.get("properties"):
+            payload["properties"] = body["properties"]
+        if body.get("children"):
+            payload["children"] = body["children"]
+        if body.get("icon"):
+            icon_value = body["icon"]
+            if isinstance(icon_value, str):
+                payload["icon"] = {"type": "emoji", "emoji": icon_value}
+            elif isinstance(icon_value, dict):
+                payload["icon"] = icon_value
+
+        url = "https://api.notion.com/v1/pages"
+        status, resp = self._notion_request("POST", url, payload)
+        self._send_json(status, resp)
+
+    def _handle_notion_append(self, body: dict[str, Any]):
+        """POST /notion/append - append blocks to a page."""
+        page_id = str(body.get("page_id", "")).strip()
+        if not page_id:
+            self._send_json(400, {"error": "page_id required"})
+            return
+
+        children = body.get("children")
+        if not children or not isinstance(children, list):
+            self._send_json(400, {"error": "children array required"})
+            return
+
+        payload = {"children": children}
+        url = f"https://api.notion.com/v1/blocks/{page_id}/children"
+        status, resp = self._notion_request("PATCH", url, payload)
+        self._send_json(status, resp)
+
+    def _handle_notion_search(self, body: dict[str, Any]):
+        """POST /notion/search - search Notion."""
+        query = str(body.get("query", "")).strip()
+
+        payload: dict[str, Any] = {}
+        if query:
+            payload["query"] = query
+        if body.get("filter"):
+            payload["filter"] = body["filter"]
+        if body.get("sort"):
+            payload["sort"] = body["sort"]
+        if body.get("page_size"):
+            payload["page_size"] = int(body["page_size"])
+        if body.get("start_cursor"):
+            payload["start_cursor"] = body["start_cursor"]
+
+        url = "https://api.notion.com/v1/search"
+        status, resp = self._notion_request("POST", url, payload)
+        self._send_json(status, resp)
+
+    def _handle_notion_page_get(self):
+        """GET /notion/page/{page_id} - get page blocks/content."""
+        from urllib.parse import urlparse, parse_qs
+
+        # Extract page_id from path: /notion/page/{page_id}
+        parts = self.path.split("?", 1)
+        path_part = parts[0]
+        prefix = "/notion/page/"
+        page_id = path_part[len(prefix):].strip()
+
+        if not page_id:
+            self._send_json(400, {"error": "page_id required in URL path"})
+            return
+
+        # Optional query params for pagination
+        qs = parse_qs(parts[1]) if len(parts) > 1 else {}
+        url = f"https://api.notion.com/v1/blocks/{page_id}/children"
+        params = []
+        if qs.get("page_size"):
+            params.append(f"page_size={qs['page_size'][0]}")
+        if qs.get("start_cursor"):
+            params.append(f"start_cursor={qs['start_cursor'][0]}")
+        if params:
+            url += "?" + "&".join(params)
+
+        status, resp = self._notion_request("GET", url)
+        self._send_json(status, resp)
 
     # ------------------------------------------------------------------
     # Image Upload API (avatar / background)
