@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
+import hmac
 import hashlib
 import ipaddress
 import json
@@ -536,7 +537,7 @@ class ServerState:
 
         server_cfg = config.get("server", {})
         self.host: str = server_cfg.get("host", "127.0.0.1")
-        self.port: int = int(server_cfg.get("port", 8795))
+        self.port: int = int(server_cfg.get("port", 8291))
         self.token_store_path: str = server_cfg.get(
             "token_store_path", str(HERE / "tokens" / "active.json")
         )
@@ -551,6 +552,43 @@ class ServerState:
         self.allow_remote_control: bool = bool(server_cfg.get("allow_remote_control", False))
         self.allowed_ips: list[str] = list(server_cfg.get("allowed_ips", []) or [])
         self.default_session: str = server_cfg.get("default_session", "cc")
+        self.channel_transport_enabled: bool = bool(server_cfg.get("channel_transport_enabled", False))
+        self.channel_transport_url: str = str(
+            server_cfg.get("channel_transport_url", "http://127.0.0.1:8810")
+        ).rstrip("/")
+        # Warn if channel transport URL points to a non-localhost address
+        try:
+            from urllib.parse import urlparse
+            _ct_host = urlparse(self.channel_transport_url).hostname or ""
+            if _ct_host not in ("127.0.0.1", "localhost", "::1"):
+                logger.warning(
+                    "channel_transport_url points to non-localhost host %r — "
+                    "ensure this is intentional and the endpoint is trusted",
+                    _ct_host,
+                )
+        except Exception:
+            pass
+        self.channel_transport_token: str = str(server_cfg.get("channel_transport_token", "") or "")
+        self.channel_transport_contacts: list[str] = [
+            str(item).strip().lower()
+            for item in (server_cfg.get("channel_transport_contacts", ["xiaoke"]) or [])
+            if str(item).strip()
+        ]
+        self.channel_transport_fallback_to_tmux: bool = bool(
+            server_cfg.get("channel_transport_fallback_to_tmux", True)
+        )
+        self.channel_transport_timeout_seconds: float = float(
+            server_cfg.get("channel_transport_timeout_seconds", 5)
+        )
+
+        auth_cfg = config.get("auth", {})
+        self.login_username: str = str(auth_cfg.get("username", "") or "")
+        self.login_password: str = str(auth_cfg.get("password", "") or "")
+        self.login_ghp_token: str = str(auth_cfg.get("ghp_token", "") or "")
+        public_server_url = str(auth_cfg.get("server_url", "") or "").strip()
+        self.public_server_url: str = (
+            public_server_url or "https://companion-vps2.xiaonancaleb.xyz"
+        ).rstrip("/")
 
         if self.apns_enabled:
             self.jwt = APNsJWT(
@@ -911,6 +949,29 @@ class PushHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _handle_login(self, body: dict[str, Any]):
+        username = str(body.get("username", "") or "")
+        password = str(body.get("password", "") or "")
+        expected_username = self.state.login_username
+        expected_password = self.state.login_password
+        if (
+            not expected_username
+            or not expected_password
+            or not hmac.compare_digest(username, expected_username)
+            or not hmac.compare_digest(password, expected_password)
+        ):
+            self._send_json(401, {"ok": False, "error": "invalid credentials"})
+            return
+        self._send_json(
+            200,
+            {
+                "ok": True,
+                "server_url": self.state.public_server_url,
+                "auth_token": self.state.shared_secret or "",
+                "ghp_token": self.state.login_ghp_token,
+            },
+        )
 
     # ---------- routes ----------
 
@@ -1287,6 +1348,14 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/health-records"):
             self._handle_health_records_get()
             return
+        # --- Appearance Settings GET ---
+        if self.path == "/appearance-settings":
+            self._handle_appearance_settings_get()
+            return
+        # --- Appearance Assets GET ---
+        if self.path.startswith("/appearance-assets/"):
+            self._handle_appearance_assets_get()
+            return
         # --- User Settings GET ---
         if self.path == "/user-settings":
             self._handle_user_settings_get()
@@ -1304,6 +1373,14 @@ class PushHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._check_ip_allowed():
             return
+        if self.path == "/login":
+            try:
+                body = self._read_body()
+            except Exception as e:
+                self._send_json(400, {"ok": False, "error": f"bad json: {e}"})
+                return
+            self._handle_login(body)
+            return
         if not self._require_write_auth():
             return
         # /chat/upload 走 multipart 不解析 JSON 直接 handle raw (现在含 query string)
@@ -1315,6 +1392,9 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/upload":
             self._handle_upload_multipart()
+            return
+        if self.path == "/appearance-assets":
+            self._handle_appearance_assets_upload()
             return
 
         try:
@@ -1490,6 +1570,9 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         elif self.path == "/health-records":
             self._handle_health_records_post(body)
+            return
+        elif self.path == "/appearance-settings":
+            self._handle_appearance_settings_post(body)
             return
         elif self.path == "/user-settings":
             self._handle_user_settings_post(body)
@@ -1748,6 +1831,7 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "text required"})
             return
         rec = self.state.task_buffer.append(text=text, source=source)
+        self.state.chat.append(role="task", text=text, source=source)
         self._send_json(200, {"ok": True, "record": rec})
 
     def _auto_push_from_task(self, snap: dict[str, Any], action: str):
@@ -3431,6 +3515,113 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json(500, {"ok": False, "error": str(e)})
 
+    def _channel_transport_enabled_for(self, contact_id: str) -> bool:
+        if not self.state.channel_transport_enabled:
+            return False
+        return contact_id in self.state.channel_transport_contacts
+
+    def _redact_channel_error(self, text: Any) -> str:
+        value = str(text or "").strip()
+        token = self.state.channel_transport_token
+        if token:
+            value = value.replace(token, "[redacted]")
+        return value[:500]
+
+    def _channel_message_id(
+        self,
+        body: dict[str, Any],
+        contact_id: str,
+        text: str,
+        quoted_ts: str | None,
+    ) -> str:
+        client_msg_id = str(body.get("client_msg_id") or "").strip()
+        if client_msg_id:
+            return client_msg_id
+        location = body.get("location") if isinstance(body.get("location"), dict) else None
+        # Include a second-level timestamp so identical content at different
+        # times produces distinct message IDs (avoids false deduplication).
+        ts_epoch = int(time.time())
+        seed = json.dumps(
+            {
+                "contact_id": contact_id,
+                "text": text,
+                "quoted_ts": quoted_ts,
+                "location": location,
+                "ts": ts_epoch,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+        return f"ccc:{digest}"
+
+    def _send_to_channel_transport(
+        self,
+        *,
+        message_id: str,
+        contact_id: str,
+        text: str,
+        quoted_ts: str | None,
+        user_record: dict[str, Any],
+    ) -> tuple[bool, str, dict[str, Any] | None]:
+        import urllib.error
+        import urllib.request
+
+        url = f"{self.state.channel_transport_url}/messages"
+        metadata: dict[str, Any] = {
+            "source": "ios-app",
+            "transport": "channel",
+            "user_record_ts": user_record.get("ts"),
+        }
+        location = user_record.get("location")
+        if isinstance(location, dict):
+            location_summary = {
+                key: location.get(key)
+                for key in ("lat", "lon", "label")
+                if location.get(key) is not None
+            }
+            if location_summary:
+                metadata["location"] = location_summary
+
+        payload = {
+            "message_id": message_id,
+            "contact_id": contact_id,
+            "text": text,
+            "quoted_ts": quoted_ts,
+            "metadata": metadata,
+        }
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.state.channel_transport_token:
+            headers["X-Auth-Token"] = self.state.channel_transport_token
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(
+                req,
+                timeout=max(0.1, self.state.channel_transport_timeout_seconds),
+            ) as resp:
+                status = int(resp.status)
+                raw = resp.read(64 * 1024).decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            raw = e.read(4096).decode("utf-8", errors="replace")
+            return False, self._redact_channel_error(f"http {e.code}: {raw}"), None
+        except urllib.error.URLError as e:
+            return False, self._redact_channel_error(f"request failed: {e.reason}"), None
+        except Exception as e:
+            return False, self._redact_channel_error(f"request failed: {e}"), None
+
+        try:
+            response_json = json.loads(raw) if raw.strip() else {}
+        except Exception:
+            return False, self._redact_channel_error(f"http {status}: invalid json response"), None
+
+        if not (200 <= status < 300):
+            return False, self._redact_channel_error(f"http {status}: {raw[:500]}"), None
+        if isinstance(response_json, dict) and response_json.get("ok") is False:
+            err = response_json.get("error") or response_json.get("message") or "ok false"
+            return False, self._redact_channel_error(err), response_json
+        return True, "", response_json if isinstance(response_json, dict) else {"response": response_json}
+
     def _handle_chat_send(self, body: dict[str, Any]):
         """iPhone 发消息进来 → 写 user 条 + 调 bus_send.py 注入主 session"""
         contact_id = self._contact_id_from_body(body)
@@ -3482,6 +3673,38 @@ class PushHandler(BaseHTTPRequestHandler):
                     injected = f"{injected}\n{text}"
         # set typing — Cc 收到 message 在 thinking
         self._set_typing_for_contact(contact_id, {"is_typing": True, "since": rec["ts"]})
+        if self._channel_transport_enabled_for(contact_id):
+            message_id = self._channel_message_id(body, contact_id, injected, quoted_ts)
+            ok, err, _channel_response = self._send_to_channel_transport(
+                message_id=message_id,
+                contact_id=contact_id,
+                text=injected,
+                quoted_ts=quoted_ts,
+                user_record=rec,
+            )
+            if ok:
+                self._send_json(200, {
+                    "ok": True,
+                    "record": rec,
+                    "transport": "channel",
+                    "message_id": message_id,
+                })
+                return
+            logger.warning(
+                "channel transport failed contact_id=%s message_id=%s error=%s",
+                contact_id,
+                message_id,
+                err,
+            )
+            if not self.state.channel_transport_fallback_to_tmux:
+                self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
+                self._send_json(502, {
+                    "ok": False,
+                    "record": rec,
+                    "transport": "channel",
+                    "error": err or "channel transport failed",
+                })
+                return
         # 注入文本到 active tmux session
         # 2026-05-14 build 200 — 不依赖 ~/scripts/bus_send.py (Opia 内部 file, ccc 公开版用户没有)
         # 如果 bus_send.py 存在 用它走 bus dispatcher 路由 (Opia 内部多 agent 协调用)
@@ -4118,6 +4341,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "text required"})
                 return
             rec = self.state.task_buffer.append(text=text, source=body.get("source", "system"))
+            chat.append(role="task", text=text, source=body.get("source", "system"))
             self._send_json(200, {"ok": True, "record": rec})
             return
 
@@ -4779,6 +5003,202 @@ class PushHandler(BaseHTTPRequestHandler):
         self._send_json(status, resp)
 
     # ------------------------------------------------------------------
+    # Appearance Settings Sync API (Android cloud backup)
+    # ------------------------------------------------------------------
+
+    _APPEARANCE_SETTINGS_PATH = HERE / "state" / "appearance_settings.json"
+    _APPEARANCE_SETTINGS_LOCK = threading.Lock()
+    _APPEARANCE_ASSETS_DIR = HERE / "state" / "appearance_assets"
+
+    def _appearance_settings_load(self) -> dict[str, Any]:
+        path = self._APPEARANCE_SETTINGS_PATH
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _appearance_settings_save(self, settings: dict[str, Any]) -> None:
+        path = self._APPEARANCE_SETTINGS_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def _handle_appearance_settings_get(self):
+        """GET /appearance-settings — return stored appearance settings."""
+        try:
+            with self._APPEARANCE_SETTINGS_LOCK:
+                settings = self._appearance_settings_load()
+            if not settings:
+                self._send_json(200, {"ok": True, "found": False, "settings": {}})
+            else:
+                self._send_json(200, {"ok": True, "found": True, "settings": settings})
+        except Exception as e:
+            logger.exception("appearance settings get fail")
+            self._send_json(500, {"error": str(e)})
+
+    def _handle_appearance_settings_post(self, body: dict[str, Any]):
+        """POST /appearance-settings — save full appearance settings JSON."""
+        if not body:
+            self._send_json(400, {"error": "empty body"})
+            return
+        try:
+            with self._APPEARANCE_SETTINGS_LOCK:
+                self._appearance_settings_save(body)
+            self._send_json(200, {"ok": True})
+        except Exception as e:
+            logger.exception("appearance settings post fail")
+            self._send_json(500, {"error": str(e)})
+
+    def _handle_appearance_assets_upload(self):
+        """POST /appearance-assets — multipart upload for wallpaper/avatar images."""
+        allowed_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
+        allowed_types = {"ai_avatar", "user_avatar", "wallpaper"}
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except Exception:
+            length = 0
+        max_size = 10 * 1024 * 1024
+
+        if length <= 0:
+            self._send_json(400, {"error": "empty upload"})
+            return
+        if length > max_size:
+            self._send_json(413, {"error": "file too large (max 10MB)"})
+            return
+
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in content_type or "boundary=" not in content_type:
+            self._send_json(400, {"error": "multipart/form-data required"})
+            return
+
+        try:
+            from email import policy
+            from email.parser import BytesParser
+
+            raw = self.rfile.read(length)
+            msg = BytesParser(policy=policy.default).parsebytes(
+                (
+                    f"Content-Type: {content_type}\r\n"
+                    "MIME-Version: 1.0\r\n\r\n"
+                ).encode("utf-8") + raw
+            )
+
+            file_part = None
+            asset_type = ""
+
+            for part in msg.iter_parts():
+                param_name = part.get_param("name", header="content-disposition")
+                if param_name == "file":
+                    file_part = part
+                elif param_name == "type":
+                    val = part.get_payload(decode=True)
+                    if val:
+                        asset_type = val.decode("utf-8", errors="replace").strip()
+
+            if file_part is None:
+                self._send_json(400, {"error": "file field required"})
+                return
+
+            dynamic_asset_type = bool(re.fullmatch(r"contact_avatar_[A-Za-z0-9_-]{1,64}", asset_type))
+            if asset_type not in allowed_types and not (
+                dynamic_asset_type or asset_type in {"light_app_bg", "dark_app_bg"}
+            ):
+                self._send_json(400, {"error": f"type must be one of: {', '.join(sorted(allowed_types))}, contact_avatar_*, light_app_bg, dark_app_bg"})
+                return
+
+            filename = file_part.get_filename() or "upload.bin"
+            ext = Path(filename).suffix.lower()
+            if ext not in allowed_exts:
+                self._send_json(400, {"error": f"unsupported extension, allowed: {', '.join(sorted(allowed_exts))}"})
+                return
+
+            payload = file_part.get_payload(decode=True) or b""
+            if not payload:
+                self._send_json(400, {"error": "empty file"})
+                return
+            if len(payload) > max_size:
+                self._send_json(413, {"error": "file too large"})
+                return
+
+            assets_dir = self._APPEARANCE_ASSETS_DIR
+            assets_dir.mkdir(parents=True, exist_ok=True)
+
+            stored_name = f"{asset_type}{ext}"
+            stored_path = assets_dir / stored_name
+
+            # Remove old file with same type but different extension
+            for old in assets_dir.glob(f"{asset_type}.*"):
+                if old != stored_path:
+                    try:
+                        old.unlink()
+                    except Exception:
+                        pass
+
+            tmp_path = stored_path.with_suffix(".tmp")
+            tmp_path.write_bytes(payload)
+            tmp_path.replace(stored_path)
+
+            url = f"/appearance-assets/{stored_name}"
+            self._send_json(200, {"ok": True, "url": url, "filename": stored_name})
+
+        except Exception as e:
+            logger.exception("appearance assets upload fail")
+            self._send_json(500, {"error": str(e)})
+
+    def _handle_appearance_assets_get(self):
+        """GET /appearance-assets/{filename} — serve stored appearance asset."""
+        from urllib.parse import unquote
+
+        rel = self.path[len("/appearance-assets/"):]
+        rel = unquote(rel.split("?", 1)[0])
+
+        if "/" in rel or ".." in rel or rel.startswith(".") or not rel:
+            self._send_json(400, {"error": "bad filename"})
+            return
+
+        target = self._APPEARANCE_ASSETS_DIR / rel
+        if not target.exists() or not target.is_file():
+            self._send_json(404, {"error": "not found"})
+            return
+
+        ext = target.suffix.lower()
+        mime_map = {
+            ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+            ".gif": "image/gif", ".webp": "image/webp",
+            ".heic": "image/heic", ".heif": "image/heif",
+        }
+        mime = mime_map.get(ext, "application/octet-stream")
+
+        try:
+            file_size = target.stat().st_size
+        except Exception:
+            self._send_json(500, {"error": "read fail"})
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(file_size))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+
+        try:
+            with target.open("rb") as f:
+                while True:
+                    chunk = f.read(64 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError) as e:
+            logger.debug("appearance_assets client disconnected path=%s err=%s", target.name, e)
+        except Exception:
+            logger.exception("appearance_assets stream fail path=%s", target)
+
+    # ------------------------------------------------------------------
     # Image Upload API (avatar / background)
     # ------------------------------------------------------------------
 
@@ -4972,8 +5392,30 @@ class PushHandler(BaseHTTPRequestHandler):
         allowed_keys = {
             "avatar_url", "background_url", "font_size",
             "bubble_color", "theme_color", "display_name", "bot_name",
+            "appearance",
         }
         updates = {k: v for k, v in body.items() if k in allowed_keys}
+        if "appearance" not in updates:
+            appearance_keys = {
+                "bgUri", "aiName", "aiStatus", "aiAvatarUri", "meName", "meAvatarUri",
+                "contactAvatarUris", "contactNicknames", "inputHint",
+                "toolSummaryBeforeCount", "toolSummaryAfterCount",
+                "aiColor", "aiOpacity", "aiGlass", "aiBlur", "aiText",
+                "userColor", "userOpacity", "userGlass", "userBlur", "userText",
+                "darkAiColor", "darkAiOpacity", "darkAiGlass", "darkAiBlur", "darkAiText",
+                "darkUserColor", "darkUserOpacity", "darkUserGlass", "darkUserBlur", "darkUserText",
+                "lightAiColor", "lightAiOpacity", "lightAiGlass", "lightAiBlur", "lightAiText",
+                "lightUserColor", "lightUserOpacity", "lightUserGlass", "lightUserBlur", "lightUserText",
+                "fontSize", "radius", "gap", "darkMode", "themeMode", "themeColor",
+                "lightSettingsPageBg", "lightAppBgColor", "darkAppBgColor",
+                "lightAppBgUri", "darkAppBgUri",
+            }
+            appearance = {k: v for k, v in body.items() if k in appearance_keys}
+            if appearance:
+                updates["appearance"] = appearance
+        if "appearance" in updates and not isinstance(updates["appearance"], dict):
+            self._send_json(400, {"error": "appearance must be an object"})
+            return
         if not updates:
             self._send_json(400, {"error": f"no valid fields provided. allowed: {', '.join(sorted(allowed_keys))}"})
             return
@@ -4981,6 +5423,10 @@ class PushHandler(BaseHTTPRequestHandler):
         try:
             with self._USER_SETTINGS_LOCK:
                 settings = self._user_settings_load()
+                if "appearance" in updates and isinstance(settings.get("appearance"), dict):
+                    merged_appearance = dict(settings.get("appearance") or {})
+                    merged_appearance.update(updates["appearance"])
+                    updates["appearance"] = merged_appearance
                 settings.update(updates)
                 self._user_settings_save(settings)
             self._send_json(200, {"ok": True, "settings": settings})
@@ -4993,6 +5439,11 @@ class PushHandler(BaseHTTPRequestHandler):
         try:
             with self._USER_SETTINGS_LOCK:
                 settings = self._user_settings_load()
+            if "appearance" not in settings:
+                with self._APPEARANCE_SETTINGS_LOCK:
+                    appearance = self._appearance_settings_load()
+                if appearance:
+                    settings = {**settings, "appearance": appearance}
             self._send_json(200, {"ok": True, "settings": settings})
         except Exception as e:
             logger.exception("user settings get fail")

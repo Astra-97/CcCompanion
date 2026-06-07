@@ -57,3 +57,41 @@ allowed_ips = []
 # default_session sets the tmux session name CcCompanion connects to.
 # Change this to match your own tmux session name.
 # default_session = "cc"
+
+# CC Companion channel transport for /chat/send.
+# 默认关闭。开启后，普通 xiaoke 联系人的 /chat/send 会先 POST 到
+# {channel_transport_url}/messages；成功则不再注入 tmux，失败按
+# channel_transport_fallback_to_tmux 决定是否回退旧 tmux 注入路径。
+# kairos / apples 等特殊联系人不走这个开关。
+#
+# 安全提示：不要把 8810 裸露到公网。推荐只监听 127.0.0.1，或放在有认证、
+# HTTPS、访问控制的内网/reverse proxy 后面。
+#
+# 使用前需要先独立启动 channel test session / POC 服务，并确保它能处理：
+# POST /messages
+# Header: X-Auth-Token: COMPANION_CHANNEL_TOKEN
+# Body: {message_id, contact_id, text, quoted_ts?, metadata?}
+channel_transport_enabled = false
+channel_transport_url = "http://127.0.0.1:8810"
+channel_transport_token = ""
+
+# 命中的 contact 才会尝试 channel transport。默认只允许 xiaoke。
+# 空列表 [] 表示不允许任何 contact，即使 channel_transport_enabled=true 也不会路由。
+channel_transport_contacts = ["xiaoke"]
+
+# true: channel 请求失败时自动 fallback 到原 tmux 注入。
+# false: channel 请求失败时直接返回 502，并保留已写入的 user history record。
+channel_transport_fallback_to_tmux = true
+channel_transport_timeout_seconds = 5
+
+[auth]
+# Android 首次登录接口 POST /login 使用。
+# 不要把真实用户名、密码、GitHub token commit 到仓库；真实值只写本机 config.toml。
+username = ""
+password = ""
+
+# 返回给 Android 后保存到本地，用于访问私有仓库 Release 检查更新。
+ghp_token = ""
+
+# 返回给 Android 的外网 VPS 地址。真实部署可改成当前 HTTPS 域名。
+server_url = "https://companion-vps2.xiaonancaleb.xyz"
