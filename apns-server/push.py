@@ -1621,6 +1621,8 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_ai_chat_send(body)
         elif self.path == "/ai-chat/system-prompt":
             self._handle_ai_chat_system_prompt(body)
+        elif self.path == "/ai-chat/models":
+            self._handle_ai_chat_models(body)
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -2714,6 +2716,23 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "config": cfg})
         except Exception as e:
             logger.exception("ai_chat system_prompt update fail")
+            self._send_json(500, {"error": str(e)})
+
+    def _handle_ai_chat_models(self, body: dict[str, Any]):
+        if not self._check_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        try:
+            result = self.state.ai_chat.fetch_models(
+                api_url=str(body.get("api_url") or ""),
+                api_key=str(body.get("api_key") or ""),
+            )
+            status = 200 if result.get("ok") else 400
+            self._send_json(status, result)
+        except (ValueError, TypeError) as e:
+            self._send_json(400, {"error": str(e)})
+        except Exception as e:
+            logger.exception("ai_chat models fetch fail")
             self._send_json(500, {"error": str(e)})
 
     def _handle_ai_chat_send(self, body: dict[str, Any]):

@@ -188,6 +188,37 @@ class AIChatManager:
         records = self.read_history(limit=n)
         return [{"role": r["role"], "content": r["text"]} for r in records]
 
+    # ---- models discovery ----
+
+    def fetch_models(self, api_url: str = "", api_key: str = "") -> dict[str, Any]:
+        """Fetch available models from an OpenAI-compatible /models endpoint."""
+        url = api_url or self._config.get("api_url", "")
+        key = api_key or self._config.get("api_key", "")
+        if not url or not key:
+            return {"ok": False, "error": "api_url and api_key required"}
+        self._validate_url(url)
+        models_url = url.split("/chat/completions")[0].rstrip("/") + "/models"
+        req = urllib.request.Request(
+            models_url,
+            headers={
+                "Authorization": f"Bearer {key}",
+                "User-Agent": "ai-chat/1.0",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            return {"ok": False, "error": f"HTTP {e.code}"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        data = body.get("data", body.get("models", []))
+        if isinstance(data, list):
+            model_ids = [m.get("id", "") if isinstance(m, dict) else str(m) for m in data]
+            model_ids = [m for m in model_ids if m]
+            return {"ok": True, "models": sorted(model_ids)}
+        return {"ok": True, "models": []}
+
     # ---- memory (via memory-mcp) ----
 
     def _fetch_memories(self, query: str) -> list[str]:
