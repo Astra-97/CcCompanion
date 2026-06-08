@@ -72,6 +72,7 @@ from settings import Settings
 from usage import UsageReader
 import todos as todos_mod
 from studyroom import StudyroomDB
+from ai_chat import AIChatManager
 import subprocess
 import threading
 
@@ -662,6 +663,7 @@ class ServerState:
         calendar_path = Path(self.token_store_path).parent / "calendar_events.jsonl"
         self.calendar = CalendarStore(calendar_path)
         self.rp_history = RPHistory("/tmp")
+        self.ai_chat = AIChatManager(HERE / "state")
         self.task_buffer = EphemeralTaskBuffer(capacity=100)
         # Handy-Clawd pet state (2026-05-08 用户 push)
         from pet_state import PetState, PetStateBus, PetBubbleBus, PetActivityBus
@@ -838,7 +840,9 @@ class PushHandler(BaseHTTPRequestHandler):
         return self._require_auth()
 
     def _is_public_get(self) -> bool:
-        return self.path in {"/health", "/version"}
+        if self.path == "/health" and not self.headers.get("X-Forwarded-For"):
+            return True
+        return self.path in {"/version"}
 
     def _clean_contact_id(self, value: Any) -> str:
         contact_id = str(value or "xiaoke").strip().lower()
@@ -950,7 +954,14 @@ class PushHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    _login_fail_counts: dict[str, int] = {}
+    _login_locked_ips: set[str] = set()
+
     def _handle_login(self, body: dict[str, Any]):
+        client_ip = self.client_address[0]
+        if client_ip in self._login_locked_ips:
+            self._send_json(403, {"ok": False, "error": "locked"})
+            return
         username = str(body.get("username", "") or "")
         password = str(body.get("password", "") or "")
         expected_username = self.state.login_username
@@ -958,11 +969,18 @@ class PushHandler(BaseHTTPRequestHandler):
         if (
             not expected_username
             or not expected_password
-            or not hmac.compare_digest(username, expected_username)
-            or not hmac.compare_digest(password, expected_password)
+            or not hmac.compare_digest(username.encode("utf-8"), expected_username.encode("utf-8"))
+            or not hmac.compare_digest(password.encode("utf-8"), expected_password.encode("utf-8"))
         ):
-            self._send_json(401, {"ok": False, "error": "invalid credentials"})
+            self._login_fail_counts[client_ip] = self._login_fail_counts.get(client_ip, 0) + 1
+            if self._login_fail_counts[client_ip] >= 3:
+                self._login_locked_ips.add(client_ip)
+                self._send_json(403, {"ok": False, "error": "locked"})
+            else:
+                remaining = 3 - self._login_fail_counts[client_ip]
+                self._send_json(401, {"ok": False, "error": f"invalid credentials, {remaining} attempts remaining"})
             return
+        self._login_fail_counts.pop(client_ip, None)
         self._send_json(
             200,
             {
@@ -1058,6 +1076,12 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/rp/list":
             self._handle_rp_list()
+            return
+        if self.path == "/ai-chat/config":
+            self._handle_ai_chat_config_get()
+            return
+        if self.path.startswith("/ai-chat/history"):
+            self._handle_ai_chat_history()
             return
         if self.path.startswith("/chat/poll"):
             self._handle_chat_poll()
@@ -1591,6 +1615,12 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_notion_append(body)
         elif self.path == "/notion/search":
             self._handle_notion_search(body)
+        elif self.path == "/ai-chat/config":
+            self._handle_ai_chat_config_post(body)
+        elif self.path == "/ai-chat/send":
+            self._handle_ai_chat_send(body)
+        elif self.path == "/ai-chat/system-prompt":
+            self._handle_ai_chat_system_prompt(body)
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -2648,6 +2678,76 @@ class PushHandler(BaseHTTPRequestHandler):
             })
         except Exception as e:
             logger.exception("rp list fail")
+            self._send_json(500, {"error": str(e)})
+
+    # ---------- AI chat handlers ----------
+
+    def _handle_ai_chat_config_get(self):
+        if not self._check_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        self._send_json(200, {"ok": True, "config": self.state.ai_chat.get_config(mask_key=True)})
+
+    def _handle_ai_chat_config_post(self, body: dict[str, Any]):
+        if not self._check_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        try:
+            cfg = self.state.ai_chat.update_config(body)
+            self._send_json(200, {"ok": True, "config": cfg})
+        except (ValueError, TypeError) as e:
+            self._send_json(400, {"error": str(e)})
+        except Exception as e:
+            logger.exception("ai_chat config update fail")
+            self._send_json(500, {"error": str(e)})
+
+    def _handle_ai_chat_system_prompt(self, body: dict[str, Any]):
+        if not self._check_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        prompt = body.get("system_prompt")
+        if prompt is None:
+            self._send_json(400, {"error": "system_prompt required"})
+            return
+        try:
+            cfg = self.state.ai_chat.set_system_prompt(str(prompt))
+            self._send_json(200, {"ok": True, "config": cfg})
+        except Exception as e:
+            logger.exception("ai_chat system_prompt update fail")
+            self._send_json(500, {"error": str(e)})
+
+    def _handle_ai_chat_send(self, body: dict[str, Any]):
+        if not self._check_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        text = str(body.get("text") or "").strip()[:50000]
+        if not text:
+            self._send_json(400, {"error": "text required"})
+            return
+        try:
+            result = self.state.ai_chat.send_message(text)
+            status = 200 if result.get("ok") else 400
+            self._send_json(status, result)
+        except Exception as e:
+            logger.exception("ai_chat send fail")
+            self._send_json(500, {"ok": False, "error": str(e)})
+
+    def _handle_ai_chat_history(self):
+        if not self._check_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        from urllib.parse import urlparse, parse_qs
+        qs = parse_qs(urlparse(self.path).query)
+        since = qs.get("since", [None])[0]
+        try:
+            limit = int(qs.get("limit", ["200"])[0])
+        except Exception:
+            limit = 200
+        try:
+            records = self.state.ai_chat.read_history(since=since, limit=limit)
+            self._send_json(200, {"ok": True, "messages": records, "count": len(records)})
+        except Exception as e:
+            logger.exception("ai_chat history fail")
             self._send_json(500, {"error": str(e)})
 
     # ---------- group chat handlers ----------
