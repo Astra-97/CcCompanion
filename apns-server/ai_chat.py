@@ -147,7 +147,7 @@ class AIChatManager:
 
     # ---- history ----
 
-    def _append_history(self, role: str, text: str) -> str:
+    def _append_history(self, role: str, text: str, thinking: str = "") -> str:
         """Append a message to the JSONL history file.  Returns the ISO ts."""
         ts = datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds")
         rec = {
@@ -156,6 +156,8 @@ class AIChatManager:
             "text": text,
             "contact_id": self.contact_id,
         }
+        if thinking:
+            rec["thinking"] = thinking
         with self._lock:
             with self._history_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -318,15 +320,18 @@ class AIChatManager:
 
         # Call API
         try:
-            reply_text = self._call_api(api_url, api_key, model, messages)
+            reply_text, thinking = self._call_api(api_url, api_key, model, messages)
         except Exception as e:
             logger.exception("ai_chat: API call failed")
             return {"ok": False, "error": str(e), "ts": user_ts}
 
         # Store assistant reply
-        reply_ts = self._append_history("assistant", reply_text)
+        reply_ts = self._append_history("assistant", reply_text, thinking=thinking)
 
-        return {"ok": True, "reply": reply_text, "ts": reply_ts}
+        result = {"ok": True, "reply": reply_text, "ts": reply_ts}
+        if thinking:
+            result["thinking"] = thinking
+        return result
 
     def _call_api(
         self,
@@ -362,4 +367,5 @@ class AIChatManager:
         content = str(message.get("content", "")).strip()
         if not content:
             raise RuntimeError("模型返回了空回复")
-        return content
+        thinking = str(message.get("reasoning_content") or message.get("thoughts") or "").strip()
+        return content, thinking
