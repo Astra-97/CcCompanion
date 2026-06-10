@@ -887,55 +887,27 @@ class ServerState:
     def deliver_trigger(self, contact_id: str, text: str, rule_id: str) -> tuple[bool, str]:
         """Deliver a scheduled tool-dispatcher trigger into the live session.
 
-        Same delivery path as a user chat message (/chat/send):
-          1. Persist a record to that contact's chat history so the user SEES
-             what woke 小克 (visibility requirement). Marked source="tool-dispatcher"
-             and role="user" so the assistant treats it as an incoming prompt.
-          2. Inject into the session via channel transport (preferred), falling
-             back to direct tmux injection when transport is disabled/unavailable.
+        Inject into the session via channel transport (preferred), falling
+        back to direct tmux injection when transport is disabled/unavailable.
+        On success, archive to toolbot window (chat_history_toolbot.jsonl).
+        The trigger text is intentionally NOT written to the contact's own
+        chat history — it must not appear as a user message in their chat view.
         Returns (ok, error). On failure nothing is marked served by the caller,
         so it retries on the next tick within the rule's grace window.
         """
         contact_id = (contact_id or "xiaoke").strip().lower() or "xiaoke"
-        chat = self.contact_chats.get(contact_id) or self.chat
 
         from datetime import datetime as _dt
         ts_prefix = "[" + _dt.now().strftime("%Y-%m-%d %H:%M:%S") + "]"
         injected = f"{ts_prefix} {text}"
 
-        # 1) visibility: write to chat history before injecting.
-        try:
-            rec = chat.append(
-                role="user",
-                text=text,
-                source="tool-dispatcher",
-                metadata={"tool_dispatcher_rule": rule_id, "trigger": True},
-            )
-        except Exception as e:
-            logger.error("deliver_trigger: chat history append failed: %s", e)
-            rec = {"ts": None}
-
-        # 1b) B-plan 公文存档：把这次"派活"记进「小克·工具版」(toolbot) 独立窗口。
-        # app 端围观工具版到底 @ 没 @ 小克、派了什么活，可追责。失败不影响主流程。
-        if contact_id != "toolbot":
-            self.toolbot_archive(
-                f"已派活 → @{contact_id}（{rule_id}）\n{text}",
-                source="tool-dispatcher",
-                metadata={
-                    "tool_dispatcher_rule": rule_id,
-                    "dispatched_to": contact_id,
-                    "trigger": True,
-                },
-            )
-
-        # 2) inject — channel transport first (same as _handle_chat_send).
+        # 1) inject — channel transport first (same as _handle_chat_send).
         if self.channel_transport_enabled and contact_id in self.channel_transport_contacts:
             message_id = f"tool:{rule_id}:{int(time.time())}"
             metadata = {
                 "source": "tool-dispatcher",
                 "transport": "channel",
                 "tool_dispatcher_rule": rule_id,
-                "user_record_ts": rec.get("ts"),
             }
             ok, err = _channel_transport_post(
                 self,
@@ -945,6 +917,18 @@ class ServerState:
                 metadata=metadata,
             )
             if ok:
+                # 2) archive after successful injection — prevents duplicate
+                #    "已派活" entries when injection fails and retries occur.
+                if contact_id != "toolbot":
+                    self.toolbot_archive(
+                        f"已派活 → @{contact_id}（{rule_id}）\n{text}",
+                        source="tool-dispatcher",
+                        metadata={
+                            "tool_dispatcher_rule": rule_id,
+                            "dispatched_to": contact_id,
+                            "trigger": True,
+                        },
+                    )
                 return True, ""
             logger.warning("deliver_trigger: channel transport failed rule=%s: %s", rule_id, err)
             if not self.channel_transport_fallback_to_tmux:
@@ -955,6 +939,17 @@ class ServerState:
         ok, err = _inject_to_tmux_session(self, target, injected)
         if not ok:
             return False, f"tmux inject to '{target}' failed: {err}"
+        # 2) archive after successful tmux injection.
+        if contact_id != "toolbot":
+            self.toolbot_archive(
+                f"已派活 → @{contact_id}（{rule_id}）\n{text}",
+                source="tool-dispatcher",
+                metadata={
+                    "tool_dispatcher_rule": rule_id,
+                    "dispatched_to": contact_id,
+                    "trigger": True,
+                },
+            )
         return True, ""
 
     def toolbot_archive(
