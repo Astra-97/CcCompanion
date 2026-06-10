@@ -66,6 +66,7 @@ from diary import Diary
 from favorites import Favorites
 from worklog import Worklog
 from reminders import ReminderStore
+from tool_dispatcher import ScheduleStore, ToolDispatcher, DEFAULT_SCHEDULE
 from timeline import Timeline
 from tts import TTS
 from settings import Settings
@@ -514,6 +515,132 @@ WEB_CHAT_HTML = r"""<!DOCTYPE html>
 """
 
 
+def _channel_transport_post(
+    state: "ServerState",
+    *,
+    message_id: str,
+    contact_id: str,
+    text: str,
+    metadata: dict[str, Any],
+) -> tuple[bool, str]:
+    """POST a message to the channel transport (same endpoint as /chat/send).
+
+    Standalone (no PushHandler) so the tool dispatcher can reuse the exact
+    transport the iOS app uses. Returns (ok, error). Errors are token-redacted.
+    """
+    import urllib.error
+    import urllib.request
+
+    def _redact(value: Any) -> str:
+        out = str(value or "").strip()
+        if state.channel_transport_token:
+            out = out.replace(state.channel_transport_token, "[redacted]")
+        return out[:500]
+
+    url = f"{state.channel_transport_url}/messages"
+    payload = {
+        "message_id": message_id,
+        "contact_id": contact_id,
+        "text": text,
+        "quoted_ts": None,
+        "metadata": metadata,
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if state.channel_transport_token:
+        headers["X-Auth-Token"] = state.channel_transport_token
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(
+            req, timeout=max(0.1, state.channel_transport_timeout_seconds)
+        ) as resp:
+            status = int(resp.status)
+            raw = resp.read(64 * 1024).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        raw = e.read(4096).decode("utf-8", errors="replace")
+        return False, _redact(f"http {e.code}: {raw}")
+    except urllib.error.URLError as e:
+        return False, _redact(f"request failed: {e.reason}")
+    except Exception as e:
+        return False, _redact(f"request failed: {e}")
+
+    if not (200 <= status < 300):
+        return False, _redact(f"http {status}: {raw[:500]}")
+    try:
+        response_json = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        return False, _redact(f"http {status}: invalid json response")
+    if isinstance(response_json, dict) and response_json.get("ok") is False:
+        err = response_json.get("error") or response_json.get("message") or "ok false"
+        return False, _redact(err)
+    return True, ""
+
+
+def _inject_to_tmux_session(state: "ServerState", session: str, text: str) -> tuple[bool, str]:
+    """Direct tmux load-buffer + paste-buffer + send-keys fallback injection.
+
+    Mirrors PushHandler._inject_to_session's tmux path so the dispatcher can
+    fall back identically when channel transport is unavailable.
+    """
+    try:
+        has = subprocess.run(
+            ["tmux", "has-session", "-t", session],
+            capture_output=True, text=True, timeout=2,
+        )
+        if has.returncode != 0:
+            return False, f"tmux session not found: {session}"
+    except FileNotFoundError:
+        return False, "tmux not installed"
+    except Exception as e:
+        return False, f"tmux has-session check failed: {e}"
+    try:
+        p = subprocess.Popen(["tmux", "load-buffer", "-"], stdin=subprocess.PIPE)
+        p.communicate(input=text.encode("utf-8"))
+        paste = subprocess.run(
+            ["tmux", "paste-buffer", "-t", session, "-p"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if paste.returncode != 0:
+            return False, f"tmux paste-buffer failed: {paste.stderr.strip()}"
+        send = subprocess.run(
+            ["tmux", "send-keys", "-t", session, "Enter"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if send.returncode != 0:
+            return False, f"tmux send-keys failed: {send.stderr.strip()}"
+        return True, ""
+    except Exception as e:
+        return False, f"tmux inject failed: {e}"
+
+
+# Toolbot command-menu model allowlist (mirrors ccbot-lite AVAILABLE_MODELS).
+# Only these concrete ids may be passed to `/model` via /toolbot/command;
+# aliases are resolved to a member of TOOLBOT_MODEL_ALLOWLIST. Anything else is
+# rejected — no free-form model string ever reaches the tmux injection.
+TOOLBOT_MODEL_ALLOWLIST: frozenset = frozenset({
+    "claude-fable-5",
+    "claude-opus-4-6",
+    "claude-opus-4-6[1m]",
+    "claude-opus-4-7",
+    "claude-opus-4-7[1m]",
+    "claude-opus-4-8",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
+})
+TOOLBOT_MODEL_ALIASES: dict[str, str] = {
+    "fable": "claude-fable-5",
+    "fable5": "claude-fable-5",
+    "fable-5": "claude-fable-5",
+    "opus": "claude-opus-4-6",
+    "opus-1m": "claude-opus-4-6[1m]",
+    "opus4.7": "claude-opus-4-7",
+    "opus4.7-1m": "claude-opus-4-7[1m]",
+    "opus4.8": "claude-opus-4-8",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5-20251001",
+}
+
+
 class ServerState:
     def __init__(self, config: dict[str, Any], sandbox_override: bool | None = None):
         apns_cfg = config.get("apns", {})
@@ -645,6 +772,9 @@ class ServerState:
             "kairos": ChatHistory(contact_history_dir / "chat_history_kairos.jsonl"),
             "hajiki": ChatHistory(contact_history_dir / "chat_history_hajiki.jsonl"),
             "apples": ChatHistory(contact_history_dir / "chat_history_apples.jsonl"),
+            # 小克·工具版 (toolbot) — 只读派活存档窗口。scheduler 往这里写派活记录，
+            # app 端围观；用户不能往这个 contact 发消息 (chat/send 会 501)。
+            "toolbot": ChatHistory(contact_history_dir / "chat_history_toolbot.jsonl"),
         }
         self.group_reply_lock = threading.Lock()
         self.group_reply_pending: list[dict[str, Any]] = []
@@ -679,6 +809,7 @@ class ServerState:
             "kairos": {"is_typing": False, "since": None},
             "hajiki": {"is_typing": False, "since": None},
             "apples": {"is_typing": False, "since": None},
+            "toolbot": {"is_typing": False, "since": None},
         }
         # 书房 v1 (2026-05-09) — vault-aware project dashboard. read-only db (indexer 写)
         studyroom_db_path = HERE / "state" / "studyroom.db"
@@ -721,6 +852,23 @@ class ServerState:
         # 定时 reminder 队列
         reminders_path = Path(self.token_store_path).parent / "reminders.jsonl"
         self.reminders = ReminderStore(reminders_path)
+        # 小克·工具版 (tool-version dispatcher) — rule-driven, no-AI scheduler.
+        # 在排定时间把 trigger 文本走和 /chat/send 一样的通道注入主 session，
+        # 同时写进 chat history 让用户可见。
+        self.tool_schedule_enabled: bool = bool(
+            server_cfg.get("tool_dispatcher_enabled", True)
+        )
+        tool_schedule_path = server_cfg.get("tool_dispatcher_schedule_path") or str(
+            Path(self.token_store_path).parent / "tool_dispatcher.json"
+        )
+        self.tool_schedule = ScheduleStore(tool_schedule_path)
+        if bool(server_cfg.get("tool_dispatcher_seed_default", True)):
+            self.tool_schedule.ensure_seed(DEFAULT_SCHEDULE)
+        self.tool_dispatcher = ToolDispatcher(
+            self.tool_schedule,
+            self.deliver_trigger,
+            tick_seconds=float(server_cfg.get("tool_dispatcher_tick_seconds", 20)),
+        )
         # 服务器启动时间 (unix timestamp) — 用于 uptime 计算
         self.started_at: float = time.time()
         # 完整 config 引用 (anthropic dashboard url 等)
@@ -735,6 +883,116 @@ class ServerState:
             len(self.tokens.all_active()),
             self.tasks.snapshot()["active"]["title"] if self.tasks.snapshot()["active"] else None,
         )
+
+    def deliver_trigger(self, contact_id: str, text: str, rule_id: str) -> tuple[bool, str]:
+        """Deliver a scheduled tool-dispatcher trigger into the live session.
+
+        Same delivery path as a user chat message (/chat/send):
+          1. Persist a record to that contact's chat history so the user SEES
+             what woke 小克 (visibility requirement). Marked source="tool-dispatcher"
+             and role="user" so the assistant treats it as an incoming prompt.
+          2. Inject into the session via channel transport (preferred), falling
+             back to direct tmux injection when transport is disabled/unavailable.
+        Returns (ok, error). On failure nothing is marked served by the caller,
+        so it retries on the next tick within the rule's grace window.
+        """
+        contact_id = (contact_id or "xiaoke").strip().lower() or "xiaoke"
+        chat = self.contact_chats.get(contact_id) or self.chat
+
+        from datetime import datetime as _dt
+        ts_prefix = "[" + _dt.now().strftime("%Y-%m-%d %H:%M:%S") + "]"
+        injected = f"{ts_prefix} {text}"
+
+        # 1) visibility: write to chat history before injecting.
+        try:
+            rec = chat.append(
+                role="user",
+                text=text,
+                source="tool-dispatcher",
+                metadata={"tool_dispatcher_rule": rule_id, "trigger": True},
+            )
+        except Exception as e:
+            logger.error("deliver_trigger: chat history append failed: %s", e)
+            rec = {"ts": None}
+
+        # 1b) B-plan 公文存档：把这次"派活"记进「小克·工具版」(toolbot) 独立窗口。
+        # app 端围观工具版到底 @ 没 @ 小克、派了什么活，可追责。失败不影响主流程。
+        if contact_id != "toolbot":
+            self.toolbot_archive(
+                f"已派活 → @{contact_id}（{rule_id}）\n{text}",
+                source="tool-dispatcher",
+                metadata={
+                    "tool_dispatcher_rule": rule_id,
+                    "dispatched_to": contact_id,
+                    "trigger": True,
+                },
+            )
+
+        # 2) inject — channel transport first (same as _handle_chat_send).
+        if self.channel_transport_enabled and contact_id in self.channel_transport_contacts:
+            message_id = f"tool:{rule_id}:{int(time.time())}"
+            metadata = {
+                "source": "tool-dispatcher",
+                "transport": "channel",
+                "tool_dispatcher_rule": rule_id,
+                "user_record_ts": rec.get("ts"),
+            }
+            ok, err = _channel_transport_post(
+                self,
+                message_id=message_id,
+                contact_id=contact_id,
+                text=injected,
+                metadata=metadata,
+            )
+            if ok:
+                return True, ""
+            logger.warning("deliver_trigger: channel transport failed rule=%s: %s", rule_id, err)
+            if not self.channel_transport_fallback_to_tmux:
+                return False, err or "channel transport failed"
+
+        # fallback: direct tmux injection into the active session.
+        target = (self.active_session or self.default_session).strip()
+        ok, err = _inject_to_tmux_session(self, target, injected)
+        if not ok:
+            return False, f"tmux inject to '{target}' failed: {err}"
+        return True, ""
+
+    def toolbot_archive(
+        self,
+        text: str,
+        *,
+        title: str | None = None,
+        role: str = "assistant",
+        source: str = "toolbot-broadcast",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Append a record to the 小克·工具版 (toolbot) window.
+
+        Single source of truth for writing into the toolbot public-archive
+        window. Used by deliver_trigger's archive write, by /toolbot/broadcast
+        (system sentinels / daily reports), and by /toolbot/command (command
+        execution results). Failures are swallowed (returns None) so callers
+        never break their primary flow on an archive write.
+        """
+        toolbot_chat = self.contact_chats.get("toolbot")
+        if toolbot_chat is None:
+            return None
+        body = text or ""
+        if title:
+            body = f"【{title}】\n{body}" if body else f"【{title}】"
+        meta: dict[str, Any] = {"toolbot_archive": True}
+        if metadata and isinstance(metadata, dict):
+            meta.update(metadata)
+        try:
+            return toolbot_chat.append(
+                role=role,
+                text=body,
+                source=source,
+                metadata=meta,
+            )
+        except Exception as e:
+            logger.warning("toolbot_archive append failed: %s", e)
+            return None
 
     def shutdown(self):
         if self.client:
@@ -1301,6 +1559,20 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/reminder/list"):
             self._send_json(200, {"ok": True, "reminders": self.state.reminders.list_pending()})
             return
+        if self.path == "/tool/schedule":
+            if not self._check_auth():
+                self._send_json(401, {"error": "auth required"})
+                return
+            self._send_json(200, {
+                "ok": True,
+                "enabled": self.state.tool_schedule_enabled and self.state.tool_schedule.globally_enabled(),
+                "running": bool(
+                    getattr(self.state.tool_dispatcher, "_thread", None)
+                    and self.state.tool_dispatcher._thread.is_alive()
+                ),
+                "rules": self.state.tool_schedule.rules(),
+            })
+            return
         if self.path == "/tokens":
             if not self._check_auth():
                 self._send_json(401, {"error": "auth required"})
@@ -1445,6 +1717,15 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         elif self.path.startswith("/reminder/fired"):
             self._handle_reminder_update(body, "fired")
+            return
+        elif self.path == "/tool/trigger":
+            self._handle_tool_trigger(body)
+            return
+        elif self.path == "/toolbot/broadcast":
+            self._handle_toolbot_broadcast(body)
+            return
+        elif self.path == "/toolbot/command":
+            self._handle_toolbot_command(body)
             return
         elif self.path == "/push/clear-unread":
             self._handle_clear_unread()
@@ -6112,6 +6393,230 @@ class PushHandler(BaseHTTPRequestHandler):
             ok = self.state.reminders.mark_fired(reminder_id)
         self._send_json(200 if ok else 404, {"ok": ok, "id": reminder_id})
 
+    def _handle_tool_trigger(self, body: dict[str, Any]):
+        """POST /tool/trigger — manually fire a tool-dispatcher rule now.
+
+        Body: {"rule_id": "morning_greeting"} OR {"text": "...", "contact_id": "xiaoke"}.
+        Reuses the exact delivery path (chat history visibility + channel
+        transport / tmux). Does NOT mark the rule served, so the real scheduled
+        occurrence is unaffected — this is for testing/on-demand wakeups.
+        """
+        if not self._require_write_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        rule_id = str(body.get("rule_id") or "").strip()
+        contact_id = str(body.get("contact_id") or "xiaoke").strip().lower() or "xiaoke"
+        text = str(body.get("text") or "").strip()
+        if rule_id and not text:
+            match = next(
+                (r for r in self.state.tool_schedule.rules() if str(r.get("id")) == rule_id),
+                None,
+            )
+            if not match:
+                self._send_json(404, {"ok": False, "error": f"rule not found: {rule_id}"})
+                return
+            text = str(match.get("text") or "").strip()
+            contact_id = str(match.get("contact_id") or contact_id).strip().lower() or "xiaoke"
+        if not text:
+            self._send_json(400, {"error": "rule_id or text required"})
+            return
+        ok, err = self.state.deliver_trigger(contact_id, text, rule_id or "manual")
+        self._send_json(200 if ok else 502, {
+            "ok": ok,
+            "rule_id": rule_id or "manual",
+            "contact_id": contact_id,
+            "error": None if ok else err,
+        })
+
+    def _handle_toolbot_broadcast(self, body: dict[str, Any]):
+        """POST /toolbot/broadcast — append a system播报 into the toolbot window.
+
+        Body: {"title": "...", "text": "..."}. Auth: X-Auth-Token == shared_secret.
+        Used by model_sentinel / vps-access-monitor / auto_backup_all to mirror
+        their Telegram broadcasts into the app's 工具版 archive window. Pure
+        append; never injects into any session or runs shell.
+        """
+        if not self._require_write_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        title = str(body.get("title") or "").strip() or None
+        text = str(body.get("text") or "").strip()
+        if not text and not title:
+            self._send_json(400, {"error": "title or text required"})
+            return
+        # Bound size so a runaway script can't bloat the archive.
+        if len(text) > 8000:
+            text = text[:8000] + "…（截断）"
+        rec = self.state.toolbot_archive(
+            text,
+            title=title,
+            source="toolbot-broadcast",
+            metadata={"broadcast": True},
+        )
+        self._send_json(200 if rec else 502, {
+            "ok": bool(rec),
+            "ts": (rec or {}).get("ts"),
+        })
+
+    # 严格白名单：命令名 -> 动作。绝不 eval / 拼接任意 shell。
+    # 仅这 8 个键可被 /toolbot/command 触发；未在表内一律 403。
+    TOOLBOT_COMMANDS: frozenset = frozenset({
+        "forge", "statusbar", "vps", "model",
+        "morning_on", "morning_off", "diary_on", "diary_off",
+    })
+    # morning/diary 开关映射到 dispatcher 注册表里的规则 id。
+    _TOOLBOT_MORNING_RULES = ["morning_greeting"]
+    _TOOLBOT_DIARY_RULES = ["diary_reminder", "diary_supplement"]
+
+    def _handle_toolbot_command(self, body: dict[str, Any]):
+        """POST /toolbot/command — run a whitelisted command, archive the result.
+
+        Body: {"command": "<one of TOOLBOT_COMMANDS>", "args": "<optional str>"}.
+        Auth: X-Auth-Token == shared_secret. Strict whitelist — the command name
+        is matched against a fixed set and dispatched to a hard-coded handler.
+        No shell string is ever built from user input; `args` is only used by
+        `model` (validated against a model-name allowlist) and ignored elsewhere.
+        Execution result is appended to the toolbot window so 方小南 sees
+        "执行了 X，结果 Y" in the public-archive window.
+        """
+        if not self._require_write_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        command = str(body.get("command") or "").strip().lower()
+        args = str(body.get("args") or "").strip()
+        if command not in self.TOOLBOT_COMMANDS:
+            self._send_json(403, {"ok": False, "error": f"command not allowed: {command or '(empty)'}"})
+            return
+
+        title = f"指令 · {command}"
+        try:
+            ok, result_text = self._run_toolbot_command(command, args)
+        except Exception as e:
+            logger.exception("toolbot command %r failed", command)
+            ok, result_text = False, f"执行异常：{e}"
+
+        status_icon = "✅" if ok else "⚠️"
+        archive_text = f"{status_icon} 执行 `{command}`" + (f" {args}" if args else "") + f"\n{result_text}"
+        self.state.toolbot_archive(
+            archive_text,
+            title=title,
+            source="toolbot-command",
+            metadata={"command": command, "ok": ok},
+        )
+        self._send_json(200 if ok else 502, {
+            "ok": ok,
+            "command": command,
+            "result": result_text,
+        })
+
+    def _run_toolbot_command(self, command: str, args: str) -> tuple[bool, str]:
+        """Dispatch a whitelisted toolbot command. Returns (ok, result_text).
+
+        Each branch maps to a fixed action. No arbitrary shell. tmux-touching
+        commands reuse the same load-buffer/send-keys injection path the rest of
+        the server uses; subprocess argv lists are fully literal.
+        """
+        session = "cctg"  # the Claude Code tmux session (same as ccbot-lite)
+
+        if command == "statusbar":
+            # Read-only: capture the tmux pane tail, like /statusbar in ccbot-lite.
+            try:
+                proc = subprocess.run(
+                    ["tmux", "capture-pane", "-t", session, "-p"],
+                    capture_output=True, text=True, timeout=5,
+                )
+            except FileNotFoundError:
+                return False, "tmux 未安装"
+            except Exception as e:
+                return False, f"capture-pane 失败：{e}"
+            if proc.returncode != 0:
+                return False, f"capture-pane 失败：{proc.stderr.strip() or 'session 不存在'}"
+            tail = "\n".join(proc.stdout.rstrip().splitlines()[-12:])
+            return True, f"```\n{tail or '(空)'}\n```"
+
+        if command == "vps":
+            # Read-only: run the fixed /root/vps-status.sh script (no args).
+            script = "/root/vps-status.sh"
+            if not os.path.exists(script):
+                return False, f"{script} 不存在"
+            try:
+                proc = subprocess.run(
+                    ["/bin/bash", script],
+                    capture_output=True, text=True, timeout=20,
+                )
+            except Exception as e:
+                return False, f"运行 vps-status.sh 失败：{e}"
+            out = (proc.stdout or "").strip() or "(无输出)"
+            if proc.returncode != 0:
+                out = f"{out}\n[exit {proc.returncode}] {(proc.stderr or '').strip()}".strip()
+            if len(out) > 3500:
+                out = out[-3500:]
+            return True, f"```\n{out}\n```"
+
+        if command == "model":
+            # Switch model via Claude Code's built-in /model. args validated.
+            model_id = self._resolve_toolbot_model(args)
+            if model_id is None:
+                return False, f"未知模型：{args or '(空)'}（允许：{', '.join(sorted(TOOLBOT_MODEL_ALLOWLIST))}）"
+            ok, err = self._inject_to_session(session, f"/model {model_id}", source="toolbot", sender="toolbot")
+            if not ok:
+                return False, f"注入失败：{err}"
+            return True, f"已发送 `/model {model_id}` 到会话。"
+
+        if command == "forge":
+            # Slide the context window. Runs the fixed forge wrapper; args limited
+            # to a context-retain token (digits or 'all') validated below.
+            forge_bin = "/usr/local/bin/forge-reload-claude"
+            if not os.path.exists(forge_bin):
+                return False, f"{forge_bin} 不存在"
+            argv = [forge_bin]
+            retain = args.strip().lower()
+            if retain:
+                if retain != "all" and not retain.isdigit():
+                    return False, "forge 参数只能是 all 或纯数字 token 数。"
+                argv.append(retain)
+            try:
+                proc = subprocess.run(
+                    argv, capture_output=True, text=True, timeout=150,
+                )
+            except subprocess.TimeoutExpired:
+                return False, "forge 超时（150s）。"
+            except Exception as e:
+                return False, f"forge 执行失败：{e}"
+            out = (proc.stdout or "").strip()
+            if len(out) > 3000:
+                out = out[-3000:]
+            if proc.returncode == 0:
+                return True, f"Forge-reload 完成。\n```\n{out or '(无输出)'}\n```"
+            return False, f"Forge-reload 失败（exit {proc.returncode}）：{(proc.stderr or '').strip()[:1000]}"
+
+        if command in ("morning_on", "morning_off"):
+            enabled = command.endswith("_on")
+            changed = self.state.tool_schedule.set_rules_enabled(self._TOOLBOT_MORNING_RULES, enabled)
+            rstate = self.state.tool_schedule.rule_enabled_state(self._TOOLBOT_MORNING_RULES)
+            label = "开启" if enabled else "关闭"
+            return True, f"早安定时已{label}。当前规则状态：{rstate}（本次改动：{changed or '无变化'}）"
+
+        if command in ("diary_on", "diary_off"):
+            enabled = command.endswith("_on")
+            changed = self.state.tool_schedule.set_rules_enabled(self._TOOLBOT_DIARY_RULES, enabled)
+            rstate = self.state.tool_schedule.rule_enabled_state(self._TOOLBOT_DIARY_RULES)
+            label = "开启" if enabled else "关闭"
+            return True, f"日记提醒已{label}。当前规则状态：{rstate}（本次改动：{changed or '无变化'}）"
+
+        return False, f"未实现的命令：{command}"
+
+    def _resolve_toolbot_model(self, choice: str) -> str | None:
+        """Map a model alias/id to a concrete model id, or None if not allowed."""
+        normalized = (choice or "").strip().lower()
+        if not normalized:
+            return None
+        if normalized in TOOLBOT_MODEL_ALIASES:
+            return TOOLBOT_MODEL_ALIASES[normalized]
+        if normalized in TOOLBOT_MODEL_ALLOWLIST:
+            return normalized
+        return None
+
     def _handle_clear_unread(self):
         """chat tab 打开时调 — 把灵动岛 unread 归零，保留活跃任务状态"""
         active_tokens = self.state.tokens.all_active()
@@ -6327,6 +6832,15 @@ def run_server(state: ServerState):
         target=cleanup_loop, args=(state,), daemon=True, name="cleanup"
     )
     cleanup_thread.start()
+    # 小克·工具版 dispatcher — rule-driven scheduler injecting triggers into the
+    # main session at scheduled times (no AI here; the session does the thinking).
+    if getattr(state, "tool_schedule_enabled", False):
+        try:
+            state.tool_dispatcher.start()
+        except Exception:
+            logger.exception("failed to start tool dispatcher")
+    else:
+        logger.info("tool dispatcher disabled (tool_dispatcher_enabled=false)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

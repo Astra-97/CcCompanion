@@ -84,6 +84,25 @@ channel_transport_contacts = ["xiaoke"]
 channel_transport_fallback_to_tmux = true
 channel_transport_timeout_seconds = 5
 
+# 小克·工具版 (tool-version dispatcher) — 规则驱动的定时调度器（不含 AI）。
+# 在排定时间把固定的 trigger 文本，走和 /chat/send 完全一样的通道注入主 session
+# （channel transport，失败回退 tmux），并写进 chat history 让用户可见。主 session
+# 收到 trigger 后用自己的上下文/记忆生成真正的回复（例如早安问候）。调度本身不调用 LLM。
+#
+# tool_dispatcher_enabled: 总开关，默认 true。
+# tool_dispatcher_schedule_path: 排程文件路径，默认 <token_store 同目录>/tool_dispatcher.json。
+# tool_dispatcher_seed_default: 文件不存在时是否写入内置默认排程（早安/日记等），默认 true。
+# tool_dispatcher_tick_seconds: 轮询间隔秒数，默认 20。
+#
+# 排程文件为 JSON，每条 rule 字段：
+#   id / enabled / time("HH:MM") / tz(IANA 时区) / weekdays([0=周一..6=周日], 空=每天)
+#   contact_id(默认 xiaoke) / text(trigger 文本) / catch_up_grace_minutes(错过补发宽限分钟)
+# 规则按本地日期去重（last_fired），重启不会重复触发也不会漏发已服务的时段。
+tool_dispatcher_enabled = true
+# tool_dispatcher_schedule_path = "~/CcCompanion/apns-server/tokens/tool_dispatcher.json"
+tool_dispatcher_seed_default = true
+tool_dispatcher_tick_seconds = 20
+
 [auth]
 # Android 首次登录接口 POST /login 使用。
 # 不要把真实用户名、密码、GitHub token commit 到仓库；真实值只写本机 config.toml。

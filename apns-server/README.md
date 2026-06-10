@@ -51,6 +51,29 @@ For security, this server ships with `strict_auth = true` and `allow_remote_cont
 | POST   | `/chain/abort`        | Send Ctrl+C to abort current reply         | shared_secret |
 | POST   | `/tmux/send`          | Inject keys into a tmux session            | shared_secret |
 | POST   | `/register-device-token` | iPhone reports its APNs device token   | none (公开)   |
+| GET    | `/tool/schedule`      | List tool-dispatcher rules + run state      | shared_secret |
+| POST   | `/tool/trigger`       | Manually fire a rule now (test/on-demand)   | shared_secret |
+
+### 小克·工具版 (tool-version dispatcher)
+
+A rule-driven scheduler (no AI / no LLM calls) baked into the server. At
+scheduled times it injects a fixed trigger string into the main `claude` session
+through the **same channel transport** a user chat message uses (with tmux
+fallback), and writes the trigger to chat history so the user sees what woke the
+assistant. The session then generates the real reply (e.g. a morning greeting)
+with its own context/memory.
+
+- Module: `tool_dispatcher.py` (`ScheduleStore` + `ToolDispatcher`); wired into
+  `ServerState` and started from `run_server`.
+- Schedule file: `tokens/tool_dispatcher.json` (auto-seeded on first run).
+- Rules dedupe by local date (`last_fired`) so restarts don't double-fire; a
+  missed slot past `catch_up_grace_minutes` is marked served instead of firing
+  stale. A failed delivery retries on the next tick within the grace window.
+- Config keys under `[server]`: `tool_dispatcher_enabled`,
+  `tool_dispatcher_schedule_path`, `tool_dispatcher_seed_default`,
+  `tool_dispatcher_tick_seconds` (see `config.example.toml`).
+- `POST /tool/trigger` with `{"rule_id": "..."}` (or `{"text": "...", "contact_id": "..."}`)
+  fires immediately without marking the rule served — handy for testing.
 
 其它端点 (`/diary/*`, `/group/*`, `/favorites/*`, `/timeline/*`, `/todos/*`, `/calendar/*` etc.) 是给私有客户端用的, CcCompanion iOS app 不调它们。保留在 codebase 里因为 `push.py` 引用了对应 module — 删模块会让 import graph 散架。
 
