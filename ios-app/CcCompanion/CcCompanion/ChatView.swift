@@ -4245,45 +4245,11 @@ private struct ToolActivityStackView: View {
     @State private var isExpanded: Bool = false
     @State private var pulseScale: CGFloat = 0.6
 
-    private var runningPrefix: String {
-        let a = stack.agent
-        if a.isEmpty || a.lowercased() == "system" || a == "unknown" { return "" }
-        return "\(a) "
-    }
-
     var body: some View {
-        Group {
-            if stack.isRunning {
-                runningView
-            } else {
-                collapsedView
-            }
-        }
+        collapsedView
         .padding(.leading, 12)
         .padding(.trailing, 12)
         .padding(.vertical, 2)
-    }
-
-    private var runningView: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(Color.ccAccent)
-                .frame(width: 6, height: 6)
-                .scaleEffect(pulseScale)
-                .animation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true), value: pulseScale)
-            Text(runningPrefix + "正在执行 \(stack.tools.last?.text ?? "...")")
-                .font(.ccSerifAdaptive(size: 11))
-                .foregroundStyle(Color.ccTextDim)
-                .lineLimit(1)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(Color.ccCard.opacity(0.5))
-        .clipShape(Capsule())
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .onAppear {
-            pulseScale = 1.1
-        }
     }
 
     private var collapsedView: some View {
@@ -4292,6 +4258,16 @@ private struct ToolActivityStackView: View {
                 withAnimation(.easeInOut(duration: 0.18)) { isExpanded.toggle() }
             } label: {
                 HStack(spacing: 6) {
+                    if stack.isRunning {
+                        Circle()
+                            .fill(Color.ccAccent)
+                            .frame(width: 6, height: 6)
+                            .scaleEffect(pulseScale)
+                            .animation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true), value: pulseScale)
+                            .onAppear {
+                                pulseScale = 1.1
+                            }
+                    }
                     Image(systemName: "chevron.right")
                         .font(.ccSerifAdaptive(size: 11))
                         .foregroundStyle(Color.ccTextDim)

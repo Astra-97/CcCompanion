@@ -147,7 +147,7 @@ class AIChatManager:
 
     # ---- history ----
 
-    def _append_history(self, role: str, text: str, thinking: str = "") -> str:
+    def _append_history(self, role: str, text: str, thinking: str = "", **extra: Any) -> str:
         """Append a message to the JSONL history file.  Returns the ISO ts."""
         ts = datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds")
         rec = {
@@ -158,6 +158,16 @@ class AIChatManager:
         }
         if thinking:
             rec["thinking"] = thinking
+        for key in (
+            "attachment_url",
+            "attachment_type",
+            "attachment_filename",
+            "image",
+            "files",
+        ):
+            value = extra.get(key)
+            if value:
+                rec[key] = value
         with self._lock:
             with self._history_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -289,6 +299,36 @@ class AIChatManager:
         with self._send_lock:
             return self._send_message_locked(user_text)
 
+    def send_attachment(
+        self,
+        user_text: str,
+        attachment_url: str,
+        attachment_type: str,
+        attachment_filename: str,
+        local_path: str,
+    ) -> dict[str, Any]:
+        """Store an uploaded attachment in AI chat history and notify the AI."""
+        if not self.enabled:
+            return {"ok": False, "error": "ai chat is not enabled"}
+
+        display_text = user_text.strip() or f"[用户发了{'图片' if attachment_type == 'image' else '文件'}: {attachment_filename}]"
+        prompt = display_text
+        prompt += (
+            f"\n\n[用户上传了{'图片' if attachment_type == 'image' else '文件'}: {attachment_filename}]"
+            f"\n附件 URL: {attachment_url}"
+        )
+        if local_path:
+            prompt += f"\n服务端本地路径: {local_path}"
+
+        with self._send_lock:
+            return self._send_attachment_locked(
+                display_text=display_text,
+                prompt=prompt,
+                attachment_url=attachment_url,
+                attachment_type=attachment_type,
+                attachment_filename=attachment_filename,
+            )
+
     def _send_message_locked(self, user_text: str) -> dict[str, Any]:
 
         api_url = self._config.get("api_url", "")
@@ -326,6 +366,57 @@ class AIChatManager:
             return {"ok": False, "error": str(e), "ts": user_ts}
 
         # Store assistant reply
+        reply_ts = self._append_history("assistant", reply_text, thinking=thinking)
+
+        result = {"ok": True, "reply": reply_text, "ts": reply_ts}
+        if thinking:
+            result["thinking"] = thinking
+        return result
+
+    def _send_attachment_locked(
+        self,
+        display_text: str,
+        prompt: str,
+        attachment_url: str,
+        attachment_type: str,
+        attachment_filename: str,
+    ) -> dict[str, Any]:
+        api_url = self._config.get("api_url", "")
+        api_key = self._config.get("api_key", "")
+        model = self._config.get("model", "")
+        system_prompt = self._config.get("system_prompt", "")
+        max_ctx = int(self._config.get("max_context_messages", 20))
+
+        if not api_url or not api_key or not model:
+            return {"ok": False, "error": "ai chat not configured (missing api_url / api_key / model)"}
+
+        memories = self._fetch_memories(prompt)
+
+        messages: list[dict[str, str]] = []
+        if system_prompt:
+            now = datetime.now(timezone.utc).astimezone()
+            time_block = f"\n\n## 当前时间\n{now.strftime('%Y年%m月%d日 %H:%M %A')}"
+            mem_block = ""
+            if memories:
+                mem_block = "\n\n## 相关记忆\n" + "\n---\n".join(memories)
+            messages.append({"role": "system", "content": system_prompt + time_block + mem_block})
+        messages.extend(self._recent_messages(max_ctx))
+        messages.append({"role": "user", "content": prompt})
+
+        user_ts = self._append_history(
+            "user",
+            display_text,
+            attachment_url=attachment_url,
+            attachment_type=attachment_type,
+            attachment_filename=attachment_filename,
+        )
+
+        try:
+            reply_text, thinking = self._call_api(api_url, api_key, model, messages)
+        except Exception as e:
+            logger.exception("ai_chat: attachment API call failed")
+            return {"ok": False, "error": str(e), "ts": user_ts}
+
         reply_ts = self._append_history("assistant", reply_text, thinking=thinking)
 
         result = {"ok": True, "reply": reply_text, "ts": reply_ts}

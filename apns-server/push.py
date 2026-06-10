@@ -1408,6 +1408,9 @@ class PushHandler(BaseHTTPRequestHandler):
         if not self._require_write_auth():
             return
         # /chat/upload 走 multipart 不解析 JSON 直接 handle raw (现在含 query string)
+        if self.path.startswith("/ai-chat/upload"):
+            self._handle_ai_chat_upload()
+            return
         if self.path.startswith("/chat/upload"):
             self._handle_chat_upload()
             return
@@ -3692,6 +3695,11 @@ class PushHandler(BaseHTTPRequestHandler):
             "transport": "channel",
             "user_record_ts": user_record.get("ts"),
         }
+        # 上游 (如 _handle_chat_upload) 在 user_record 里塞的 metadata 一并带上
+        # (比如附件 image_path / attachment_url) 让 channel 端能把图片路径透出给 chain.
+        extra_metadata = user_record.get("metadata")
+        if isinstance(extra_metadata, dict):
+            metadata.update(extra_metadata)
         location = user_record.get("location")
         if isinstance(location, dict):
             location_summary = {
@@ -4788,8 +4796,48 @@ class PushHandler(BaseHTTPRequestHandler):
                 hint = hint + " " + text
             if rec.get("quoted_text"):
                 hint = f"[引用 \"{rec['quoted_text']}\"]\n" + hint
-            # 给主 session 一条 hint 让 chain 读 file (mac mini 内可读 stored_path)
+            # 给主 session 一条 hint 让 chain 读 file (server 本地可读 stored_path)
             hint += f"\n本地路径: {stored_path}"
+            # 优先走 channel transport (跟 _handle_chat_send 一致) — 否则附件 hint
+            # 只进 tmux, channel 模式下 chain 收不到图片路径 (测试图片 bug).
+            if self._channel_transport_enabled_for(contact_id):
+                attach_meta = {
+                    "transport": "channel",
+                    "user_record_ts": rec.get("ts"),
+                    "attachment_type": atype,
+                    "attachment_filename": filename,
+                    "attachment_url": attachment_url,
+                    "image_path" if atype == "image" else "attachment_path": str(stored_path),
+                }
+                message_id = self._channel_message_id({}, contact_id, hint, quoted_ts)
+                ok, err, _channel_response = self._send_to_channel_transport(
+                    message_id=message_id,
+                    contact_id=contact_id,
+                    text=hint,
+                    quoted_ts=quoted_ts,
+                    user_record={**rec, "metadata": attach_meta},
+                )
+                if ok:
+                    self._send_json(200, {
+                        "ok": True,
+                        "contact_id": contact_id,
+                        "record": rec,
+                        "transport": "channel",
+                        "message_id": message_id,
+                    })
+                    return
+                logger.warning(
+                    "channel transport attachment failed contact_id=%s message_id=%s error=%s",
+                    contact_id, message_id, err,
+                )
+                if not self.state.channel_transport_fallback_to_tmux:
+                    self._send_json(502, {
+                        "ok": False,
+                        "error": f"channel transport attachment failed: {err}",
+                        "record": rec,
+                    })
+                    return
+                # fallback 继续走 tmux 注入
             target_session = (self.state.active_session or self.state.default_session).strip()
             ok, err = self._inject_to_session(target_session, hint, source="ios-app", sender="iphone")
             if not ok:
@@ -4802,6 +4850,78 @@ class PushHandler(BaseHTTPRequestHandler):
                 return
 
         self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec})
+
+    def _handle_ai_chat_upload(self):
+        """Raw upload for the custom AI chat."""
+        import uuid as _uuid
+        from urllib.parse import urlparse, parse_qs, unquote
+
+        qs = parse_qs(urlparse(self.path).query)
+        filename = (
+            qs.get("filename", [None])[0]
+            or self.headers.get("X-Filename")
+            or "upload.bin"
+        )
+        text = (
+            qs.get("text", [None])[0]
+            or self.headers.get("X-Text")
+            or ""
+        )
+
+        try:
+            if filename:
+                filename = unquote(filename)
+        except Exception:
+            pass
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except Exception:
+            length = 0
+        if length <= 0 or length > 50 * 1024 * 1024:
+            self._send_json(400, {"error": "invalid content-length (max 50MB)"})
+            return
+
+        ext = Path(filename).suffix.lower()
+        image_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
+        atype = "image" if ext in image_exts else "file"
+
+        stored_name = f"{_uuid.uuid4().hex}{ext}"
+        stored_path = self.state.attachments_dir / stored_name
+
+        try:
+            with stored_path.open("wb") as f:
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, 65536))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+        except Exception as e:
+            logger.exception("ai chat upload write fail")
+            self._send_json(500, {"error": f"write fail: {e}"})
+            return
+
+        attachment_url = f"/attachments/{stored_name}"
+        result = self.state.ai_chat.send_attachment(
+            user_text=text,
+            attachment_url=attachment_url,
+            attachment_type=atype,
+            attachment_filename=filename,
+            local_path=str(stored_path),
+        )
+        if not result.get("ok"):
+            self._send_json(502, result)
+            return
+        self._send_json(200, {
+            "ok": True,
+            "contact_id": self.state.ai_chat.contact_id,
+            "attachment_url": attachment_url,
+            "attachment_type": atype,
+            "attachment_filename": filename,
+            "result": result,
+        })
 
     def _handle_attachment_get(self):
         """静态服务 attachment 文件 — GET /attachments/<filename>"""
