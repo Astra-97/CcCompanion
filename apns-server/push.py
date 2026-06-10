@@ -6564,17 +6564,44 @@ class PushHandler(BaseHTTPRequestHandler):
             return True, f"已发送 `/model {model_id}` 到会话。"
 
         if command == "forge":
-            # Slide the context window. Runs the fixed forge wrapper; args limited
-            # to a context-retain token (digits or 'all') validated below.
+            # Slide the context window. Runs the fixed forge wrapper. args is a
+            # whitespace-separated "[retain] [model]" two-part form, both parts
+            # optional in any order:
+            #   retain := 'all' | <digits>   (context-retain tokens)
+            #   model  := a TOOLBOT_MODEL_ALIASES key or TOOLBOT_MODEL_ALLOWLIST id
+            # Each token must match exactly one of those rules; anything else is
+            # rejected. The model is resolved to a concrete allowlisted id before
+            # being passed as its own argv element — no free-form string reaches
+            # the wrapper.
             forge_bin = "/usr/local/bin/forge-reload-claude"
             if not os.path.exists(forge_bin):
                 return False, f"{forge_bin} 不存在"
             argv = [forge_bin]
-            retain = args.strip().lower()
-            if retain:
-                if retain != "all" and not retain.isdigit():
-                    return False, "forge 参数只能是 all 或纯数字 token 数。"
-                argv.append(retain)
+            retain_val: str | None = None
+            model_val: str | None = None
+            for tok in args.split():
+                low = tok.strip().lower()
+                if not low:
+                    continue
+                if low == "all" or low.isdigit():
+                    if retain_val is not None:
+                        return False, "forge 参数里 retain（all/数字）只能给一个。"
+                    retain_val = low
+                    continue
+                resolved = self._resolve_toolbot_model(low)
+                if resolved is not None:
+                    if model_val is not None:
+                        return False, "forge 参数里 model 只能给一个。"
+                    model_val = resolved
+                    continue
+                return False, (
+                    f"forge 参数无效：`{tok}`。retain 只能是 all 或纯数字；"
+                    f"model 需是允许的别名/全名（{', '.join(sorted(TOOLBOT_MODEL_ALIASES))}）。"
+                )
+            if retain_val is not None:
+                argv.append(retain_val)
+            if model_val is not None:
+                argv.append(model_val)
             try:
                 proc = subprocess.run(
                     argv, capture_output=True, text=True, timeout=150,
@@ -6586,9 +6613,10 @@ class PushHandler(BaseHTTPRequestHandler):
             out = (proc.stdout or "").strip()
             if len(out) > 3000:
                 out = out[-3000:]
+            detail = f"保留上下文：{retain_val or '默认'}；模型：{model_val or '默认/当前'}"
             if proc.returncode == 0:
-                return True, f"Forge-reload 完成。\n```\n{out or '(无输出)'}\n```"
-            return False, f"Forge-reload 失败（exit {proc.returncode}）：{(proc.stderr or '').strip()[:1000]}"
+                return True, f"Forge-reload 完成（{detail}）。\n```\n{out or '(无输出)'}\n```"
+            return False, f"Forge-reload 失败（exit {proc.returncode}，{detail}）：{(proc.stderr or '').strip()[:1000]}"
 
         if command in ("morning_on", "morning_off"):
             enabled = command.endswith("_on")
