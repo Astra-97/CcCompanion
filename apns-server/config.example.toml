@@ -58,6 +58,13 @@ allowed_ips = []
 # Change this to match your own tmux session name.
 # default_session = "cc"
 
+# Kairos Codex shared active session state. App Kairos private chat reads this
+# shared pointer from the Telegram bot state first, then falls back to the
+# legacy per-user active session below.
+# codex_bot_state_path = "/root/Windows-Codex-TG/.runtime/bot_state.json"
+# codex_user_id = "8715009653"
+# codex_shared_session_name = "kairos"
+
 # CC Companion channel transport for /chat/send.
 # 默认关闭。开启后，普通 xiaoke 联系人的 /chat/send 会先 POST 到
 # {channel_transport_url}/messages；成功则不再注入 tmux，失败按

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
+from contextlib import contextmanager
 import hmac
 import hashlib
 import ipaddress
@@ -45,6 +46,10 @@ import sys
 import threading
 import time
 import unicodedata
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Linux service path uses fcntl.
+    fcntl = None  # type: ignore[assignment]
 try:
     import tomllib
 except ModuleNotFoundError:
@@ -86,6 +91,20 @@ except ImportError:
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_CONFIG = HERE / "config.toml"
+
+
+@contextmanager
+def _locked_json_state(path: Path, *, exclusive: bool):
+    lock_path = path.with_name(f".{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -784,6 +803,7 @@ class ServerState:
             "/root/Windows-Codex-TG/.runtime/bot_state.json",
         )
         self.codex_user_id: str = str(server_cfg.get("codex_user_id", "8715009653"))
+        self.codex_shared_session_name: str = str(server_cfg.get("codex_shared_session_name", "kairos") or "kairos")
         self.codex_bin: str = server_cfg.get("codex_bin", "/usr/bin/codex")
         self.codex_home: str = server_cfg.get("codex_home", "/root/.codex")
         self.codex_model: str = server_cfg.get("codex_model", "gpt-5.5")
@@ -4154,7 +4174,13 @@ class PushHandler(BaseHTTPRequestHandler):
         if not state_path.exists():
             return None, default_cwd
         try:
-            data = json.loads(state_path.read_text(encoding="utf-8"))
+            with _locked_json_state(state_path, exclusive=False):
+                data = json.loads(state_path.read_text(encoding="utf-8"))
+            shared = ((data.get("shared_sessions") or {}).get(self.state.codex_shared_session_name) or {})
+            session_id = str(shared.get("active_session_id") or "").strip() or None
+            if session_id:
+                cwd = Path(str(shared.get("active_cwd") or default_cwd)).expanduser()
+                return session_id, cwd
             user = (data.get("users") or {}).get(self.state.codex_user_id) or {}
             session_id = str(user.get("active_session_id") or "").strip() or None
             cwd = Path(str(user.get("active_cwd") or default_cwd)).expanduser()
@@ -4162,6 +4188,44 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception as e:
             logger.warning("load codex target failed: %s", e)
             return None, default_cwd
+
+    def _save_codex_target(self, session_id: str | None, cwd: Path, source: str) -> None:
+        if not session_id:
+            return
+        state_path = Path(self.state.codex_bot_state_path).expanduser()
+        try:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            with _locked_json_state(state_path, exclusive=True):
+                data: dict[str, Any] = {}
+                if state_path.exists():
+                    loaded = json.loads(state_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        data = loaded
+                shared_sessions = data.setdefault("shared_sessions", {})
+                if not isinstance(shared_sessions, dict):
+                    shared_sessions = {}
+                    data["shared_sessions"] = shared_sessions
+                shared = shared_sessions.setdefault(self.state.codex_shared_session_name, {})
+                if not isinstance(shared, dict):
+                    shared = {}
+                    shared_sessions[self.state.codex_shared_session_name] = shared
+                shared["active_session_id"] = str(session_id)
+                shared["active_cwd"] = str(cwd)
+                shared["updated_at"] = int(time.time())
+                shared["updated_by"] = source
+
+                users = data.setdefault("users", {})
+                if isinstance(users, dict):
+                    user = users.setdefault(self.state.codex_user_id, {})
+                    if isinstance(user, dict):
+                        user["active_session_id"] = str(session_id)
+                        user["active_cwd"] = str(cwd)
+
+                tmp = state_path.with_name(f".{state_path.name}.tmp.{os.getpid()}")
+                tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                os.replace(str(tmp), str(state_path))
+        except Exception as e:
+            logger.warning("save codex target failed: %s", e)
 
     def _codex_session_busy(self, session_id: str | None) -> bool:
         if not session_id:
@@ -4224,6 +4288,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         return
                     prompt = (
                         "当前时间：" + datetime.now().astimezone().strftime("%Y-%m-%d %H:%M") + "\n"
+                        "[消息来源]\n入口: cc_companion_kairos_private\ncontact_id: kairos\n\n"
                         "Astra 正在通过 CcCompanion app 和 Kairos 对话。请直接回复她，不要提到后台路由。\n"
                         f"对方说：{text}"
                     )
@@ -4242,12 +4307,14 @@ class PushHandler(BaseHTTPRequestHandler):
                         "CODEX_MODEL": self.state.codex_model,
                         "CODEX_REASONING_EFFORT": self.state.codex_reasoning_effort,
                     }
-                    _, answer, stderr_text, return_code = runner.run_prompt(
+                    thread_id, answer, stderr_text, return_code = runner.run_prompt(
                         prompt=prompt,
                         cwd=cwd,
                         session_id=session_id,
                         env_overrides=env_overrides,
                     )
+                    if thread_id:
+                        self._save_codex_target(thread_id, cwd, "cc-app:kairos")
                     if return_code != 0 and stderr_text:
                         logger.warning("kairos codex return_code=%s stderr=%s", return_code, stderr_text[-800:])
                     answer = (answer or "").strip() or "Kairos 没有返回可展示内容。"
@@ -4279,6 +4346,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         return
                     prompt = (
                         "当前时间：" + datetime.now().astimezone().strftime("%Y-%m-%d %H:%M") + "\n"
+                        "[消息来源]\n入口: cc_companion_apples_group\ncontact_id: apples\n\n"
                         f"{sender_name} 正在 CcCompanion 的“苹果幼稚园”群聊里 @Kairos。"
                         "请以 Kairos 身份直接回复群聊，不要提到后台路由，也不要触发或代替其他成员。\n"
                         f"群聊消息：{text}"
@@ -4298,12 +4366,14 @@ class PushHandler(BaseHTTPRequestHandler):
                         "CODEX_MODEL": self.state.codex_model,
                         "CODEX_REASONING_EFFORT": self.state.codex_reasoning_effort,
                     }
-                    _, answer, stderr_text, return_code = runner.run_prompt(
+                    thread_id, answer, stderr_text, return_code = runner.run_prompt(
                         prompt=prompt,
                         cwd=cwd,
                         session_id=session_id,
                         env_overrides=env_overrides,
                     )
+                    if thread_id:
+                        self._save_codex_target(thread_id, cwd, "cc-app:apples:kairos")
                     if return_code != 0 and stderr_text:
                         logger.warning("group kairos codex return_code=%s stderr=%s", return_code, stderr_text[-800:])
                     answer = (answer or "").strip() or "Kairos 没有返回可展示内容。"
