@@ -40,10 +40,11 @@ import logging
 import os
 import re
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import sys
 import threading
 import time
+import unicodedata
 try:
     import tomllib
 except ModuleNotFoundError:
@@ -1659,6 +1660,14 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/notion/page/"):
             self._handle_notion_page_get()
             return
+        # --- AI status (chat header) GET — per-contact ---
+        if self.path.startswith("/ai-status"):
+            qs = self._query_params()
+            contact_id = str(
+                qs.get("contact_id", qs.get("contactId", ["xiaoke"]))[0] or "xiaoke"
+            ).strip().lower() or "xiaoke"
+            self._send_json(200, {"contact_id": contact_id, "text": _read_ai_status(contact_id)})
+            return
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -1721,6 +1730,9 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         elif self.path == "/toolbot/command":
             self._handle_toolbot_command(body)
+            return
+        elif self.path == "/ai-status":
+            self._handle_ai_status_post(body)
             return
         elif self.path == "/push/clear-unread":
             self._handle_clear_unread()
@@ -3665,7 +3677,11 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"ok": False, "error": str(e)})
 
     def _handle_chain_sessions_get(self):
-        """Phase B /chain/sessions — list tmux sessions, mark active."""
+        """Phase B /chain/sessions — list tmux sessions, mark active.
+
+        DEPRECATED (2026-06): superseded by the `sessions` toolbot command,
+        which lists real Claude session jsonl files instead of tmux sessions.
+        Kept so older app builds don't crash. Do not extend."""
         try:
             result = subprocess.run(
                 ["tmux", "list-sessions", "-F", "#{session_name}:#{session_windows}:#{session_attached}"],
@@ -3685,6 +3701,9 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _handle_chain_new_session(self, body: dict[str, Any]):
         """Phase B /chain/new_session — create new tmux session + start CC.
+
+        DEPRECATED (2026-06): tmux-session based, not wired to the real
+        --resume session tracking. Kept for old app builds; do not extend.
         2026-05-14 — 之前默认自动 switch active_session 到新建的 sid 但用户测试一下就被踢到
         陌生的新 claude 不知道 UX 不友好. 改成"创了但不切" 用户想切过去再 /switch <sid> 显式."""
         import time as _t
@@ -3711,7 +3730,11 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"ok": False, "error": str(e)})
 
     def _handle_chain_switch(self, body: dict[str, Any]):
-        """Phase B /chain/switch — persist active_session for future chat sends."""
+        """Phase B /chain/switch — persist active_session for future chat sends.
+
+        DEPRECATED (2026-06): writes active_session.json which nothing reads to
+        decide --resume; does not restart claude. Superseded by the
+        `session_switch` toolbot command. Kept for old app builds; do not extend."""
         sid = str(body.get("sid") or "opia").strip()
         if not sid:
             self._send_json(400, {"error": "sid required"})
@@ -6458,6 +6481,8 @@ class PushHandler(BaseHTTPRequestHandler):
     TOOLBOT_COMMANDS: frozenset = frozenset({
         "forge", "statusbar", "vps", "model",
         "morning_on", "morning_off", "diary_on", "diary_off",
+        "sessions", "session_rename", "session_switch",
+        "session_preview", "status_set",
     })
     # morning/diary 开关映射到 dispatcher 注册表里的规则 id。
     _TOOLBOT_MORNING_RULES = ["morning_greeting"]
@@ -6504,6 +6529,31 @@ class PushHandler(BaseHTTPRequestHandler):
             "result": result_text,
         })
 
+    def _handle_ai_status_post(self, body: dict[str, Any]):
+        """POST /ai-status {"contact_id": ..., "text": ...} — set the chat-header
+        AI status text for one contact (contact_id defaults to xiaoke).
+
+        Auth: shares the same _require_write_auth gate as other writes (already
+        enforced in do_POST before dispatch). Clamps to 1.._AI_STATUS_MAX_LEN
+        chars and strips control characters, then atomically persists."""
+        contact_id = str(
+            body.get("contact_id") or body.get("contactId") or "xiaoke"
+        ).strip().lower() or "xiaoke"
+        text = _sanitize_ai_status(str(body.get("text") or ""))
+        if text is None:
+            self._send_json(400, {
+                "ok": False,
+                "error": f"text 需为 1-{_AI_STATUS_MAX_LEN} 字符（去掉控制字符后）",
+            })
+            return
+        try:
+            _write_ai_status(text, contact_id)
+        except Exception as e:
+            logger.exception("write ai_status failed")
+            self._send_json(500, {"ok": False, "error": str(e)})
+            return
+        self._send_json(200, {"ok": True, "contact_id": contact_id, "text": text})
+
     def _run_toolbot_command(self, command: str, args: str) -> tuple[bool, str]:
         """Dispatch a whitelisted toolbot command. Returns (ok, result_text).
 
@@ -6514,7 +6564,24 @@ class PushHandler(BaseHTTPRequestHandler):
         session = "cctg"  # the Claude Code tmux session (same as ccbot-lite)
 
         if command == "statusbar":
-            # Read-only: capture the tmux pane tail, like /statusbar in ccbot-lite.
+            # Read-only. Prefer the @claude-code-status-json tmux variable (the
+            # same source ccbot-lite's /statusbar uses) rendered pretty; fall
+            # back to the raw capture-pane tail if that's missing/unparseable.
+            try:
+                jproc = subprocess.run(
+                    ["tmux", "show-option", "-gqv", "@claude-code-status-json"],
+                    capture_output=True, text=True, timeout=4,
+                )
+                if jproc.returncode == 0 and jproc.stdout.strip():
+                    sdata = json.loads(jproc.stdout.strip())
+                    pretty = _format_statusbar_from_json(sdata)
+                    if pretty:
+                        return True, pretty
+            except FileNotFoundError:
+                return False, "tmux 未安装"
+            except Exception as e:
+                logger.debug("statusbar json render failed, falling back: %s", e)
+            # Fallback: raw pane tail.
             try:
                 proc = subprocess.run(
                     ["tmux", "capture-pane", "-t", session, "-p"],
@@ -6626,6 +6693,127 @@ class PushHandler(BaseHTTPRequestHandler):
             rstate = self.state.tool_schedule.rule_enabled_state(self._TOOLBOT_DIARY_RULES)
             label = "开启" if enabled else "关闭"
             return True, f"日记提醒已{label}。当前规则状态：{rstate}（本次改动：{changed or '无变化'}）"
+
+        if command == "sessions":
+            # List the 10 most recently active Claude session jsonl files.
+            # Returns a JSON string in `result` (structured, not pretty text) so
+            # the app can parse it directly via POST /toolbot/command.
+            try:
+                jsonls = [
+                    p for p in CLAUDE_SESSION_DIR.glob("*.jsonl")
+                    if p.is_file()
+                ]
+            except Exception as e:
+                return False, f"扫描 session 目录失败：{e}"
+            jsonls.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            jsonls = jsonls[:10]
+            names = _load_session_names()
+            try:
+                active_sid = CCBOT_CURRENT_SESSION_FILE.read_text(encoding="utf-8").strip()
+            except Exception:
+                active_sid = ""
+            items: list[dict[str, Any]] = []
+            for p in jsonls:
+                sid = p.stem
+                try:
+                    st = p.stat()
+                    mtime_iso = datetime.fromtimestamp(st.st_mtime, timezone.utc).astimezone().isoformat(timespec="seconds")
+                    size_kb = round(st.st_size / 1024.0, 1)
+                except Exception:
+                    mtime_iso, size_kb = "", 0.0
+                items.append({
+                    "sid": sid,
+                    "name": names.get(sid),  # None when no alias
+                    "mtime_iso": mtime_iso,
+                    "size_kb": size_kb,
+                    "preview": _session_preview(p),
+                    "active": sid == active_sid and bool(active_sid),
+                })
+            return True, json.dumps({"sessions": items, "active_sid": active_sid}, ensure_ascii=False)
+
+        if command == "session_rename":
+            # args = "<sid> <new name>" — first space splits sid from the name;
+            # the name may itself contain spaces. The name only ever enters the
+            # JSON alias table — never a shell argv.
+            parts = args.split(" ", 1)
+            if len(parts) < 2:
+                return False, "用法：session_rename <sid> <新名字>"
+            sid, raw_name = parts[0].strip(), parts[1]
+            if _session_jsonl_path(sid) is None:
+                return False, f"session 不存在或 id 非法：{sid}"
+            name = _sanitize_session_name(raw_name)
+            if name is None:
+                return False, f"名字需为 1-{_SESSION_NAME_MAX_LEN} 个字符（去掉控制字符后）。"
+            names = _load_session_names()
+            names[sid] = name
+            try:
+                _save_session_names(names)
+            except Exception as e:
+                return False, f"写别名表失败：{e}"
+            return True, f"已重命名 {sid[:8]} → 「{name}」"
+
+        if command == "session_switch":
+            # args = "<sid>". Validate jsonl exists → write current-session →
+            # sync active_session.json → restart claude-tg.service (the same
+            # kill+resume mechanism forge-reload-claude uses). push.py runs as a
+            # separate service (cc-companion.service), so restarting claude-tg
+            # does NOT kill us — the response is sent reliably even though the
+            # cctg claude that may have triggered this gets killed. We archive
+            # below in _handle_toolbot_command after this returns.
+            sid = args.strip()
+            if _session_jsonl_path(sid) is None:
+                return False, f"session 不存在或 id 非法：{sid}"
+            try:
+                _atomic_write_text(CCBOT_CURRENT_SESSION_FILE, sid + "\n")
+            except Exception as e:
+                return False, f"写 current-session 失败：{e}"
+            # Keep the deprecated active_session.json in sync for any old reader.
+            self.state.active_session = sid
+            _persist_active_session(self.state)
+            try:
+                proc = subprocess.run(
+                    ["systemctl", "restart", "claude-tg.service"],
+                    capture_output=True, text=True, timeout=60,
+                )
+            except subprocess.TimeoutExpired:
+                return False, f"已切到 {sid[:8]}，但重启 claude-tg 超时（60s）。请手动检查。"
+            except Exception as e:
+                return False, f"已切到 {sid[:8]}，但重启失败：{e}"
+            if proc.returncode != 0:
+                return False, (
+                    f"已写入目标 session {sid[:8]}，但 systemctl restart 失败"
+                    f"（exit {proc.returncode}）：{(proc.stderr or '').strip()[:500]}"
+                )
+            names = _load_session_names()
+            label = names.get(sid) or sid[:8]
+            return True, f"已切换到「{label}」并重启会话。新对话将 resume 该 session。"
+
+        if command == "session_preview":
+            # args = "<sid>". Read the tail of the session jsonl and return the
+            # last few user/assistant text messages as structured JSON in
+            # `result` (the app parses it directly). Read-only.
+            sid = args.strip()
+            p = _session_jsonl_path(sid)
+            if p is None:
+                return False, f"session 不存在或 id 非法：{sid}"
+            try:
+                msgs = _session_preview_messages(p, limit=6, max_chars=80)
+            except Exception as e:
+                return False, f"读取 session 预览失败：{e}"
+            return True, json.dumps({"sid": sid, "messages": msgs}, ensure_ascii=False)
+
+        if command == "status_set":
+            # args = the new AI-status text. Writes ONLY xiaoke's per-contact
+            # entry in ai_status.json (小克只动自己的状态). Lets 方小南 change it
+            # from inside a session via a local curl to /toolbot/command.
+            text = _sanitize_ai_status(args)
+            if text is None:
+                return False, f"文案需为 1-{_AI_STATUS_MAX_LEN} 字符（去掉控制字符后）。"
+            try:
+                _write_ai_status(text, "xiaoke")
+            except Exception as e:
+                return False, f"写 ai_status 失败：{e}"
+            return True, f"AI 状态文案已更新为「{text}」（小克）"
 
         return False, f"未实现的命令：{command}"
 
@@ -6827,6 +7015,352 @@ def cleanup_loop(state: ServerState, interval: float = 1800):
                 logger.info("cleanup removed %d stale tokens", n)
         except Exception:
             logger.exception("cleanup loop error")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Claude session switch / rename (工具版 session 管理)
+# ──────────────────────────────────────────────────────────────────────
+#
+# Unlike the deprecated /chain/* endpoints (which list tmux sessions and
+# write active_session.json that nothing reads), these operate on the real
+# Claude Code session jsonl files in CLAUDE_SESSION_DIR. The active session
+# id lives in CCBOT_CURRENT_SESSION_FILE — that's the file
+# /root/claude-telegram-start.sh reads to decide `claude --resume <sid>`.
+# Switching = atomically write that file then restart claude-tg.service
+# (same mechanical kill+resume forge-reload-claude relies on).
+
+CLAUDE_SESSION_DIR = Path("/root/.claude/projects/-root")
+CCBOT_CURRENT_SESSION_FILE = Path("/root/.ccbot/current-session")
+SESSION_NAMES_FILE = Path("/root/.ccbot/session_names.json")
+_SESSION_NAME_MAX_LEN = 24
+# UUID-ish session id: hex + dashes only. Belt-and-suspenders so a sid never
+# carries shell metacharacters even though we never build a shell string.
+_SESSION_SID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+
+
+def _session_jsonl_path(sid: str) -> Path | None:
+    """Return the jsonl Path for *sid* if it's a valid id and the file exists.
+
+    Validates the sid shape and ensures the resolved path is a direct child of
+    CLAUDE_SESSION_DIR (no traversal, no memory/ subdir)."""
+    sid = (sid or "").strip()
+    if not _SESSION_SID_RE.match(sid):
+        return None
+    p = CLAUDE_SESSION_DIR / f"{sid}.jsonl"
+    try:
+        if p.parent.resolve() != CLAUDE_SESSION_DIR.resolve():
+            return None
+    except Exception:
+        return None
+    if not p.is_file():
+        return None
+    return p
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write *text* to *path* atomically (temp file in same dir + os.replace)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def _load_session_names() -> dict[str, str]:
+    """Read the {sid: name} alias table; tolerate missing/corrupt file."""
+    try:
+        if SESSION_NAMES_FILE.exists():
+            data = json.loads(SESSION_NAMES_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+    except Exception as e:
+        logger.warning("load session_names failed: %s", e)
+    return {}
+
+
+def _save_session_names(names: dict[str, str]) -> None:
+    """Atomically persist the alias table."""
+    _atomic_write_text(SESSION_NAMES_FILE, json.dumps(names, ensure_ascii=False, indent=0))
+
+
+def _sanitize_session_name(raw: str) -> str | None:
+    """Strip control chars, trim; return None if not 1..MAX chars after cleanup."""
+    if raw is None:
+        return None
+    # Drop control characters (incl. newlines/tabs); keep normal printable text.
+    cleaned = "".join(ch for ch in raw if unicodedata.category(ch)[0] != "C")
+    cleaned = cleaned.strip()
+    if not cleaned or len(cleaned) > _SESSION_NAME_MAX_LEN:
+        return None
+    return cleaned
+
+
+# ──────────────────────────────────────────────────────────────────────
+# AI 状态文案 (chat header) — shared between app + sessions via ai_status.json
+# ──────────────────────────────────────────────────────────────────────
+AI_STATUS_FILE = Path("/root/CcCompanion/apns-server/tokens/ai_status.json")
+_AI_STATUS_MAX_LEN = 60
+
+
+def _sanitize_ai_status(raw: str) -> str | None:
+    """Strip control chars + trim; return None if not 1.._AI_STATUS_MAX_LEN chars."""
+    if raw is None:
+        return None
+    cleaned = "".join(ch for ch in raw if unicodedata.category(ch)[0] != "C")
+    cleaned = cleaned.strip()
+    if not cleaned or len(cleaned) > _AI_STATUS_MAX_LEN:
+        return None
+    return cleaned
+
+
+def _load_ai_status_map() -> dict[str, dict]:
+    """Load the per-contact AI-status map from ai_status.json.
+
+    New format: {"<contact_id>": {"text":..., "updated_at":...}, ...}
+    Legacy format (read-compat): {"text":..., "updated_at":...} is treated as
+    the xiaoke entry. Returns {} on missing/corrupt file.
+    """
+    try:
+        if AI_STATUS_FILE.exists():
+            data = json.loads(AI_STATUS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                # legacy single-status file → xiaoke
+                if "text" in data and not any(
+                    isinstance(v, dict) for v in data.values()
+                ):
+                    text = str(data.get("text") or "")
+                    if not text:
+                        return {}
+                    return {"xiaoke": {"text": text, "updated_at": data.get("updated_at")}}
+                # new per-contact map — keep only dict entries
+                return {
+                    str(k): v
+                    for k, v in data.items()
+                    if isinstance(v, dict)
+                }
+    except Exception as e:
+        logger.warning("read ai_status failed: %s", e)
+    return {}
+
+
+def _read_ai_status(contact_id: str = "xiaoke") -> str:
+    """Read the stored AI-status text for a contact; "" on missing/corrupt."""
+    contact_id = (contact_id or "xiaoke").strip().lower() or "xiaoke"
+    entry = _load_ai_status_map().get(contact_id)
+    if isinstance(entry, dict):
+        return str(entry.get("text") or "")
+    return ""
+
+
+def _write_ai_status(text: str, contact_id: str = "xiaoke") -> None:
+    """Atomically persist the AI-status text for one contact (others kept)."""
+    contact_id = (contact_id or "xiaoke").strip().lower() or "xiaoke"
+    data = _load_ai_status_map()
+    data[contact_id] = {
+        "text": text,
+        "updated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+    }
+    _atomic_write_text(AI_STATUS_FILE, json.dumps(data, ensure_ascii=False))
+
+
+# ──────────────────────────────────────────────────────────────────────
+# statusbar 美化 (mirrors ccbot-lite's _format_status_pretty)
+# ──────────────────────────────────────────────────────────────────────
+CCBOT_MODEL_FILE = Path("/root/.ccbot/current-model")
+
+
+def _read_ccbot_model_file() -> str:
+    """Read the configured model id from ~/.ccbot/current-model (best-effort)."""
+    try:
+        if CCBOT_MODEL_FILE.exists():
+            return CCBOT_MODEL_FILE.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _format_reset_beijing(reset_at: object) -> str:
+    """Format a Claude statusline epoch value as Beijing-time 'MM-DD HH:MM'."""
+    if reset_at is None:
+        return ""
+    try:
+        reset_ts = float(reset_at)
+    except (TypeError, ValueError):
+        return ""
+    utc8 = timezone(timedelta(hours=8))
+    reset = datetime.fromtimestamp(reset_ts, timezone.utc).astimezone(utc8)
+    return reset.strftime("北京时间 %m-%d %H:%M")
+
+
+def _status_bar_glyph(pct: float, width: int = 10) -> str:
+    """Render a 0-100 percentage as a width-char █/░ progress bar."""
+    try:
+        filled = round(float(pct) / 100 * width)
+    except (TypeError, ValueError):
+        filled = 0
+    filled = max(0, min(width, filled))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _format_statusbar_from_json(data: dict) -> str:
+    """Pretty-format the @claude-code-status-json payload (ccbot-lite style).
+
+    Fields used (confirmed live):
+      model.display_name / model.id
+      context_window.used_percentage
+      rate_limits.five_hour.used_percentage / .resets_at
+      rate_limits.seven_day.used_percentage / .resets_at
+    Returns "" when there's nothing renderable so the caller can fall back."""
+    parts: list[str] = []
+    model = data.get("model") or {}
+    model_name = model.get("display_name") or model.get("id") or ""
+    configured = _read_ccbot_model_file()
+    if model_name:
+        label = model_name
+        if "[1m]" in configured.lower():
+            label += " (1M)"
+        parts.append(f"🤖 {label}")
+    elif configured:
+        parts.append(f"🤖 {configured}")
+
+    ctx = data.get("context_window") or {}
+    ctx_pct = ctx.get("used_percentage")
+    if ctx_pct is not None:
+        try:
+            cp = float(ctx_pct)
+            parts.append(f"📊 Context: {_status_bar_glyph(cp)} {cp:.0f}%")
+        except (TypeError, ValueError):
+            pass
+
+    rl = data.get("rate_limits") or {}
+    five = rl.get("five_hour") or {}
+    week = rl.get("seven_day") or {}
+    five_pct = five.get("used_percentage")
+    if five_pct is not None:
+        try:
+            fp = float(five_pct)
+            reset = _format_reset_beijing(five.get("resets_at"))
+            suffix = f" ({reset})" if reset else ""
+            parts.append(f"⏱ 5h Quota: {_status_bar_glyph(fp)} {fp:.0f}%{suffix}")
+        except (TypeError, ValueError):
+            pass
+    week_pct = week.get("used_percentage")
+    if week_pct is not None:
+        try:
+            wp = float(week_pct)
+            reset = _format_reset_beijing(week.get("resets_at"))
+            suffix = f" ({reset})" if reset else ""
+            parts.append(f"📅 7d Quota: {_status_bar_glyph(wp)} {wp:.0f}%{suffix}")
+        except (TypeError, ValueError):
+            pass
+
+    return "\n".join(parts)
+
+
+def _session_preview(path: Path) -> str:
+    """Best-effort preview: last user/assistant text in the jsonl, first 40 chars.
+
+    Reads the file tail (~64KB) and scans the last lines in reverse; tolerant of
+    malformed lines."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            if size > 65536:
+                f.seek(-65536, os.SEEK_END)
+            chunk = f.read()
+        lines = chunk.decode("utf-8", errors="ignore").splitlines()
+    except Exception:
+        return ""
+    for line in reversed(lines[-80:]):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if ev.get("type") not in ("user", "assistant"):
+            continue
+        msg = ev.get("message") or {}
+        content = msg.get("content")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text", "")
+                    if text.strip():
+                        break
+        text = " ".join(text.split())
+        # Skip CC boilerplate / channel wrappers — they're not useful previews.
+        if not text or text.startswith("<"):
+            continue
+        return text[:40]
+    return ""
+
+
+def _session_preview_messages(
+    path: Path, limit: int = 6, max_chars: int = 80
+) -> list[dict[str, str]]:
+    """Return the last *limit* user/assistant text messages from a session jsonl.
+
+    Reads the file tail (~64KB), scans lines newest→oldest collecting plain-text
+    user/assistant messages (skips tool calls / system / channel-wrapper lines),
+    truncates each to *max_chars*, then returns them oldest→newest as
+    [{"role": "user"|"assistant", "text": ...}]. Tolerant of malformed lines —
+    mirrors the tail-read + lenient-parse pattern used by _session_preview."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            if size > 65536:
+                f.seek(-65536, os.SEEK_END)
+            chunk = f.read()
+        lines = chunk.decode("utf-8", errors="ignore").splitlines()
+    except Exception:
+        return []
+    out: list[dict[str, str]] = []
+    # Scan a generous window of recent lines newest-first until we have `limit`.
+    for line in reversed(lines[-400:]):
+        if len(out) >= limit:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        role = ev.get("type")
+        if role not in ("user", "assistant"):
+            continue
+        msg = ev.get("message") or {}
+        content = msg.get("content")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    candidate = block.get("text", "")
+                    if candidate.strip():
+                        text = candidate
+                        break
+        text = " ".join(text.split())
+        # Skip empties, CC boilerplate / channel wrappers, and tool-only turns.
+        if not text or text.startswith("<"):
+            continue
+        if len(text) > max_chars:
+            text = text[:max_chars] + "…"
+        out.append({"role": role, "text": text})
+    out.reverse()  # chronological order: oldest → newest
+    return out
 
 
 def _persist_active_session(state: "ServerState") -> None:
