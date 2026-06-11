@@ -7186,7 +7186,7 @@ def _read_ccbot_model_file() -> str:
 
 
 def _format_reset_beijing(reset_at: object) -> str:
-    """Format a Claude statusline epoch value as Beijing-time 'MM-DD HH:MM'."""
+    """Format a Claude statusline epoch value as Beijing-time 'MM-DD HH:MM' (no zone prefix)."""
     if reset_at is None:
         return ""
     try:
@@ -7195,7 +7195,7 @@ def _format_reset_beijing(reset_at: object) -> str:
         return ""
     utc8 = timezone(timedelta(hours=8))
     reset = datetime.fromtimestamp(reset_ts, timezone.utc).astimezone(utc8)
-    return reset.strftime("北京时间 %m-%d %H:%M")
+    return reset.strftime("%m-%d %H:%M")
 
 
 def _status_bar_glyph(pct: float, width: int = 10) -> str:
@@ -7234,7 +7234,7 @@ def _format_statusbar_from_json(data: dict) -> str:
     if ctx_pct is not None:
         try:
             cp = float(ctx_pct)
-            parts.append(f"📊 Context: {_status_bar_glyph(cp)} {cp:.0f}%")
+            parts.append(f"📊 Ctx {_status_bar_glyph(cp)} {cp:.0f}%")
         except (TypeError, ValueError):
             pass
 
@@ -7246,8 +7246,8 @@ def _format_statusbar_from_json(data: dict) -> str:
         try:
             fp = float(five_pct)
             reset = _format_reset_beijing(five.get("resets_at"))
-            suffix = f" ({reset})" if reset else ""
-            parts.append(f"⏱ 5h Quota: {_status_bar_glyph(fp)} {fp:.0f}%{suffix}")
+            suffix = f" → {reset}" if reset else ""
+            parts.append(f"⏱ 5h {_status_bar_glyph(fp)} {fp:.0f}%{suffix}")
         except (TypeError, ValueError):
             pass
     week_pct = week.get("used_percentage")
@@ -7255,8 +7255,8 @@ def _format_statusbar_from_json(data: dict) -> str:
         try:
             wp = float(week_pct)
             reset = _format_reset_beijing(week.get("resets_at"))
-            suffix = f" ({reset})" if reset else ""
-            parts.append(f"📅 7d Quota: {_status_bar_glyph(wp)} {wp:.0f}%{suffix}")
+            suffix = f" → {reset}" if reset else ""
+            parts.append(f"📅 7d {_status_bar_glyph(wp)} {wp:.0f}%{suffix}")
         except (TypeError, ValueError):
             pass
 
