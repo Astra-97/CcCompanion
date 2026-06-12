@@ -4590,7 +4590,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 sandbox_mode=None,
                 approval_policy=None,
                 dangerous_bypass_level=2,
-                idle_timeout_sec=0,
+                idle_timeout_sec=240,
             )
             env_overrides = {
                 "CODEX_HOME": self.state.codex_home,
@@ -4686,7 +4686,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         sandbox_mode=None,
                         approval_policy=None,
                         dangerous_bypass_level=2,
-                        idle_timeout_sec=0,
+                        idle_timeout_sec=240,
                     )
                     env_overrides = {
                         "CODEX_HOME": self.state.codex_home,
@@ -4770,7 +4770,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         sandbox_mode=None,
                         approval_policy=None,
                         dangerous_bypass_level=2,
-                        idle_timeout_sec=0,
+                        idle_timeout_sec=240,
                     )
                     env_overrides = {
                         "CODEX_HOME": self.state.codex_home,
