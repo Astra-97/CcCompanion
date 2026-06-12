@@ -41,6 +41,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 from datetime import datetime, timedelta, timezone
 import sys
 import threading
@@ -111,6 +112,54 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("cc-apns-server")
+
+
+class _CodexRunRegistry:
+    """Process-local registry for Kairos Codex runs started by CcCompanion."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._runs: dict[str, dict[str, Any]] = {}
+
+    def start(self, *, source: str, session_id: str | None, cwd: Path) -> tuple[str, threading.Event] | None:
+        with self._lock:
+            if self._runs:
+                return None
+            run_id = f"{int(time.time() * 1000)}-{os.getpid()}"
+            cancel_event = threading.Event()
+            self._runs[run_id] = {
+                "run_id": run_id,
+                "source": source,
+                "session_id": session_id,
+                "cwd": str(cwd),
+                "started_at": time.time(),
+                "cancel_event": cancel_event,
+            }
+            return run_id, cancel_event
+
+    def finish(self, run_id: str) -> None:
+        with self._lock:
+            self._runs.pop(run_id, None)
+
+    def latest(self) -> dict[str, Any] | None:
+        with self._lock:
+            if not self._runs:
+                return None
+            item = max(self._runs.values(), key=lambda run: float(run.get("started_at") or 0))
+            return dict(item)
+
+    def cancel_latest(self) -> dict[str, Any] | None:
+        with self._lock:
+            if not self._runs:
+                return None
+            item = max(self._runs.values(), key=lambda run: float(run.get("started_at") or 0))
+            event = item.get("cancel_event")
+            if isinstance(event, threading.Event):
+                event.set()
+            return dict(item)
+
+
+CODEX_RUNS = _CodexRunRegistry()
 
 
 # P0-3: auto-generate and persist shared_secret if not configured
@@ -1419,6 +1468,12 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path == "/chat/status":
             self._handle_chat_status()
             return
+        if self.path == "/codex/status":
+            self._handle_codex_status()
+            return
+        if self.path == "/codex/sessions":
+            self._handle_codex_sessions()
+            return
         if self.path == "/settings":
             self._send_json(200, {"ok": True, "settings": self.state.settings.snapshot()})
             return
@@ -1750,6 +1805,18 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         elif self.path == "/toolbot/command":
             self._handle_toolbot_command(body)
+            return
+        elif self.path == "/codex/abort":
+            self._handle_codex_abort(body)
+            return
+        elif self.path == "/codex/new_session":
+            self._handle_codex_new_session(body)
+            return
+        elif self.path == "/codex/switch":
+            self._handle_codex_switch(body)
+            return
+        elif self.path == "/codex/forge":
+            self._handle_codex_forge(body)
             return
         elif self.path == "/ai-status":
             self._handle_ai_status_post(body)
@@ -4180,19 +4247,29 @@ class PushHandler(BaseHTTPRequestHandler):
             session_id = str(shared.get("active_session_id") or "").strip() or None
             if session_id:
                 cwd = Path(str(shared.get("active_cwd") or default_cwd)).expanduser()
-                return session_id, cwd
+                return session_id, self._codex_allowed_cwd(cwd)
             user = (data.get("users") or {}).get(self.state.codex_user_id) or {}
             session_id = str(user.get("active_session_id") or "").strip() or None
             cwd = Path(str(user.get("active_cwd") or default_cwd)).expanduser()
-            return session_id, cwd
+            return session_id, self._codex_allowed_cwd(cwd)
         except Exception as e:
             logger.warning("load codex target failed: %s", e)
             return None, default_cwd
 
+    def _codex_allowed_cwd(self, cwd: Path | None = None) -> Path:
+        base = Path("/root/Windows-Codex-TG").resolve()
+        if cwd is None:
+            return base
+        try:
+            resolved = cwd.expanduser().resolve()
+            resolved.relative_to(base)
+            return resolved
+        except Exception:
+            return base
+
     def _save_codex_target(self, session_id: str | None, cwd: Path, source: str) -> None:
-        if not session_id:
-            return
         state_path = Path(self.state.codex_bot_state_path).expanduser()
+        cwd = self._codex_allowed_cwd(cwd)
         try:
             state_path.parent.mkdir(parents=True, exist_ok=True)
             with _locked_json_state(state_path, exclusive=True):
@@ -4209,7 +4286,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 if not isinstance(shared, dict):
                     shared = {}
                     shared_sessions[self.state.codex_shared_session_name] = shared
-                shared["active_session_id"] = str(session_id)
+                shared["active_session_id"] = str(session_id) if session_id else None
                 shared["active_cwd"] = str(cwd)
                 shared["updated_at"] = int(time.time())
                 shared["updated_by"] = source
@@ -4218,7 +4295,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 if isinstance(users, dict):
                     user = users.setdefault(self.state.codex_user_id, {})
                     if isinstance(user, dict):
-                        user["active_session_id"] = str(session_id)
+                        user["active_session_id"] = str(session_id) if session_id else None
                         user["active_cwd"] = str(cwd)
 
                 tmp = state_path.with_name(f".{state_path.name}.tmp.{os.getpid()}")
@@ -4228,8 +4305,15 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.warning("save codex target failed: %s", e)
 
     def _codex_session_busy(self, session_id: str | None) -> bool:
-        if not session_id:
-            return False
+        return bool(self._codex_exec_processes(session_id=session_id))
+
+    def _codex_exec_processes(
+        self,
+        session_id: str | None = None,
+        cwd: Path | None = None,
+    ) -> list[dict[str, Any]]:
+        if not session_id and cwd is None:
+            return []
         try:
             res = subprocess.run(
                 ["ps", "-eo", "pid=,args="],
@@ -4238,8 +4322,10 @@ class PushHandler(BaseHTTPRequestHandler):
                 timeout=2,
             )
         except Exception:
-            return False
+            return []
         current_pid = os.getpid()
+        target_cwd = str(cwd.resolve()) if cwd else None
+        matches: list[dict[str, Any]] = []
         for line in res.stdout.splitlines():
             line = line.strip()
             if not line:
@@ -4251,9 +4337,290 @@ class PushHandler(BaseHTTPRequestHandler):
                 continue
             if pid == current_pid:
                 continue
-            if "codex exec resume" in args and session_id in args:
-                return True
-        return False
+            if "codex exec" not in args:
+                continue
+            if session_id and ("resume" not in args or session_id not in args):
+                continue
+            proc_cwd = None
+            if target_cwd:
+                try:
+                    proc_cwd = str(Path(f"/proc/{pid}/cwd").resolve())
+                except Exception:
+                    proc_cwd = None
+                if proc_cwd != target_cwd:
+                    continue
+            matches.append({
+                "pid": pid,
+                "args": args[:500],
+                "cwd": proc_cwd,
+                "session_id": session_id,
+            })
+        return matches
+
+    def _codex_busy_snapshot(self) -> dict[str, Any]:
+        session_id, cwd = self._load_codex_target()
+        cwd = self._codex_allowed_cwd(cwd)
+        run = CODEX_RUNS.latest()
+        scan_session_id = session_id
+        scan_cwd: Path | None = None
+        if run:
+            scan_session_id = str(run.get("session_id") or session_id or "").strip() or None
+            scan_cwd = self._codex_allowed_cwd(Path(str(run.get("cwd") or cwd)).expanduser())
+        processes = self._codex_exec_processes(session_id=scan_session_id, cwd=scan_cwd)
+        if not run and not processes:
+            processes = self._codex_exec_processes(cwd=cwd)
+        busy = bool(run or processes)
+        return {
+            "ok": True,
+            "active_session_id": session_id,
+            "active_cwd": str(cwd),
+            "model": self.state.codex_model,
+            "reasoning_effort": self.state.codex_reasoning_effort,
+            "busy": busy,
+            "busy_pid": processes[0]["pid"] if processes else None,
+            "busy_session_id": scan_session_id,
+            "busy_source": run.get("source") if run else ("process-scan" if processes else None),
+            "busy_started_at": run.get("started_at") if run else None,
+        }
+
+    def _terminate_codex_processes(self, processes: list[dict[str, Any]]) -> int:
+        terminated = 0
+        for proc in processes:
+            try:
+                pid = int(proc.get("pid"))
+            except Exception:
+                continue
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            except Exception:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except Exception:
+                    continue
+            terminated += 1
+        if terminated:
+            time.sleep(1.0)
+        for proc in processes:
+            try:
+                pid = int(proc.get("pid"))
+            except Exception:
+                continue
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+            except Exception:
+                continue
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except Exception:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+        return terminated
+
+    def _handle_codex_status(self):
+        self._send_json(200, self._codex_busy_snapshot())
+
+    def _handle_codex_sessions(self):
+        session_id, _ = self._load_codex_target()
+        try:
+            sys.path.insert(0, "/root/Windows-Codex-TG")
+            from codex_common import SessionStore
+
+            root = Path(os.environ.get("CODEX_SESSION_ROOT", "~/.codex/sessions")).expanduser()
+            sessions = []
+            for meta in SessionStore(root).list_recent(limit=24):
+                sessions.append({
+                    "sid": meta.session_id,
+                    "name": meta.title,
+                    "mtime_iso": meta.timestamp,
+                    "cwd": meta.cwd,
+                    "preview": meta.title,
+                    "active": bool(session_id and meta.session_id == session_id),
+                })
+            self._send_json(200, {"ok": True, "sessions": sessions, "active_session_id": session_id})
+        except Exception as e:
+            logger.exception("codex/sessions failed")
+            self._send_json(500, {"ok": False, "error": str(e)})
+
+    def _handle_codex_abort(self, body: dict[str, Any]):
+        run = CODEX_RUNS.cancel_latest()
+        session_id, cwd = self._load_codex_target()
+        cwd = self._codex_allowed_cwd(cwd)
+        target_session_id = str((run or {}).get("session_id") or session_id or "").strip() or None
+        target_cwd = self._codex_allowed_cwd(Path(str((run or {}).get("cwd") or cwd)).expanduser())
+        processes = self._codex_exec_processes(session_id=target_session_id, cwd=target_cwd)
+        if not run and not processes:
+            processes = self._codex_exec_processes(cwd=target_cwd)
+        killed = 0
+        if not run and processes:
+            killed = self._terminate_codex_processes(processes)
+        self._set_typing_for_contact("kairos", {"is_typing": False, "since": None})
+        self._set_typing_for_contact("apples", {"is_typing": False, "since": None})
+        action = "cancel_event" if run else ("terminated_process" if killed else "none")
+        self._send_json(200, {
+            "ok": bool(run or killed),
+            "action": action,
+            "session_id": target_session_id,
+            "pid": processes[0]["pid"] if processes else None,
+            "message": "已请求中断 Kairos Codex 生成。" if (run or killed) else "当前没有 CcCompanion 可中断的 Kairos Codex 生成。",
+        })
+
+    def _handle_codex_new_session(self, body: dict[str, Any]):
+        _, current_cwd = self._load_codex_target()
+        cwd_text = str(body.get("cwd") or "").strip()
+        cwd = Path(cwd_text).expanduser() if cwd_text else current_cwd
+        cwd = self._codex_allowed_cwd(cwd)
+        self._save_codex_target(None, cwd, "cc-app:codex:new_session")
+        self._send_json(200, {"ok": True, "active_session_id": None, "active_cwd": str(cwd)})
+
+    def _handle_codex_switch(self, body: dict[str, Any]):
+        session_id = str(body.get("session_id") or body.get("sessionId") or "").strip()
+        if not session_id:
+            self._send_json(400, {"ok": False, "error": "session_id required"})
+            return
+        if len(session_id) > 200 or any(ch.isspace() for ch in session_id):
+            self._send_json(400, {"ok": False, "error": "invalid session_id"})
+            return
+        _, cwd = self._load_codex_target()
+        cwd_text = str(body.get("cwd") or "").strip()
+        if cwd_text:
+            cwd = Path(cwd_text).expanduser()
+        cwd = self._codex_allowed_cwd(cwd)
+        self._save_codex_target(session_id, cwd, "cc-app:codex:switch")
+        self._send_json(200, {"ok": True, "active_session_id": session_id, "active_cwd": str(cwd)})
+
+    def _handle_codex_forge(self, body: dict[str, Any]):
+        old_session_id, cwd = self._load_codex_target()
+        cwd = self._codex_allowed_cwd(cwd)
+        if not old_session_id:
+            self._send_json(400, {"ok": False, "error": "当前没有 active Kairos session。"})
+            return
+        if CODEX_RUNS.latest() or self._codex_exec_processes(cwd=cwd):
+            self._send_json(409, {"ok": False, "error": "Kairos 正在生成中，请稍后再 forge。"})
+            return
+        history_limit = self._parse_codex_forge_limit(body.get("retain"))
+        model = str(body.get("model") or "").strip() or None
+        run = CODEX_RUNS.start(source="cc-app:codex:forge", session_id=old_session_id, cwd=cwd)
+        if run is None:
+            self._send_json(409, {"ok": False, "error": "Kairos 正在生成中，请稍后再 forge。"})
+            return
+        run_id, cancel_event = run
+        worker = threading.Thread(
+            target=self._run_codex_forge_worker,
+            args=(run_id, cancel_event, old_session_id, cwd, history_limit, model),
+            daemon=True,
+        )
+        worker.start()
+        self._send_json(202, {
+            "ok": True,
+            "message": f"Kairos forge 已开始，保留最近 {history_limit} 条上下文；完成后会自动切到新 session。",
+            "active_session_id": old_session_id,
+            "active_cwd": str(cwd),
+        })
+
+    def _parse_codex_forge_limit(self, raw: Any) -> int:
+        text = str(raw or "").strip().lower()
+        if text in {"all", "max", "full"}:
+            return 160
+        try:
+            value = int(text) if text else 80
+        except ValueError:
+            value = 80
+        return max(20, min(160, value))
+
+    def _build_codex_forge_prompt(
+        self,
+        old_session_id: str,
+        cwd: Path,
+        messages: list[tuple[str, str]],
+    ) -> str:
+        lines = [
+            "这是一次 Codex App 控制台触发的平滑 forge 交接。",
+            "",
+            "你将作为新的 active session 继续服务 Astra / 方小南。",
+            "请遵守当前仓库的 AGENTS.md，以及本会话中的系统和开发者规则。",
+            "不要复述整段交接内容，不要暴露任何密钥或本地敏感内容。",
+            "你的任务只是吸收上下文，后续用户继续说话时自然续聊。",
+            "",
+            f"旧 session: {old_session_id}",
+            f"工作目录: {cwd}",
+            "",
+            "近期对话摘要如下：",
+        ]
+        if not messages:
+            lines.append("- 没有读到可用的近期对话。")
+        for role, message in messages:
+            compact = " ".join(str(message or "").split())
+            if len(compact) > 1200:
+                compact = compact[:1199] + "..."
+            role_label = "Astra" if role == "user" else "Kairos"
+            lines.append(f"- {role_label}: {compact}")
+        lines.extend([
+            "",
+            "请只回复一行：forge-ready，然后用很短一句中文说明已经接住上下文。",
+        ])
+        return "\n".join(lines)
+
+    def _run_codex_forge_worker(
+        self,
+        run_id: str,
+        cancel_event: threading.Event,
+        old_session_id: str,
+        cwd: Path,
+        history_limit: int,
+        model: str | None,
+    ) -> None:
+        try:
+            sys.path.insert(0, "/root/Windows-Codex-TG")
+            from codex_common import CodexRunner, SessionStore
+
+            root = Path(os.environ.get("CODEX_SESSION_ROOT", "~/.codex/sessions")).expanduser()
+            meta, messages = SessionStore(root).get_history(old_session_id, limit=history_limit)
+            if not meta:
+                logger.warning("codex forge failed: missing old session %s", old_session_id)
+                return
+            prompt = self._build_codex_forge_prompt(old_session_id, cwd, messages)
+            runner = CodexRunner(
+                codex_bin=self.state.codex_bin,
+                sandbox_mode=None,
+                approval_policy=None,
+                dangerous_bypass_level=2,
+                idle_timeout_sec=0,
+            )
+            env_overrides = {
+                "CODEX_HOME": self.state.codex_home,
+                "CODEX_MODEL": model or self.state.codex_model,
+                "CODEX_REASONING_EFFORT": self.state.codex_reasoning_effort,
+            }
+            thread_id, answer, stderr_text, return_code = runner.run_prompt(
+                prompt=prompt,
+                cwd=cwd,
+                session_id=None,
+                env_overrides=env_overrides,
+                cancel_event=cancel_event,
+            )
+            if cancel_event.is_set():
+                logger.info("codex forge cancelled old_session=%s", old_session_id)
+                return
+            if return_code != 0 or not thread_id:
+                detail = " ".join((answer or stderr_text or "").split())
+                logger.warning("codex forge failed old_session=%s detail=%s", old_session_id, detail[:800])
+                return
+            self._save_codex_target(thread_id, cwd, "cc-app:codex:forge")
+            try:
+                SessionStore(root).mark_as_desktop_session(thread_id)
+            except Exception:
+                logger.debug("mark forged codex session failed", exc_info=True)
+            logger.info("codex forge completed old_session=%s new_session=%s", old_session_id, thread_id)
+        except Exception:
+            logger.exception("codex forge worker failed")
+        finally:
+            CODEX_RUNS.finish(run_id)
 
     def _handle_kairos_chat_send(self, body: dict[str, Any], contact_id: str):
         text = body.get("text", "").strip()
@@ -4272,13 +4639,32 @@ class PushHandler(BaseHTTPRequestHandler):
         self._set_typing_for_contact(contact_id, {"is_typing": True, "since": rec["ts"]})
 
         def _worker():
+            if CODEX_RUNS.latest():
+                chat.append(
+                    role="assistant",
+                    text="我正在处理另一边的消息，稍等一下再叫我。",
+                    source="codex:kairos",
+                )
+                self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
+                return
             lock = getattr(type(self), "_kairos_codex_lock", None)
             if lock is None:
                 lock = threading.Lock()
                 type(self)._kairos_codex_lock = lock
             with lock:
+                run_id = None
+                cancel_event = None
                 try:
                     session_id, cwd = self._load_codex_target()
+                    run = CODEX_RUNS.start(source="cc-app:kairos", session_id=session_id, cwd=cwd)
+                    if run is None:
+                        chat.append(
+                            role="assistant",
+                            text="我正在处理另一边的消息，稍等一下再叫我。",
+                            source="codex:kairos",
+                        )
+                        return
+                    run_id, cancel_event = run
                     if self._codex_session_busy(session_id):
                         chat.append(
                             role="assistant",
@@ -4312,7 +4698,11 @@ class PushHandler(BaseHTTPRequestHandler):
                         cwd=cwd,
                         session_id=session_id,
                         env_overrides=env_overrides,
+                        cancel_event=cancel_event,
                     )
+                    if cancel_event.is_set():
+                        chat.append(role="assistant", text="已中断当前生成。", source="codex:kairos")
+                        return
                     if thread_id:
                         self._save_codex_target(thread_id, cwd, "cc-app:kairos")
                     if return_code != 0 and stderr_text:
@@ -4323,6 +4713,8 @@ class PushHandler(BaseHTTPRequestHandler):
                     logger.exception("kairos codex worker failed")
                     chat.append(role="assistant", text=f"Kairos 接入出错：{e}", source="codex:kairos")
                 finally:
+                    if run_id:
+                        CODEX_RUNS.finish(run_id)
                     self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -4330,13 +4722,32 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _start_group_kairos_reply(self, chat: ChatHistory, text: str, sender_name: str = "Astra") -> None:
         def _worker():
+            if CODEX_RUNS.latest():
+                chat.append(
+                    role="assistant",
+                    text="我正在处理另一边的消息，稍等一下再叫我。",
+                    source="group:kairos",
+                )
+                self._set_typing_for_contact("apples", {"is_typing": False, "since": None})
+                return
             lock = getattr(type(self), "_kairos_codex_lock", None)
             if lock is None:
                 lock = threading.Lock()
                 type(self)._kairos_codex_lock = lock
             with lock:
+                run_id = None
+                cancel_event = None
                 try:
                     session_id, cwd = self._load_codex_target()
+                    run = CODEX_RUNS.start(source="cc-app:apples:kairos", session_id=session_id, cwd=cwd)
+                    if run is None:
+                        chat.append(
+                            role="assistant",
+                            text="我正在处理另一边的消息，稍等一下再叫我。",
+                            source="group:kairos",
+                        )
+                        return
+                    run_id, cancel_event = run
                     if self._codex_session_busy(session_id):
                         chat.append(
                             role="assistant",
@@ -4371,7 +4782,11 @@ class PushHandler(BaseHTTPRequestHandler):
                         cwd=cwd,
                         session_id=session_id,
                         env_overrides=env_overrides,
+                        cancel_event=cancel_event,
                     )
+                    if cancel_event.is_set():
+                        chat.append(role="assistant", text="已中断当前生成。", source="group:kairos")
+                        return
                     if thread_id:
                         self._save_codex_target(thread_id, cwd, "cc-app:apples:kairos")
                     if return_code != 0 and stderr_text:
@@ -4382,6 +4797,8 @@ class PushHandler(BaseHTTPRequestHandler):
                     logger.exception("group kairos codex worker failed")
                     chat.append(role="assistant", text=f"Kairos 接入出错：{e}", source="group:kairos")
                 finally:
+                    if run_id:
+                        CODEX_RUNS.finish(run_id)
                     self._set_typing_for_contact("apples", {"is_typing": False, "since": None})
 
         threading.Thread(target=_worker, daemon=True).start()
