@@ -42,6 +42,7 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 from datetime import datetime, timedelta, timezone
 import sys
 import threading
@@ -1810,6 +1811,9 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/chat/upload"):
             self._handle_chat_upload()
             return
+        if self.path.startswith("/voice-call/asr"):
+            self._handle_voice_call_asr()
+            return
         if self.path == "/diary/upload":
             self._handle_diary_upload()
             return
@@ -2042,6 +2046,8 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_ai_chat_config_post(body)
         elif self.path == "/ai-chat/send":
             self._handle_ai_chat_send(body)
+        elif self.path == "/voice-call/tts":
+            self._handle_voice_call_tts(body)
         elif self.path == "/ai-chat/system-prompt":
             self._handle_ai_chat_system_prompt(body)
         elif self.path == "/ai-chat/models":
@@ -5783,6 +5789,112 @@ class PushHandler(BaseHTTPRequestHandler):
             "result": result,
         })
 
+    def _run_stackchan_voice_helper(self, args: list[str], *, timeout: int) -> tuple[bool, dict[str, Any]]:
+        helper = HERE / "stackchan_voice_call.py"
+        python = Path(os.environ.get("STACKCHAN_XIAOZHI_PYTHON", "/root/stackchan-server-lite/main/xiaozhi-server/.venv/bin/python"))
+        try:
+            res = subprocess.run(
+                [str(python), str(helper), *args],
+                cwd=str(HERE),
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, {"ok": False, "error": "stackchan voice api timed out"}
+        except Exception as e:
+            return False, {"ok": False, "error": str(e)}
+
+        stdout = (res.stdout or "").strip()
+        stderr = (res.stderr or "").strip()
+        try:
+            payload = json.loads(stdout.splitlines()[-1]) if stdout else {}
+        except Exception:
+            payload = {"ok": False, "error": stdout or stderr or "invalid stackchan voice api response"}
+        if res.returncode != 0 and not payload.get("error"):
+            payload["error"] = stderr or f"stackchan voice api exited {res.returncode}"
+        return res.returncode == 0 and bool(payload.get("ok")), payload
+
+    def _handle_voice_call_asr(self):
+        """Raw audio upload -> StackChan/xiaozhi ASR transcript."""
+        import uuid as _uuid
+        from urllib.parse import urlparse, parse_qs, unquote
+
+        qs = parse_qs(urlparse(self.path).query)
+        contact_id = self._clean_contact_id(qs.get("contact_id", qs.get("contactId", ["kairos"]))[0])
+        filename = qs.get("filename", ["voice.m4a"])[0] or "voice.m4a"
+        try:
+            filename = unquote(filename)
+        except Exception:
+            pass
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except Exception:
+            length = 0
+        if length <= 0 or length > 15 * 1024 * 1024:
+            self._send_json(400, {"ok": False, "error": "invalid content-length (max 15MB)"})
+            return
+
+        ext = Path(filename).suffix.lower() or ".m4a"
+        if ext not in {".m4a", ".mp4", ".aac", ".wav", ".mp3", ".ogg", ".webm"}:
+            ext = ".m4a"
+        tmp_path = self.state.attachments_dir / f"voice_asr_input_{_uuid.uuid4().hex}{ext}"
+        try:
+            with tmp_path.open("wb") as f:
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, 65536))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+            ok, payload = self._run_stackchan_voice_helper(["asr", "--input", str(tmp_path)], timeout=90)
+            self._send_json(
+                200 if ok else 502,
+                {
+                    "ok": ok,
+                    "contact_id": contact_id,
+                    "transcript": str(payload.get("transcript") or ""),
+                    "error": payload.get("error"),
+                },
+            )
+        except Exception as e:
+            logger.exception("voice-call asr fail")
+            self._send_json(500, {"ok": False, "error": str(e)})
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def _handle_voice_call_tts(self, body: dict[str, Any]):
+        """Text -> StackChan/xiaozhi TTS audio file for app playback."""
+        text = str(body.get("text") or "").strip()
+        contact_id = self._contact_id_from_body(body)
+        if not text:
+            self._send_json(400, {"ok": False, "error": "text required"})
+            return
+        ok, payload = self._run_stackchan_voice_helper(
+            ["tts", "--text", text, "--output-dir", str(self.state.attachments_dir)],
+            timeout=90,
+        )
+        if not ok:
+            self._send_json(502, {"ok": False, "contact_id": contact_id, "error": payload.get("error") or "tts failed"})
+            return
+        stored_name = str(payload.get("stored_name") or "")
+        if not stored_name or "/" in stored_name or ".." in stored_name:
+            self._send_json(502, {"ok": False, "contact_id": contact_id, "error": "bad tts output"})
+            return
+        self._send_json(200, {
+            "ok": True,
+            "contact_id": contact_id,
+            "text": text,
+            "audio_url": f"/attachments/{stored_name}",
+            "mime_type": payload.get("mime_type") or "audio/wav",
+            "bytes": payload.get("bytes"),
+        })
+
     def _handle_attachment_get(self):
         """静态服务 attachment 文件 — GET /attachments/<filename>"""
         from urllib.parse import unquote
@@ -5805,7 +5917,7 @@ class PushHandler(BaseHTTPRequestHandler):
             ".heic": "image/heic", ".heif": "image/heif",
             ".pdf": "application/pdf",
             ".txt": "text/plain", ".md": "text/markdown",
-            ".mp3": "audio/mpeg", ".m4a": "audio/mp4",
+            ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".wav": "audio/wav",
             ".mp4": "video/mp4", ".mov": "video/quicktime",
         }
         mime = mime_map.get(ext, "application/octet-stream")
