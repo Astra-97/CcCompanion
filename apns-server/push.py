@@ -881,6 +881,10 @@ class ServerState:
             "apples": {"is_typing": False, "since": None},
             "toolbot": {"is_typing": False, "since": None},
         }
+        # In-memory assistant drafts for polling clients. Drafts are transient UI
+        # state only; final assistant replies remain in chat_history jsonl.
+        self.chat_draft_lock = threading.Lock()
+        self.chat_drafts: dict[str, dict[str, Any]] = {}
         # 书房 v1 (2026-05-09) — vault-aware project dashboard. read-only db (indexer 写)
         studyroom_db_path = HERE / "state" / "studyroom.db"
         self.studyroom = StudyroomDB(studyroom_db_path)
@@ -1199,6 +1203,44 @@ class PushHandler(BaseHTTPRequestHandler):
         else:
             self.state.contact_typing_states[contact_id] = value
 
+    def _set_chat_draft(
+        self,
+        contact_id: str,
+        text: str,
+        *,
+        source: str | None = None,
+        session_id: str | None = None,
+    ) -> None:
+        draft_text = str(text or "")
+        if not draft_text.strip():
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        with self.state.chat_draft_lock:
+            self.state.chat_drafts[contact_id] = {
+                "contact_id": contact_id,
+                "is_active": True,
+                "text": draft_text,
+                "updated_at": now,
+                "source": source or "",
+                "session_id": session_id or "",
+            }
+
+    def _clear_chat_draft(self, contact_id: str) -> None:
+        with self.state.chat_draft_lock:
+            self.state.chat_drafts.pop(contact_id, None)
+
+    def _chat_draft_snapshot(self, contact_id: str) -> dict[str, Any]:
+        with self.state.chat_draft_lock:
+            draft = dict(self.state.chat_drafts.get(contact_id) or {})
+        return {
+            "contact_id": contact_id,
+            "is_active": bool(draft.get("is_active")),
+            "text": str(draft.get("text") or ""),
+            "updated_at": draft.get("updated_at"),
+            "source": draft.get("source") or "",
+            "session_id": draft.get("session_id") or "",
+        }
+
     def _detect_apples_mentions(self, text: str) -> set[str]:
         targets: set[str] = set()
         if re.search(r"@kairos\b", text, flags=re.IGNORECASE):
@@ -1356,6 +1398,9 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/chat/history"):
             self._handle_chat_history()
+            return
+        if self.path.startswith("/chat/draft"):
+            self._handle_chat_draft()
             return
         if self.path == "/pet/state":
             self._handle_pet_state_get()
@@ -3667,6 +3712,10 @@ class PushHandler(BaseHTTPRequestHandler):
         records = chat_records
         self._send_json(200, {"ok": True, "contact_id": contact_id, "records": records, "count": len(records)})
 
+    def _handle_chat_draft(self):
+        contact_id = self._contact_id_from_query()
+        self._send_json(200, {"ok": True, **self._chat_draft_snapshot(contact_id)})
+
     def _handle_chat_search(self):
         qs = self._query_params()
         contact_id = self._clean_contact_id(qs.get("contact_id", qs.get("contactId", ["xiaoke"]))[0])
@@ -4637,6 +4686,7 @@ class PushHandler(BaseHTTPRequestHandler):
             quoted_ts=quoted_ts,
         )
         self._set_typing_for_contact(contact_id, {"is_typing": True, "since": rec["ts"]})
+        self._clear_chat_draft(contact_id)
 
         def _worker():
             if CODEX_RUNS.latest():
@@ -4693,12 +4743,22 @@ class PushHandler(BaseHTTPRequestHandler):
                         "CODEX_MODEL": self.state.codex_model,
                         "CODEX_REASONING_EFFORT": self.state.codex_reasoning_effort,
                     }
+
+                    def _on_update(live_text: str) -> None:
+                        self._set_chat_draft(
+                            contact_id,
+                            live_text,
+                            source="codex:kairos",
+                            session_id=session_id,
+                        )
+
                     thread_id, answer, stderr_text, return_code = runner.run_prompt(
                         prompt=prompt,
                         cwd=cwd,
                         session_id=session_id,
                         env_overrides=env_overrides,
                         cancel_event=cancel_event,
+                        on_update=_on_update,
                     )
                     if cancel_event.is_set():
                         chat.append(role="assistant", text="已中断当前生成。", source="codex:kairos")
@@ -4713,6 +4773,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     logger.exception("kairos codex worker failed")
                     chat.append(role="assistant", text=f"Kairos 接入出错：{e}", source="codex:kairos")
                 finally:
+                    self._clear_chat_draft(contact_id)
                     if run_id:
                         CODEX_RUNS.finish(run_id)
                     self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
@@ -4721,6 +4782,8 @@ class PushHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec})
 
     def _start_group_kairos_reply(self, chat: ChatHistory, text: str, sender_name: str = "Astra") -> None:
+        self._clear_chat_draft("apples")
+
         def _worker():
             if CODEX_RUNS.latest():
                 chat.append(
@@ -4777,12 +4840,22 @@ class PushHandler(BaseHTTPRequestHandler):
                         "CODEX_MODEL": self.state.codex_model,
                         "CODEX_REASONING_EFFORT": self.state.codex_reasoning_effort,
                     }
+
+                    def _on_update(live_text: str) -> None:
+                        self._set_chat_draft(
+                            "apples",
+                            live_text,
+                            source="group:kairos",
+                            session_id=session_id,
+                        )
+
                     thread_id, answer, stderr_text, return_code = runner.run_prompt(
                         prompt=prompt,
                         cwd=cwd,
                         session_id=session_id,
                         env_overrides=env_overrides,
                         cancel_event=cancel_event,
+                        on_update=_on_update,
                     )
                     if cancel_event.is_set():
                         chat.append(role="assistant", text="已中断当前生成。", source="group:kairos")
@@ -4797,6 +4870,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     logger.exception("group kairos codex worker failed")
                     chat.append(role="assistant", text=f"Kairos 接入出错：{e}", source="group:kairos")
                 finally:
+                    self._clear_chat_draft("apples")
                     if run_id:
                         CODEX_RUNS.finish(run_id)
                     self._set_typing_for_contact("apples", {"is_typing": False, "since": None})
