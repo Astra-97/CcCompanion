@@ -31,7 +31,7 @@ POST /push 触发 SPOKE / 状态切换 等
 from __future__ import annotations
 
 import argparse
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from contextlib import contextmanager
 import hmac
 import hashlib
@@ -887,6 +887,10 @@ class ServerState:
         self.chat_draft_lock = threading.Lock()
         self.chat_drafts: dict[str, dict[str, Any]] = {}
         self.chat_reply_states: dict[str, dict[str, Any]] = {}
+        self.kairos_queue_lock = threading.Lock()
+        self.kairos_queue_path = contact_history_dir / "kairos_queue.json"
+        self.kairos_queue: deque[dict[str, Any]] = self._load_kairos_queue()
+        self.kairos_queue_worker_running = False
         self.kairos_pending_run_path = contact_history_dir / "kairos_pending_run.json"
         self._recover_pending_kairos_run()
         # 书房 v1 (2026-05-09) — vault-aware project dashboard. read-only db (indexer 写)
@@ -961,6 +965,35 @@ class ServerState:
             len(self.tokens.all_active()),
             self.tasks.snapshot()["active"]["title"] if self.tasks.snapshot()["active"] else None,
         )
+
+    def _load_kairos_queue(self) -> deque[dict[str, Any]]:
+        try:
+            if not self.kairos_queue_path.exists():
+                return deque()
+            payload = json.loads(self.kairos_queue_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, list):
+                return deque()
+            tasks = deque()
+            for item in payload:
+                if isinstance(item, dict) and str(item.get("user_ts") or "").strip():
+                    tasks.append(item)
+            return tasks
+        except Exception:
+            logger.warning("load kairos queue failed", exc_info=True)
+            return deque()
+
+    def persist_kairos_queue_locked(self) -> None:
+        try:
+            items = list(self.kairos_queue)
+            if items:
+                self.kairos_queue_path.write_text(
+                    json.dumps(items, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            else:
+                self.kairos_queue_path.unlink(missing_ok=True)
+        except Exception:
+            logger.warning("persist kairos queue failed", exc_info=True)
 
     def mark_kairos_pending_run(self, contact_id: str, user_ts: str, text: str) -> None:
         contact_id = (contact_id or "kairos").strip().lower() or "kairos"
@@ -1281,11 +1314,17 @@ class PushHandler(BaseHTTPRequestHandler):
         source: str | None = None,
         session_id: str | None = None,
         user_ts: str | None = None,
+        queued_at: str | None = None,
+        started_at: str | None = None,
+        activity_text: str | None = None,
+        activity_count: int = 0,
+        activity_items: list[str] | None = None,
     ) -> None:
         draft_text = str(text or "")
         if not draft_text.strip():
             return
         now = datetime.now(timezone.utc).isoformat()
+        items = [str(item).strip() for item in (activity_items or []) if str(item).strip()]
         with self.state.chat_draft_lock:
             self.state.chat_drafts[contact_id] = {
                 "contact_id": contact_id,
@@ -1294,19 +1333,33 @@ class PushHandler(BaseHTTPRequestHandler):
                 "updated_at": now,
                 "source": source or "",
                 "session_id": session_id or "",
-                "reply_state": "replying",
-                "status_text": "回复中",
+                "reply_state": "generating",
+                "status_text": "生成中",
                 "user_ts": user_ts or "",
                 "final_ts": "",
+                "queued_at": queued_at or "",
+                "started_at": started_at or now,
+                "completed_at": "",
+                "queue_position": 0,
+                "activity_text": activity_text or "",
+                "activity_count": max(0, int(activity_count or 0)),
+                "activity_items": items,
             }
             self.state.chat_reply_states[contact_id] = {
-                "reply_state": "replying",
-                "status_text": "回复中",
+                "reply_state": "generating",
+                "status_text": "生成中",
                 "updated_at": now,
                 "source": source or "",
                 "session_id": session_id or "",
                 "user_ts": user_ts or "",
                 "final_ts": "",
+                "queued_at": queued_at or "",
+                "started_at": started_at or now,
+                "completed_at": "",
+                "queue_position": 0,
+                "activity_text": activity_text or "",
+                "activity_count": max(0, int(activity_count or 0)),
+                "activity_items": items,
             }
 
     def _clear_chat_draft(self, contact_id: str) -> None:
@@ -1314,25 +1367,87 @@ class PushHandler(BaseHTTPRequestHandler):
             self.state.chat_drafts.pop(contact_id, None)
             self.state.chat_reply_states.pop(contact_id, None)
 
-    def _set_chat_replying(
+    def _set_chat_queued(
         self,
         contact_id: str,
         *,
         user_ts: str | None = None,
+        queued_at: str | None = None,
+        queue_position: int = 1,
+        activity_text: str | None = None,
         source: str | None = None,
         session_id: str | None = None,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self.state.chat_draft_lock:
             self.state.chat_reply_states[contact_id] = {
-                "reply_state": "replying",
-                "status_text": "回复中",
+                "reply_state": "queued",
+                "status_text": "已排队",
                 "updated_at": now,
                 "source": source or "",
                 "session_id": session_id or "",
                 "user_ts": user_ts or "",
                 "final_ts": "",
+                "queued_at": queued_at or now,
+                "started_at": "",
+                "completed_at": "",
+                "queue_position": max(1, int(queue_position or 1)),
+                "activity_text": activity_text or "",
+                "activity_count": 0,
+                "activity_items": [],
             }
+
+    def _set_chat_generating(
+        self,
+        contact_id: str,
+        *,
+        user_ts: str | None = None,
+        queued_at: str | None = None,
+        started_at: str | None = None,
+        source: str | None = None,
+        session_id: str | None = None,
+    ) -> str:
+        now = started_at or datetime.now(timezone.utc).isoformat()
+        with self.state.chat_draft_lock:
+            self.state.chat_drafts.pop(contact_id, None)
+            self.state.chat_reply_states[contact_id] = {
+                "reply_state": "generating",
+                "status_text": "生成中",
+                "updated_at": now,
+                "source": source or "",
+                "session_id": session_id or "",
+                "user_ts": user_ts or "",
+                "final_ts": "",
+                "queued_at": queued_at or "",
+                "started_at": now,
+                "completed_at": "",
+                "queue_position": 0,
+                "activity_text": "",
+                "activity_count": 0,
+                "activity_items": [],
+            }
+        return now
+
+    def _set_chat_activity(
+        self,
+        contact_id: str,
+        *,
+        activity_text: str,
+        activity_count: int,
+        activity_items: list[str] | None = None,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        items = [str(item).strip() for item in (activity_items or []) if str(item).strip()]
+        with self.state.chat_draft_lock:
+            for bucket_name in ("chat_reply_states", "chat_drafts"):
+                bucket = getattr(self.state, bucket_name)
+                state = bucket.get(contact_id)
+                if not isinstance(state, dict):
+                    continue
+                state["activity_text"] = str(activity_text or "")
+                state["activity_count"] = max(0, int(activity_count or 0))
+                state["activity_items"] = items
+                state["updated_at"] = now
 
     def _set_chat_completed(
         self,
@@ -1355,25 +1470,71 @@ class PushHandler(BaseHTTPRequestHandler):
                 "session_id": session_id or "",
                 "user_ts": user_ts or "",
                 "final_ts": final_ts or "",
+                "queued_at": "",
+                "started_at": "",
+                "completed_at": now,
+                "queue_position": 0,
+                "activity_text": "",
+                "activity_count": 0,
+                "activity_items": [],
+                "expires_at": time.time() + ttl_sec,
+            }
+
+    def _set_chat_interrupted(
+        self,
+        contact_id: str,
+        *,
+        user_ts: str | None = None,
+        source: str | None = None,
+        session_id: str | None = None,
+        ttl_sec: float = 15.0,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.state.chat_draft_lock:
+            self.state.chat_drafts.pop(contact_id, None)
+            self.state.chat_reply_states[contact_id] = {
+                "reply_state": "interrupted",
+                "status_text": "已中断",
+                "updated_at": now,
+                "source": source or "",
+                "session_id": session_id or "",
+                "user_ts": user_ts or "",
+                "final_ts": "",
+                "queued_at": "",
+                "started_at": "",
+                "completed_at": now,
+                "queue_position": 0,
+                "activity_text": "",
+                "activity_count": 0,
+                "activity_items": [],
                 "expires_at": time.time() + ttl_sec,
             }
 
     def _chat_draft_snapshot(self, contact_id: str) -> dict[str, Any]:
+        if contact_id == "kairos":
+            self._ensure_kairos_queue_worker()
         with self.state.chat_draft_lock:
             draft = dict(self.state.chat_drafts.get(contact_id) or {})
             reply_state = dict(self.state.chat_reply_states.get(contact_id) or {})
             if (
-                reply_state.get("reply_state") == "completed"
+                reply_state.get("reply_state") in {"completed", "interrupted"}
                 and float(reply_state.get("expires_at") or 0) < time.time()
             ):
                 self.state.chat_reply_states.pop(contact_id, None)
                 reply_state = {}
         state_name = str(draft.get("reply_state") or reply_state.get("reply_state") or "idle")
-        if state_name not in {"idle", "replying", "completed"}:
+        if state_name == "replying":
+            state_name = "generating"
+        if state_name not in {"idle", "queued", "generating", "completed", "interrupted"}:
             state_name = "idle"
         status_text = str(draft.get("status_text") or reply_state.get("status_text") or "")
         if not status_text:
-            status_text = {"replying": "回复中", "completed": "已完成"}.get(state_name, "")
+            status_text = {
+                "queued": "已排队",
+                "generating": "生成中",
+                "completed": "已完成",
+                "interrupted": "已中断",
+            }.get(state_name, "")
         return {
             "contact_id": contact_id,
             "is_active": bool(draft.get("is_active")),
@@ -1385,6 +1546,19 @@ class PushHandler(BaseHTTPRequestHandler):
             "status_text": status_text,
             "user_ts": draft.get("user_ts") or reply_state.get("user_ts") or "",
             "final_ts": draft.get("final_ts") or reply_state.get("final_ts") or "",
+            "queued_at": draft.get("queued_at") or reply_state.get("queued_at") or "",
+            "started_at": draft.get("started_at") or reply_state.get("started_at") or "",
+            "completed_at": draft.get("completed_at") or reply_state.get("completed_at") or "",
+            "queue_position": int(draft.get("queue_position") or reply_state.get("queue_position") or 0),
+            "activity_text": draft.get("activity_text") or reply_state.get("activity_text") or "",
+            "activity_count": int(draft.get("activity_count") or reply_state.get("activity_count") or 0),
+            "activity_items": (
+                draft.get("activity_items")
+                if isinstance(draft.get("activity_items"), list)
+                else reply_state.get("activity_items")
+                if isinstance(reply_state.get("activity_items"), list)
+                else []
+            ),
         }
 
     def _detect_apples_mentions(self, text: str) -> set[str]:
@@ -4871,6 +5045,274 @@ class PushHandler(BaseHTTPRequestHandler):
         finally:
             CODEX_RUNS.finish(run_id)
 
+    def _kairos_queue_position_locked(self, contact_id: str, user_ts: str) -> int:
+        position = 0
+        for task in self.state.kairos_queue:
+            if task.get("contact_id") != contact_id:
+                continue
+            position += 1
+            if task.get("user_ts") == user_ts:
+                return max(1, position)
+        return 1
+
+    def _ensure_kairos_queue_worker(self) -> None:
+        should_start = False
+        with self.state.kairos_queue_lock:
+            if self.state.kairos_queue and not self.state.kairos_queue_worker_running:
+                self.state.kairos_queue_worker_running = True
+                should_start = True
+        if should_start:
+            threading.Thread(target=self._kairos_queue_worker, daemon=True).start()
+
+    def _enqueue_kairos_task(self, task: dict[str, Any]) -> None:
+        contact_id = str(task.get("contact_id") or "kairos")
+        user_ts = str(task.get("user_ts") or "")
+        queued_at = str(task.get("queued_at") or user_ts or datetime.now(timezone.utc).isoformat())
+        task["queued_at"] = queued_at
+        with self.state.kairos_queue_lock:
+            self.state.kairos_queue.append(task)
+            position = self._kairos_queue_position_locked(contact_id, user_ts)
+            self.state.persist_kairos_queue_locked()
+            self._set_chat_queued(
+                contact_id,
+                user_ts=user_ts,
+                queued_at=queued_at,
+                queue_position=position,
+                source="cc-app:kairos",
+            )
+            should_start = not self.state.kairos_queue_worker_running
+            if should_start:
+                self.state.kairos_queue_worker_running = True
+        if should_start:
+            threading.Thread(target=self._kairos_queue_worker, daemon=True).start()
+
+    def _kairos_queue_worker(self) -> None:
+        while True:
+            with self.state.kairos_queue_lock:
+                if not self.state.kairos_queue:
+                    self.state.kairos_queue_worker_running = False
+                    self.state.persist_kairos_queue_locked()
+                    return
+                task = self.state.kairos_queue.popleft()
+                self.state.persist_kairos_queue_locked()
+                for idx, queued in enumerate(self.state.kairos_queue, start=1):
+                    self._set_chat_queued(
+                        str(queued.get("contact_id") or "kairos"),
+                        user_ts=str(queued.get("user_ts") or ""),
+                        queued_at=str(queued.get("queued_at") or ""),
+                        queue_position=idx,
+                        source="cc-app:kairos",
+                    )
+            self._process_kairos_task(task)
+
+    def _kairos_prompt_for_task(self, task: dict[str, Any]) -> str:
+        text = str(task.get("text") or "").strip()
+        attachment_lines = []
+        for path in task.get("image_paths") or []:
+            attachment_lines.append(f"- 图片本地路径：{path}")
+        attachment_text = ""
+        if attachment_lines:
+            attachment_text = "\n\n随附图片：\n" + "\n".join(attachment_lines)
+        return (
+            "当前时间：" + datetime.now().astimezone().strftime("%Y-%m-%d %H:%M") + "\n"
+            "[消息来源]\n入口: cc_companion_kairos_private\ncontact_id: kairos\n\n"
+            "Astra 正在通过 CcCompanion app 和 Kairos 对话。请直接回复她，不要提到后台路由。\n"
+            f"对方说：{text or '[发来了一张图片]'}"
+            f"{attachment_text}"
+        )
+
+    @staticmethod
+    def _is_codex_prompt_busy_answer(answer: str) -> bool:
+        return str(answer or "").startswith("同一个 Kairos session 正在另一边生成中")
+
+    def _process_kairos_task(self, task: dict[str, Any]) -> None:
+        contact_id = str(task.get("contact_id") or "kairos")
+        text = str(task.get("text") or "")
+        user_ts = str(task.get("user_ts") or "")
+        queued_at = str(task.get("queued_at") or user_ts)
+        chat = self._chat_for_contact(contact_id)
+        run_id = None
+        cancel_event = None
+        assistant_appended = False
+        source = "codex:kairos"
+        activity_count = 0
+        activity_items: list[str] = []
+        wait_started_at = time.monotonic()
+        max_queue_wait_sec = 900.0
+        if user_ts:
+            self.state.mark_kairos_pending_run(contact_id, user_ts, text)
+
+        def _append_activity_card() -> None:
+            if not activity_items or task.get("activity_appended"):
+                return
+            for activity in activity_items:
+                chat.append(role="task", text=activity, source="codex:kairos:activity")
+            task["activity_appended"] = True
+
+        def _append_assistant(message: str, append_source: str = source) -> None:
+            nonlocal assistant_appended
+            _append_activity_card()
+            assistant_rec = chat.append(role="assistant", text=message, source=append_source)
+            assistant_appended = True
+            self._set_chat_completed(
+                contact_id,
+                user_ts=user_ts,
+                final_ts=str(assistant_rec.get("ts") or ""),
+                source=append_source,
+            )
+            self.state.clear_kairos_pending_run(user_ts)
+
+        lock = getattr(type(self), "_kairos_codex_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            type(self)._kairos_codex_lock = lock
+
+        with lock:
+            try:
+                session_id, cwd = self._load_codex_target()
+                while True:
+                    if time.monotonic() - wait_started_at >= max_queue_wait_sec:
+                        _append_assistant("这条消息排队超过 15 分钟还没轮到，我先标记失败。你可以直接重发。")
+                        return
+                    if CODEX_RUNS.latest() or self._codex_session_busy(session_id):
+                        self._set_chat_queued(
+                            contact_id,
+                            user_ts=user_ts,
+                            queued_at=queued_at,
+                            queue_position=1,
+                            activity_text="等上一条结束",
+                            source="cc-app:kairos",
+                        )
+                        time.sleep(1.0)
+                        continue
+                    run = CODEX_RUNS.start(source="cc-app:kairos", session_id=session_id, cwd=cwd)
+                    if run is not None:
+                        run_id, cancel_event = run
+                        break
+                    time.sleep(1.0)
+
+                started_at = self._set_chat_generating(
+                    contact_id,
+                    user_ts=user_ts,
+                    queued_at=queued_at,
+                    source="cc-app:kairos",
+                    session_id=session_id,
+                )
+                self._set_typing_for_contact(contact_id, {"is_typing": True, "since": user_ts or started_at})
+                prompt = self._kairos_prompt_for_task(task)
+                sys.path.insert(0, "/root/Windows-Codex-TG")
+                from codex_common import CodexRunner
+
+                runner = CodexRunner(
+                    codex_bin=self.state.codex_bin,
+                    sandbox_mode=None,
+                    approval_policy=None,
+                    dangerous_bypass_level=2,
+                    idle_timeout_sec=240,
+                )
+                env_overrides = {
+                    "CODEX_HOME": self.state.codex_home,
+                    "CODEX_MODEL": self.state.codex_model,
+                    "CODEX_REASONING_EFFORT": self.state.codex_reasoning_effort,
+                }
+
+                def _on_update(live_text: str) -> None:
+                    self._set_chat_draft(
+                        contact_id,
+                        live_text,
+                        source=source,
+                        session_id=session_id,
+                        user_ts=user_ts,
+                        queued_at=queued_at,
+                        started_at=started_at,
+                        activity_text=str(task.get("activity_text") or ""),
+                        activity_count=activity_count,
+                        activity_items=activity_items,
+                    )
+
+                def _on_activity(activity_text: str) -> None:
+                    nonlocal activity_count
+                    activity = str(activity_text or "").strip()
+                    if not activity:
+                        return
+                    activity_count += 1
+                    activity_items.append(activity)
+                    task["activity_text"] = activity
+                    self._set_chat_activity(
+                        contact_id,
+                        activity_text=activity,
+                        activity_count=activity_count,
+                        activity_items=activity_items,
+                    )
+
+                image_paths = [Path(p) for p in task.get("image_paths") or [] if str(p).strip()]
+                while True:
+                    if time.monotonic() - wait_started_at >= max_queue_wait_sec:
+                        _append_assistant("这条消息排队超过 15 分钟还没轮到，我先标记失败。你可以直接重发。")
+                        return
+                    thread_id, answer, stderr_text, return_code = runner.run_prompt(
+                        prompt=prompt,
+                        cwd=cwd,
+                        session_id=session_id,
+                        env_overrides=env_overrides,
+                        cancel_event=cancel_event,
+                        on_update=_on_update,
+                        on_activity=_on_activity,
+                        image_paths=image_paths,
+                        max_runtime_sec=900,
+                    )
+                    if not self._is_codex_prompt_busy_answer(answer):
+                        break
+                    if run_id:
+                        CODEX_RUNS.finish(run_id)
+                        run_id = None
+                    self._set_chat_queued(
+                        contact_id,
+                        user_ts=user_ts,
+                        queued_at=queued_at,
+                        queue_position=1,
+                        activity_text="等上一条结束",
+                        source="cc-app:kairos",
+                    )
+                    time.sleep(1.0)
+                    run = CODEX_RUNS.start(source="cc-app:kairos", session_id=session_id, cwd=cwd)
+                    if run is not None:
+                        run_id, cancel_event = run
+                        self._set_chat_generating(
+                            contact_id,
+                            user_ts=user_ts,
+                            queued_at=queued_at,
+                            started_at=started_at,
+                            source="cc-app:kairos",
+                            session_id=session_id,
+                        )
+                        continue
+                    time.sleep(1.0)
+
+                if cancel_event and cancel_event.is_set():
+                    _append_activity_card()
+                    chat.append(role="assistant", text="已中断当前生成。", source=source)
+                    assistant_appended = True
+                    self._set_chat_interrupted(contact_id, user_ts=user_ts, source=source, session_id=session_id)
+                    self.state.clear_kairos_pending_run(user_ts)
+                    return
+                if thread_id:
+                    self._save_codex_target(thread_id, cwd, "cc-app:kairos")
+                if return_code != 0 and stderr_text:
+                    logger.warning("kairos codex return_code=%s stderr=%s", return_code, stderr_text[-800:])
+                answer = (answer or "").strip() or "Kairos 没有返回可展示内容。"
+                _append_assistant(answer)
+            except Exception:
+                logger.exception("kairos codex queue worker failed")
+                _append_assistant("Kairos 接入出错：后端生成进程异常退出。你可以重发这条，我不会让它静默消失。")
+            finally:
+                if run_id:
+                    CODEX_RUNS.finish(run_id)
+                if not assistant_appended:
+                    self._set_chat_interrupted(contact_id, user_ts=user_ts, source=source)
+                    self.state.clear_kairos_pending_run(user_ts)
+                self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
+
     def _handle_kairos_chat_send(self, body: dict[str, Any], contact_id: str):
         text = body.get("text", "").strip()
         quoted_ts = body.get("quoted_ts") or None
@@ -4887,108 +5329,15 @@ class PushHandler(BaseHTTPRequestHandler):
         )
         self._set_typing_for_contact(contact_id, {"is_typing": True, "since": rec["ts"]})
         self._clear_chat_draft(contact_id)
-        self._set_chat_replying(contact_id, user_ts=rec["ts"], source="cc-app:kairos")
-        self.state.mark_kairos_pending_run(contact_id, rec["ts"], text)
-
-        def _worker():
-            assistant_appended = False
-            final_ts = ""
-
-            def _append_assistant(message: str, source: str = "codex:kairos") -> None:
-                nonlocal assistant_appended, final_ts
-                assistant_rec = chat.append(role="assistant", text=message, source=source)
-                assistant_appended = True
-                final_ts = str(assistant_rec.get("ts") or "")
-                self._set_chat_completed(
-                    contact_id,
-                    user_ts=rec["ts"],
-                    final_ts=final_ts,
-                    source=source,
-                )
-                self.state.clear_kairos_pending_run(rec["ts"])
-
-            if CODEX_RUNS.latest():
-                _append_assistant("我正在处理另一边的消息，稍等一下再叫我。")
-                self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
-                return
-            lock = getattr(type(self), "_kairos_codex_lock", None)
-            if lock is None:
-                lock = threading.Lock()
-                type(self)._kairos_codex_lock = lock
-            with lock:
-                run_id = None
-                cancel_event = None
-                try:
-                    session_id, cwd = self._load_codex_target()
-                    run = CODEX_RUNS.start(source="cc-app:kairos", session_id=session_id, cwd=cwd)
-                    if run is None:
-                        _append_assistant("我正在处理另一边的消息，稍等一下再叫我。")
-                        return
-                    run_id, cancel_event = run
-                    if self._codex_session_busy(session_id):
-                        _append_assistant("我正在处理另一边的消息，稍等一下再叫我。")
-                        return
-                    prompt = (
-                        "当前时间：" + datetime.now().astimezone().strftime("%Y-%m-%d %H:%M") + "\n"
-                        "[消息来源]\n入口: cc_companion_kairos_private\ncontact_id: kairos\n\n"
-                        "Astra 正在通过 CcCompanion app 和 Kairos 对话。请直接回复她，不要提到后台路由。\n"
-                        f"对方说：{text}"
-                    )
-                    sys.path.insert(0, "/root/Windows-Codex-TG")
-                    from codex_common import CodexRunner
-
-                    runner = CodexRunner(
-                        codex_bin=self.state.codex_bin,
-                        sandbox_mode=None,
-                        approval_policy=None,
-                        dangerous_bypass_level=2,
-                        idle_timeout_sec=240,
-                    )
-                    env_overrides = {
-                        "CODEX_HOME": self.state.codex_home,
-                        "CODEX_MODEL": self.state.codex_model,
-                        "CODEX_REASONING_EFFORT": self.state.codex_reasoning_effort,
-                    }
-
-                    def _on_update(live_text: str) -> None:
-                        self._set_chat_draft(
-                            contact_id,
-                            live_text,
-                            source="codex:kairos",
-                            session_id=session_id,
-                            user_ts=rec["ts"],
-                        )
-
-                    thread_id, answer, stderr_text, return_code = runner.run_prompt(
-                        prompt=prompt,
-                        cwd=cwd,
-                        session_id=session_id,
-                        env_overrides=env_overrides,
-                        cancel_event=cancel_event,
-                        on_update=_on_update,
-                        max_runtime_sec=900,
-                    )
-                    if cancel_event.is_set():
-                        _append_assistant("已中断当前生成。")
-                        return
-                    if thread_id:
-                        self._save_codex_target(thread_id, cwd, "cc-app:kairos")
-                    if return_code != 0 and stderr_text:
-                        logger.warning("kairos codex return_code=%s stderr=%s", return_code, stderr_text[-800:])
-                    answer = (answer or "").strip() or "Kairos 没有返回可展示内容。"
-                    _append_assistant(answer)
-                except Exception as e:
-                    logger.exception("kairos codex worker failed")
-                    _append_assistant("Kairos 接入出错：后端生成进程异常退出。你可以重发这条，我不会让它静默消失。")
-                finally:
-                    if not assistant_appended:
-                        _append_assistant("Kairos 生成没有正常结束。你可以重发这条，我不会让它静默消失。")
-                    if run_id:
-                        CODEX_RUNS.finish(run_id)
-                    self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
-
-        threading.Thread(target=_worker, daemon=True).start()
-        self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec})
+        self._enqueue_kairos_task({
+            "contact_id": contact_id,
+            "text": text,
+            "quoted_ts": quoted_ts,
+            "user_ts": rec["ts"],
+            "queued_at": rec["ts"],
+            "image_paths": [],
+        })
+        self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec, "queued": True})
 
     def _start_group_kairos_reply(self, chat: ChatHistory, text: str, sender_name: str = "Astra") -> None:
         self._clear_chat_draft("apples")
@@ -5917,6 +6266,19 @@ class PushHandler(BaseHTTPRequestHandler):
                     "record": rec,
                 })
                 return
+
+        if role == "user" and contact_id == "kairos":
+            task_text = text.strip() or f"[用户发了{'图片' if atype == 'image' else '文件'}: {filename}]"
+            image_paths = [str(stored_path)] if atype == "image" else []
+            self._clear_chat_draft(contact_id)
+            self._enqueue_kairos_task({
+                "contact_id": contact_id,
+                "text": task_text,
+                "quoted_ts": quoted_ts,
+                "user_ts": rec["ts"],
+                "queued_at": rec["ts"],
+                "image_paths": image_paths,
+            })
 
         self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec})
 
