@@ -1859,6 +1859,55 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         self._send_json(404, {"error": "not found"})
 
+    def do_HEAD(self):
+        """Handle HEAD requests needed for Android MediaPlayer audio streaming."""
+        if not self._is_public_get() and not self._check_ip_allowed():
+            return
+        if not self._is_public_get() and not self._require_auth():
+            return
+        if self.path.startswith("/attachments/"):
+            self._handle_attachment_head()
+            return
+        # For other paths, return 200 with no body (minimal HEAD support)
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _handle_attachment_head(self):
+        """HEAD for /attachments/<filename>, returning headers without body."""
+        from urllib.parse import unquote
+        rel = self.path[len("/attachments/"):]
+        rel = unquote(rel.split("?", 1)[0])
+        if "/" in rel or ".." in rel or rel.startswith("."):
+            self._send_json(400, {"error": "bad filename"})
+            return
+        target = self.state.attachments_dir / rel
+        if not target.exists() or not target.is_file():
+            self._send_json(404, {"error": "not found"})
+            return
+        ext = target.suffix.lower()
+        mime_map = {
+            ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+            ".gif": "image/gif", ".webp": "image/webp",
+            ".heic": "image/heic", ".heif": "image/heif",
+            ".pdf": "application/pdf",
+            ".txt": "text/plain", ".md": "text/markdown",
+            ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".wav": "audio/wav",
+            ".mp4": "video/mp4", ".mov": "video/quicktime",
+        }
+        mime = mime_map.get(ext, "application/octet-stream")
+        try:
+            length = target.stat().st_size
+        except Exception:
+            self._send_json(500, {"error": "read fail"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+
     def do_POST(self):
         if not self._check_ip_allowed():
             return
@@ -5997,6 +6046,7 @@ class PushHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
         self.send_header("Cache-Control", "public, max-age=86400")
         self.end_headers()
         try:
