@@ -886,6 +886,7 @@ class ServerState:
         # state only; final assistant replies remain in chat_history jsonl.
         self.chat_draft_lock = threading.Lock()
         self.chat_drafts: dict[str, dict[str, Any]] = {}
+        self.chat_reply_states: dict[str, dict[str, Any]] = {}
         self.kairos_pending_run_path = contact_history_dir / "kairos_pending_run.json"
         self._recover_pending_kairos_run()
         # 书房 v1 (2026-05-09) — vault-aware project dashboard. read-only db (indexer 写)
@@ -1279,6 +1280,7 @@ class PushHandler(BaseHTTPRequestHandler):
         *,
         source: str | None = None,
         session_id: str | None = None,
+        user_ts: str | None = None,
     ) -> None:
         draft_text = str(text or "")
         if not draft_text.strip():
@@ -1292,22 +1294,97 @@ class PushHandler(BaseHTTPRequestHandler):
                 "updated_at": now,
                 "source": source or "",
                 "session_id": session_id or "",
+                "reply_state": "replying",
+                "status_text": "回复中",
+                "user_ts": user_ts or "",
+                "final_ts": "",
+            }
+            self.state.chat_reply_states[contact_id] = {
+                "reply_state": "replying",
+                "status_text": "回复中",
+                "updated_at": now,
+                "source": source or "",
+                "session_id": session_id or "",
+                "user_ts": user_ts or "",
+                "final_ts": "",
             }
 
     def _clear_chat_draft(self, contact_id: str) -> None:
         with self.state.chat_draft_lock:
             self.state.chat_drafts.pop(contact_id, None)
+            self.state.chat_reply_states.pop(contact_id, None)
+
+    def _set_chat_replying(
+        self,
+        contact_id: str,
+        *,
+        user_ts: str | None = None,
+        source: str | None = None,
+        session_id: str | None = None,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.state.chat_draft_lock:
+            self.state.chat_reply_states[contact_id] = {
+                "reply_state": "replying",
+                "status_text": "回复中",
+                "updated_at": now,
+                "source": source or "",
+                "session_id": session_id or "",
+                "user_ts": user_ts or "",
+                "final_ts": "",
+            }
+
+    def _set_chat_completed(
+        self,
+        contact_id: str,
+        *,
+        user_ts: str | None = None,
+        final_ts: str | None = None,
+        source: str | None = None,
+        session_id: str | None = None,
+        ttl_sec: float = 15.0,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.state.chat_draft_lock:
+            self.state.chat_drafts.pop(contact_id, None)
+            self.state.chat_reply_states[contact_id] = {
+                "reply_state": "completed",
+                "status_text": "已完成",
+                "updated_at": now,
+                "source": source or "",
+                "session_id": session_id or "",
+                "user_ts": user_ts or "",
+                "final_ts": final_ts or "",
+                "expires_at": time.time() + ttl_sec,
+            }
 
     def _chat_draft_snapshot(self, contact_id: str) -> dict[str, Any]:
         with self.state.chat_draft_lock:
             draft = dict(self.state.chat_drafts.get(contact_id) or {})
+            reply_state = dict(self.state.chat_reply_states.get(contact_id) or {})
+            if (
+                reply_state.get("reply_state") == "completed"
+                and float(reply_state.get("expires_at") or 0) < time.time()
+            ):
+                self.state.chat_reply_states.pop(contact_id, None)
+                reply_state = {}
+        state_name = str(draft.get("reply_state") or reply_state.get("reply_state") or "idle")
+        if state_name not in {"idle", "replying", "completed"}:
+            state_name = "idle"
+        status_text = str(draft.get("status_text") or reply_state.get("status_text") or "")
+        if not status_text:
+            status_text = {"replying": "回复中", "completed": "已完成"}.get(state_name, "")
         return {
             "contact_id": contact_id,
             "is_active": bool(draft.get("is_active")),
             "text": str(draft.get("text") or ""),
-            "updated_at": draft.get("updated_at"),
+            "updated_at": draft.get("updated_at") or reply_state.get("updated_at"),
             "source": draft.get("source") or "",
             "session_id": draft.get("session_id") or "",
+            "reply_state": state_name,
+            "status_text": status_text,
+            "user_ts": draft.get("user_ts") or reply_state.get("user_ts") or "",
+            "final_ts": draft.get("final_ts") or reply_state.get("final_ts") or "",
         }
 
     def _detect_apples_mentions(self, text: str) -> set[str]:
@@ -4810,15 +4887,24 @@ class PushHandler(BaseHTTPRequestHandler):
         )
         self._set_typing_for_contact(contact_id, {"is_typing": True, "since": rec["ts"]})
         self._clear_chat_draft(contact_id)
+        self._set_chat_replying(contact_id, user_ts=rec["ts"], source="cc-app:kairos")
         self.state.mark_kairos_pending_run(contact_id, rec["ts"], text)
 
         def _worker():
             assistant_appended = False
+            final_ts = ""
 
             def _append_assistant(message: str, source: str = "codex:kairos") -> None:
-                nonlocal assistant_appended
-                chat.append(role="assistant", text=message, source=source)
+                nonlocal assistant_appended, final_ts
+                assistant_rec = chat.append(role="assistant", text=message, source=source)
                 assistant_appended = True
+                final_ts = str(assistant_rec.get("ts") or "")
+                self._set_chat_completed(
+                    contact_id,
+                    user_ts=rec["ts"],
+                    final_ts=final_ts,
+                    source=source,
+                )
                 self.state.clear_kairos_pending_run(rec["ts"])
 
             if CODEX_RUNS.latest():
@@ -4870,6 +4956,7 @@ class PushHandler(BaseHTTPRequestHandler):
                             live_text,
                             source="codex:kairos",
                             session_id=session_id,
+                            user_ts=rec["ts"],
                         )
 
                     thread_id, answer, stderr_text, return_code = runner.run_prompt(
@@ -4896,7 +4983,6 @@ class PushHandler(BaseHTTPRequestHandler):
                 finally:
                     if not assistant_appended:
                         _append_assistant("Kairos 生成没有正常结束。你可以重发这条，我不会让它静默消失。")
-                    self._clear_chat_draft(contact_id)
                     if run_id:
                         CODEX_RUNS.finish(run_id)
                     self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
