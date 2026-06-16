@@ -886,6 +886,8 @@ class ServerState:
         # state only; final assistant replies remain in chat_history jsonl.
         self.chat_draft_lock = threading.Lock()
         self.chat_drafts: dict[str, dict[str, Any]] = {}
+        self.kairos_pending_run_path = contact_history_dir / "kairos_pending_run.json"
+        self._recover_pending_kairos_run()
         # 书房 v1 (2026-05-09) — vault-aware project dashboard. read-only db (indexer 写)
         studyroom_db_path = HERE / "state" / "studyroom.db"
         self.studyroom = StudyroomDB(studyroom_db_path)
@@ -958,6 +960,72 @@ class ServerState:
             len(self.tokens.all_active()),
             self.tasks.snapshot()["active"]["title"] if self.tasks.snapshot()["active"] else None,
         )
+
+    def mark_kairos_pending_run(self, contact_id: str, user_ts: str, text: str) -> None:
+        contact_id = (contact_id or "kairos").strip().lower() or "kairos"
+        preview = " ".join(str(text or "").split())[:300]
+        payload = {
+            "contact_id": contact_id,
+            "user_ts": str(user_ts or ""),
+            "text_preview": preview,
+            "started_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds"),
+            "pid": os.getpid(),
+        }
+        try:
+            self.kairos_pending_run_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            logger.warning("mark kairos pending run failed", exc_info=True)
+
+    def clear_kairos_pending_run(self, user_ts: str | None = None) -> None:
+        try:
+            if user_ts and self.kairos_pending_run_path.exists():
+                try:
+                    payload = json.loads(self.kairos_pending_run_path.read_text(encoding="utf-8"))
+                except Exception:
+                    payload = {}
+                if str(payload.get("user_ts") or "") not in {"", str(user_ts)}:
+                    return
+            self.kairos_pending_run_path.unlink(missing_ok=True)
+        except Exception:
+            logger.warning("clear kairos pending run failed", exc_info=True)
+
+    def _recover_pending_kairos_run(self) -> None:
+        path = getattr(self, "kairos_pending_run_path", None)
+        if not path or not Path(path).exists():
+            return
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning("recover kairos pending run: unreadable pending file", exc_info=True)
+            self.clear_kairos_pending_run()
+            return
+        contact_id = str(payload.get("contact_id") or "kairos").strip().lower() or "kairos"
+        user_ts = str(payload.get("user_ts") or "")
+        chat = self.contact_chats.get(contact_id)
+        if chat is None or not user_ts:
+            self.clear_kairos_pending_run()
+            return
+        try:
+            later = chat.read_since(since_ts=user_ts, limit=200, include_hidden=True)
+            if not any(rec.get("role") == "assistant" for rec in later):
+                chat.append(
+                    role="assistant",
+                    text=(
+                        "上一条 Kairos 回复在后端重启或进程退出时中断了，没有完成落库。"
+                        "你可以直接重发；我不会再让它静默消失。"
+                    ),
+                    source="codex:kairos:recovered",
+                )
+                logger.warning(
+                    "recovered interrupted kairos run contact_id=%s user_ts=%s",
+                    contact_id,
+                    user_ts,
+                )
+        finally:
+            self.clear_kairos_pending_run(user_ts)
 
     def deliver_trigger(self, contact_id: str, text: str, rule_id: str) -> tuple[bool, str]:
         """Deliver a scheduled tool-dispatcher trigger into the live session.
@@ -4693,14 +4761,19 @@ class PushHandler(BaseHTTPRequestHandler):
         )
         self._set_typing_for_contact(contact_id, {"is_typing": True, "since": rec["ts"]})
         self._clear_chat_draft(contact_id)
+        self.state.mark_kairos_pending_run(contact_id, rec["ts"], text)
 
         def _worker():
+            assistant_appended = False
+
+            def _append_assistant(message: str, source: str = "codex:kairos") -> None:
+                nonlocal assistant_appended
+                chat.append(role="assistant", text=message, source=source)
+                assistant_appended = True
+                self.state.clear_kairos_pending_run(rec["ts"])
+
             if CODEX_RUNS.latest():
-                chat.append(
-                    role="assistant",
-                    text="我正在处理另一边的消息，稍等一下再叫我。",
-                    source="codex:kairos",
-                )
+                _append_assistant("我正在处理另一边的消息，稍等一下再叫我。")
                 self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
                 return
             lock = getattr(type(self), "_kairos_codex_lock", None)
@@ -4714,19 +4787,11 @@ class PushHandler(BaseHTTPRequestHandler):
                     session_id, cwd = self._load_codex_target()
                     run = CODEX_RUNS.start(source="cc-app:kairos", session_id=session_id, cwd=cwd)
                     if run is None:
-                        chat.append(
-                            role="assistant",
-                            text="我正在处理另一边的消息，稍等一下再叫我。",
-                            source="codex:kairos",
-                        )
+                        _append_assistant("我正在处理另一边的消息，稍等一下再叫我。")
                         return
                     run_id, cancel_event = run
                     if self._codex_session_busy(session_id):
-                        chat.append(
-                            role="assistant",
-                            text="我正在处理另一边的消息，稍等一下再叫我。",
-                            source="codex:kairos",
-                        )
+                        _append_assistant("我正在处理另一边的消息，稍等一下再叫我。")
                         return
                     prompt = (
                         "当前时间：" + datetime.now().astimezone().strftime("%Y-%m-%d %H:%M") + "\n"
@@ -4765,20 +4830,23 @@ class PushHandler(BaseHTTPRequestHandler):
                         env_overrides=env_overrides,
                         cancel_event=cancel_event,
                         on_update=_on_update,
+                        max_runtime_sec=900,
                     )
                     if cancel_event.is_set():
-                        chat.append(role="assistant", text="已中断当前生成。", source="codex:kairos")
+                        _append_assistant("已中断当前生成。")
                         return
                     if thread_id:
                         self._save_codex_target(thread_id, cwd, "cc-app:kairos")
                     if return_code != 0 and stderr_text:
                         logger.warning("kairos codex return_code=%s stderr=%s", return_code, stderr_text[-800:])
                     answer = (answer or "").strip() or "Kairos 没有返回可展示内容。"
-                    chat.append(role="assistant", text=answer, source="codex:kairos")
+                    _append_assistant(answer)
                 except Exception as e:
                     logger.exception("kairos codex worker failed")
-                    chat.append(role="assistant", text=f"Kairos 接入出错：{e}", source="codex:kairos")
+                    _append_assistant("Kairos 接入出错：后端生成进程异常退出。你可以重发这条，我不会让它静默消失。")
                 finally:
+                    if not assistant_appended:
+                        _append_assistant("Kairos 生成没有正常结束。你可以重发这条，我不会让它静默消失。")
                     self._clear_chat_draft(contact_id)
                     if run_id:
                         CODEX_RUNS.finish(run_id)
