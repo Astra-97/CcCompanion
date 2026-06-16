@@ -200,6 +200,9 @@ VPS_SERVICE_UNITS: list[tuple[str, str]] = [
 VPS_STATUS_CACHE_TTL = 5.0
 VPS_STATUS_CACHE_LOCK = threading.Lock()
 VPS_STATUS_CACHE: dict[str, Any] = {"ts": 0.0, "data": None}
+CODEX_QUOTA_CACHE_TTL = 60.0
+CODEX_QUOTA_CACHE_LOCK = threading.Lock()
+CODEX_QUOTA_CACHE: dict[str, Any] = {"ts": 0.0, "lines": None}
 
 
 def _run_status_cmd(args: list[str], timeout: float = 1.5) -> str:
@@ -4793,7 +4796,7 @@ class PushHandler(BaseHTTPRequestHandler):
         if not run and not processes:
             processes = self._codex_exec_processes(cwd=cwd)
         busy = bool(run or processes)
-        return {
+        payload = {
             "ok": True,
             "active_session_id": session_id,
             "active_cwd": str(cwd),
@@ -4804,6 +4807,212 @@ class PushHandler(BaseHTTPRequestHandler):
             "busy_session_id": scan_session_id,
             "busy_source": run.get("source") if run else ("process-scan" if processes else None),
             "busy_started_at": run.get("started_at") if run else None,
+        }
+        payload.update(self._codex_runtime_detail(session_id, cwd))
+        return payload
+
+    @staticmethod
+    def _parse_quota_lines(lines: list[str]) -> dict[str, Any]:
+        quota: dict[str, Any] = {"label": "", "plan": "", "email": "", "windows": []}
+        if not lines:
+            return quota
+        first = str(lines[0] or "").strip()
+        if first.startswith("额度:"):
+            label = first.split(":", 1)[1].strip()
+            quota["label"] = label
+            if "/" in label:
+                plan, email = label.split("/", 1)
+                quota["plan"] = plan.strip()
+                quota["email"] = PushHandler._mask_status_email(email.strip())
+            else:
+                quota["plan"] = label.strip()
+        for line in lines[1:]:
+            text = str(line or "").strip()
+            m = re.match(r"^(.+?):\s*剩余\s*(\d+)%（(.+)）$", text)
+            if not m:
+                continue
+            quota["windows"].append({
+                "label": m.group(1).strip(),
+                "remaining_percent": int(m.group(2)),
+                "reset_text": m.group(3).strip(),
+                "text": text,
+            })
+        return quota
+
+    @staticmethod
+    def _mask_status_email(value: str) -> str:
+        cleaned = str(value or "").strip()
+        if "@" not in cleaned:
+            return cleaned
+        name, domain = cleaned.split("@", 1)
+        if not name or not domain:
+            return ""
+        return f"{name[0]}***@{domain}"
+
+    @classmethod
+    def _sanitize_quota_lines(cls, lines: list[str]) -> list[str]:
+        sanitized: list[str] = []
+        for line in lines:
+            text = str(line or "")
+            sanitized.append(re.sub(r"([A-Za-z0-9._%+\-])[A-Za-z0-9._%+\-]*@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})", r"\1***@\2", text))
+        return sanitized
+
+    @staticmethod
+    def _format_token_count_compact(value: int) -> str:
+        if value >= 1_000_000:
+            return f"{value / 1_000_000:.1f}M"
+        if value >= 1_000:
+            return f"{value / 1_000:.1f}k"
+        return str(value)
+
+    def _codex_context_snapshot(self, meta: Any) -> dict[str, Any]:
+        try:
+            sys.path.insert(0, "/root/Windows-Codex-TG")
+            from tg_codex_bot import TgCodexService
+
+            usage = TgCodexService._latest_context_usage(meta)
+        except Exception:
+            usage = None
+        empty = {
+            "available": False,
+            "bar": "",
+            "used_percent": None,
+            "input_tokens": None,
+            "window_tokens": None,
+            "last_turn_tokens": None,
+            "context_text": "暂无 token_count 记录",
+            "last_turn_text": "",
+            "forge_hint": "暂无判断依据",
+        }
+        if not usage:
+            return empty
+        info = usage.get("info") if isinstance(usage.get("info"), dict) else {}
+        last = info.get("last_token_usage") if isinstance(info.get("last_token_usage"), dict) else {}
+        try:
+            input_tokens = int(last.get("input_tokens"))
+            total_tokens = int(last.get("total_tokens") or input_tokens)
+            window = int(info.get("model_context_window"))
+        except (TypeError, ValueError):
+            return {**empty, "context_text": "token_count 格式不可读"}
+        if window <= 0:
+            return {**empty, "context_text": "model_context_window 不可用"}
+        percent = input_tokens / window * 100
+        if percent >= 90:
+            forge_hint = "建议现在 forge（上下文接近上限）"
+        elif percent >= 80:
+            forge_hint = "建议准备 forge"
+        else:
+            forge_hint = "暂时不用"
+        bar = _status_bar_glyph(percent)
+        return {
+            "available": True,
+            "bar": bar,
+            "used_percent": round(percent, 1),
+            "input_tokens": input_tokens,
+            "window_tokens": window,
+            "last_turn_tokens": total_tokens,
+            "context_text": (
+                f"Context: {bar} {percent:.0f}% "
+                f"（{self._format_token_count_compact(input_tokens)} / {self._format_token_count_compact(window)}）"
+            ),
+            "last_turn_text": f"last turn: {self._format_token_count_compact(total_tokens)} tokens",
+            "forge_hint": forge_hint,
+        }
+
+    def _codex_quota_lines_cached(self) -> list[str]:
+        now = time.time()
+        with CODEX_QUOTA_CACHE_LOCK:
+            cached = CODEX_QUOTA_CACHE.get("lines")
+            if isinstance(cached, list) and now - float(CODEX_QUOTA_CACHE.get("ts") or 0) < CODEX_QUOTA_CACHE_TTL:
+                return [str(line) for line in cached]
+        try:
+            sys.path.insert(0, "/root/Windows-Codex-TG")
+            from tg_codex_bot import TgCodexService
+
+            lines = TgCodexService._quota_status_lines(Path(self.state.codex_home).expanduser())
+        except Exception as e:
+            lines = [f"额度: unavailable（{e.__class__.__name__}）"]
+        lines = self._sanitize_quota_lines(lines)
+        with CODEX_QUOTA_CACHE_LOCK:
+            CODEX_QUOTA_CACHE["ts"] = now
+            CODEX_QUOTA_CACHE["lines"] = list(lines)
+        return list(lines)
+
+    def _codex_runtime_detail(self, session_id: str | None, cwd: Path) -> dict[str, Any]:
+        account_label = self._mask_status_email(os.environ.get("CODEX_STATUS_ACCOUNT_LABEL", "main") or "main")
+        quota_lines = self._codex_quota_lines_cached()
+        quota = self._parse_quota_lines(quota_lines)
+
+        meta = None
+        session_title = f"session {str(session_id or '')[:8]}".strip()
+        try:
+            sys.path.insert(0, "/root/Windows-Codex-TG")
+            from codex_common import SessionStore
+
+            root = Path(os.environ.get("CODEX_SESSION_ROOT", "~/.codex/sessions")).expanduser()
+            if session_id:
+                meta = SessionStore(root).find_by_id(session_id)
+                if meta and getattr(meta, "title", ""):
+                    session_title = str(meta.title)
+        except Exception:
+            meta = None
+        context = self._codex_context_snapshot(meta)
+        percent_value = context.get("used_percent")
+        percent_text = ""
+        try:
+            if percent_value is not None:
+                percent_text = f"{float(percent_value):.0f}%"
+        except (TypeError, ValueError):
+            percent_text = ""
+        summary_parts = [self.state.codex_model]
+        if percent_text:
+            summary_parts.append(percent_text)
+        if quota.get("plan"):
+            summary_parts.append(str(quota.get("plan")))
+        return {
+            "account": {
+                "label": account_label,
+                "email": quota.get("email") or "",
+            },
+            "permissions": {
+                "bypass": 2,
+                "text": "bypass=2",
+            },
+            "quota": quota,
+            "current_session": {
+                "title": session_title if session_id else "当前没有绑定会话",
+                "session_id": session_id or "",
+                "cwd": str(cwd),
+                "shared_pointer": self.state.codex_shared_session_name,
+                "supports_local_client": True,
+            },
+            "context": context,
+            "summary": {
+                "default": " · ".join(part for part in summary_parts if str(part).strip()),
+                "model": self.state.codex_model,
+                "context_percent": percent_text,
+                "plan": quota.get("plan") or "",
+            },
+            "runtime_lines": [
+                "运行状态:",
+                f"account: {account_label}",
+                f"model: {self.state.codex_model}",
+                f"cwd: {cwd}",
+                "权限: bypass=2",
+                *quota_lines,
+                "",
+                "当前会话:",
+                session_title if session_id else "当前没有绑定会话。",
+                f"session: {session_id or ''}",
+                f"cwd: {cwd}",
+                "支持与本地 Codex 客户端交替续聊。",
+                f"共享指针: {self.state.codex_shared_session_name}",
+                "",
+                "上下文:",
+                str(context.get("context_text") or ""),
+                str(context.get("last_turn_text") or ""),
+                f"forge: {context.get('forge_hint') or '暂无判断依据'}",
+            ],
         }
 
     def _terminate_codex_processes(self, processes: list[dict[str, Any]]) -> int:
