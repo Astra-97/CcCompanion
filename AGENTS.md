@@ -27,3 +27,7 @@ safety, or user instructions in an active Codex session.
   out of git.
 - For non-trivial changes, prefer an implementation pass plus an independent
   review pass before pushing or releasing.
+- Do not restart `cc-companion.service` while replying to Astra through the
+  CcCompanion app. That service owns the active request and final history
+  append; restarting it mid-response will produce a recovered interruption
+  message instead of the intended assistant reply.
