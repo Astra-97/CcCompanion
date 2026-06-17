@@ -5410,7 +5410,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._set_typing_for_contact(contact_id, {"is_typing": True, "since": user_ts or started_at})
                 prompt = self._kairos_prompt_for_task(task)
                 sys.path.insert(0, "/root/Windows-Codex-TG")
-                from codex_common import CodexRunner
+                from codex_common import CodexRunner, SessionStore
 
                 runner = CodexRunner(
                     codex_bin=self.state.codex_bin,
@@ -5454,11 +5454,77 @@ class PushHandler(BaseHTTPRequestHandler):
                         activity_items=activity_items,
                     )
 
+                session_root = Path(os.environ.get("CODEX_SESSION_ROOT", "~/.codex/sessions")).expanduser()
+                session_store = SessionStore(session_root)
+
+                def _codex_session_marker(target_session_id: str | None) -> tuple[Path, int] | None:
+                    if not target_session_id:
+                        return None
+                    try:
+                        meta = session_store.find_by_id(target_session_id)
+                        if not meta:
+                            return None
+                        path = Path(meta.file_path)
+                        return path, path.stat().st_size
+                    except Exception:
+                        return None
+
+                def _mcp_activity_label(evt: dict[str, Any], seen_call_ids: set[str]) -> str:
+                    payload = evt.get("payload") if isinstance(evt.get("payload"), dict) else {}
+                    payload_type = str(payload.get("type") or "").strip()
+                    call_id = str(payload.get("call_id") or "").strip()
+                    if payload_type in {"function_call", "custom_tool_call"}:
+                        namespace = str(payload.get("namespace") or "").strip()
+                        if not namespace.startswith("mcp__"):
+                            return ""
+                        if call_id:
+                            seen_call_ids.add(call_id)
+                        name = str(payload.get("name") or "").strip()
+                        return f"调用 {name}" if name else ""
+                    if payload_type == "mcp_tool_call_end":
+                        if call_id and call_id in seen_call_ids:
+                            return ""
+                        invocation = payload.get("invocation") if isinstance(payload.get("invocation"), dict) else {}
+                        name = str(
+                            invocation.get("tool")
+                            or invocation.get("name")
+                            or invocation.get("tool_name")
+                            or ""
+                        ).strip()
+                        return f"调用 {name}" if name else ""
+                    return ""
+
+                def _harvest_mcp_session_activities(
+                    marker: tuple[Path, int] | None,
+                    target_session_id: str | None,
+                ) -> None:
+                    resolved_marker = marker or _codex_session_marker(target_session_id)
+                    if not resolved_marker:
+                        return
+                    path, offset = resolved_marker
+                    if not path.exists():
+                        return
+                    seen_call_ids: set[str] = set()
+                    try:
+                        with path.open("rb") as f:
+                            f.seek(max(0, offset))
+                            for raw in f:
+                                try:
+                                    evt = json.loads(raw.decode("utf-8", "replace"))
+                                except Exception:
+                                    continue
+                                activity = _mcp_activity_label(evt, seen_call_ids)
+                                if activity:
+                                    _on_activity(activity)
+                    except Exception:
+                        logger.debug("harvest MCP session activities failed", exc_info=True)
+
                 image_paths = [Path(p) for p in task.get("image_paths") or [] if str(p).strip()]
                 while True:
                     if time.monotonic() - wait_started_at >= max_queue_wait_sec:
                         _append_assistant("这条消息排队超过 15 分钟还没轮到，我先标记失败。你可以直接重发。")
                         return
+                    session_marker = _codex_session_marker(session_id)
                     thread_id, answer, stderr_text, return_code = runner.run_prompt(
                         prompt=prompt,
                         cwd=cwd,
@@ -5470,6 +5536,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         image_paths=image_paths,
                         max_runtime_sec=900,
                     )
+                    _harvest_mcp_session_activities(session_marker, thread_id or session_id)
                     if not self._is_codex_prompt_busy_answer(answer):
                         break
                     if run_id:
