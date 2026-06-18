@@ -82,6 +82,9 @@ class ChatHistory:
         metadata: dict[str, Any] | None = None,
         thinking: str | None = None,
         tools: str | None = None,
+        sender_id: str | None = None,
+        sender_name: str | None = None,
+        mentions: list[str] | None = None,
     ) -> dict[str, Any]:
         rec: dict[str, Any] = {
             "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds"),
@@ -113,6 +116,12 @@ class ChatHistory:
             rec["thinking"] = thinking
         if tools and isinstance(tools, str):
             rec["tools"] = tools
+        if sender_id:
+            rec["sender_id"] = str(sender_id)
+        if sender_name:
+            rec["sender_name"] = str(sender_name)
+        if mentions:
+            rec["mentions"] = [str(item) for item in mentions if str(item).strip()]
         with self._lock:
             with self.path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")

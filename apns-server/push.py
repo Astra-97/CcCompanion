@@ -1564,6 +1564,49 @@ class PushHandler(BaseHTTPRequestHandler):
             ),
         }
 
+    def _apples_members(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "kairos",
+                "display_name": "Kairos",
+                "mention": "@Kairos",
+                "kind": "agent",
+                "color": "gold",
+                "can_reply": True,
+            },
+            {
+                "id": "xiaoke",
+                "display_name": "小克",
+                "mention": "@小克",
+                "kind": "agent",
+                "color": "clay",
+                "can_reply": True,
+            },
+        ]
+
+    def _apples_member_name(self, member_id: str) -> str:
+        member_id = str(member_id or "").strip().lower()
+        for member in self._apples_members():
+            if member["id"] == member_id:
+                return str(member["display_name"])
+        if member_id == "astra":
+            return "Astra"
+        return member_id or "member"
+
+    def _apples_source_member(self, source: str) -> str | None:
+        lowered = str(source or "").strip().lower()
+        if lowered.startswith("group:kairos") or "kairos" in lowered:
+            return "kairos"
+        if lowered.startswith("group:xiaoke") or "xiaoke" in lowered or "ccc-stop-hook" in lowered:
+            return "xiaoke"
+        return None
+
+    def _handle_chat_members(self):
+        qs = self._query_params()
+        contact_id = self._clean_contact_id(qs.get("contact_id", qs.get("contactId", ["xiaoke"]))[0])
+        members = self._apples_members() if contact_id == "apples" else []
+        self._send_json(200, {"ok": True, "contact_id": contact_id, "members": members})
+
     def _detect_apples_mentions(self, text: str) -> set[str]:
         targets: set[str] = set()
         if re.search(r"@kairos\b", text, flags=re.IGNORECASE):
@@ -1577,7 +1620,7 @@ class PushHandler(BaseHTTPRequestHandler):
         safe_ts = re.sub(r"[^0-9A-Za-z_.:+-]", "_", user_ts)[:80]
         return f"[[CCC_GROUP_REPLY:apples:{safe_member}:{safe_ts}]]"
 
-    def _remember_group_reply(self, member_id: str, user_ts: str) -> None:
+    def _remember_group_reply(self, member_id: str, user_ts: str, source_member: str | None = None) -> None:
         now = time.time()
         with self.state.group_reply_lock:
             self.state.group_reply_pending = [
@@ -1588,17 +1631,35 @@ class PushHandler(BaseHTTPRequestHandler):
                 "contact_id": "apples",
                 "member_id": member_id,
                 "user_ts": user_ts,
+                "source_member": str(source_member or ""),
                 "created_at": now,
             })
 
-    def _consume_group_reply_route(self, text: str) -> tuple[str | None, str | None, str]:
+    def _has_pending_group_reply(self) -> bool:
+        now = time.time()
+        with self.state.group_reply_lock:
+            self.state.group_reply_pending = [
+                item for item in self.state.group_reply_pending
+                if now - float(item.get("created_at", 0)) < 600
+            ]
+            return bool(self.state.group_reply_pending)
+
+    def _consume_group_reply_route(self, text: str) -> tuple[str | None, str | None, str | None, str]:
         marker_re = re.compile(r"\[\[CCC_GROUP_REPLY:apples:([a-z0-9_-]+):([^\]]+)\]\]", re.IGNORECASE)
         match = marker_re.search(text)
         if match:
             cleaned = (text[:match.start()] + text[match.end():]).strip()
             marker_member = match.group(1).lower()
             marker_ts = match.group(2)
+            source_member = ""
             with self.state.group_reply_lock:
+                for item in self.state.group_reply_pending:
+                    if (
+                        str(item.get("member_id") or "").lower() == marker_member
+                        and str(item.get("user_ts") or "") == marker_ts
+                    ):
+                        source_member = str(item.get("source_member") or "")
+                        break
                 self.state.group_reply_pending = [
                     item for item in self.state.group_reply_pending
                     if not (
@@ -1606,9 +1667,9 @@ class PushHandler(BaseHTTPRequestHandler):
                         and str(item.get("user_ts") or "") == marker_ts
                     )
                 ]
-            return "apples", marker_member, cleaned
+            return "apples", marker_member, source_member, cleaned
 
-        return None, None, text
+        return None, None, None, text
 
     def _check_ip_allowed(self) -> bool:
         allowed = self.state.allowed_ips
@@ -1725,6 +1786,9 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/chat/draft"):
             self._handle_chat_draft()
             return
+        if self.path.startswith("/chat/members"):
+            self._handle_chat_members()
+            return
         if self.path == "/pet/state":
             self._handle_pet_state_get()
             return
@@ -1831,6 +1895,12 @@ class PushHandler(BaseHTTPRequestHandler):
                         ts = self._typing_for_contact(contact_id)
                 except Exception:
                     pass
+            if contact_id == "apples" and ts.get("is_typing") and not ts.get("member_id"):
+                pending = []
+                with self.state.group_reply_lock:
+                    pending = list(self.state.group_reply_pending)
+                if pending:
+                    ts = {**ts, "member_id": str(pending[-1].get("member_id") or "")}
             self._send_json(200, {"ok": True, **ts})
             return
         if self.path == "/chat/status":
@@ -5624,6 +5694,8 @@ class PushHandler(BaseHTTPRequestHandler):
                     role="assistant",
                     text="我正在处理另一边的消息，稍等一下再叫我。",
                     source="group:kairos",
+                    sender_id="kairos",
+                    sender_name=self._apples_member_name("kairos"),
                 )
                 self._set_typing_for_contact("apples", {"is_typing": False, "since": None})
                 return
@@ -5634,6 +5706,7 @@ class PushHandler(BaseHTTPRequestHandler):
             with lock:
                 run_id = None
                 cancel_event = None
+                routed_after_answer: list[str] = []
                 try:
                     session_id, cwd = self._load_codex_target()
                     run = CODEX_RUNS.start(source="cc-app:apples:kairos", session_id=session_id, cwd=cwd)
@@ -5642,6 +5715,8 @@ class PushHandler(BaseHTTPRequestHandler):
                             role="assistant",
                             text="我正在处理另一边的消息，稍等一下再叫我。",
                             source="group:kairos",
+                            sender_id="kairos",
+                            sender_name=self._apples_member_name("kairos"),
                         )
                         return
                     run_id, cancel_event = run
@@ -5650,6 +5725,8 @@ class PushHandler(BaseHTTPRequestHandler):
                             role="assistant",
                             text="我正在处理另一边的消息，稍等一下再叫我。",
                             source="group:kairos",
+                            sender_id="kairos",
+                            sender_name=self._apples_member_name("kairos"),
                         )
                         return
                     prompt = (
@@ -5692,22 +5769,45 @@ class PushHandler(BaseHTTPRequestHandler):
                         on_update=_on_update,
                     )
                     if cancel_event.is_set():
-                        chat.append(role="assistant", text="已中断当前生成。", source="group:kairos")
+                        chat.append(
+                            role="assistant",
+                            text="已中断当前生成。",
+                            source="group:kairos",
+                            sender_id="kairos",
+                            sender_name=self._apples_member_name("kairos"),
+                        )
                         return
                     if thread_id:
                         self._save_codex_target(thread_id, cwd, "cc-app:apples:kairos")
                     if return_code != 0 and stderr_text:
                         logger.warning("group kairos codex return_code=%s stderr=%s", return_code, stderr_text[-800:])
                     answer = (answer or "").strip() or "Kairos 没有返回可展示内容。"
-                    chat.append(role="assistant", text=answer, source="group:kairos")
+                    rec = chat.append(
+                        role="assistant",
+                        text=answer,
+                        source="group:kairos",
+                        sender_id="kairos",
+                        sender_name=self._apples_member_name("kairos"),
+                        mentions=sorted(self._detect_apples_mentions(answer)),
+                    )
+                    routed_after_answer = self._maybe_route_apples_assistant_mention(
+                        chat, "assistant", "group:kairos", answer, rec
+                    )
                 except Exception as e:
                     logger.exception("group kairos codex worker failed")
-                    chat.append(role="assistant", text=f"Kairos 接入出错：{e}", source="group:kairos")
+                    chat.append(
+                        role="assistant",
+                        text=f"Kairos 接入出错：{e}",
+                        source="group:kairos",
+                        sender_id="kairos",
+                        sender_name=self._apples_member_name("kairos"),
+                    )
                 finally:
                     self._clear_chat_draft("apples")
                     if run_id:
                         CODEX_RUNS.finish(run_id)
-                    self._set_typing_for_contact("apples", {"is_typing": False, "since": None})
+                    if not routed_after_answer and not self._has_pending_group_reply():
+                        self._set_typing_for_contact("apples", {"is_typing": False, "since": None})
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -5721,14 +5821,37 @@ class PushHandler(BaseHTTPRequestHandler):
     ) -> list[str]:
         if role != "assistant" or not text:
             return []
-        if not str(source or "").strip().lower().startswith("group:xiaoke"):
-            return []
+        source_key = str(source or "").strip().lower()
         targets = self._detect_apples_mentions(text)
-        if "kairos" not in targets:
-            return []
-        self._set_typing_for_contact("apples", {"is_typing": True, "since": rec["ts"]})
-        self._start_group_kairos_reply(chat, text, sender_name="小克")
-        return ["kairos"]
+        metadata = rec.get("metadata") if isinstance(rec, dict) else None
+        route_source_member = ""
+        if isinstance(metadata, dict):
+            route_source_member = str(metadata.get("route_source_member") or "").strip().lower()
+        if source_key.startswith("group:xiaoke") and "kairos" in targets:
+            if route_source_member == "kairos":
+                return []
+            self._set_typing_for_contact("apples", {"is_typing": True, "since": rec["ts"], "member_id": "kairos"})
+            self._start_group_kairos_reply(chat, text, sender_name="小克")
+            return ["kairos"]
+        if source_key.startswith("group:kairos") and "xiaoke" in targets:
+            from datetime import datetime as _dt
+            ts_prefix = "[" + _dt.now().strftime("%Y-%m-%d %H:%M:%S") + "]"
+            marker = self._group_reply_marker("xiaoke", rec["ts"])
+            injected = (
+                f"{ts_prefix} [苹果幼稚园群聊][Kairos 在群里点名你。只回复 Kairos 这条消息，不要触发其他 AI。]\n"
+                f"请在本轮回复开头原样输出路由标记 {marker} ，然后直接回复群聊内容。"
+                f"不要在回复里 @Kairos，避免循环触发。\n"
+                f"{text}"
+            )
+            target_session = (self.state.active_session or self.state.default_session).strip()
+            self._set_typing_for_contact("apples", {"is_typing": True, "since": rec["ts"], "member_id": "xiaoke"})
+            ok, err = self._inject_to_session(target_session, injected, source="ios-app:apples", sender="iphone")
+            if ok:
+                self._remember_group_reply("xiaoke", rec["ts"], source_member="kairos")
+                return ["xiaoke"]
+            self._set_typing_for_contact("apples", {"is_typing": False, "since": None})
+            logger.warning("group kairos mention to xiaoke inject failed session=%s err=%s", target_session, err)
+        return []
 
     def _handle_apples_chat_send(self, body: dict[str, Any], contact_id: str):
         text = body.get("text", "").strip()
@@ -5739,19 +5862,30 @@ class PushHandler(BaseHTTPRequestHandler):
             return
 
         chat = self._chat_for_contact(contact_id)
+        targets = self._detect_apples_mentions(text)
         rec = chat.append(
             role="user",
             text=text,
             source="ios-app:apples",
             quoted_ts=quoted_ts,
             location=location,
+            sender_id="astra",
+            sender_name=self._apples_member_name("astra"),
+            mentions=sorted(targets),
         )
-        targets = self._detect_apples_mentions(text)
         if not targets:
             self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec, "routed": []})
             return
 
-        self._set_typing_for_contact(contact_id, {"is_typing": True, "since": rec["ts"]})
+        typing_target = None
+        if "xiaoke" in targets:
+            typing_target = "xiaoke"
+        elif "kairos" in targets:
+            typing_target = "kairos"
+        typing_state = {"is_typing": True, "since": rec["ts"]}
+        if typing_target:
+            typing_state["member_id"] = typing_target
+        self._set_typing_for_contact(contact_id, typing_state)
         routed: list[str] = []
         errors: dict[str, str] = {}
 
@@ -6151,11 +6285,15 @@ class PushHandler(BaseHTTPRequestHandler):
         if role == "assistant":
             has_group_marker = "[[CCC_GROUP_REPLY:apples:" in text
             if has_group_marker:
-                routed_contact_id, routed_member_id, cleaned_text = self._consume_group_reply_route(text)
+                routed_contact_id, routed_member_id, route_source_member, cleaned_text = self._consume_group_reply_route(text)
                 if routed_contact_id:
                     contact_id = routed_contact_id
                     text = cleaned_text
                     source = f"group:{routed_member_id or 'xiaoke'}"
+                    route_metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+                    if route_source_member:
+                        route_metadata = {**route_metadata, "route_source_member": route_source_member}
+                        body["metadata"] = route_metadata
         chat = self._chat_for_contact(contact_id)
         if role == "task":
             if not text:
@@ -6194,6 +6332,17 @@ class PushHandler(BaseHTTPRequestHandler):
         tools = body.get("tools") or ""
         if isinstance(tools, str) and len(tools) > 5000:
             tools = tools[:5000]
+        sender_id = None
+        sender_name = None
+        mentions = None
+        if contact_id == "apples":
+            member_id = self._apples_source_member(source)
+            if role == "user":
+                member_id = "astra"
+            if member_id:
+                sender_id = member_id
+                sender_name = self._apples_member_name(member_id)
+            mentions = sorted(self._detect_apples_mentions(text)) if text else None
         if not text and not attachment_url and not thinking and not tools:
             self._send_json(400, {"error": "text or attachment required"})
             return
@@ -6282,6 +6431,9 @@ class PushHandler(BaseHTTPRequestHandler):
             metadata=metadata,
             thinking=thinking,
             tools=tools,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            mentions=mentions,
         )
 
         # move 成功 append 后缓存 client_msg_id (LRU 100)
