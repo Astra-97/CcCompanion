@@ -6474,9 +6474,11 @@ class PushHandler(BaseHTTPRequestHandler):
             threading.Thread(target=_tts_async, daemon=True).start()
         # 我刚 reply 完 — typing = false
         if role == "assistant":
-            self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
+            routed: list[str] = []
             if contact_id == "apples":
-                self._maybe_route_apples_assistant_mention(chat, role, source, text, rec)
+                routed = self._maybe_route_apples_assistant_mention(chat, role, source, text, rec)
+            if not routed and not self._has_pending_group_reply():
+                self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
 
         # 5-7 dedupe cache 回填真 rec
         if dedupe_cache_key is not None:
@@ -8149,7 +8151,7 @@ class PushHandler(BaseHTTPRequestHandler):
         "forge", "statusbar", "vps", "model",
         "morning_on", "morning_off", "diary_on", "diary_off",
         "sessions", "session_rename", "session_switch",
-        "session_preview", "status_set",
+        "session_new", "session_preview", "status_set",
     })
     # morning/diary 开关映射到 dispatcher 注册表里的规则 id。
     _TOOLBOT_MORNING_RULES = ["morning_greeting"]
@@ -8455,6 +8457,50 @@ class PushHandler(BaseHTTPRequestHandler):
             label = names.get(sid) or sid[:8]
             return True, f"已切换到「{label}」并重启会话。新对话将 resume 该 session。"
 
+        if command == "session_new":
+            # args = optional model alias. Creates a brand-new session (no
+            # context retained) by touching a start-fresh flag, clearing
+            # current-session, and optionally switching the model.
+            model_arg = args.strip() if args else ""
+            model_label = ""
+            if model_arg:
+                model_id = self._resolve_toolbot_model(model_arg)
+                if model_id is None:
+                    return False, (
+                        f"未知模型：{model_arg}。可选："
+                        f"{', '.join(sorted(TOOLBOT_MODEL_ALIASES))}"
+                    )
+                try:
+                    _atomic_write_text(CCBOT_CURRENT_MODEL_FILE, model_id + "\n")
+                    model_label = f"（模型→{model_arg}）"
+                except Exception as e:
+                    return False, f"写 current-model 失败：{e}"
+            try:
+                _atomic_write_text(CCBOT_CURRENT_SESSION_FILE, "")
+            except Exception as e:
+                return False, f"清空 current-session 失败：{e}"
+            # Touch the start-fresh flag so the start script skips --resume/--continue
+            fresh_flag = CCBOT_CURRENT_SESSION_FILE.parent / "start-fresh"
+            try:
+                fresh_flag.touch()
+            except Exception as e:
+                return False, f"创建 start-fresh flag 失败：{e}"
+            try:
+                proc = subprocess.run(
+                    ["systemctl", "restart", "claude-tg.service"],
+                    capture_output=True, text=True, timeout=60,
+                )
+            except subprocess.TimeoutExpired:
+                return False, f"已清空 session{model_label}，但重启 claude-tg 超时（60s）。"
+            except Exception as e:
+                return False, f"已清空 session{model_label}，但重启失败：{e}"
+            if proc.returncode != 0:
+                return False, (
+                    f"已清空 session{model_label}，但 systemctl restart 失败"
+                    f"（exit {proc.returncode}）：{(proc.stderr or '').strip()[:500]}"
+                )
+            return True, f"已新建全新会话{model_label}，服务已重启。"
+
         if command == "session_preview":
             # args = "<sid>". Read the tail of the session jsonl and return the
             # last few user/assistant text messages as structured JSON in
@@ -8698,6 +8744,7 @@ def cleanup_loop(state: ServerState, interval: float = 1800):
 
 CLAUDE_SESSION_DIR = Path("/root/.claude/projects/-root")
 CCBOT_CURRENT_SESSION_FILE = Path("/root/.ccbot/current-session")
+CCBOT_CURRENT_MODEL_FILE = Path("/root/.ccbot/current-model")
 SESSION_NAMES_FILE = Path("/root/.ccbot/session_names.json")
 _SESSION_NAME_MAX_LEN = 24
 # UUID-ish session id: hex + dashes only. Belt-and-suspenders so a sid never
