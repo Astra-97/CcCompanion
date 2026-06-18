@@ -5843,7 +5843,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 f"不要在回复里 @Kairos，避免循环触发。\n"
                 f"{text}"
             )
-            target_session = (self.state.active_session or self.state.default_session).strip()
+            target_session = "cctg"
             self._set_typing_for_contact("apples", {"is_typing": True, "since": rec["ts"], "member_id": "xiaoke"})
             ok, err = self._inject_to_session(target_session, injected, source="ios-app:apples", sender="iphone")
             if ok:
@@ -5914,7 +5914,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 loc_str = f"[位置 lat={loc['lat']:.6f} lon={loc['lon']:.6f}{(' ' + label) if label else ''}]"
                 injected = f"{injected}\n{loc_str}"
 
-            target_session = (self.state.active_session or self.state.default_session).strip()
+            target_session = "cctg"
             ok, err = self._inject_to_session(target_session, injected, source="ios-app:apples", sender="iphone")
             if ok:
                 self._remember_group_reply("xiaoke", rec["ts"])
