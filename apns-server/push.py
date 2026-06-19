@@ -2489,6 +2489,8 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_ai_chat_send(body)
         elif self.path == "/voice-call/tts":
             self._handle_voice_call_tts(body)
+        elif self.path == "/voice/push":
+            self._handle_voice_push(body)
         elif self.path == "/ai-chat/system-prompt":
             self._handle_ai_chat_system_prompt(body)
         elif self.path == "/ai-chat/models":
@@ -6888,6 +6890,71 @@ class PushHandler(BaseHTTPRequestHandler):
             "audio_url": f"/attachments/{stored_name}",
             "mime_type": payload.get("mime_type") or "audio/wav",
             "bytes": payload.get("bytes"),
+        })
+
+    def _handle_voice_push(self, body: dict[str, Any]):
+        """小克主动推语音消息 — TTS 生成 wav + 写 assistant chat record (type=voice).
+
+        Body: {"text": "...", "contact_id": "xiaoke"} (default xiaoke)
+        Auth: 走 do_POST 顶层 _require_write_auth, 已经强制了 X-Auth-Token。
+        """
+        text = str(body.get("text") or "").strip()
+        if not text:
+            self._send_json(400, {"ok": False, "error": "text required"})
+            return
+        contact_id = self._contact_id_from_body(body)
+
+        ok, payload = self._run_stackchan_voice_helper(
+            ["tts", "--text", text, "--output-dir", str(self.state.attachments_dir)],
+            timeout=90,
+        )
+        if not ok:
+            self._send_json(502, {"ok": False, "error": payload.get("error") or "tts failed"})
+            return
+        stored_name = str(payload.get("stored_name") or "")
+        if not stored_name or "/" in stored_name or ".." in stored_name:
+            self._send_json(502, {"ok": False, "error": "bad tts output"})
+            return
+
+        audio_url = f"/attachments/{stored_name}"
+        mime_type = payload.get("mime_type") or "audio/wav"
+        audio_bytes = payload.get("bytes") or 0
+
+        chat = self._chat_for_contact(contact_id)
+        try:
+            rec = chat.append(
+                role="assistant",
+                text=text,
+                source="xiaoke-voice-push",
+                attachment_url=audio_url,
+                attachment_type="audio",
+                attachment_filename=stored_name,
+                metadata={
+                    "type": "voice",
+                    "audio_url": audio_url,
+                    "mime_type": mime_type,
+                    "bytes": audio_bytes,
+                },
+            )
+        except Exception as e:
+            logger.exception("voice push chat append fail")
+            self._send_json(500, {"ok": False, "error": f"chat append fail: {e}"})
+            return
+
+        try:
+            preview = text[:80] if text else "[语音消息]"
+            self._send_chat_notification("Cc", f"[语音] {preview}")
+        except Exception as e:
+            logger.warning("voice push notification fail: %s", e)
+
+        self._send_json(200, {
+            "ok": True,
+            "contact_id": contact_id,
+            "text": text,
+            "audio_url": audio_url,
+            "mime_type": mime_type,
+            "bytes": audio_bytes,
+            "record": rec,
         })
 
     def _handle_attachment_get(self):
