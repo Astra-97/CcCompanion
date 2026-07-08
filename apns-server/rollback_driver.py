@@ -449,13 +449,15 @@ def assert_not_busy(tmux_session: str) -> None:
         raise RollbackRefused("小克正在生成回复，等这条说完再回滚。", code="busy")
 
 
-BACKUP_KEEP = 5  # 同目录最多保留几份 rollback 备份（gzip 后按 mtime 淘汰最老的）
+BACKUP_KEEP = 5  # 失败残留的备份最多保留几份（成功的回滚会自删备份）
 
 
 def backup_session_jsonl(jsonl_path: Path) -> Path:
     """截断前强制备份原 jsonl（同目录 .bak-rollback-<ts>.gz，不带 .jsonl 后缀
     结尾所以不会被 session 扫描 glob 到）。失败即中止。
-    备份 gzip 压缩，且只保留最近 BACKUP_KEEP 份，防止大 session 反复回滚把盘吃满
+    备份是事务式的：只护住回滚执行中的窗口，execute_rollback 成功后即删
+    （原 jsonl 从未被改动，长期恢复靠它+CC 的 30 天自动清理策略）。这里的
+    prune 只兜底失败路径残留的备份，防止累积
     （恢复方法：gunzip 后改回 .jsonl 名，current-session 指回原 sid）。"""
     ts = datetime.now().strftime("%Y%m%d%H%M%S")
     backup = jsonl_path.with_name(f"{jsonl_path.name}.bak-rollback-{ts}.gz")
@@ -711,6 +713,16 @@ def execute_rollback(
     injected = format_injection(plan.user_text, plan.user_ts)
     inject_prompt(plan.tmux_session, injected)
     info["injected_text"] = injected
+    # 事务式备份（方小南定的策略）：备份只护住回滚执行中这几十秒，全链路
+    # 成功即删——原 jsonl 从未被改动、还留在原地等 CC 的 30 天自动清理，
+    # 长期归档没必要。失败路径不走到这里，备份会留下用于恢复。
+    bak = info.get("backup_path")
+    if bak:
+        try:
+            Path(bak).unlink(missing_ok=True)
+            info["backup_deleted"] = True
+        except Exception:
+            logger.warning("rollback backup cleanup failed (non-fatal): %s", bak, exc_info=True)
     logger.info("rollback complete: session=%s new_sid=%s", plan.tmux_session, info["new_sid"])
     return info
 
