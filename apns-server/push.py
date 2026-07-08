@@ -6860,7 +6860,9 @@ class PushHandler(BaseHTTPRequestHandler):
 
         # ── 同步预检（定位 jsonl / 截断点校验干跑 / 副作用上锁 / busy 检测）──
         # 全部通过才派后台线程；这里失败不动任何东西，直接把原因回给 app。
-        target_session = (self.state.active_session or self.state.default_session).strip()
+        # 注意：active_session 是 deprecated chain 概念（可能残留 claude 会话
+        # UUID，2026-07-08 首验就栽在这），tmux 会话名以 default_session 为准。
+        target_session = (self.state.default_session or rollback_driver.PRODUCTION_TMUX_SESSION).strip()
         try:
             plan = rollback_driver.prepare_rollback(
                 tmux_session=target_session,
