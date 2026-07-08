@@ -27,6 +27,10 @@ import os
 import struct
 import sys
 import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 import wave
 from pathlib import Path
@@ -64,9 +68,14 @@ VAD_RMS_SPEAK = 500          # >= this -> definitely speaking
 VAD_RMS_SILENCE = 300        # < this -> silence candidate
 VAD_SILENCE_END_MS = 700     # 700ms of silence after speech => utterance end
 MAX_UTTERANCE_MS = 30_000    # safety cap
+VAD_MIN_SPEECH_MS = 400      # utterances with less active speech are dropped (anti ASR hallucination)
+ASR_SINGLE_CHAR_MIN_MS = 600 # single-char transcript needs at least this much active speech
 
 ASR_TIMEOUT_SEC = 90
 TTS_TIMEOUT_SEC = 90
+LIVE_REPLY_TIMEOUT_SEC = 180
+LIVE_REPLY_POLL_INTERVAL_SEC = 1.0
+PUSH_HTTP_BASE = "http://127.0.0.1:8291"
 
 logger = logging.getLogger("voice_call_ws")
 
@@ -151,6 +160,105 @@ def get_ai_manager() -> Any:
 
         _ai_mgr = AIChatManager(STATE_DIR)
     return _ai_mgr
+
+
+def _request_json(
+    path: str,
+    *,
+    method: str = "GET",
+    payload: Optional[dict[str, Any]] = None,
+    timeout: float = 15,
+) -> dict[str, Any]:
+    data = None
+    headers = {"X-Auth-Token": AUTH_TOKEN}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(
+        f"{PUSH_HTTP_BASE}{path}",
+        data=data,
+        headers=headers,
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            body = json.loads(raw) if raw.strip() else {}
+            if not isinstance(body, dict):
+                return {"ok": False, "error": "unexpected json response"}
+            if not (200 <= int(resp.status) < 300):
+                body.setdefault("ok", False)
+                body.setdefault("error", f"http {resp.status}")
+            return body
+    except urllib.error.HTTPError as e:
+        raw = e.read(4096).decode("utf-8", "replace")
+        try:
+            body = json.loads(raw) if raw.strip() else {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        body.setdefault("ok", False)
+        body.setdefault("error", f"http {e.code}: {raw[:300]}")
+        return body
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _send_live_contact_message(contact_id: str, text: str) -> str:
+    body = _request_json(
+        "/chat/send",
+        method="POST",
+        payload={
+            "text": text,
+            "contact_id": contact_id,
+            "source": "android-app:voice-call",
+        },
+        timeout=20,
+    )
+    if not body.get("ok"):
+        raise RuntimeError(str(body.get("error") or "chat send failed"))
+    record = body.get("record") if isinstance(body.get("record"), dict) else {}
+    ts = str(record.get("ts") or "")
+    if not ts:
+        raise RuntimeError("chat send returned no user timestamp")
+    return ts
+
+
+def _read_live_contact_records(contact_id: str, since_ts: str) -> list[dict[str, Any]]:
+    query = urllib.parse.urlencode({
+        "contact_id": contact_id,
+        "since": since_ts,
+        "limit": 50,
+    })
+    body = _request_json(f"/chat/history?{query}", timeout=10)
+    records = body.get("records")
+    if not isinstance(records, list):
+        return []
+    return [item for item in records if isinstance(item, dict)]
+
+
+async def send_live_contact_and_wait_reply(contact_id: str, text: str) -> str:
+    """Send a transcript to a live CC Companion contact and wait for its next
+    assistant message. Used by voice calls for xiaoke/kairos-style contacts.
+    """
+    loop = asyncio.get_running_loop()
+    user_ts = await loop.run_in_executor(
+        None, _send_live_contact_message, contact_id, text
+    )
+    deadline = time.monotonic() + LIVE_REPLY_TIMEOUT_SEC
+    while time.monotonic() < deadline:
+        records = await loop.run_in_executor(
+            None, _read_live_contact_records, contact_id, user_ts
+        )
+        for rec in records:
+            if rec.get("role") != "assistant":
+                continue
+            reply_text = str(rec.get("text") or "").strip()
+            if reply_text:
+                return reply_text
+        await asyncio.sleep(LIVE_REPLY_POLL_INTERVAL_SEC)
+    raise TimeoutError(f"timed out waiting for {contact_id} reply")
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +494,7 @@ class Utterance:
         self.has_spoken = False
         self.silence_ms = 0
         self.total_ms = 0
+        self.speech_ms = 0  # active (non-silence) speech duration
 
     def feed(self, frame: bytes) -> bool:
         """Returns True when the utterance has just ended (caller should flush)."""
@@ -396,6 +505,7 @@ class Utterance:
             self.is_speaking = True
             self.has_spoken = True
             self.silence_ms = 0
+            self.speech_ms += FRAME_MS
             self.buf.extend(frame)
         elif self.is_speaking and rms < VAD_RMS_SILENCE:
             # In a silence run after speech started.
@@ -406,6 +516,7 @@ class Utterance:
         elif self.is_speaking:
             # Mid-range; still counts as speech.
             self.silence_ms = 0
+            self.speech_ms += FRAME_MS
             self.buf.extend(frame)
 
         if self.has_spoken and self.total_ms >= MAX_UTTERANCE_MS:
@@ -418,6 +529,7 @@ class Utterance:
         self.has_spoken = False
         self.silence_ms = 0
         self.total_ms = 0
+        self.speech_ms = 0
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +665,7 @@ async def handle_utterance(
     pcm: bytes,
     interrupt_event: asyncio.Event,
     contact_id: str,
+    speech_ms: int = 0,
 ) -> None:
     """ASR -> LLM -> TTS for a single utterance. Caller has already cleared
     interrupt_event."""
@@ -576,6 +689,22 @@ async def handle_utterance(
             )
             return
         transcript = str(payload.get("transcript") or "").strip()
+        # Anti ASR hallucination (second line of defense): a single-character
+        # transcript from a very short burst is almost always a ghost word
+        # ("好" etc.) hallucinated from breath/reverb noise.
+        core = "".join(
+            ch
+            for ch in transcript
+            if not ch.isspace() and not unicodedata.category(ch).startswith("P")
+        )
+        if len(core) <= 1 and speech_ms < ASR_SINGLE_CHAR_MIN_MS:
+            logger.info(
+                "asr: dropped ghost transcript %r speech=%dms (<%dms)",
+                transcript,
+                speech_ms,
+                ASR_SINGLE_CHAR_MIN_MS,
+            )
+            return
         await send_json(ws, {"type": "asr_final", "text": transcript})
         if not transcript:
             return
@@ -583,25 +712,40 @@ async def handle_utterance(
         # --- LLM -------------------------------------------------------
         if interrupt_event.is_set():
             return
-        try:
-            mgr = get_ai_manager()
-        except Exception as e:
-            await send_json(ws, {"type": "error", "msg": f"ai_chat init failed: {e}"})
-            return
+        if contact_id == "ai-custom":
+            try:
+                mgr = get_ai_manager()
+            except Exception as e:
+                await send_json(ws, {"type": "error", "msg": f"ai_chat init failed: {e}"})
+                return
 
-        loop = asyncio.get_running_loop()
-        try:
-            result = await loop.run_in_executor(None, mgr.send_message, transcript)
-        except Exception as e:
-            await send_json(ws, {"type": "error", "msg": f"llm failed: {e}"})
+            loop = asyncio.get_running_loop()
+            try:
+                result = await loop.run_in_executor(None, mgr.send_message, transcript)
+            except Exception as e:
+                await send_json(ws, {"type": "error", "msg": f"llm failed: {e}"})
+                return
+            if interrupt_event.is_set():
+                return
+            if not isinstance(result, dict) or not result.get("ok"):
+                err = (result or {}).get("error") if isinstance(result, dict) else "llm error"
+                await send_json(ws, {"type": "error", "msg": f"llm: {err}"})
+                return
+            reply_text = str(result.get("reply") or "").strip()
+        elif contact_id in {"xiaoke", "kairos"}:
+            try:
+                reply_text = await send_live_contact_and_wait_reply(contact_id, transcript)
+            except Exception as e:
+                await send_json(ws, {"type": "error", "msg": f"live chat: {e}"})
+                return
+            if interrupt_event.is_set():
+                return
+        else:
+            await send_json(
+                ws,
+                {"type": "error", "msg": f"voice call contact not supported: {contact_id}"},
+            )
             return
-        if interrupt_event.is_set():
-            return
-        if not isinstance(result, dict) or not result.get("ok"):
-            err = (result or {}).get("error") if isinstance(result, dict) else "llm error"
-            await send_json(ws, {"type": "error", "msg": f"llm: {err}"})
-            return
-        reply_text = str(result.get("reply") or "").strip()
         await send_json(ws, {"type": "reply_text", "text": reply_text})
         if not reply_text:
             return
@@ -688,6 +832,12 @@ class Session:
                 cid = str(msg.get("contact_id") or "xiaoke").strip().lower()
                 self.contact_id = cid or "xiaoke"
                 self.started = True
+                logger.info(
+                    "ws session start contact=%s sample_rate=%d peer=%s",
+                    self.contact_id,
+                    sr,
+                    self.ws.remote_address,
+                )
                 await send_json(self.ws, {"type": "ready"})
             elif mtype == "interrupt":
                 self.interrupt_event.set()
@@ -710,13 +860,28 @@ class Session:
                 continue
 
             pcm = bytes(self.utterance.buf)
+            speech_ms = self.utterance.speech_ms
             self.utterance.reset()
+
+            # Anti ASR hallucination: too little active speech means the "VAD
+            # trigger" was likely a breath / reverb pop after mic reopen.
+            if speech_ms < VAD_MIN_SPEECH_MS:
+                logger.info(
+                    "vad: dropped short utterance speech=%dms (<%dms) bytes=%d",
+                    speech_ms,
+                    VAD_MIN_SPEECH_MS,
+                    len(pcm),
+                )
+                continue
+
             self.interrupt_event.clear()
 
             # Run ASR/LLM/TTS as a cancellable task so a fresh `interrupt`
             # arriving mid-stream cleanly aborts the send loop.
             self.current_task = asyncio.create_task(
-                handle_utterance(self.ws, pcm, self.interrupt_event, self.contact_id)
+                handle_utterance(
+                    self.ws, pcm, self.interrupt_event, self.contact_id, speech_ms
+                )
             )
             try:
                 await self.current_task
@@ -775,10 +940,27 @@ async def ws_handler(ws: ServerConnection) -> None:
         client_tok = (qs.get("token") or [""])[0]
 
     if not AUTH_TOKEN or client_tok != AUTH_TOKEN:
-        logger.warning("ws auth failed peer=%s", ws.remote_address)
+        # Log header presence to disambiguate "token wrong" vs "header stripped
+        # by proxy" — Android sends X-Auth-Token, but some intermediaries lower-
+        # case-only or drop unknown headers. We accept ?token= as a fallback.
+        seen_headers = sorted(
+            [k for k in headers.keys() if k.lower().startswith(("x-auth", "authorization"))]
+        )
+        logger.warning(
+            "ws auth failed peer=%s have_token=%s auth_headers=%s ua=%r",
+            ws.remote_address,
+            bool(client_tok),
+            seen_headers,
+            headers.get("User-Agent", ""),
+        )
         await ws.close(code=4401, reason="unauthorized")
         return
 
+    logger.info(
+        "ws auth ok peer=%s ua=%r",
+        ws.remote_address,
+        headers.get("User-Agent", "")[:80],
+    )
     sess = Session(ws)
     try:
         await sess.run()
@@ -786,6 +968,7 @@ async def ws_handler(ws: ServerConnection) -> None:
         pass
     except Exception:
         logger.exception("session crashed")
+    logger.info("ws session ended peer=%s", ws.remote_address)
 
 
 # ---------------------------------------------------------------------------
@@ -808,8 +991,10 @@ async def amain() -> None:
         WS_HOST,
         WS_PORT,
         max_size=2 * 1024 * 1024,
-        ping_interval=20,
-        ping_timeout=20,
+        # Tighter keepalive: detect dead mobile connections fast so we don't
+        # hold half-open sessions when the phone backgrounded or lost wifi.
+        ping_interval=10,
+        ping_timeout=10,
     ):
         await asyncio.Future()
 
