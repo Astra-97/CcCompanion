@@ -75,6 +75,7 @@ from favorites import Favorites
 from worklog import Worklog
 from reminders import ReminderStore
 from tool_dispatcher import ScheduleStore, ToolDispatcher, DEFAULT_SCHEDULE
+import rollback_driver
 from timeline import Timeline
 from tts import TTS
 from settings import Settings
@@ -93,6 +94,8 @@ except ImportError:
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_CONFIG = HERE / "config.toml"
+CLIENT_LOG_PATH = HERE / "client_logs.jsonl"
+CLIENT_LOG_MAX_FIELD = 20_000
 
 
 @contextmanager
@@ -1005,6 +1008,8 @@ class ServerState:
             "contact_id": contact_id,
             "user_ts": str(user_ts or ""),
             "text_preview": preview,
+            "draft_text": "",
+            "draft_updated_at": "",
             "started_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds"),
             "pid": os.getpid(),
         }
@@ -1015,6 +1020,32 @@ class ServerState:
             )
         except Exception:
             logger.warning("mark kairos pending run failed", exc_info=True)
+
+    def update_kairos_pending_draft(self, contact_id: str, user_ts: str, text: str) -> None:
+        contact_id = (contact_id or "kairos").strip().lower() or "kairos"
+        user_ts = str(user_ts or "")
+        draft_text = str(text or "")
+        if not user_ts or not draft_text.strip():
+            return
+        try:
+            if not self.kairos_pending_run_path.exists():
+                return
+            try:
+                payload = json.loads(self.kairos_pending_run_path.read_text(encoding="utf-8"))
+            except Exception:
+                return
+            if str(payload.get("contact_id") or "kairos").strip().lower() != contact_id:
+                return
+            if str(payload.get("user_ts") or "") != user_ts:
+                return
+            payload["draft_text"] = draft_text[-20000:]
+            payload["draft_updated_at"] = datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds")
+            self.kairos_pending_run_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            logger.warning("update kairos pending draft failed", exc_info=True)
 
     def clear_kairos_pending_run(self, user_ts: str | None = None) -> None:
         try:
@@ -1048,12 +1079,20 @@ class ServerState:
         try:
             later = chat.read_since(since_ts=user_ts, limit=200, include_hidden=True)
             if not any(rec.get("role") == "assistant" for rec in later):
-                chat.append(
-                    role="assistant",
-                    text=(
+                draft_text = str(payload.get("draft_text") or "").strip()
+                if draft_text:
+                    recovery_text = (
+                        draft_text
+                        + "\n\n[这条回复在后端重启或进程退出时中断，以上是已经生成的草稿。]"
+                    )
+                else:
+                    recovery_text = (
                         "上一条 Kairos 回复在后端重启或进程退出时中断了，没有完成落库。"
                         "你可以直接重发；我不会再让它静默消失。"
-                    ),
+                    )
+                chat.append(
+                    role="assistant",
+                    text=recovery_text,
                     source="codex:kairos:recovered",
                 )
                 logger.warning(
@@ -1293,6 +1332,73 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _contact_id_from_body(self, body: dict[str, Any]) -> str:
         return self._clean_contact_id(body.get("contact_id") or body.get("contactId") or "xiaoke")
+
+    def _source_for_request(self, contact_suffix: str = "") -> str:
+        """Detect client platform from User-Agent and produce a source tag.
+
+        Returns ``android-app`` for the Android companion, ``ios-app`` for the
+        iOS one, ``mobile-app`` when we know it's mobile but not which OS, and
+        finally falls back to ``ios-app`` for backwards compatibility when
+        nothing identifying is sent (legacy callers / scripts).
+
+        Pass ``contact_suffix`` to get ``"<source>:<suffix>"`` (e.g. ``android-app:apples``).
+        """
+        try:
+            ua = (self.headers.get("User-Agent", "") or "").lower()
+        except Exception:
+            ua = ""
+        xp = ""
+        try:
+            xp = (self.headers.get("X-Client-Platform", "") or "").lower()
+        except Exception:
+            pass
+        if xp in ("android", "ios"):
+            base = "android-app" if xp == "android" else "ios-app"
+        elif "android" in ua or "okhttp" in ua or "cccompanion" in ua:
+            base = "android-app"
+        elif "iphone" in ua or "ipad" in ua or "ios" in ua or "cfnetwork" in ua or "darwin" in ua:
+            base = "ios-app"
+        elif "mozilla" in ua or "chrome" in ua or "safari" in ua:
+            base = "ios-app"  # web inspector; preserve legacy default
+        else:
+            base = "ios-app"
+        if contact_suffix:
+            return f"{base}:{contact_suffix}"
+        return base
+
+    @staticmethod
+    def _client_log_value(value: Any, *, limit: int = CLIENT_LOG_MAX_FIELD) -> Any:
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            return value[:limit]
+        if isinstance(value, list):
+            return [PushHandler._client_log_value(item, limit=limit) for item in value[:20]]
+        if isinstance(value, dict):
+            return {
+                str(key)[:120]: PushHandler._client_log_value(val, limit=limit)
+                for key, val in list(value.items())[:80]
+            }
+        return str(value)[:limit]
+
+    def _handle_client_log(self, body: dict[str, Any]) -> None:
+        try:
+            entry = {
+                "server_ts": datetime.now(timezone.utc).isoformat(),
+                "source": self._source_for_request(),
+                "ip": self.client_address[0] if self.client_address else "",
+                "ua": (self.headers.get("User-Agent", "") or "")[:300],
+                "body": self._client_log_value(body),
+            }
+            CLIENT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with CLIENT_LOG_PATH.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
+            event = str(body.get("event") or body.get("type") or "client_log")[:80]
+            logger.warning("client_log event=%s source=%s", event, entry["source"])
+            self._send_json(200, {"ok": True})
+        except Exception as e:
+            logger.exception("client_log write failed")
+            self._send_json(500, {"ok": False, "error": str(e)})
 
     def _chat_for_contact(self, contact_id: str) -> ChatHistory:
         return self.state.contact_chats.get(contact_id) or self.state.chat
@@ -1565,7 +1671,17 @@ class PushHandler(BaseHTTPRequestHandler):
         }
 
     def _apples_members(self) -> list[dict[str, Any]]:
+        # astra (方小南) 是群里的人类成员，列出来给 mention picker UI 用，但
+        # can_reply=False — 她不能被 bot 路由当 reply target（她本人才是说话人）。
         return [
+            {
+                "id": "astra",
+                "display_name": "方小南",
+                "mention": "@方小南",
+                "kind": "human",
+                "color": "rose",
+                "can_reply": False,
+            },
             {
                 "id": "kairos",
                 "display_name": "Kairos",
@@ -1576,13 +1692,40 @@ class PushHandler(BaseHTTPRequestHandler):
             },
             {
                 "id": "xiaoke",
-                "display_name": "小克",
+                "display_name": "小克（螃蟹版）",
                 "mention": "@小克",
                 "kind": "agent",
                 "color": "clay",
                 "can_reply": True,
             },
         ]
+
+    def _apples_self_id(self) -> str:
+        # client 端的本人 id（用于 UI 在 mention picker 里过滤掉自己）。
+        # 目前 cc-companion 只有方小南一个人类用户。
+        return "astra"
+
+    def _apples_member_ids(self) -> set[str]:
+        return {str(m["id"]).lower() for m in self._apples_members()}
+
+    def _normalize_mentioned_member_ids(self, raw: Any) -> list[str]:
+        """metadata.mentioned_member_ids → 去重 + lowercase + 只保留合法 member id。
+
+        client 显式传过来的稳定 ID 优先级 > text grep，可以解决 Kairos / kairos
+        大小写以及 typo（"@Karios" 之类）导致 grep 路由失败的问题。
+        """
+        if not isinstance(raw, (list, tuple, set)):
+            return []
+        valid = self._apples_member_ids()
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in raw:
+            mid = str(item or "").strip().lower()
+            if not mid or mid in seen or mid not in valid:
+                continue
+            seen.add(mid)
+            out.append(mid)
+        return sorted(out)
 
     def _apples_member_name(self, member_id: str) -> str:
         member_id = str(member_id or "").strip().lower()
@@ -1591,6 +1734,8 @@ class PushHandler(BaseHTTPRequestHandler):
                 return str(member["display_name"])
         if member_id == "astra":
             return "Astra"
+        if member_id == "system":
+            return "系统"
         return member_id or "member"
 
     def _apples_source_member(self, source: str) -> str | None:
@@ -1605,7 +1750,13 @@ class PushHandler(BaseHTTPRequestHandler):
         qs = self._query_params()
         contact_id = self._clean_contact_id(qs.get("contact_id", qs.get("contactId", ["xiaoke"]))[0])
         members = self._apples_members() if contact_id == "apples" else []
-        self._send_json(200, {"ok": True, "contact_id": contact_id, "members": members})
+        self_id = self._apples_self_id() if contact_id == "apples" else ""
+        self._send_json(200, {
+            "ok": True,
+            "contact_id": contact_id,
+            "members": members,
+            "self_id": self_id,
+        })
 
     def _detect_apples_mentions(self, text: str) -> set[str]:
         targets: set[str] = set()
@@ -1787,6 +1938,10 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_chat_draft()
             return
         if self.path.startswith("/chat/members"):
+            self._handle_chat_members()
+            return
+        if self.path.startswith("/companion/group-members"):
+            # alias for /chat/members — stable mention-picker endpoint
             self._handle_chat_members()
             return
         if self.path == "/pet/state":
@@ -2311,6 +2466,9 @@ class PushHandler(BaseHTTPRequestHandler):
         elif self.path == "/ai-status":
             self._handle_ai_status_post(body)
             return
+        elif self.path == "/client-log":
+            self._handle_client_log(body)
+            return
         elif self.path == "/push/clear-unread":
             self._handle_clear_unread()
             return
@@ -2345,6 +2503,13 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(403, {"error": "remote_control disabled", "hint": "set allow_remote_control=true in config.toml"})
                 return
             self._handle_chat_regenerate(body)
+        elif self.path == "/chat/rollback":
+            # 2026-07-08 长按消息重roll — 驱动 Claude Code 原生双 Esc 回滚。
+            # 和 regenerate 一样属于远程控制类，走 remote control gate。
+            if not self.state.allow_remote_control:
+                self._send_json(403, {"error": "remote_control disabled", "hint": "set allow_remote_control=true in config.toml"})
+                return
+            self._handle_chat_rollback(body)
         elif self.path == "/pet/state":
             self._handle_pet_state_post(body)
         elif self.path == "/pet/bubble":
@@ -2487,6 +2652,8 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_ai_chat_config_post(body)
         elif self.path == "/ai-chat/send":
             self._handle_ai_chat_send(body)
+        elif self.path == "/ai-chat/stream":
+            self._handle_ai_chat_stream(body)
         elif self.path == "/voice-call/tts":
             self._handle_voice_call_tts(body)
         elif self.path == "/voice/push":
@@ -2592,7 +2759,7 @@ class PushHandler(BaseHTTPRequestHandler):
         """
         role = str(body.get("role") or "").strip().lower()
         text = (body.get("text") or body.get("content") or "").strip()
-        source = str(body.get("source") or ("chain" if role == "assistant" else "ios-app")).strip()
+        source = str(body.get("source") or ("chain" if role == "assistant" else self._source_for_request())).strip()
         if role not in ("user", "assistant", "system"):
             self._send_json(400, {"ok": False, "error": "role must be user|assistant|system"})
             return
@@ -3440,7 +3607,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 sid=sid,
                 role="user",
                 text=text,
-                source="ios-app",
+                source=self._source_for_request(),
                 character_id=meta.get("character_id") or sid,
             )
             self._rp_chain_append(sid, rec)
@@ -3615,13 +3782,58 @@ class PushHandler(BaseHTTPRequestHandler):
         if not text:
             self._send_json(400, {"error": "text required"})
             return
+        client_message_id = str(body.get("client_message_id") or "").strip()[:200]
         try:
-            result = self.state.ai_chat.send_message(text)
+            result = self.state.ai_chat.send_message(text, client_message_id=client_message_id)
             status = 200 if result.get("ok") else 400
             self._send_json(status, result)
         except Exception as e:
             logger.exception("ai_chat send fail")
             self._send_json(500, {"ok": False, "error": str(e)})
+
+    def _handle_ai_chat_stream(self, body: dict[str, Any]):
+        if not self._check_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        text = str(body.get("text") or "").strip()[:50000]
+        if not text:
+            self._send_json(400, {"error": "text required"})
+            return
+        client_message_id = str(body.get("client_message_id") or "").strip()[:200]
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        def emit(event: dict[str, Any]) -> None:
+            data = json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n"
+            self.wfile.write(data)
+            self.wfile.flush()
+
+        try:
+            result = self.state.ai_chat.send_message_stream(text, emit, client_message_id=client_message_id)
+            if result.get("ok"):
+                done = {
+                    "type": "done",
+                    "ok": True,
+                    "reply": result.get("reply", ""),
+                    "ts": result.get("ts", ""),
+                }
+                if result.get("thinking"):
+                    done["thinking"] = result.get("thinking", "")
+                emit(done)
+            else:
+                emit({"type": "error", "ok": False, "error": result.get("error", "AI回复失败")})
+        except (BrokenPipeError, ConnectionResetError):
+            logger.info("ai_chat stream client disconnected")
+        except Exception as e:
+            logger.exception("ai_chat stream fail")
+            try:
+                emit({"type": "error", "ok": False, "error": str(e)})
+            except Exception:
+                pass
 
     def _handle_ai_chat_history(self):
         if not self._check_auth():
@@ -3778,7 +3990,7 @@ class PushHandler(BaseHTTPRequestHandler):
             rec = self.state.group_chat.append(
                 sender_id,
                 text,
-                source=str(body.get("source") or "ios-app"),
+                source=str(body.get("source") or self._source_for_request()),
                 mentions=mentions,
                 parent_msg_id=body.get("parent_msg_id") or None,
                 reply_to=body.get("reply_to") or None,
@@ -4575,7 +4787,7 @@ class PushHandler(BaseHTTPRequestHandler):
 
         url = f"{self.state.channel_transport_url}/messages"
         metadata: dict[str, Any] = {
-            "source": "ios-app",
+            "source": self._source_for_request(),
             "transport": "channel",
             "user_record_ts": user_record.get("ts"),
         }
@@ -4649,6 +4861,7 @@ class PushHandler(BaseHTTPRequestHandler):
         text = body.get("text", "").strip()
         quoted_ts = body.get("quoted_ts") or None
         location = body.get("location") or None
+        source = str(body.get("source") or self._source_for_request()).strip()
         if not text and not location:
             self._send_json(400, {"error": "text or location required"})
             return
@@ -4657,7 +4870,7 @@ class PushHandler(BaseHTTPRequestHandler):
         rec = chat.append(
             role="user",
             text=text,
-            source="ios-app",
+            source=source,
             quoted_ts=quoted_ts,
             location=location,
         )
@@ -4721,7 +4934,7 @@ class PushHandler(BaseHTTPRequestHandler):
         # 如果 bus_send.py 存在 用它走 bus dispatcher 路由 (Opia 内部多 agent 协调用)
         # 不存在 fallback 直接 tmux paste-buffer + send-keys 注入 (ccc 公开版默认走这条)
         target_session = (self.state.active_session or self.state.default_session).strip()
-        ok, err = self._inject_to_session(target_session, injected, source="ios-app", sender="iphone")
+        ok, err = self._inject_to_session(target_session, injected, source=source, sender="iphone")
         if not ok:
             # 注入失败 (target session 不存在 / tmux 没装 / bus_send crash 等). 用 502 surface
             # 给客户端 不再 silent 200 — 否则 ccc app 显示发送成功但 chain 根本收不到.
@@ -5443,6 +5656,29 @@ class PushHandler(BaseHTTPRequestHandler):
             )
             self.state.clear_kairos_pending_run(user_ts)
 
+        def _current_draft_text() -> str:
+            with self.state.chat_draft_lock:
+                draft = self.state.chat_drafts.get(contact_id)
+                if isinstance(draft, dict):
+                    return str(draft.get("text") or "").strip()
+            return ""
+
+        def _append_interrupted_draft() -> None:
+            nonlocal assistant_appended
+            _append_activity_card()
+            draft_text = _current_draft_text()
+            if draft_text:
+                message = (
+                    draft_text
+                    + "\n\n[这条回复被主动中断，以上是已经生成的草稿。]"
+                )
+            else:
+                message = "已中断当前生成。"
+            chat.append(role="assistant", text=message, source=f"{source}:interrupted")
+            assistant_appended = True
+            self._set_chat_interrupted(contact_id, user_ts=user_ts, source=source, session_id=session_id)
+            self.state.clear_kairos_pending_run(user_ts)
+
         lock = getattr(type(self), "_kairos_codex_lock", None)
         if lock is None:
             lock = threading.Lock()
@@ -5510,6 +5746,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         activity_count=activity_count,
                         activity_items=activity_items,
                     )
+                    self.state.update_kairos_pending_draft(contact_id, user_ts, live_text)
 
                 def _on_activity(activity_text: str) -> None:
                     nonlocal activity_count
@@ -5638,11 +5875,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     time.sleep(1.0)
 
                 if cancel_event and cancel_event.is_set():
-                    _append_activity_card()
-                    chat.append(role="assistant", text="已中断当前生成。", source=source)
-                    assistant_appended = True
-                    self._set_chat_interrupted(contact_id, user_ts=user_ts, source=source, session_id=session_id)
-                    self.state.clear_kairos_pending_run(user_ts)
+                    _append_interrupted_draft()
                     return
                 if thread_id:
                     self._save_codex_target(thread_id, cwd, "cc-app:kairos")
@@ -5657,8 +5890,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 if run_id:
                     CODEX_RUNS.finish(run_id)
                 if not assistant_appended:
-                    self._set_chat_interrupted(contact_id, user_ts=user_ts, source=source)
-                    self.state.clear_kairos_pending_run(user_ts)
+                    _append_interrupted_draft()
                 self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
 
     def _handle_kairos_chat_send(self, body: dict[str, Any], contact_id: str):
@@ -5687,7 +5919,7 @@ class PushHandler(BaseHTTPRequestHandler):
         })
         self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec, "queued": True})
 
-    def _start_group_kairos_reply(self, chat: ChatHistory, text: str, sender_name: str = "Astra") -> None:
+    def _start_group_kairos_reply(self, chat: ChatHistory, text: str, sender_name: str = "Astra", hop_count: int = 0) -> None:
         self._clear_chat_draft("apples")
 
         def _worker():
@@ -5731,11 +5963,18 @@ class PushHandler(BaseHTTPRequestHandler):
                             sender_name=self._apples_member_name("kairos"),
                         )
                         return
+                    hop_hint = ""
+                    if hop_count and hop_count > 0:
+                        hop_hint = (
+                            f"\n[hop {hop_count}] 这是 agent-to-agent 的第 {hop_count} 跳对话，"
+                            f"请简洁回复并避免再次主动 @ 其他 agent，让循环自然结束。"
+                        )
                     prompt = (
                         "当前时间：" + datetime.now().astimezone().strftime("%Y-%m-%d %H:%M") + "\n"
                         "[消息来源]\n入口: cc_companion_apples_group\ncontact_id: apples\n\n"
                         f"{sender_name} 正在 CcCompanion 的“苹果幼稚园”群聊里 @Kairos。"
-                        "请以 Kairos 身份直接回复群聊，不要提到后台路由，也不要触发或代替其他成员。\n"
+                        "请以 Kairos 身份直接回复群聊，不要提到后台路由，也不要触发或代替其他成员。"
+                        f"{hop_hint}\n"
                         f"群聊消息：{text}"
                     )
                     sys.path.insert(0, "/root/Windows-Codex-TG")
@@ -5813,6 +6052,279 @@ class PushHandler(BaseHTTPRequestHandler):
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    # apples 群 agent-to-agent loop guard 常量
+    APPLES_HOP_LIMIT = 2  # 人发起后, agent A 回 -> agent B 再接一轮就停 (kairos verdict 收紧 3->2)
+    APPLES_HOP_LIMIT_DEBUG = 3  # debug-only escape hatch (未启用)
+    APPLES_PAIR_RATE_LIMIT_SEC = 60.0  # 同 sender->target 60s 一次
+    APPLES_SENDER_GLOBAL_LIMIT = 3  # 单 sender 60s 内最多 dispatch 次数 (任何 target)
+    APPLES_ROOM_GLOBAL_LIMIT = 6  # 整个 apples 群 60s 内最多 dispatch 次数 (任何 sender)
+    APPLES_GLOBAL_WINDOW_SEC = 60.0
+
+    # 已知 agent sender (人类 sender 全部豁免限速)
+    APPLES_AGENT_SENDERS = frozenset({"kairos", "xiaoke"})
+
+    def _apples_is_human_sender(self, sender_id: str) -> bool:
+        """Human / unknown sender 全部豁免限速。astra 是人类, 其他非 agent 也走人类逻辑。"""
+        sid = (sender_id or "").strip().lower()
+        return sid not in self.APPLES_AGENT_SENDERS
+
+    def _apples_dispatch_allowed(self, sender_id: str, target_id: str) -> bool:
+        """同一 sender→target 60s 内只允许 1 次 dispatch (super 防 loop)。
+        返回 True 表示允许并已记录, False 表示限速 drop.
+        人类 sender 豁免, 不记 cache."""
+        if not sender_id or not target_id:
+            return True
+        if self._apples_is_human_sender(sender_id):
+            return True
+        cache = getattr(type(self), "_apples_dispatch_rate", None)
+        if cache is None:
+            cache = {}
+            type(self)._apples_dispatch_rate = cache
+        key = f"{sender_id.lower()}->{target_id.lower()}"
+        now_ts = time.time()
+        last = cache.get(key, 0.0)
+        if now_ts - last < self.APPLES_PAIR_RATE_LIMIT_SEC:
+            return False
+        cache[key] = now_ts
+        # GC 老条目
+        for k in list(cache.keys()):
+            if now_ts - cache[k] > 600:
+                del cache[k]
+        return True
+
+    def _apples_sender_global_allowed(self, sender_id: str) -> bool:
+        """Check (no record) — per-sender global rate limit.
+        人类 sender 豁免. 返回 True 表示允许 (调用方需要 dispatch 成功后调 _apples_record_global)."""
+        if self._apples_is_human_sender(sender_id):
+            return True
+        cache = getattr(type(self), "_apples_sender_global", None)
+        if cache is None:
+            return True
+        now_ts = time.time()
+        key = sender_id.lower()
+        deque_list = cache.get(key, [])
+        # 清掉窗口外的
+        deque_list = [t for t in deque_list if now_ts - t < self.APPLES_GLOBAL_WINDOW_SEC]
+        cache[key] = deque_list
+        return len(deque_list) < self.APPLES_SENDER_GLOBAL_LIMIT
+
+    def _apples_room_global_allowed(self, sender_id: str) -> bool:
+        """Check (no record) — per-room global rate limit. 人类 sender 豁免."""
+        if self._apples_is_human_sender(sender_id):
+            return True
+        cache = getattr(type(self), "_apples_room_global", None)
+        if cache is None:
+            return True
+        now_ts = time.time()
+        deque_list = list(cache.get("ts", []))
+        deque_list = [t for t in deque_list if now_ts - t < self.APPLES_GLOBAL_WINDOW_SEC]
+        cache["ts"] = deque_list
+        return len(deque_list) < self.APPLES_ROOM_GLOBAL_LIMIT
+
+    def _apples_record_global(self, sender_id: str) -> None:
+        """Record a successful dispatch ts for both per-sender + per-room counters.
+        人类 sender 不记 (反正豁免)."""
+        if self._apples_is_human_sender(sender_id):
+            return
+        now_ts = time.time()
+        sender_cache = getattr(type(self), "_apples_sender_global", None)
+        if sender_cache is None:
+            sender_cache = {}
+            type(self)._apples_sender_global = sender_cache
+        key = sender_id.lower()
+        lst = sender_cache.get(key, [])
+        lst = [t for t in lst if now_ts - t < self.APPLES_GLOBAL_WINDOW_SEC]
+        lst.append(now_ts)
+        sender_cache[key] = lst
+
+        room_cache = getattr(type(self), "_apples_room_global", None)
+        if room_cache is None:
+            room_cache = {"ts": []}
+            type(self)._apples_room_global = room_cache
+        rlst = [t for t in room_cache.get("ts", []) if now_ts - t < self.APPLES_GLOBAL_WINDOW_SEC]
+        rlst.append(now_ts)
+        room_cache["ts"] = rlst
+
+    def _apples_emit_drop_system_msg(
+        self,
+        contact_id: str,
+        reason: str,
+        sender_id: str,
+        targets: list[str] | set[str],
+        hop_count: int,
+        original_text: str = "",
+    ) -> None:
+        """Drop 不静默 — 写一条 system 消息到 apples chat history 让所有人看到。
+        不触发任何 agent。"""
+        reason_label = {
+            "hop_limit": "hop limit",
+            "pair_rate_limit": "per-pair rate limit",
+            "sender_rate_limit": "sender rate limit",
+            "room_rate_limit": "room rate limit",
+        }.get(reason, reason)
+        text = f"已停止 agent 接力，等待人类继续。({reason_label})"
+        try:
+            chat = self._chat_for_contact(contact_id)
+            chat.append(
+                role="system",
+                text=text,
+                source="system:apples_dispatch_guard",
+                sender_id="system",
+                sender_name=self._apples_member_name("system"),
+                metadata={
+                    "drop_reason": reason,
+                    "original_sender_id": sender_id,
+                    "original_targets": sorted(list(targets)),
+                    "hop_count": hop_count,
+                    "original_text_preview": (original_text or "")[:120],
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("apples emit drop system msg failed reason=%s err=%s", reason, exc)
+
+    def _dispatch_apples_mentions(
+        self,
+        rec: dict[str, Any],
+        contact_id: str,
+        targets: set,
+        sender_name: str,
+        hop_count: int = 0,
+        sender_id: str = "",
+    ) -> tuple[list[str], dict[str, str]]:
+        """Shared dispatch for apples group @mentions.
+
+        Routes to kairos (codex inject) and/or xiaoke (tmux inject).
+        Enforces hop_count<APPLES_HOP_LIMIT + per-pair 60s + per-sender 3/60s
+        + per-room 6/60s rate limits to prevent agent-to-agent infinite loops.
+
+        人类 sender (astra / 未知非 agent) 豁免所有限速。
+
+        Drop 不静默 — 命中任何 limit 时写一条 system 消息到 apples chat。
+
+        Returns (routed_member_ids, errors).
+        """
+        routed: list[str] = []
+        errors: dict[str, str] = {}
+        if not targets:
+            return routed, errors
+
+        sender_id_norm = (sender_id or "").strip().lower()
+        text = str(rec.get("text") or "")
+
+        # hop guard — 第 N 跳之后停止再 dispatch (但仍允许用户原始 send → 此函数初始 hop=0)
+        if hop_count >= self.APPLES_HOP_LIMIT and not self._apples_is_human_sender(sender_id_norm):
+            logger.info(
+                "apples dispatch hop_limit hit hop=%s sender=%s targets=%s — skip",
+                hop_count, sender_id_norm, sorted(targets),
+            )
+            self._apples_emit_drop_system_msg(
+                contact_id, "hop_limit", sender_id_norm, targets, hop_count, text,
+            )
+            errors["__all__"] = "hop_limit"
+            return routed, errors
+
+        # per-sender global (60s 窗口内最多 3 次, 任何 target)
+        if not self._apples_sender_global_allowed(sender_id_norm or "unknown"):
+            logger.info(
+                "apples dispatch sender_global limit hit sender=%s targets=%s — skip",
+                sender_id_norm, sorted(targets),
+            )
+            self._apples_emit_drop_system_msg(
+                contact_id, "sender_rate_limit", sender_id_norm, targets, hop_count, text,
+            )
+            errors["__all__"] = "sender_rate_limit"
+            return routed, errors
+
+        # per-room global (60s 窗口内整个群最多 6 次)
+        if not self._apples_room_global_allowed(sender_id_norm or "unknown"):
+            logger.info(
+                "apples dispatch room_global limit hit sender=%s targets=%s — skip",
+                sender_id_norm, sorted(targets),
+            )
+            self._apples_emit_drop_system_msg(
+                contact_id, "room_rate_limit", sender_id_norm, targets, hop_count, text,
+            )
+            errors["__all__"] = "room_rate_limit"
+            return routed, errors
+
+        chat = self._chat_for_contact(contact_id)
+        next_hop = hop_count + 1
+
+        if "kairos" in targets and sender_id_norm != "kairos":
+            if not self._apples_dispatch_allowed(sender_id_norm or "unknown", "kairos"):
+                logger.info("apples dispatch rate-limited sender=%s -> kairos", sender_id_norm)
+                errors["kairos"] = "rate_limited (60s per sender→target)"
+                self._apples_emit_drop_system_msg(
+                    contact_id, "pair_rate_limit", sender_id_norm, ["kairos"], hop_count, text,
+                )
+            else:
+                self._set_typing_for_contact(
+                    contact_id, {"is_typing": True, "since": rec["ts"], "member_id": "kairos"}
+                )
+                self._start_group_kairos_reply(chat, text, sender_name=sender_name, hop_count=next_hop)
+                self._apples_record_global(sender_id_norm or "unknown")
+                routed.append("kairos")
+
+        if "xiaoke" in targets and sender_id_norm != "xiaoke":
+            if not self._apples_dispatch_allowed(sender_id_norm or "unknown", "xiaoke"):
+                logger.info("apples dispatch rate-limited sender=%s -> xiaoke", sender_id_norm)
+                errors["xiaoke"] = "rate_limited (60s per sender→target)"
+                self._apples_emit_drop_system_msg(
+                    contact_id, "pair_rate_limit", sender_id_norm, ["xiaoke"], hop_count, text,
+                )
+            else:
+                from datetime import datetime as _dt
+                ts_prefix = "[" + _dt.now().strftime("%Y-%m-%d %H:%M:%S") + "]"
+                marker = self._group_reply_marker("xiaoke", rec["ts"])
+                hop_hint = ""
+                if next_hop > 1:
+                    hop_hint = (
+                        f"[hop {next_hop}] 这是 agent-to-agent 的第 {next_hop} 跳对话，"
+                        f"请简洁回复并避免再次主动 @ 其他 agent，让循环自然结束。\n"
+                    )
+                header = (
+                    f"{ts_prefix} [苹果幼稚园群聊][回复 {sender_name} 的群聊消息，"
+                    f"不要触发或代替其他 AI。]\n"
+                    f"请在本轮回复开头原样输出路由标记 {marker} ，然后直接回复群聊内容。"
+                )
+                if sender_id_norm and sender_id_norm != "astra":
+                    header += "\n不要在回复里 @{0}，避免循环触发。".format(sender_name)
+                injected = f"{header}\n{hop_hint}{text}"
+                if rec.get("quoted_text"):
+                    injected = (
+                        f"{header}\n{hop_hint}"
+                        f"[引用 \"{rec['quoted_text']}\"]\n{text}"
+                    )
+                if rec.get("location"):
+                    loc = rec["location"]
+                    label = loc.get("label", "")
+                    loc_str = f"[位置 lat={loc['lat']:.6f} lon={loc['lon']:.6f}{(' ' + label) if label else ''}]"
+                    injected = f"{injected}\n{loc_str}"
+
+                target_session = "cctg"
+                self._set_typing_for_contact(
+                    contact_id, {"is_typing": True, "since": rec["ts"], "member_id": "xiaoke"}
+                )
+                ok, err = self._inject_to_session(
+                    target_session,
+                    injected,
+                    source=self._source_for_request(contact_id),
+                    sender="iphone",
+                )
+                if ok:
+                    source_member = sender_id_norm if sender_id_norm and sender_id_norm != "astra" else None
+                    self._remember_group_reply("xiaoke", rec["ts"], source_member=source_member)
+                    self._apples_record_global(sender_id_norm or "unknown")
+                    routed.append("xiaoke")
+                else:
+                    errors["xiaoke"] = f"inject to tmux session '{target_session}' failed: {err}"
+                    logger.warning(
+                        "apples dispatch xiaoke inject failed session=%s sender=%s err=%s",
+                        target_session, sender_id_norm, err,
+                    )
+
+        return routed, errors
+
     def _maybe_route_apples_assistant_mention(
         self,
         chat: ChatHistory,
@@ -5820,40 +6332,55 @@ class PushHandler(BaseHTTPRequestHandler):
         source: str,
         text: str,
         rec: dict[str, Any],
+        hop_count: int = 0,
     ) -> list[str]:
+        """Route an assistant's @mention to other apples agents.
+
+        Sender 用 rec['sender_id'] 判断 (不再依赖 source string), 这样 CC 通过
+        mcp__companion__reply (source='cc-companion-channel') 发的 assistant 消息
+        也能正确触发路由.
+        """
         if role != "assistant" or not text:
             return []
-        source_key = str(source or "").strip().lower()
-        targets = self._detect_apples_mentions(text)
+        sender_id = str((rec or {}).get("sender_id") or "").strip().lower()
+        if not sender_id:
+            # 老逻辑兜底 — 没有 sender_id 时从 source 推断
+            source_key = str(source or "").strip().lower()
+            if source_key.startswith("group:xiaoke") or "xiaoke" in source_key or "ccc-stop-hook" in source_key:
+                sender_id = "xiaoke"
+            elif source_key.startswith("group:kairos") or "kairos" in source_key:
+                sender_id = "kairos"
+        # astra 是人类用户, 不该走这条 assistant 路由 (她的消息通过 _handle_apples_chat_send)
+        if sender_id == "astra":
+            return []
+
+        # 优先用 rec.mentions (client 显式标记或入库时已 detect 好)，否则 text grep
+        mentions_raw = (rec or {}).get("mentions") if isinstance(rec, dict) else None
+        if isinstance(mentions_raw, list) and mentions_raw:
+            targets = {str(m).lower() for m in mentions_raw if str(m).strip()}
+        else:
+            targets = set(self._detect_apples_mentions(text))
+        if sender_id:
+            targets.discard(sender_id)
+        targets.discard("astra")  # @方小南 不路由
+        if not targets:
+            return []
+
+        # 老 route_source_member 反向触发保护 (kairos→xiaoke→kairos 单跳 bounce)
         metadata = rec.get("metadata") if isinstance(rec, dict) else None
-        route_source_member = ""
         if isinstance(metadata, dict):
             route_source_member = str(metadata.get("route_source_member") or "").strip().lower()
-        if source_key.startswith("group:xiaoke") and "kairos" in targets:
-            if route_source_member == "kairos":
+            if route_source_member and route_source_member in targets:
+                # 上一跳来源刚发的 → 不立即 bounce 回去
+                targets.discard(route_source_member)
+            if not targets:
                 return []
-            self._set_typing_for_contact("apples", {"is_typing": True, "since": rec["ts"], "member_id": "kairos"})
-            self._start_group_kairos_reply(chat, text, sender_name="小克")
-            return ["kairos"]
-        if source_key.startswith("group:kairos") and "xiaoke" in targets:
-            from datetime import datetime as _dt
-            ts_prefix = "[" + _dt.now().strftime("%Y-%m-%d %H:%M:%S") + "]"
-            marker = self._group_reply_marker("xiaoke", rec["ts"])
-            injected = (
-                f"{ts_prefix} [苹果幼稚园群聊][Kairos 在群里点名你。只回复 Kairos 这条消息，不要触发其他 AI。]\n"
-                f"请在本轮回复开头原样输出路由标记 {marker} ，然后直接回复群聊内容。"
-                f"不要在回复里 @Kairos，避免循环触发。\n"
-                f"{text}"
-            )
-            target_session = "cctg"
-            self._set_typing_for_contact("apples", {"is_typing": True, "since": rec["ts"], "member_id": "xiaoke"})
-            ok, err = self._inject_to_session(target_session, injected, source="ios-app:apples", sender="iphone")
-            if ok:
-                self._remember_group_reply("xiaoke", rec["ts"], source_member="kairos")
-                return ["xiaoke"]
-            self._set_typing_for_contact("apples", {"is_typing": False, "since": None})
-            logger.warning("group kairos mention to xiaoke inject failed session=%s err=%s", target_session, err)
-        return []
+
+        sender_name = self._apples_member_name(sender_id) if sender_id else "成员"
+        routed, _errors = self._dispatch_apples_mentions(
+            rec, "apples", targets, sender_name, hop_count=hop_count, sender_id=sender_id,
+        )
+        return routed
 
     def _handle_apples_chat_send(self, body: dict[str, Any], contact_id: str):
         text = body.get("text", "").strip()
@@ -5864,11 +6391,19 @@ class PushHandler(BaseHTTPRequestHandler):
             return
 
         chat = self._chat_for_contact(contact_id)
-        targets = self._detect_apples_mentions(text)
+        # 优先：client UI 显式标记的 member_ids（不受大小写/typo 影响）
+        # fallback：text grep（兼容老 client 和纯文本路径）
+        meta = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+        explicit = self._normalize_mentioned_member_ids(meta.get("mentioned_member_ids"))
+        if explicit:
+            # astra (self) 不应该作为路由目标 — 她是发消息的人
+            targets = {mid for mid in explicit if mid != self._apples_self_id()}
+        else:
+            targets = self._detect_apples_mentions(text)
         rec = chat.append(
             role="user",
             text=text,
-            source="ios-app:apples",
+            source=self._source_for_request("apples"),
             quoted_ts=quoted_ts,
             location=location,
             sender_id="astra",
@@ -5888,41 +6423,16 @@ class PushHandler(BaseHTTPRequestHandler):
         if typing_target:
             typing_state["member_id"] = typing_target
         self._set_typing_for_contact(contact_id, typing_state)
-        routed: list[str] = []
-        errors: dict[str, str] = {}
 
-        if "kairos" in targets:
-            self._start_group_kairos_reply(chat, text, sender_name="Astra")
-            routed.append("kairos")
-
-        if "xiaoke" in targets:
-            from datetime import datetime as _dt
-            ts_prefix = "[" + _dt.now().strftime("%Y-%m-%d %H:%M:%S") + "]"
-            marker = self._group_reply_marker("xiaoke", rec["ts"])
-            injected = (
-                f"{ts_prefix} [苹果幼稚园群聊][只回复 Astra 这条用户消息，不要触发其他 AI。]\n"
-                f"请在本轮回复开头原样输出路由标记 {marker} ，然后直接回复群聊内容。\n"
-                f"{text}"
-            )
-            if rec.get("quoted_text"):
-                injected = (
-                    f"{ts_prefix} [苹果幼稚园群聊][只回复 Astra 这条用户消息，不要触发其他 AI。]\n"
-                    f"请在本轮回复开头原样输出路由标记 {marker} ，然后直接回复群聊内容。\n"
-                    f"[引用 \"{rec['quoted_text']}\"]\n{text}"
-                )
-            if rec.get("location"):
-                loc = rec["location"]
-                label = loc.get("label", "")
-                loc_str = f"[位置 lat={loc['lat']:.6f} lon={loc['lon']:.6f}{(' ' + label) if label else ''}]"
-                injected = f"{injected}\n{loc_str}"
-
-            target_session = "cctg"
-            ok, err = self._inject_to_session(target_session, injected, source="ios-app:apples", sender="iphone")
-            if ok:
-                self._remember_group_reply("xiaoke", rec["ts"])
-                routed.append("xiaoke")
-            else:
-                errors["xiaoke"] = f"inject to tmux session '{target_session}' failed: {err}"
+        # astra 直接发的消息 → hop_count 从 0 起算 (走 shared dispatcher)
+        routed, errors = self._dispatch_apples_mentions(
+            rec,
+            contact_id,
+            set(targets),
+            sender_name=self._apples_member_name("astra"),
+            hop_count=0,
+            sender_id="astra",
+        )
 
         if errors and not routed:
             self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
@@ -6250,7 +6760,7 @@ class PushHandler(BaseHTTPRequestHandler):
         # 注入 regenerate 文本到 active session — 走 _inject_to_session helper
         # ccc 公开用户没 ~/scripts/bus_send.py 时 fallback 直接 tmux 注入
         target_session = (self.state.active_session or self.state.default_session).strip()
-        ok, err = self._inject_to_session(target_session, injected, source="ios-app", sender="iphone")
+        ok, err = self._inject_to_session(target_session, injected, source=self._source_for_request(), sender="iphone")
         if not ok:
             self._send_json(502, {
                 "ok": False,
@@ -6269,6 +6779,127 @@ class PushHandler(BaseHTTPRequestHandler):
             "interrupted": True,
         })
 
+    def _handle_chat_rollback(self, body: dict[str, Any]):
+        """2026-07-08 app 长按消息「回滚到这里/重roll」。
+
+        驱动 Claude Code 原生双 Esc Rewind：把 live 会话（active tmux session）
+        回退到目标用户消息之前并原话重新提交，真正从模型上下文里撤掉之后的
+        回复（对比 /chat/regenerate 只是追加一条 [regenerate] 请求）。
+
+        body: {
+          "target_msg_id": "<chat_history ts，长按的那条消息>",
+          "role": "user" | "assistant",   # 长按的是谁的消息
+          "text": "...",                   # 兜底匹配用
+          "client_msg_id": "uuid",         # 防重复点击
+          "contact_id": "xiaoke",
+        }
+        语义：长按用户消息 = 回滚到该消息重发；长按 assistant 消息 = 定位它
+        前面最近一条用户消息原话重跑。
+        细节与副作用上锁都在 rollback_driver 模块里（可单测）。
+        """
+        contact_id = self._contact_id_from_body(body)
+        if contact_id != "xiaoke":
+            self._send_json(501, {"ok": False, "reason": f"rollback 只支持小克主窗口（got {contact_id}）"})
+            return
+        target_msg_id = str(body.get("target_msg_id") or "").strip()
+        role = str(body.get("role") or "").strip() or "user"
+        text_hint = str(body.get("text") or "").strip()
+        client_msg_id = body.get("client_msg_id")
+        if not target_msg_id and not text_hint:
+            self._send_json(400, {"ok": False, "reason": "target_msg_id or text required"})
+            return
+
+        # dedupe 10s 窗口（回滚链路本身要跑好几秒）
+        cache = getattr(type(self), "_rollback_dedupe_cache", None)
+        if cache is None:
+            cache = {}
+            type(self)._rollback_dedupe_cache = cache
+        now_ts = time.time()
+        cache_key = f"cmid:{client_msg_id}" if client_msg_id else f"target:{target_msg_id or text_hint[:64]}"
+        if now_ts - cache.get(cache_key, 0) < 10.0:
+            self._send_json(429, {"ok": False, "reason": "刚触发过一次回滚，别连点", "deduped": True})
+            return
+        cache[cache_key] = now_ts
+        for k in list(cache.keys()):
+            if now_ts - cache[k] > 120:
+                del cache[k]
+
+        # 定位目标用户消息（长按 assistant → 往前找最近的 user 条）
+        chat = self._chat_for_contact(contact_id)
+        records = chat.read_since(since_ts=None, limit=10000, include_hidden=True)
+        target_idx = -1
+        if target_msg_id:
+            for i, rec in enumerate(records):
+                if rec.get("ts") == target_msg_id:
+                    target_idx = i
+                    break
+        if target_idx < 0 and text_hint:
+            for i, rec in enumerate(records):
+                if rec.get("role") == role and (rec.get("text") or "").strip() == text_hint:
+                    target_idx = i  # 取最后一个同文本命中
+        if target_idx < 0:
+            self._send_json(404, {"ok": False, "reason": "在聊天记录里找不到这条消息"})
+            return
+        user_rec: dict[str, Any] | None = None
+        if records[target_idx].get("role") == "user":
+            user_rec = records[target_idx]
+        else:
+            for rec in reversed(records[:target_idx]):
+                if rec.get("role") == "user":
+                    user_rec = rec
+                    break
+        if not user_rec or not (user_rec.get("text") or "").strip():
+            self._send_json(404, {"ok": False, "reason": "这条回复前面找不到对应的用户消息"})
+            return
+        user_ts = str(user_rec.get("ts") or "")
+        user_text = str(user_rec.get("text") or "")
+
+        target_session = (self.state.active_session or self.state.default_session).strip()
+        try:
+            info = rollback_driver.rollback_to_user_message(
+                tmux_session=target_session,
+                user_record_ts=user_ts,
+                raw_text=user_text,
+            )
+        except rollback_driver.RollbackRefused as e:
+            logger.info("chat/rollback refused code=%s reason=%s", e.code, e.reason)
+            self._send_json(409, {"ok": False, "code": e.code, "reason": e.reason})
+            return
+        except rollback_driver.RollbackError as e:
+            logger.warning("chat/rollback failed code=%s reason=%s", e.code, e.reason)
+            self._send_json(502, {"ok": False, "code": e.code, "reason": e.reason})
+            return
+        except Exception as e:
+            logger.exception("chat/rollback unexpected error")
+            self._send_json(502, {"ok": False, "reason": f"回滚驱动异常: {e}"})
+            return
+
+        # 回滚成功：目标之后的 assistant 回复已从模型上下文撤掉，
+        # UI 侧也标记隐藏（复用 regenerate 的 hidden_in_ui 机制）。
+        hidden = 0
+        for rec in records:
+            if (
+                rec.get("role") == "assistant"
+                and str(rec.get("ts") or "") > user_ts
+                and not rec.get("hidden_in_ui")
+            ):
+                if chat.mark_regenerated(old_ts=str(rec.get("ts"))):
+                    hidden += 1
+
+        from datetime import datetime as _dt
+        self._set_typing_for_contact(contact_id, {"is_typing": True, "since": _dt.now().isoformat(timespec="milliseconds")})
+        logger.info(
+            "chat/rollback ok user_ts=%s ups=%s hidden=%d session=%s",
+            user_ts, info.get("ups"), hidden, target_session,
+        )
+        self._send_json(200, {
+            "ok": True,
+            "message": "已回滚，正在重新生成",
+            "rolled_back_to": user_ts,
+            "ups": info.get("ups"),
+            "hidden_assistant": hidden,
+        })
+
     def _handle_chat_append(self, body: dict[str, Any]):
         """bus_stop_hook 抓到回复后调 → 写 assistant 条 + push spoke 状态
         也支持从 mac mini 这边发图/文件 给 iPhone:
@@ -6281,9 +6912,9 @@ class PushHandler(BaseHTTPRequestHandler):
         contact_id = self._contact_id_from_body(body)
         text = body.get("text", "").strip()
         role = body.get("role", "assistant")
-        source = body.get("source", "ios-app")
+        source = body.get("source", self._source_for_request())
         if not isinstance(source, str) or not source:
-            source = "ios-app"
+            source = self._source_for_request()
         if role == "assistant":
             has_group_marker = "[[CCC_GROUP_REPLY:apples:" in text
             if has_group_marker:
@@ -6341,10 +6972,21 @@ class PushHandler(BaseHTTPRequestHandler):
             member_id = self._apples_source_member(source)
             if role == "user":
                 member_id = "astra"
+            elif not member_id and role == "assistant":
+                # CC append → apples group 默认是螃蟹版小克，不是泛 ai
+                member_id = "xiaoke"
             if member_id:
                 sender_id = member_id
                 sender_name = self._apples_member_name(member_id)
-            mentions = sorted(self._detect_apples_mentions(text)) if text else None
+            # mention 解析：优先用 metadata.mentioned_member_ids（client 显式标记），
+            # 否则 fallback 到 text grep（兼容老 client / 纯文本场景）。
+            meta_in = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+            explicit_mentions = self._normalize_mentioned_member_ids(meta_in.get("mentioned_member_ids"))
+            if explicit_mentions:
+                # 排除 self（发件人自己不应被标 mention）
+                mentions = [m for m in explicit_mentions if m != sender_id]
+            else:
+                mentions = sorted(self._detect_apples_mentions(text)) if text else None
         if not text and not attachment_url and not thinking and not tools:
             self._send_json(400, {"error": "text or attachment required"})
             return
@@ -6478,7 +7120,17 @@ class PushHandler(BaseHTTPRequestHandler):
         if role == "assistant":
             routed: list[str] = []
             if contact_id == "apples":
-                routed = self._maybe_route_apples_assistant_mention(chat, role, source, text, rec)
+                # hop_count: client/上游可在 body 顶层 或 metadata 里塞, 默认 0
+                try:
+                    raw_hop = body.get("hop_count")
+                    if raw_hop is None and isinstance(body.get("metadata"), dict):
+                        raw_hop = body["metadata"].get("hop_count")
+                    hop_count = int(raw_hop or 0)
+                except Exception:
+                    hop_count = 0
+                routed = self._maybe_route_apples_assistant_mention(
+                    chat, role, source, text, rec, hop_count=hop_count,
+                )
             if not routed and not self._has_pending_group_reply():
                 self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
 
@@ -6627,7 +7279,7 @@ class PushHandler(BaseHTTPRequestHandler):
         rec = chat.append(
             role=role,
             text=text,
-            source="ios-app" if contact_id == "xiaoke" else f"ios-app:{contact_id}",
+            source=self._source_for_request() if contact_id == "xiaoke" else self._source_for_request(contact_id),
             quoted_ts=quoted_ts,
             attachment_url=attachment_url,
             attachment_type=atype,
@@ -6689,7 +7341,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     return
                 # fallback 继续走 tmux 注入
             target_session = (self.state.active_session or self.state.default_session).strip()
-            ok, err = self._inject_to_session(target_session, hint, source="ios-app", sender="iphone")
+            ok, err = self._inject_to_session(target_session, hint, source=self._source_for_request(), sender="iphone")
             if not ok:
                 # 附件已存盘 + 历史已 append 但 chain 注入失败 — 502 surface
                 self._send_json(502, {
