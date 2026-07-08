@@ -36,6 +36,7 @@ DRIVER_LOCK 覆盖全流程。失败日志落 /var/log/cc-rollback.log。
 from __future__ import annotations
 
 import copy
+import gzip
 import json
 import logging
 import os
@@ -448,15 +449,32 @@ def assert_not_busy(tmux_session: str) -> None:
         raise RollbackRefused("小克正在生成回复，等这条说完再回滚。", code="busy")
 
 
+BACKUP_KEEP = 5  # 同目录最多保留几份 rollback 备份（gzip 后按 mtime 淘汰最老的）
+
+
 def backup_session_jsonl(jsonl_path: Path) -> Path:
-    """截断前强制备份原 jsonl（同目录 .bak-rollback-<ts>，不带 .jsonl 后缀
-    结尾所以不会被 session 扫描 glob 到）。失败即中止。"""
+    """截断前强制备份原 jsonl（同目录 .bak-rollback-<ts>.gz，不带 .jsonl 后缀
+    结尾所以不会被 session 扫描 glob 到）。失败即中止。
+    备份 gzip 压缩，且只保留最近 BACKUP_KEEP 份，防止大 session 反复回滚把盘吃满
+    （恢复方法：gunzip 后改回 .jsonl 名，current-session 指回原 sid）。"""
     ts = datetime.now().strftime("%Y%m%d%H%M%S")
-    backup = jsonl_path.with_name(f"{jsonl_path.name}.bak-rollback-{ts}")
+    backup = jsonl_path.with_name(f"{jsonl_path.name}.bak-rollback-{ts}.gz")
     try:
-        shutil.copy2(jsonl_path, backup)
+        with open(jsonl_path, "rb") as src, gzip.open(backup, "wb") as dst:
+            shutil.copyfileobj(src, dst)
     except Exception as e:
         raise RollbackError(f"备份原 session 失败（{e}），中止，什么都没动。", code="backup_failed")
+    try:
+        baks = sorted(
+            jsonl_path.parent.glob("*.bak-rollback-*"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for old in baks[BACKUP_KEEP:]:
+            old.unlink()
+            logger.info("pruned old rollback backup: %s", old.name)
+    except Exception:
+        logger.warning("rollback backup prune failed (non-fatal)", exc_info=True)
     return backup
 
 
