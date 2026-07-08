@@ -159,6 +159,7 @@ class AIChatManager:
         if thinking:
             rec["thinking"] = thinking
         for key in (
+            "client_message_id",
             "attachment_url",
             "attachment_type",
             "attachment_filename",
@@ -172,6 +173,29 @@ class AIChatManager:
             with self._history_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         return ts
+
+    def _find_client_message_result(self, client_message_id: str) -> dict[str, Any] | None:
+        if not client_message_id:
+            return None
+        records = self.read_history(limit=1000)
+        user_index = -1
+        for i, rec in enumerate(records):
+            if rec.get("role") == "user" and rec.get("client_message_id") == client_message_id:
+                user_index = i
+        if user_index < 0:
+            return None
+        for rec in records[user_index + 1:]:
+            if rec.get("role") == "assistant" and rec.get("client_message_id") == client_message_id:
+                result = {
+                    "ok": True,
+                    "duplicate": True,
+                    "reply": rec.get("text", ""),
+                    "ts": rec.get("ts", ""),
+                }
+                if rec.get("thinking"):
+                    result["thinking"] = rec.get("thinking", "")
+                return result
+        return {"ok": False, "duplicate": True, "error": "duplicate client message already in progress"}
 
     def read_history(self, since: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
         """Return history records, optionally filtered by *since* timestamp."""
@@ -290,14 +314,14 @@ class AIChatManager:
 
     # ---- API call ----
 
-    def send_message(self, user_text: str) -> dict[str, Any]:
+    def send_message(self, user_text: str, client_message_id: str = "") -> dict[str, Any]:
         """Send *user_text*, call the AI API, store both sides, return result dict.
         Serialized per-session to prevent interleaving."""
         if not self.enabled:
             return {"ok": False, "error": "ai chat is not enabled"}
 
         with self._send_lock:
-            return self._send_message_locked(user_text)
+            return self._send_message_locked(user_text, client_message_id=client_message_id)
 
     def send_attachment(
         self,
@@ -329,7 +353,7 @@ class AIChatManager:
                 attachment_filename=attachment_filename,
             )
 
-    def _send_message_locked(self, user_text: str) -> dict[str, Any]:
+    def _send_message_locked(self, user_text: str, client_message_id: str = "") -> dict[str, Any]:
 
         api_url = self._config.get("api_url", "")
         api_key = self._config.get("api_key", "")
@@ -339,6 +363,10 @@ class AIChatManager:
 
         if not api_url or not api_key or not model:
             return {"ok": False, "error": "ai chat not configured (missing api_url / api_key / model)"}
+
+        duplicate = self._find_client_message_result(client_message_id)
+        if duplicate is not None:
+            return duplicate
 
         # Fetch relevant memories
         memories = self._fetch_memories(user_text)
@@ -356,7 +384,7 @@ class AIChatManager:
         messages.append({"role": "user", "content": user_text})
 
         # Store user message
-        user_ts = self._append_history("user", user_text)
+        user_ts = self._append_history("user", user_text, client_message_id=client_message_id)
 
         # Call API
         try:
@@ -366,8 +394,62 @@ class AIChatManager:
             return {"ok": False, "error": str(e), "ts": user_ts}
 
         # Store assistant reply
-        reply_ts = self._append_history("assistant", reply_text, thinking=thinking)
+        reply_ts = self._append_history("assistant", reply_text, thinking=thinking, client_message_id=client_message_id)
 
+        result = {"ok": True, "reply": reply_text, "ts": reply_ts}
+        if thinking:
+            result["thinking"] = thinking
+        return result
+
+    def send_message_stream(self, text: str, emit: Any, client_message_id: str = "") -> dict[str, Any]:
+        """Send a message and emit newline-JSON stream events while the reply arrives."""
+        text = text.strip()
+        if not text:
+            return {"ok": False, "error": "empty message"}
+        with self._send_lock:
+            return self._send_message_stream_locked(text, emit, client_message_id=client_message_id)
+
+    def _send_message_stream_locked(self, user_text: str, emit: Any, client_message_id: str = "") -> dict[str, Any]:
+        api_url = self._config.get("api_url", "")
+        api_key = self._config.get("api_key", "")
+        model = self._config.get("model", "")
+        system_prompt = self._config.get("system_prompt", "")
+        max_ctx = int(self._config.get("max_context_messages", 20))
+
+        if not api_url or not api_key or not model:
+            return {"ok": False, "error": "ai chat not configured (missing api_url / api_key / model)"}
+
+        duplicate = self._find_client_message_result(client_message_id)
+        if duplicate is not None:
+            if duplicate.get("ok") and duplicate.get("reply"):
+                emit({"type": "delta", "text": duplicate.get("reply", "")})
+                if duplicate.get("thinking"):
+                    emit({"type": "thinking_delta", "text": duplicate.get("thinking", "")})
+            return duplicate
+
+        memories = self._fetch_memories(user_text)
+
+        messages: list[dict[str, str]] = []
+        if system_prompt:
+            now = datetime.now(timezone.utc).astimezone()
+            time_block = f"\n\n## 当前时间\n{now.strftime('%Y年%m月%d日 %H:%M %A')}"
+            mem_block = ""
+            if memories:
+                mem_block = "\n\n## 相关记忆\n" + "\n---\n".join(memories)
+            messages.append({"role": "system", "content": system_prompt + time_block + mem_block})
+        messages.extend(self._recent_messages(max_ctx))
+        messages.append({"role": "user", "content": user_text})
+
+        user_ts = self._append_history("user", user_text, client_message_id=client_message_id)
+        emit({"type": "user", "ts": user_ts, "text": user_text})
+
+        try:
+            reply_text, thinking = self._call_api_stream(api_url, api_key, model, messages, emit)
+        except Exception as e:
+            logger.exception("ai_chat: streaming API call failed")
+            return {"ok": False, "error": str(e), "ts": user_ts}
+
+        reply_ts = self._append_history("assistant", reply_text, thinking=thinking, client_message_id=client_message_id)
         result = {"ok": True, "reply": reply_text, "ts": reply_ts}
         if thinking:
             result["thinking"] = thinking
@@ -432,11 +514,27 @@ class AIChatManager:
         messages: list[dict[str, str]],
     ) -> str:
         """POST to an OpenAI-compatible chat/completions endpoint.  Returns reply text."""
-        payload = json.dumps({"model": model, "messages": messages}, ensure_ascii=False).encode("utf-8")
+        def _chat_completions_url(url: str) -> str:
+            stripped = url.rstrip("/")
+            if stripped.endswith("/chat/completions"):
+                return stripped
+            return stripped + "/chat/completions"
+
+        def _preview(raw: bytes, limit: int = 300) -> str:
+            text = raw.decode("utf-8", errors="replace")
+            text = re.sub(r"\s+", " ", text).strip()
+            return text[:limit]
+
+        payload_obj: dict[str, Any] = {"model": model, "messages": messages}
+        if (urlparse(api_url).hostname or "").endswith("openrouter.ai"):
+            payload_obj["reasoning"] = {"enabled": True, "exclude": False}
+            payload_obj["include_reasoning"] = True
+        payload = json.dumps(payload_obj, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
-            api_url,
+            _chat_completions_url(api_url),
             data=payload,
             headers={
+                "Accept": "application/json",
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {api_key}",
             },
@@ -444,10 +542,38 @@ class AIChatManager:
         )
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
+                status = resp.getcode()
+                content_type = resp.headers.get("Content-Type", "")
+                raw = resp.read()
+                try:
+                    body = json.loads(raw.decode("utf-8"))
+                except json.JSONDecodeError as e:
+                    preview = _preview(raw)
+                    logger.warning(
+                        "ai_chat: API non-JSON response status=%s content_type=%r bytes=%d preview=%r",
+                        status,
+                        content_type,
+                        len(raw),
+                        preview,
+                    )
+                    detail = preview or "<empty body>"
+                    raise RuntimeError(
+                        f"API returned non-JSON response (HTTP {status}, {content_type or 'unknown content type'}, "
+                        f"{len(raw)} bytes): {detail}"
+                    ) from e
         except urllib.error.HTTPError as e:
-            logger.warning("ai_chat: API HTTP %d", e.code)
-            raise RuntimeError(f"API returned HTTP {e.code}") from e
+            raw = e.read()
+            content_type = e.headers.get("Content-Type", "") if e.headers else ""
+            preview = _preview(raw)
+            logger.warning(
+                "ai_chat: API HTTP %d content_type=%r bytes=%d preview=%r",
+                e.code,
+                content_type,
+                len(raw),
+                preview,
+            )
+            detail = f": {preview}" if preview else ""
+            raise RuntimeError(f"API returned HTTP {e.code}{detail}") from e
         except urllib.error.URLError as e:
             raise RuntimeError(f"API request failed: {e.reason}") from e
 
@@ -458,5 +584,161 @@ class AIChatManager:
         content = str(message.get("content", "")).strip()
         if not content:
             raise RuntimeError("模型返回了空回复")
-        thinking = str(message.get("reasoning_content") or message.get("thoughts") or "").strip()
+        thinking = str(
+            message.get("reasoning")
+            or message.get("reasoning_content")
+            or message.get("thoughts")
+            or ""
+        ).strip()
+        if not thinking:
+            reasoning_details = message.get("reasoning_details")
+            if isinstance(reasoning_details, list):
+                parts: list[str] = []
+                for item in reasoning_details:
+                    if not isinstance(item, dict):
+                        continue
+                    text = item.get("text") or item.get("content")
+                    if text:
+                        parts.append(str(text))
+                thinking = "\n".join(parts).strip()
         return content, thinking
+
+    def _call_api_stream(
+        self,
+        api_url: str,
+        api_key: str,
+        model: str,
+        messages: list[dict[str, str]],
+        emit: Any,
+    ) -> tuple[str, str]:
+        """POST to chat/completions with stream=true and emit incremental chunks."""
+        def _chat_completions_url(url: str) -> str:
+            stripped = url.rstrip("/")
+            if stripped.endswith("/chat/completions"):
+                return stripped
+            return stripped + "/chat/completions"
+
+        def _preview(raw: bytes, limit: int = 300) -> str:
+            text = raw.decode("utf-8", errors="replace")
+            text = re.sub(r"\s+", " ", text).strip()
+            return text[:limit]
+
+        payload_obj: dict[str, Any] = {"model": model, "messages": messages, "stream": True}
+        if (urlparse(api_url).hostname or "").endswith("openrouter.ai"):
+            payload_obj["reasoning"] = {"enabled": True, "exclude": False}
+            payload_obj["include_reasoning"] = True
+        payload = json.dumps(payload_obj, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            _chat_completions_url(api_url),
+            data=payload,
+            headers={
+                "Accept": "text/event-stream, application/json",
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+
+        reply_parts: list[str] = []
+        thinking_parts: list[str] = []
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                if "text/event-stream" not in content_type and "application/x-ndjson" not in content_type:
+                    raw = resp.read()
+                    preview = _preview(raw)
+                    logger.warning(
+                        "ai_chat: API stream non-stream response status=%s content_type=%r bytes=%d preview=%r",
+                        resp.getcode(),
+                        content_type,
+                        len(raw),
+                        preview,
+                    )
+                    try:
+                        body = json.loads(raw.decode("utf-8"))
+                    except json.JSONDecodeError as e:
+                        detail = preview or "<empty body>"
+                        raise RuntimeError(
+                            f"API returned non-stream response (HTTP {resp.getcode()}, "
+                            f"{content_type or 'unknown content type'}, {len(raw)} bytes): {detail}"
+                        ) from e
+                    choices = body.get("choices")
+                    if not choices or not isinstance(choices, list):
+                        raise RuntimeError(f"unexpected API response shape: {json.dumps(body, ensure_ascii=False)[:300]}")
+                    message = choices[0].get("message", {})
+                    content = str(message.get("content", "")).strip()
+                    thinking = str(message.get("reasoning") or message.get("reasoning_content") or "").strip()
+                    if content:
+                        emit({"type": "delta", "text": content})
+                    if thinking:
+                        emit({"type": "thinking_delta", "text": thinking})
+                    if not content:
+                        raise RuntimeError("模型返回了空回复")
+                    return content, thinking
+
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    if line.startswith(":"):
+                        continue
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if not line:
+                        continue
+                    if line == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        logger.debug("ai_chat: ignored non-json stream line: %r", line[:200])
+                        continue
+                    choices = chunk.get("choices")
+                    if not choices or not isinstance(choices, list):
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    content_piece = delta.get("content")
+                    if content_piece:
+                        text = str(content_piece)
+                        reply_parts.append(text)
+                        emit({"type": "delta", "text": text})
+                    thinking_piece = (
+                        delta.get("reasoning")
+                        or delta.get("reasoning_content")
+                        or delta.get("thoughts")
+                    )
+                    if thinking_piece:
+                        text = str(thinking_piece)
+                        thinking_parts.append(text)
+                        emit({"type": "thinking_delta", "text": text})
+                    reasoning_details = delta.get("reasoning_details")
+                    if isinstance(reasoning_details, list):
+                        for item in reasoning_details:
+                            if not isinstance(item, dict):
+                                continue
+                            detail_text = item.get("text") or item.get("content")
+                            if detail_text:
+                                text = str(detail_text)
+                                thinking_parts.append(text)
+                                emit({"type": "thinking_delta", "text": text})
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            content_type = e.headers.get("Content-Type", "") if e.headers else ""
+            preview = _preview(raw)
+            logger.warning(
+                "ai_chat: API stream HTTP %d content_type=%r bytes=%d preview=%r",
+                e.code,
+                content_type,
+                len(raw),
+                preview,
+            )
+            detail = f": {preview}" if preview else ""
+            raise RuntimeError(f"API returned HTTP {e.code}{detail}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"API request failed: {e.reason}") from e
+
+        reply_text = "".join(reply_parts).strip()
+        thinking = "".join(thinking_parts).strip()
+        if not reply_text:
+            raise RuntimeError("模型返回了空回复")
+        return reply_text, thinking
