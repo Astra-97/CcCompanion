@@ -69,7 +69,35 @@ VAD_RMS_SILENCE = 300        # < this -> silence candidate
 VAD_SILENCE_END_MS = 700     # 700ms of silence after speech => utterance end
 MAX_UTTERANCE_MS = 30_000    # safety cap
 VAD_MIN_SPEECH_MS = 400      # utterances with less active speech are dropped (anti ASR hallucination)
-ASR_SINGLE_CHAR_MIN_MS = 600 # single-char transcript needs at least this much active speech
+ASR_SINGLE_CHAR_MIN_MS = 900 # single-char transcript needs at least this much active speech
+
+# Anti ASR hallucination (third line of defense): classic Whisper-style
+# hallucination phrases emitted on silence/noise. Matched against the
+# transcript with whitespace/punctuation stripped and lowercased.
+ASR_HALLUCINATION_BLACKLIST = frozenset(
+    {
+        "谢谢大家",
+        "谢谢观看",
+        "感谢观看",
+        "谢谢收看",
+        "感谢收看",
+        "谢谢聆听",
+        "感谢聆听",
+        "请不吝点赞订阅转发打赏支持明镜与点点栏目",
+        "优优独播剧场yoyotelevisionseriesexclusive",
+        "字幕由amaraorg社群提供",
+        "字幕志愿者",
+        "by索兰娅",
+        "明镜需要您的支持",
+        "多謝觀看",
+        "謝謝觀看",
+        "thankyouforwatching",
+        "thanksforwatching",
+        "pleasesubscribe",
+    }
+)
+# Substring markers: any transcript containing these is a subtitle-credit hallucination.
+ASR_HALLUCINATION_SUBSTRINGS = ("字幕由", "amara.org")
 
 ASR_TIMEOUT_SEC = 90
 TTS_TIMEOUT_SEC = 90
@@ -704,6 +732,16 @@ async def handle_utterance(
                 speech_ms,
                 ASR_SINGLE_CHAR_MIN_MS,
             )
+            return
+        # Anti ASR hallucination (third line of defense): well-known Whisper
+        # hallucination phrases ("谢谢大家", subtitle credits, ...) produced
+        # from silence/noise regardless of speech duration.
+        core_lower = core.lower()
+        transcript_lower = transcript.lower()
+        if core_lower in ASR_HALLUCINATION_BLACKLIST or any(
+            marker in transcript_lower for marker in ASR_HALLUCINATION_SUBSTRINGS
+        ):
+            logger.info("asr: dropped hallucination blacklist %r", transcript)
             return
         await send_json(ws, {"type": "asr_final", "text": transcript})
         if not transcript:
