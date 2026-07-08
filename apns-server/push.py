@@ -6782,9 +6782,13 @@ class PushHandler(BaseHTTPRequestHandler):
     def _handle_chat_rollback(self, body: dict[str, Any]):
         """2026-07-08 app 长按消息「回滚到这里/重roll」。
 
-        驱动 Claude Code 原生双 Esc Rewind：把 live 会话（active tmux session）
-        回退到目标用户消息之前并原话重新提交，真正从模型上下文里撤掉之后的
-        回复（对比 /chat/regenerate 只是追加一条 [regenerate] 请求）。
+        forge 式回滚（v2，原生双 Esc Rewind 不认 channel 注入消息已弃用）：
+        截断 live 会话 jsonl 到目标用户消息之前 → 重启 claude-tg → tmux
+        重注入她的原话成 typed prompt，真正从模型上下文里撤掉之后的回复
+        （对比 /chat/regenerate 只是追加一条 [regenerate] 请求）。
+
+        链路几十秒，HTTP 立即返回 200（async=true），后台线程跑完整流程；
+        失败往 chat_history append 一条 ⚠️ 消息告知原因。
 
         body: {
           "target_msg_id": "<chat_history ts，长按的那条消息>",
@@ -6854,9 +6858,11 @@ class PushHandler(BaseHTTPRequestHandler):
         user_ts = str(user_rec.get("ts") or "")
         user_text = str(user_rec.get("text") or "")
 
+        # ── 同步预检（定位 jsonl / 截断点校验干跑 / 副作用上锁 / busy 检测）──
+        # 全部通过才派后台线程；这里失败不动任何东西，直接把原因回给 app。
         target_session = (self.state.active_session or self.state.default_session).strip()
         try:
-            info = rollback_driver.rollback_to_user_message(
+            plan = rollback_driver.prepare_rollback(
                 tmux_session=target_session,
                 user_record_ts=user_ts,
                 raw_text=user_text,
@@ -6874,30 +6880,62 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(502, {"ok": False, "reason": f"回滚驱动异常: {e}"})
             return
 
-        # 回滚成功：目标之后的 assistant 回复已从模型上下文撤掉，
-        # UI 侧也标记隐藏（复用 regenerate 的 hidden_in_ui 机制）。
-        hidden = 0
-        for rec in records:
-            if (
-                rec.get("role") == "assistant"
-                and str(rec.get("ts") or "") > user_ts
-                and not rec.get("hidden_in_ui")
-            ):
-                if chat.mark_regenerated(old_ts=str(rec.get("ts"))):
-                    hidden += 1
+        # 单飞锁必须覆盖整个异步流程（截断→重启→注入），不是只锁 handler。
+        if not rollback_driver.DRIVER_LOCK.acquire(blocking=False):
+            self._send_json(409, {"ok": False, "code": "in_progress", "reason": "已经有一个回滚正在执行，等它跑完。"})
+            return
 
+        set_typing = self._set_typing_for_contact  # 只碰 self.state，线程安全使用
         from datetime import datetime as _dt
-        self._set_typing_for_contact(contact_id, {"is_typing": True, "since": _dt.now().isoformat(timespec="milliseconds")})
-        logger.info(
-            "chat/rollback ok user_ts=%s ups=%s hidden=%d session=%s",
-            user_ts, info.get("ups"), hidden, target_session,
-        )
+
+        def _after_truncate(info: dict[str, Any]) -> None:
+            # 截断成功 = 目标之后的回复已从模型上下文撤掉，UI 侧标记隐藏
+            # （复用 regenerate 的 hidden_in_ui 机制）。
+            hidden = 0
+            for rec in records:
+                if (
+                    rec.get("role") == "assistant"
+                    and str(rec.get("ts") or "") > user_ts
+                    and not rec.get("hidden_in_ui")
+                ):
+                    if chat.mark_regenerated(old_ts=str(rec.get("ts"))):
+                        hidden += 1
+            info["hidden_assistant"] = hidden
+            logger.info("chat/rollback truncated new_sid=%s hidden=%d", info.get("new_sid"), hidden)
+
+        def _rollback_worker() -> None:
+            try:
+                info = rollback_driver.execute_rollback(plan, after_truncate=_after_truncate)
+                set_typing(contact_id, {"is_typing": True, "since": _dt.now().isoformat(timespec="milliseconds")})
+                logger.info(
+                    "chat/rollback ok user_ts=%s new_sid=%s hidden=%s session=%s",
+                    user_ts, info.get("new_sid"), info.get("hidden_assistant"), target_session,
+                )
+            except (rollback_driver.RollbackRefused, rollback_driver.RollbackError) as e:
+                logger.warning("chat/rollback async failed code=%s reason=%s", e.code, e.reason)
+                set_typing(contact_id, {"is_typing": False, "since": None})
+                try:
+                    chat.append(role="assistant", text=f"⚠️ 重roll失败：{e.reason}", source="rollback-system")
+                except Exception:
+                    logger.exception("chat/rollback failed to append failure notice")
+            except Exception as e:
+                logger.exception("chat/rollback async unexpected error")
+                set_typing(contact_id, {"is_typing": False, "since": None})
+                try:
+                    chat.append(role="assistant", text=f"⚠️ 重roll失败：{e}", source="rollback-system")
+                except Exception:
+                    logger.exception("chat/rollback failed to append failure notice")
+            finally:
+                rollback_driver.DRIVER_LOCK.release()
+
+        threading.Thread(target=_rollback_worker, name="chat-rollback", daemon=True).start()
+        set_typing(contact_id, {"is_typing": True, "since": _dt.now().isoformat(timespec="milliseconds")})
+        logger.info("chat/rollback started (async) user_ts=%s session=%s", user_ts, target_session)
         self._send_json(200, {
             "ok": True,
-            "message": "已回滚，正在重新生成",
+            "async": True,
+            "message": "回滚已启动，小克重启中（约1分钟）",
             "rolled_back_to": user_ts,
-            "ups": info.get("ups"),
-            "hidden_assistant": hidden,
         })
 
     def _handle_chat_append(self, body: dict[str, Any]):
