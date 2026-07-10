@@ -74,6 +74,17 @@ allowed_ips = []
 # Fallback is disabled by default because a transport failure after turn/start
 # may have already performed tools. The bridge only marks pre-start failures as safe.
 # codex_app_server_fallback_to_exec = false
+# Kairos App turns auto-forge after the completed reply has been persisted.
+# The old session is claimed at most once across service restarts.
+# codex_auto_forge_enabled = true
+# codex_auto_forge_threshold_percent = 80
+# codex_auto_forge_retain_messages = 80
+# Optional app-server config override. It is intentionally unset by default.
+# Codex 0.144 clamps oversized model_auto_compact_token_limit values to roughly
+# 90% of the model context window, so this cannot disable compaction. The 80%
+# post-turn auto forge above is the primary protection; thread/compacted also
+# forces a forge when Codex compacts first.
+# codex_app_server_model_auto_compact_token_limit = 1000000
 
 # CC Companion channel transport for /chat/send.
 # 默认关闭。开启后，普通 xiaoke 联系人的 /chat/send 会先 POST 到

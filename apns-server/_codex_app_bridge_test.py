@@ -27,16 +27,26 @@ def write(message):
     sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 
-def log(method):
+def log(method, params):
     with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"pid": os.getpid(), "method": method}) + "\n")
+        handle.write(json.dumps({"pid": os.getpid(), "method": method, "params": params}) + "\n")
+
+def token_usage(input_tokens):
+    breakdown = {
+        "inputTokens": input_tokens,
+        "cachedInputTokens": 100,
+        "outputTokens": 20,
+        "reasoningOutputTokens": 5,
+        "totalTokens": input_tokens + 25,
+    }
+    return {"total": breakdown, "last": breakdown, "modelContextWindow": 100000}
 
 for raw in sys.stdin:
     message = json.loads(raw)
     method = message.get("method", "")
-    log(method)
     request_id = message.get("id")
     params = message.get("params") or {}
+    log(method, params)
     if request_id is None:
         continue
     if method == "initialize":
@@ -48,6 +58,20 @@ for raw in sys.stdin:
             "result": {"thread": {"id": thread_id, "turns": []}},
         })
     elif method == "thread/resume":
+        write({
+            "jsonrpc": "2.0",
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": thread_id,
+                "turnId": "old-turn",
+                "tokenUsage": token_usage(99999),
+            },
+        })
+        write({
+            "jsonrpc": "2.0",
+            "method": "thread/compacted",
+            "params": {"threadId": thread_id, "turnId": "old-turn"},
+        })
         write({
             "jsonrpc": "2.0",
             "method": "item/completed",
@@ -85,6 +109,27 @@ for raw in sys.stdin:
             "id": request_id,
             "result": {"turn": {"id": active_turn, "items": [], "status": "inProgress"}},
         })
+        for usage_thread_id, usage_turn_id, input_tokens in [
+            ("wrong-thread", active_turn, 99000),
+            (thread_id, "wrong-turn", 98000),
+            (thread_id, active_turn, 70000),
+            (thread_id, active_turn, 80000),
+        ]:
+            write({
+                "jsonrpc": "2.0",
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "threadId": usage_thread_id,
+                    "turnId": usage_turn_id,
+                    "tokenUsage": token_usage(input_tokens),
+                },
+            })
+        if text == "compacted":
+            write({
+                "jsonrpc": "2.0",
+                "method": "thread/compacted",
+                "params": {"threadId": thread_id, "turnId": active_turn},
+            })
         write({
             "jsonrpc": "2.0",
             "method": "item/started",
@@ -182,6 +227,11 @@ class CodexAppBridgeTest(unittest.TestCase):
             return []
         return [json.loads(line)["method"] for line in self.log_path.read_text().splitlines()]
 
+    def rpc_entries(self):
+        if not self.log_path.exists():
+            return []
+        return [json.loads(line) for line in self.log_path.read_text().splitlines()]
+
     def run_normal(self, thread_id=None, marker_provider=None):
         updates = []
         activities = []
@@ -203,17 +253,62 @@ class CodexAppBridgeTest(unittest.TestCase):
         self.assertEqual(first.thread_id, "thread-test")
         self.assertEqual(first.status, "completed")
         self.assertEqual(first.text, "bridge-ok")
+        self.assertIsNotNone(first.token_usage)
+        self.assertEqual(first.token_usage.last.input_tokens, 80000)
+        self.assertEqual(first.token_usage.model_context_window, 100000)
         self.assertIn("bridge-ok", updates)
         self.assertIn("运行命令", activities)
 
         second, _, _ = self.run_normal(first.thread_id)
         self.assertEqual(second.status, "completed")
         self.assertEqual(second.text, "bridge-ok")
+        self.assertEqual(second.token_usage.last.input_tokens, 80000)
+        self.assertFalse(second.context_compacted)
         methods = self.methods()
         self.assertEqual(methods.count("initialize"), 1)
         self.assertIn("thread/start", methods)
         self.assertIn("thread/resume", methods)
         self.assertEqual(methods.count("turn/start"), 2)
+        thread_entries = [
+            entry for entry in self.rpc_entries()
+            if entry["method"] in {"thread/start", "thread/resume"}
+        ]
+        self.assertTrue(all(
+            "model_auto_compact_token_limit" not in entry["params"]["config"]
+            for entry in thread_entries
+        ))
+
+    def test_current_turn_compaction_is_returned(self):
+        result = self.bridge.run_turn(
+            thread_id=None,
+            cwd=self.root,
+            prompt="compacted",
+            model="gpt-test",
+            effort="high",
+        )
+        self.assertEqual(result.status, "completed")
+        self.assertTrue(result.context_compacted)
+
+    def test_optional_auto_compact_limit_is_sent_to_start_and_resume(self):
+        self.bridge.close()
+        self.bridge = CodexAppBridge(
+            command=[sys.executable, str(self.server_path), str(self.log_path)],
+            codex_home=str(self.root / "codex-home"),
+            request_timeout_sec=2.0,
+            model_auto_compact_token_limit=123456,
+        )
+        first, _, _ = self.run_normal()
+        self.run_normal(first.thread_id)
+        entries = [
+            entry for entry in self.rpc_entries()
+            if entry["method"] in {"thread/start", "thread/resume"}
+        ]
+        self.assertEqual(len(entries), 2)
+        for entry in entries:
+            self.assertEqual(
+                entry["params"]["config"]["model_auto_compact_token_limit"],
+                123456,
+            )
 
     def test_external_rollout_change_restarts_app_server(self):
         marker = [str(self.root / "rollout.jsonl"), 1, 10]

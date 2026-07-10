@@ -69,12 +69,64 @@ class _TransportError(CodexAppBridgeError):
 
 
 @dataclass(frozen=True)
+class CodexTokenUsageBreakdown:
+    input_tokens: int
+    cached_input_tokens: int
+    output_tokens: int
+    reasoning_output_tokens: int
+    total_tokens: int
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> CodexTokenUsageBreakdown | None:
+        if not isinstance(payload, dict):
+            return None
+        fields = {
+            "input_tokens": payload.get("inputTokens"),
+            "cached_input_tokens": payload.get("cachedInputTokens"),
+            "output_tokens": payload.get("outputTokens"),
+            "reasoning_output_tokens": payload.get("reasoningOutputTokens"),
+            "total_tokens": payload.get("totalTokens"),
+        }
+        if any(not isinstance(value, int) or isinstance(value, bool) for value in fields.values()):
+            return None
+        return cls(**fields)
+
+
+@dataclass(frozen=True)
+class CodexThreadTokenUsage:
+    total: CodexTokenUsageBreakdown
+    last: CodexTokenUsageBreakdown
+    model_context_window: int | None
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> CodexThreadTokenUsage | None:
+        if not isinstance(payload, dict):
+            return None
+        total = CodexTokenUsageBreakdown.from_payload(payload.get("total"))
+        last = CodexTokenUsageBreakdown.from_payload(payload.get("last"))
+        model_context_window = payload.get("modelContextWindow")
+        if total is None or last is None:
+            return None
+        if model_context_window is not None and (
+            not isinstance(model_context_window, int) or isinstance(model_context_window, bool)
+        ):
+            return None
+        return cls(
+            total=total,
+            last=last,
+            model_context_window=model_context_window,
+        )
+
+
+@dataclass(frozen=True)
 class CodexTurnResult:
     thread_id: str
     turn_id: str | None
     text: str
     status: str
     error: str | None = None
+    token_usage: CodexThreadTokenUsage | None = None
+    context_compacted: bool = False
 
 
 @dataclass
@@ -95,6 +147,8 @@ class _ActiveTurn:
     turn_id: str | None = None
     status: str | None = None
     error: str | None = None
+    token_usage: CodexThreadTokenUsage | None = None
+    context_compacted: bool = False
     connection_lost: bool = False
     interrupt_requested: bool = False
     interrupt_sent: bool = False
@@ -208,6 +262,7 @@ class CodexAppBridge:
         logger: logging.Logger | None = None,
         request_timeout_sec: float = 30.0,
         interrupt_grace_sec: float = 10.0,
+        model_auto_compact_token_limit: int | None = None,
     ) -> None:
         self.codex_bin = codex_bin
         self.codex_home = str(Path(codex_home).expanduser())
@@ -215,6 +270,11 @@ class CodexAppBridge:
         self.log = logger or logging.getLogger(__name__)
         self.request_timeout_sec = request_timeout_sec
         self.interrupt_grace_sec = max(0.1, float(interrupt_grace_sec))
+        self.model_auto_compact_token_limit = (
+            int(model_auto_compact_token_limit)
+            if model_auto_compact_token_limit is not None
+            else None
+        )
 
         self._connect_lock = threading.RLock()
         self._write_lock = threading.Lock()
@@ -562,12 +622,15 @@ class CodexAppBridge:
         model: str,
         effort: str,
     ) -> tuple[str, list[dict[str, Any]]]:
+        thread_config: dict[str, Any] = {"model_reasoning_effort": effort}
+        if self.model_auto_compact_token_limit is not None:
+            thread_config["model_auto_compact_token_limit"] = self.model_auto_compact_token_limit
         common = {
             "cwd": str(cwd),
             "model": model,
             "approvalPolicy": "never",
             "sandbox": "danger-full-access",
-            "config": {"model_reasoning_effort": effort},
+            "config": thread_config,
         }
         if thread_id:
             params = {"threadId": thread_id, **common}
@@ -857,8 +920,29 @@ class CodexAppBridge:
         with active.condition:
             if active.turn_id and turn_id and active.turn_id != turn_id:
                 return
-            if not active.turn_id and turn_id:
+            if (
+                not active.turn_id
+                and turn_id
+                and method not in {"thread/tokenUsage/updated", "thread/compacted"}
+            ):
                 active.turn_id = turn_id
+
+        if method in {"thread/tokenUsage/updated", "thread/compacted"}:
+            # These thread-level notifications can be replayed by thread/resume.
+            # Require both IDs to match the accepted active turn exactly.
+            if not active.thread_id or thread_id != active.thread_id:
+                return
+            with active.condition:
+                if not active.turn_id or turn_id != active.turn_id:
+                    return
+                if method == "thread/compacted":
+                    active.context_compacted = True
+                    return
+            token_usage = CodexThreadTokenUsage.from_payload(params.get("tokenUsage"))
+            if token_usage is not None:
+                with active.condition:
+                    active.token_usage = token_usage
+            return
 
         if method == "item/agentMessage/delta":
             item_id = str(params.get("itemId") or "")
@@ -919,6 +1003,9 @@ class CodexAppBridge:
                 if item_id in active.completed_items:
                     return
                 active.completed_items.add(item_id)
+        if completed and item_type == "contextCompaction":
+            with active.condition:
+                active.context_compacted = True
         if item_type == "agentMessage":
             phase = item.get("phase")
             if completed and phase in {None, "final_answer"}:
@@ -990,6 +1077,8 @@ class CodexAppBridge:
                 text=text,
                 status=str(active.status or "failed"),
                 error=active.error,
+                token_usage=active.token_usage,
+                context_compacted=active.context_compacted,
             )
 
     @staticmethod
@@ -1016,4 +1105,6 @@ class CodexAppBridge:
                 text=text,
                 status="uncertain",
                 error=detail,
+                token_usage=active.token_usage,
+                context_compacted=active.context_compacted,
             )

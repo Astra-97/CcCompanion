@@ -80,6 +80,7 @@ from codex_app_bridge import (
     CodexAppBridge,
     CodexAppBridgeError,
     CodexPromptLockBusy,
+    CodexThreadTokenUsage,
     prompt_lock_is_busy,
 )
 from timeline import Timeline
@@ -122,6 +123,244 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("cc-apns-server")
+
+
+AUTO_FORGE_CLAIM_HISTORY_LIMIT = 256
+AUTO_FORGE_SEEN_BITS = 131_072
+AUTO_FORGE_SEEN_HASHES = 5
+
+
+def _auto_forge_usage_percent(token_usage: CodexThreadTokenUsage | None) -> float | None:
+    if token_usage is None:
+        return None
+    window = token_usage.model_context_window
+    context_tokens = token_usage.last.total_tokens
+    if window is None or window <= 0 or context_tokens < 0:
+        return None
+    return context_tokens / window * 100.0
+
+
+def _should_auto_forge(
+    token_usage: CodexThreadTokenUsage | None,
+    *,
+    threshold_percent: float,
+    context_compacted: bool,
+) -> bool:
+    if context_compacted:
+        return True
+    usage_percent = _auto_forge_usage_percent(token_usage)
+    return usage_percent is not None and usage_percent >= threshold_percent
+
+
+class AutoForgeClaimStore:
+    """Cross-process once-only claims without persisting session IDs or prompts."""
+
+    def __init__(self, path: str | Path, *, history_limit: int = AUTO_FORGE_CLAIM_HISTORY_LIMIT):
+        self.path = Path(path).expanduser()
+        self.history_limit = max(16, int(history_limit))
+
+    @staticmethod
+    def _session_key(session_id: str) -> str:
+        return hashlib.sha256(f"cc-auto-forge-v1\0{session_id}".encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _seen_indices(key: str) -> list[int]:
+        digest = bytes.fromhex(key)
+        first = int.from_bytes(digest[:8], "big")
+        step = int.from_bytes(digest[8:16], "big") | 1
+        return [
+            (first + index * step) % AUTO_FORGE_SEEN_BITS
+            for index in range(AUTO_FORGE_SEEN_HASHES)
+        ]
+
+    @classmethod
+    def _seen_contains(cls, seen: bytearray, key: str) -> bool:
+        return all(seen[index // 8] & (1 << (index % 8)) for index in cls._seen_indices(key))
+
+    @classmethod
+    def _seen_add(cls, seen: bytearray, key: str) -> None:
+        for index in cls._seen_indices(key):
+            seen[index // 8] |= 1 << (index % 8)
+
+    @staticmethod
+    def _owner_is_alive(owner_pid: Any) -> bool:
+        try:
+            pid = int(owner_pid)
+        except (TypeError, ValueError):
+            return False
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def _load_unlocked(self) -> tuple[list[dict[str, Any]], bytearray]:
+        seen = bytearray(AUTO_FORGE_SEEN_BITS // 8)
+        if not self.path.exists():
+            return [], seen
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            return [], seen
+        claims = payload.get("claims") if isinstance(payload, dict) else None
+        if not isinstance(claims, list):
+            claims = []
+        clean_claims = [
+            item for item in claims
+            if isinstance(item, dict) and isinstance(item.get("key"), str)
+        ][-self.history_limit:]
+        version = payload.get("version") if isinstance(payload, dict) else None
+        seen_hex = payload.get("seen") if isinstance(payload, dict) else None
+        if version == 3 and isinstance(seen_hex, str):
+            try:
+                decoded = bytearray.fromhex(seen_hex)
+                if len(decoded) == len(seen):
+                    seen = decoded
+            except ValueError:
+                pass
+        # Rebuild pre-v3 files because v2 also marked in-progress claims seen.
+        # In-progress claims must stay recoverable when their owner disappears.
+        for item in clean_claims:
+            if item.get("status") == "claimed":
+                continue
+            try:
+                self._seen_add(seen, item["key"])
+            except (ValueError, TypeError):
+                continue
+        return clean_claims, seen
+
+    def _write_unlocked(self, claims: list[dict[str, Any]], seen: bytearray) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 3,
+            "seen": seen.hex(),
+            "claims": claims[-self.history_limit:],
+        }
+        tmp = self.path.with_name(
+            f".{self.path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+        )
+        tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        os.replace(str(tmp), str(self.path))
+
+    def claim(self, session_id: str) -> bool:
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return False
+        key = self._session_key(session_id)
+        with _locked_json_state(self.path, exclusive=True):
+            claims, seen = self._load_unlocked()
+            if self._seen_contains(seen, key):
+                return False
+            now = int(time.time())
+            existing = next(
+                (item for item in reversed(claims) if item.get("key") == key),
+                None,
+            )
+            if existing is not None:
+                if existing.get("status") != "claimed":
+                    return False
+                if self._owner_is_alive(existing.get("owner_pid")):
+                    return False
+                existing.update({
+                    "owner_pid": os.getpid(),
+                    "claimed_at": now,
+                    "updated_at": now,
+                    "recovered": True,
+                })
+            else:
+                claims.append({
+                    "key": key,
+                    "status": "claimed",
+                    "owner_pid": os.getpid(),
+                    "claimed_at": now,
+                    "updated_at": now,
+                })
+            self._write_unlocked(claims, seen)
+            return True
+
+    def finish(self, session_id: str, status: str) -> None:
+        key = self._session_key(str(session_id or "").strip())
+        clean_status = status if status in {"completed", "failed", "cancelled", "cas_failed"} else "failed"
+        with _locked_json_state(self.path, exclusive=True):
+            claims, seen = self._load_unlocked()
+            for item in reversed(claims):
+                if item.get("key") == key:
+                    item["status"] = clean_status
+                    item["updated_at"] = int(time.time())
+                    self._seen_add(seen, key)
+                    self._write_unlocked(claims, seen)
+                    return
+
+
+def _compare_and_swap_codex_target_state(
+    state_path: Path,
+    *,
+    shared_session_name: str,
+    user_id: str,
+    expected_session_id: str,
+    new_session_id: str,
+    cwd: Path,
+    source: str,
+) -> tuple[bool, str | None]:
+    """Atomically switch the shared/user pointer only if it still names the old thread."""
+    state_path = Path(state_path).expanduser()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    with _locked_json_state(state_path, exclusive=True):
+        data: dict[str, Any] = {}
+        if state_path.exists():
+            loaded = json.loads(state_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        shared_sessions = data.get("shared_sessions")
+        shared = (
+            shared_sessions.get(shared_session_name)
+            if isinstance(shared_sessions, dict)
+            else None
+        )
+        shared_current = str((shared or {}).get("active_session_id") or "").strip() or None
+        users = data.get("users")
+        user = users.get(user_id) if isinstance(users, dict) else None
+        user_current = str((user or {}).get("active_session_id") or "").strip() or None
+        observed = [value for value in (shared_current, user_current) if value]
+        mismatched = next(
+            (value for value in observed if value != expected_session_id),
+            None,
+        )
+        if not observed or mismatched is not None:
+            return False, mismatched or shared_current or user_current
+
+        if not isinstance(shared_sessions, dict):
+            shared_sessions = {}
+            data["shared_sessions"] = shared_sessions
+        shared = shared_sessions.get(shared_session_name)
+        if not isinstance(shared, dict):
+            shared = {}
+            shared_sessions[shared_session_name] = shared
+        shared["active_session_id"] = new_session_id
+        shared["active_cwd"] = str(cwd)
+        shared["updated_at"] = int(time.time())
+        shared["updated_by"] = source
+
+        if not isinstance(users, dict):
+            users = {}
+            data["users"] = users
+        user = users.get(user_id)
+        if not isinstance(user, dict):
+            user = {}
+            users[user_id] = user
+        user["active_session_id"] = new_session_id
+        user["active_cwd"] = str(cwd)
+
+        tmp = state_path.with_name(
+            f".{state_path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+        )
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(str(tmp), str(state_path))
+        return True, new_session_id
 
 
 class _CodexRunRegistry:
@@ -879,10 +1118,47 @@ class ServerState:
         self.codex_app_server_fallback_to_exec: bool = bool(
             server_cfg.get("codex_app_server_fallback_to_exec", False)
         )
+        self.codex_auto_forge_enabled: bool = bool(
+            server_cfg.get("codex_auto_forge_enabled", True)
+        )
+        try:
+            self.codex_auto_forge_threshold_percent = float(
+                server_cfg.get("codex_auto_forge_threshold_percent", 80.0)
+            )
+        except (TypeError, ValueError):
+            self.codex_auto_forge_threshold_percent = 80.0
+        if not 1.0 <= self.codex_auto_forge_threshold_percent <= 100.0:
+            logger.warning("invalid codex_auto_forge_threshold_percent; using 80")
+            self.codex_auto_forge_threshold_percent = 80.0
+        try:
+            retain_messages = int(server_cfg.get("codex_auto_forge_retain_messages", 80))
+        except (TypeError, ValueError):
+            retain_messages = 80
+        self.codex_auto_forge_retain_messages: int = max(20, min(160, retain_messages))
+        raw_compact_limit = server_cfg.get("codex_app_server_model_auto_compact_token_limit")
+        try:
+            self.codex_app_server_model_auto_compact_token_limit: int | None = (
+                int(raw_compact_limit) if raw_compact_limit not in {None, ""} else None
+            )
+        except (TypeError, ValueError):
+            logger.warning("invalid codex_app_server_model_auto_compact_token_limit; not overriding")
+            self.codex_app_server_model_auto_compact_token_limit = None
+        if (
+            self.codex_app_server_model_auto_compact_token_limit is not None
+            and self.codex_app_server_model_auto_compact_token_limit <= 0
+        ):
+            logger.warning("non-positive codex app-server compact limit; not overriding")
+            self.codex_app_server_model_auto_compact_token_limit = None
         self.codex_app_bridge = CodexAppBridge(
             codex_bin=self.codex_bin,
             codex_home=self.codex_home,
             logger=logger,
+            model_auto_compact_token_limit=(
+                self.codex_app_server_model_auto_compact_token_limit
+            ),
+        )
+        self.codex_auto_forge_claims = AutoForgeClaimStore(
+            Path(self.token_store_path).expanduser().parent / "codex_auto_forge.json"
         )
         group_chat_path = Path(self.token_store_path).parent / "group_chat.jsonl"
         group_state_path = Path(self.token_store_path).parent / "group_state.json"
@@ -5038,6 +5314,29 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.warning("save codex target failed: %s", e)
             return False
 
+    def _compare_and_swap_codex_target(
+        self,
+        old_session_id: str,
+        new_session_id: str,
+        cwd: Path,
+        source: str,
+    ) -> tuple[bool, str | None]:
+        cwd = self._codex_allowed_cwd(cwd)
+        try:
+            return _compare_and_swap_codex_target_state(
+                Path(self.state.codex_bot_state_path),
+                shared_session_name=self.state.codex_shared_session_name,
+                user_id=self.state.codex_user_id,
+                expected_session_id=old_session_id,
+                new_session_id=new_session_id,
+                cwd=cwd,
+                source=source,
+            )
+        except Exception as exc:
+            logger.warning("compare-and-swap codex target failed: %s", exc)
+            current, _ = self._load_codex_target()
+            return False, current
+
     def _codex_rollout_marker(self, session_id: str) -> tuple[str, int, int] | None:
         if not session_id:
             return None
@@ -5543,6 +5842,156 @@ class PushHandler(BaseHTTPRequestHandler):
         ])
         return "\n".join(lines)
 
+    @staticmethod
+    def _short_codex_session_id(session_id: str | None) -> str:
+        clean = str(session_id or "").strip()
+        return clean[:8] if clean else "无"
+
+    def _auto_forge_pointer_notice(self, old_session_id: str) -> str:
+        current_session_id, _ = self._load_codex_target()
+        old_short = self._short_codex_session_id(old_session_id)
+        current_short = self._short_codex_session_id(current_session_id)
+        if current_session_id == old_session_id:
+            return f"旧 session {old_short} 仍保持 active"
+        return f"当前 pointer 为 {current_short}，未被覆盖"
+
+    def _run_kairos_auto_forge(
+        self,
+        *,
+        old_session_id: str,
+        cwd: Path,
+        token_usage: CodexThreadTokenUsage | None,
+        context_compacted: bool,
+        cancel_event: threading.Event,
+    ) -> bool:
+        """Run a new app-server thread synchronously while the Kairos queue lock is held."""
+        chat = self.state.contact_chats["kairos"]
+        claims = self.state.codex_auto_forge_claims
+        usage_percent = _auto_forge_usage_percent(token_usage)
+        usage_label = f"{usage_percent:.1f}%" if usage_percent is not None else "比例未知"
+        reason = (
+            f"系统压缩已先发生，最新上下文用量 {usage_label}"
+            if context_compacted
+            else f"上下文用量 {usage_label}"
+        )
+        old_short = self._short_codex_session_id(old_session_id)
+
+        try:
+            claimed = claims.claim(old_session_id)
+        except Exception:
+            logger.exception("auto forge claim failed old_session=%s", old_session_id)
+            chat.append(
+                role="assistant",
+                text=(
+                    f"Kairos 自动 forge 未启动（{reason}）：去重状态写入失败；"
+                    f"{self._auto_forge_pointer_notice(old_session_id)}。"
+                ),
+                source="codex:kairos:auto-forge",
+            )
+            return False
+        if not claimed:
+            return False
+
+        def _finish(status: str) -> None:
+            try:
+                claims.finish(old_session_id, status)
+            except Exception:
+                logger.exception("auto forge result persistence failed old_session=%s", old_session_id)
+
+        def _append_failure(message: str, status: str = "failed") -> bool:
+            _finish(status)
+            chat.append(
+                role="assistant",
+                text=(
+                    f"Kairos 自动 forge {message}（{reason}，旧 {old_short}）；"
+                    f"{self._auto_forge_pointer_notice(old_session_id)}。"
+                ),
+                source="codex:kairos:auto-forge",
+            )
+            return False
+
+        if cancel_event.is_set():
+            return _append_failure("已取消", "cancelled")
+
+        try:
+            sys.path.insert(0, "/root/Windows-Codex-TG")
+            from codex_common import SessionStore
+
+            default_root = Path(self.state.codex_home).expanduser() / "sessions"
+            root = Path(os.environ.get("CODEX_SESSION_ROOT", str(default_root))).expanduser()
+            session_store = SessionStore(root)
+            meta, messages = session_store.get_history(
+                old_session_id,
+                limit=self.state.codex_auto_forge_retain_messages,
+            )
+            if not meta:
+                return _append_failure("失败：读不到旧 session 历史")
+            prompt = self._build_codex_forge_prompt(old_session_id, cwd, messages)
+            result = self.state.codex_app_bridge.run_turn(
+                thread_id=None,
+                cwd=cwd,
+                prompt=prompt,
+                model=self.state.codex_model,
+                effort=self.state.codex_reasoning_effort,
+                cancel_event=cancel_event,
+                max_runtime_sec=900,
+            )
+            if cancel_event.is_set() or result.status == "interrupted":
+                return _append_failure("已取消", "cancelled")
+            new_session_id = str(result.thread_id or "").strip()
+            if result.status != "completed" or not new_session_id or new_session_id == old_session_id:
+                logger.warning(
+                    "auto forge handoff failed old_session=%s status=%s error=%s",
+                    old_session_id,
+                    result.status,
+                    str(result.error or "")[:500],
+                )
+                return _append_failure("失败：新 thread 未完成交接")
+
+            switched, current_session_id = self._compare_and_swap_codex_target(
+                old_session_id,
+                new_session_id,
+                cwd,
+                "cc-app:kairos:auto-forge",
+            )
+            new_short = self._short_codex_session_id(new_session_id)
+            if not switched:
+                _finish("cas_failed")
+                current_short = self._short_codex_session_id(current_session_id)
+                chat.append(
+                    role="assistant",
+                    text=(
+                        f"Kairos 自动 forge 已生成新 session，但 CAS 切换取消（{reason}）："
+                        f"旧 {old_short}，新 {new_short}；当前 pointer 为 {current_short}，未覆盖。"
+                    ),
+                    source="codex:kairos:auto-forge",
+                )
+                return False
+            try:
+                session_store.mark_as_desktop_session(new_session_id)
+            except Exception:
+                logger.debug("mark auto-forged Codex session failed", exc_info=True)
+            _finish("completed")
+            chat.append(
+                role="assistant",
+                text=(
+                    f"Kairos 自动 forge 完成（{reason}）：旧 {old_short} → 新 {new_short}，"
+                    "active pointer 已原子切换。"
+                ),
+                source="codex:kairos:auto-forge",
+            )
+            logger.info(
+                "auto forge completed old_session=%s new_session=%s usage_percent=%s compacted=%s",
+                old_session_id,
+                new_session_id,
+                usage_percent,
+                context_compacted,
+            )
+            return True
+        except Exception:
+            logger.exception("kairos auto forge failed old_session=%s", old_session_id)
+            return _append_failure("异常失败")
+
     def _run_codex_forge_worker(
         self,
         run_id: str,
@@ -5915,6 +6364,8 @@ class PushHandler(BaseHTTPRequestHandler):
 
                 image_paths = [Path(p) for p in task.get("image_paths") or [] if str(p).strip()]
                 bridge_status: str | None = None
+                bridge_token_usage: CodexThreadTokenUsage | None = None
+                bridge_context_compacted = False
                 while True:
                     if time.monotonic() - wait_started_at >= max_queue_wait_sec:
                         _append_assistant("这条消息排队超过 15 分钟还没轮到，我先标记失败。你可以直接重发。")
@@ -5940,6 +6391,8 @@ class PushHandler(BaseHTTPRequestHandler):
                             answer = bridge_result.text
                             stderr_text = bridge_result.error or ""
                             bridge_status = bridge_result.status
+                            bridge_token_usage = bridge_result.token_usage
+                            bridge_context_compacted = bridge_result.context_compacted
                             return_code = 0 if bridge_status == "completed" else 1
                         except CodexPromptLockBusy:
                             thread_id = session_id
@@ -6044,6 +6497,24 @@ class PushHandler(BaseHTTPRequestHandler):
                     logger.warning("kairos codex return_code=%s stderr=%s", return_code, stderr_text[-800:])
                 answer = (answer or "").strip() or _current_draft_text() or "Kairos 没有返回可展示内容。"
                 _append_assistant(answer)
+                if (
+                    contact_id == "kairos"
+                    and self.state.codex_auto_forge_enabled
+                    and bridge_status == "completed"
+                    and thread_id
+                    and _should_auto_forge(
+                        bridge_token_usage,
+                        threshold_percent=self.state.codex_auto_forge_threshold_percent,
+                        context_compacted=bridge_context_compacted,
+                    )
+                ):
+                    self._run_kairos_auto_forge(
+                        old_session_id=thread_id,
+                        cwd=cwd,
+                        token_usage=bridge_token_usage,
+                        context_compacted=bridge_context_compacted,
+                        cancel_event=cancel_event,
+                    )
             except Exception:
                 logger.exception("kairos codex queue worker failed")
                 _append_assistant("Kairos 接入出错：后端生成进程异常退出。你可以重发这条，我不会让它静默消失。")
