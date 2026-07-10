@@ -64,6 +64,16 @@ allowed_ips = []
 # codex_bot_state_path = "/root/Windows-Codex-TG/.runtime/bot_state.json"
 # codex_user_id = "8715009653"
 # codex_shared_session_name = "kairos"
+# codex_bin = "/usr/bin/codex"
+# codex_home = "/root/.codex"
+# codex_model = "gpt-5.5"
+# codex_reasoning_effort = "high"
+# `app-server` keeps one Codex app-server child and resumes the same thread.
+# Set `legacy-exec` only as a temporary rollback switch.
+# codex_kairos_backend = "app-server"
+# Fallback is disabled by default because a transport failure after turn/start
+# may have already performed tools. The bridge only marks pre-start failures as safe.
+# codex_app_server_fallback_to_exec = false
 
 # CC Companion channel transport for /chat/send.
 # 默认关闭。开启后，普通 xiaoke 联系人的 /chat/send 会先 POST 到

@@ -76,6 +76,12 @@ from worklog import Worklog
 from reminders import ReminderStore
 from tool_dispatcher import ScheduleStore, ToolDispatcher, DEFAULT_SCHEDULE
 import rollback_driver
+from codex_app_bridge import (
+    CodexAppBridge,
+    CodexAppBridgeError,
+    CodexPromptLockBusy,
+    prompt_lock_is_busy,
+)
 from timeline import Timeline
 from tts import TTS
 from settings import Settings
@@ -864,6 +870,20 @@ class ServerState:
         self.codex_home: str = server_cfg.get("codex_home", "/root/.codex")
         self.codex_model: str = server_cfg.get("codex_model", "gpt-5.5")
         self.codex_reasoning_effort: str = server_cfg.get("codex_reasoning_effort", "high")
+        self.codex_kairos_backend: str = str(
+            server_cfg.get("codex_kairos_backend", "app-server") or "app-server"
+        ).strip().lower()
+        if self.codex_kairos_backend not in {"app-server", "legacy-exec"}:
+            logger.warning("invalid codex_kairos_backend; using app-server")
+            self.codex_kairos_backend = "app-server"
+        self.codex_app_server_fallback_to_exec: bool = bool(
+            server_cfg.get("codex_app_server_fallback_to_exec", False)
+        )
+        self.codex_app_bridge = CodexAppBridge(
+            codex_bin=self.codex_bin,
+            codex_home=self.codex_home,
+            logger=logger,
+        )
         group_chat_path = Path(self.token_store_path).parent / "group_chat.jsonl"
         group_state_path = Path(self.token_store_path).parent / "group_state.json"
         self.group_chat = GroupChatStore(group_chat_path, group_state_path)
@@ -1209,6 +1229,7 @@ class ServerState:
             return None
 
     def shutdown(self):
+        self.codex_app_bridge.close()
         if self.client:
             self.client.close()
 
@@ -4978,7 +4999,7 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception:
             return base
 
-    def _save_codex_target(self, session_id: str | None, cwd: Path, source: str) -> None:
+    def _save_codex_target(self, session_id: str | None, cwd: Path, source: str) -> bool:
         state_path = Path(self.state.codex_bot_state_path).expanduser()
         cwd = self._codex_allowed_cwd(cwd)
         try:
@@ -5012,11 +5033,39 @@ class PushHandler(BaseHTTPRequestHandler):
                 tmp = state_path.with_name(f".{state_path.name}.tmp.{os.getpid()}")
                 tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
                 os.replace(str(tmp), str(state_path))
+            return True
         except Exception as e:
             logger.warning("save codex target failed: %s", e)
+            return False
+
+    def _codex_rollout_marker(self, session_id: str) -> tuple[str, int, int] | None:
+        if not session_id:
+            return None
+        try:
+            sys.path.insert(0, "/root/Windows-Codex-TG")
+            from codex_common import SessionStore
+
+            default_root = Path(self.state.codex_home).expanduser() / "sessions"
+            root = Path(os.environ.get("CODEX_SESSION_ROOT", str(default_root))).expanduser()
+            meta = SessionStore(root).find_by_id(session_id)
+            if not meta:
+                return None
+            path = Path(meta.file_path)
+            stat = path.stat()
+            return str(path), stat.st_mtime_ns, stat.st_size
+        except Exception:
+            logger.debug("read Codex rollout marker failed session_id=%s", session_id, exc_info=True)
+            return None
 
     def _codex_session_busy(self, session_id: str | None) -> bool:
-        return bool(self._codex_exec_processes(session_id=session_id))
+        bridge = self.state.codex_app_bridge.snapshot()
+        if bridge.get("busy"):
+            return True
+        _, cwd = self._load_codex_target()
+        return bool(
+            self._codex_exec_processes(session_id=session_id)
+            or prompt_lock_is_busy(session_id, cwd)
+        )
 
     def _codex_exec_processes(
         self,
@@ -5072,6 +5121,7 @@ class PushHandler(BaseHTTPRequestHandler):
         session_id, cwd = self._load_codex_target()
         cwd = self._codex_allowed_cwd(cwd)
         run = CODEX_RUNS.latest()
+        bridge = self.state.codex_app_bridge.snapshot()
         scan_session_id = session_id
         scan_cwd: Path | None = None
         if run:
@@ -5080,7 +5130,8 @@ class PushHandler(BaseHTTPRequestHandler):
         processes = self._codex_exec_processes(session_id=scan_session_id, cwd=scan_cwd)
         if not run and not processes:
             processes = self._codex_exec_processes(cwd=cwd)
-        busy = bool(run or processes)
+        busy = bool(run or processes or bridge.get("busy"))
+        bridge_busy = bool(bridge.get("busy"))
         payload = {
             "ok": True,
             "active_session_id": session_id,
@@ -5088,10 +5139,16 @@ class PushHandler(BaseHTTPRequestHandler):
             "model": self.state.codex_model,
             "reasoning_effort": self.state.codex_reasoning_effort,
             "busy": busy,
-            "busy_pid": processes[0]["pid"] if processes else None,
-            "busy_session_id": scan_session_id,
-            "busy_source": run.get("source") if run else ("process-scan" if processes else None),
-            "busy_started_at": run.get("started_at") if run else None,
+            "busy_pid": processes[0]["pid"] if processes else (bridge.get("pid") if bridge_busy else None),
+            "busy_session_id": bridge.get("thread_id") if bridge_busy else scan_session_id,
+            "busy_turn_id": bridge.get("turn_id") if bridge_busy else None,
+            "busy_phase": bridge.get("phase") if bridge_busy else None,
+            "busy_source": run.get("source") if run else (
+                "app-server-bridge" if bridge_busy else ("process-scan" if processes else None)
+            ),
+            "busy_started_at": run.get("started_at") if run else (
+                bridge.get("started_at") if bridge_busy else None
+            ),
         }
         payload.update(self._codex_runtime_detail(session_id, cwd))
         return payload
@@ -5366,6 +5423,7 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _handle_codex_abort(self, body: dict[str, Any]):
         run = CODEX_RUNS.cancel_latest()
+        bridge_interrupted = self.state.codex_app_bridge.interrupt_active()
         session_id, cwd = self._load_codex_target()
         cwd = self._codex_allowed_cwd(cwd)
         target_session_id = str((run or {}).get("session_id") or session_id or "").strip() or None
@@ -5378,13 +5436,15 @@ class PushHandler(BaseHTTPRequestHandler):
             killed = self._terminate_codex_processes(processes)
         self._set_typing_for_contact("kairos", {"is_typing": False, "since": None})
         self._set_typing_for_contact("apples", {"is_typing": False, "since": None})
-        action = "cancel_event" if run else ("terminated_process" if killed else "none")
+        action = "turn_interrupt" if bridge_interrupted else (
+            "cancel_event" if run else ("terminated_process" if killed else "none")
+        )
         self._send_json(200, {
-            "ok": bool(run or killed),
+            "ok": bool(run or bridge_interrupted or killed),
             "action": action,
             "session_id": target_session_id,
             "pid": processes[0]["pid"] if processes else None,
-            "message": "已请求中断 Kairos Codex 生成。" if (run or killed) else "当前没有 CcCompanion 可中断的 Kairos Codex 生成。",
+            "message": "已请求中断 Kairos Codex 生成。" if (run or bridge_interrupted or killed) else "当前没有 CcCompanion 可中断的 Kairos Codex 生成。",
         })
 
     def _handle_codex_new_session(self, body: dict[str, Any]):
@@ -5417,7 +5477,7 @@ class PushHandler(BaseHTTPRequestHandler):
         if not old_session_id:
             self._send_json(400, {"ok": False, "error": "当前没有 active Kairos session。"})
             return
-        if CODEX_RUNS.latest() or self._codex_exec_processes(cwd=cwd):
+        if CODEX_RUNS.latest() or self.state.codex_app_bridge.snapshot().get("busy") or self._codex_exec_processes(cwd=cwd):
             self._send_json(409, {"ok": False, "error": "Kairos 正在生成中，请稍后再 forge。"})
             return
         history_limit = self._parse_codex_forge_limit(body.get("retain"))
@@ -5679,6 +5739,25 @@ class PushHandler(BaseHTTPRequestHandler):
             self._set_chat_interrupted(contact_id, user_ts=user_ts, source=source, session_id=session_id)
             self.state.clear_kairos_pending_run(user_ts)
 
+        def _append_uncertain_draft(detail: str) -> None:
+            nonlocal assistant_appended
+            _append_activity_card()
+            draft_text = _current_draft_text()
+            notice = (
+                "[app-server 连接中断，当前 turn 的最终状态无法确认。"
+                "为避免重复执行工具，这条消息不会自动重放。]"
+            )
+            message = f"{draft_text}\n\n{notice}" if draft_text else notice
+            chat.append(role="assistant", text=message, source=f"{source}:uncertain")
+            assistant_appended = True
+            self._set_chat_interrupted(
+                contact_id,
+                user_ts=user_ts,
+                source=f"{source}:uncertain",
+                session_id=session_id,
+            )
+            self.state.clear_kairos_pending_run(user_ts)
+
         lock = getattr(type(self), "_kairos_codex_lock", None)
         if lock is None:
             lock = threading.Lock()
@@ -5747,6 +5826,12 @@ class PushHandler(BaseHTTPRequestHandler):
                         activity_items=activity_items,
                     )
                     self.state.update_kairos_pending_draft(contact_id, user_ts, live_text)
+
+                def _on_thread(new_thread_id: str) -> None:
+                    nonlocal session_id
+                    if not self._save_codex_target(new_thread_id, cwd, "cc-app:kairos:app-server"):
+                        raise CodexAppBridgeError("failed to persist app-server thread pointer")
+                    session_id = new_thread_id
 
                 def _on_activity(activity_text: str) -> None:
                     nonlocal activity_count
@@ -5829,23 +5914,86 @@ class PushHandler(BaseHTTPRequestHandler):
                         logger.debug("harvest MCP session activities failed", exc_info=True)
 
                 image_paths = [Path(p) for p in task.get("image_paths") or [] if str(p).strip()]
+                bridge_status: str | None = None
                 while True:
                     if time.monotonic() - wait_started_at >= max_queue_wait_sec:
                         _append_assistant("这条消息排队超过 15 分钟还没轮到，我先标记失败。你可以直接重发。")
                         return
-                    session_marker = _codex_session_marker(session_id)
-                    thread_id, answer, stderr_text, return_code = runner.run_prompt(
-                        prompt=prompt,
-                        cwd=cwd,
-                        session_id=session_id,
-                        env_overrides=env_overrides,
-                        cancel_event=cancel_event,
-                        on_update=_on_update,
-                        on_activity=_on_activity,
-                        image_paths=image_paths,
-                        max_runtime_sec=900,
-                    )
-                    _harvest_mcp_session_activities(session_marker, thread_id or session_id)
+                    backend = self.state.codex_kairos_backend
+                    if backend == "app-server":
+                        try:
+                            bridge_result = self.state.codex_app_bridge.run_turn(
+                                thread_id=session_id,
+                                cwd=cwd,
+                                prompt=prompt,
+                                model=self.state.codex_model,
+                                effort=self.state.codex_reasoning_effort,
+                                image_paths=image_paths,
+                                cancel_event=cancel_event,
+                                on_update=_on_update,
+                                on_activity=_on_activity,
+                                on_thread=_on_thread,
+                                marker_provider=self._codex_rollout_marker,
+                                max_runtime_sec=900,
+                            )
+                            thread_id = bridge_result.thread_id
+                            answer = bridge_result.text
+                            stderr_text = bridge_result.error or ""
+                            bridge_status = bridge_result.status
+                            return_code = 0 if bridge_status == "completed" else 1
+                        except CodexPromptLockBusy:
+                            thread_id = session_id
+                            answer = "同一个 Kairos session 正在另一边生成中。"
+                            stderr_text = ""
+                            return_code = 0
+                            bridge_status = "busy"
+                        except CodexAppBridgeError as exc:
+                            logger.warning(
+                                "kairos app-server failure fallback_safe=%s uncertain=%s error=%s",
+                                exc.fallback_safe,
+                                exc.uncertain,
+                                str(exc)[:500],
+                            )
+                            if exc.uncertain:
+                                _append_uncertain_draft(str(exc))
+                                return
+                            if not (self.state.codex_app_server_fallback_to_exec and exc.fallback_safe):
+                                _append_assistant(
+                                    "Kairos 的 app-server 接入失败了，这条消息没有进入模型。"
+                                    "我没有自动切回旧链路，避免在状态不明时重复执行。",
+                                    append_source=f"{source}:app-server-error",
+                                )
+                                return
+                            logger.warning("kairos app-server pre-start failure; using legacy exec fallback")
+                            session_marker = _codex_session_marker(session_id)
+                            thread_id, answer, stderr_text, return_code = runner.run_prompt(
+                                prompt=prompt,
+                                cwd=cwd,
+                                session_id=session_id,
+                                env_overrides=env_overrides,
+                                cancel_event=cancel_event,
+                                on_update=_on_update,
+                                on_activity=_on_activity,
+                                image_paths=image_paths,
+                                max_runtime_sec=900,
+                            )
+                            _harvest_mcp_session_activities(session_marker, thread_id or session_id)
+                            bridge_status = None
+                    else:
+                        session_marker = _codex_session_marker(session_id)
+                        thread_id, answer, stderr_text, return_code = runner.run_prompt(
+                            prompt=prompt,
+                            cwd=cwd,
+                            session_id=session_id,
+                            env_overrides=env_overrides,
+                            cancel_event=cancel_event,
+                            on_update=_on_update,
+                            on_activity=_on_activity,
+                            image_paths=image_paths,
+                            max_runtime_sec=900,
+                        )
+                        _harvest_mcp_session_activities(session_marker, thread_id or session_id)
+                        bridge_status = None
                     if not self._is_codex_prompt_busy_answer(answer):
                         break
                     if run_id:
@@ -5877,11 +6025,24 @@ class PushHandler(BaseHTTPRequestHandler):
                 if cancel_event and cancel_event.is_set():
                     _append_interrupted_draft()
                     return
+                if bridge_status == "interrupted":
+                    _append_interrupted_draft()
+                    return
+                if bridge_status == "uncertain":
+                    _append_uncertain_draft(stderr_text)
+                    return
+                if bridge_status == "failed":
+                    logger.warning("kairos app-server turn failed error=%s", stderr_text[:500])
+                    _append_assistant(
+                        "Kairos 这次生成失败了，app-server 已保留原 thread；你可以重发这条消息。",
+                        append_source=f"{source}:app-server-failed",
+                    )
+                    return
                 if thread_id:
                     self._save_codex_target(thread_id, cwd, "cc-app:kairos")
                 if return_code != 0 and stderr_text:
                     logger.warning("kairos codex return_code=%s stderr=%s", return_code, stderr_text[-800:])
-                answer = (answer or "").strip() or "Kairos 没有返回可展示内容。"
+                answer = (answer or "").strip() or _current_draft_text() or "Kairos 没有返回可展示内容。"
                 _append_assistant(answer)
             except Exception:
                 logger.exception("kairos codex queue worker failed")
