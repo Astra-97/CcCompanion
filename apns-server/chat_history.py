@@ -28,6 +28,37 @@ from typing import Any
 logger = logging.getLogger("cc-apns-server.chat_history")
 
 
+class ChatStreamBus:
+    """流式回复广播 - App 连 GET /chat/stream (SSE) listen.
+
+    cc-companion-channel 的 reply_chunk/reply_done 转发到
+    POST /chat/stream_chunk → publish 到这里 → SSE 推给在线 client.
+    事件 schema: {event: "chunk"|"done", stream_id, contact_id, text, seq?, ts}
+    done 事件的 text 是完整合并稿, client 丢 chunk 也能在 done 自愈.
+    """
+
+    def __init__(self):
+        self._subscribers: list[deque[dict[str, Any]]] = []
+        self._lock = threading.Lock()
+
+    def subscribe(self) -> deque[dict[str, Any]]:
+        q: deque[dict[str, Any]] = deque(maxlen=50)
+        with self._lock:
+            self._subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q: deque[dict[str, Any]]):
+        # 注意用身份比较: list.remove 走 __eq__, 两个内容相同的 deque 会误删别人的队列
+        with self._lock:
+            self._subscribers = [s for s in self._subscribers if s is not q]
+
+    def publish(self, rec: dict[str, Any]):
+        with self._lock:
+            subs = list(self._subscribers)
+        for q in subs:
+            q.append(rec)
+
+
 class EphemeralTaskBuffer:
     """In-memory task capsule buffer. Not persisted; reset on server restart."""
 
