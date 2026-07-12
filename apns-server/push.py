@@ -65,7 +65,7 @@ from apns_client import APNsClient, APNsResponse
 from token_store import TokenStore
 from device_token_store import DeviceTokenStore
 from task_queue import TaskQueue
-from chat_history import ChatHistory, EphemeralTaskBuffer
+from chat_history import ChatHistory, ChatStreamBus, EphemeralTaskBuffer
 from diary_stream import DiaryStream
 from group_chat import GroupChatStore
 from calendar_store import CalendarStore, CATEGORIES, CATEGORY_LABELS
@@ -1168,6 +1168,8 @@ class ServerState:
         self.rp_history = RPHistory("/tmp")
         self.ai_chat = AIChatManager(HERE / "state")
         self.task_buffer = EphemeralTaskBuffer(capacity=100)
+        # 流式回复广播 (2026-07-12): channel reply_chunk → /chat/stream_chunk → SSE
+        self.chat_stream_bus = ChatStreamBus()
         # Handy-Clawd pet state (2026-05-08 用户 push)
         from pet_state import PetState, PetStateBus, PetBubbleBus, PetActivityBus
         pet_state_path = Path(self.token_store_path).parent / "pet_state.json"
@@ -2358,6 +2360,9 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path == "/chat/status":
             self._handle_chat_status()
             return
+        if self.path.startswith("/chat/stream"):
+            self._handle_chat_stream()
+            return
         if self.path == "/codex/status":
             self._handle_codex_status()
             return
@@ -2815,6 +2820,8 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_pet_activity_post(body)
         elif self.path == "/chat/append":
             self._handle_chat_append(body)
+        elif self.path == "/chat/stream_chunk":
+            self._handle_chat_stream_chunk(body)
         elif self.path == "/chain/abort":
             # P0-2: remote control gate
             if not self.state.allow_remote_control:
@@ -7245,6 +7252,85 @@ class PushHandler(BaseHTTPRequestHandler):
         finally:
             self.state.pet_bus.unsubscribe(q)
             self.state.pet_bubble_bus.unsubscribe(bq)
+
+    def _handle_chat_stream_chunk(self, body: dict[str, Any]):
+        """POST /chat/stream_chunk — cc-companion-channel 转发 reply_chunk/reply_done.
+        body: {event: "chunk"|"done", stream_id, contact_id?, text, seq?, ts?}
+        chunk.text 是增量片段; done.text 是完整合并稿 (client 自愈用).
+        Auth: 走 do_POST 顶层 _require_write_auth.
+        """
+        event = str(body.get("event") or "").strip()
+        if event not in ("chunk", "done"):
+            self._send_json(400, {"error": "event must be chunk or done"})
+            return
+        stream_id = str(body.get("stream_id") or "").strip()
+        if not stream_id:
+            self._send_json(400, {"error": "stream_id required"})
+            return
+        text = body.get("text")
+        if not isinstance(text, str):
+            self._send_json(400, {"error": "text must be a string"})
+            return
+        ts = str(body.get("ts") or "")
+        if not ts:
+            tz = timezone(timedelta(hours=8))
+            ts = datetime.now(tz).isoformat(timespec="milliseconds")
+        rec: dict[str, Any] = {
+            "event": event,
+            "stream_id": stream_id,
+            "contact_id": self._clean_contact_id(body.get("contact_id")),
+            "text": text,
+            "ts": ts,
+        }
+        seq = body.get("seq")
+        if isinstance(seq, int):
+            rec["seq"] = seq
+        if event == "done":
+            rec["persisted"] = bool(body.get("persisted", True))
+        self.state.chat_stream_bus.publish(rec)
+        self._send_json(200, {"ok": True})
+
+    def _handle_chat_stream(self):
+        """GET /chat/stream?contact_id=xiaoke — SSE 实时推流式回复 chunk.
+        Auth: 走 do_GET 顶层 _require_auth (同 /chat/history).
+        client 断线靠现有 2s history polling 兜底, 不丢最终稿.
+        """
+        import time as _t
+        contact_filter = self._contact_id_from_query()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        try:
+            self.wfile.write(f"data: {json.dumps({'event': 'connected', 'contact_id': contact_filter}, ensure_ascii=False)}\n\n".encode("utf-8"))
+            self.wfile.flush()
+        except Exception:
+            return
+        q = self.state.chat_stream_bus.subscribe()
+        try:
+            while True:
+                wrote = False
+                if q:
+                    rec = q.popleft()
+                    if rec.get("contact_id") != contact_filter:
+                        continue
+                    try:
+                        self.wfile.write(f"data: {json.dumps(rec, ensure_ascii=False)}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                        wrote = True
+                    except Exception:
+                        break
+                if not wrote:
+                    try:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                    except Exception:
+                        break
+                    _t.sleep(1.0)
+        finally:
+            self.state.chat_stream_bus.unsubscribe(q)
 
     def _handle_pet_activity_post(self, body: dict[str, Any]):
         """POST /pet/activity — chain hook 推 streaming terminal display 行.
