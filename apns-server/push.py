@@ -2000,7 +2000,10 @@ class PushHandler(BaseHTTPRequestHandler):
             }.get(state_name, "")
         return {
             "contact_id": contact_id,
-            "is_active": bool(draft.get("is_active")),
+            # Foreground turn lifecycle starts before the first answer delta.
+            # `draft.is_active` only means partial text exists, so relying on it
+            # hides queued/generating feedback and Stop until content arrives.
+            "is_active": state_name in {"queued", "generating"},
             "text": str(draft.get("text") or ""),
             "updated_at": draft.get("updated_at") or reply_state.get("updated_at"),
             "source": draft.get("source") or "",
@@ -6350,7 +6353,12 @@ class PushHandler(BaseHTTPRequestHandler):
         def _append_assistant(message: str, append_source: str = source) -> None:
             nonlocal assistant_appended
             _append_activity_card()
-            assistant_rec = chat.append(role="assistant", text=message, source=append_source)
+            assistant_rec = chat.append(
+                role="assistant",
+                text=message,
+                source=append_source,
+                metadata={"kairos_user_ts": user_ts} if user_ts else None,
+            )
             assistant_appended = True
             self._set_chat_completed(
                 contact_id,
@@ -6378,7 +6386,12 @@ class PushHandler(BaseHTTPRequestHandler):
                 )
             else:
                 message = "已中断当前生成。"
-            interrupted_rec = chat.append(role="assistant", text=message, source=f"{source}:interrupted")
+            interrupted_rec = chat.append(
+                role="assistant",
+                text=message,
+                source=f"{source}:interrupted",
+                metadata={"kairos_user_ts": user_ts} if user_ts else None,
+            )
             assistant_appended = True
             self._set_chat_interrupted(
                 contact_id,
@@ -6398,7 +6411,12 @@ class PushHandler(BaseHTTPRequestHandler):
                 "为避免重复执行工具，这条消息不会自动重放。]"
             )
             message = f"{draft_text}\n\n{notice}" if draft_text else notice
-            chat.append(role="assistant", text=message, source=f"{source}:uncertain")
+            chat.append(
+                role="assistant",
+                text=message,
+                source=f"{source}:uncertain",
+                metadata={"kairos_user_ts": user_ts} if user_ts else None,
+            )
             assistant_appended = True
             self._set_chat_interrupted(
                 contact_id,

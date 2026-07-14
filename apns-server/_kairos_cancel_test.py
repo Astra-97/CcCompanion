@@ -169,7 +169,9 @@ class KairosCancelTest(unittest.TestCase):
 
         handler._process_kairos_task(task, task_cancel_event=event)
 
-        self.assertEqual(handler.state.contact_chats["kairos"].records[-1]["role"], "assistant")
+        final = handler.state.contact_chats["kairos"].records[-1]
+        self.assertEqual(final["role"], "assistant")
+        self.assertEqual(final["metadata"]["kairos_user_ts"], "u-pre")
         self.assertTrue(handler.interrupted)
 
     def test_interrupted_snapshot_freezes_draft_until_short_expiry(self):
@@ -222,6 +224,49 @@ class KairosCancelTest(unittest.TestCase):
         self.assertEqual(snapshot["reply_state"], "queued")
         self.assertEqual(snapshot["user_ts"], "new")
         self.assertEqual(snapshot["text"], "")
+
+    def test_foreground_reply_state_is_active_before_first_text_delta(self):
+        handler = object.__new__(PushHandler)
+        handler.state = types.SimpleNamespace(
+            chat_draft_lock=threading.Lock(),
+            chat_drafts={},
+            chat_reply_states={},
+        )
+
+        handler._set_chat_queued("test", user_ts="queued-turn")
+        queued = handler._chat_draft_snapshot("test")
+        self.assertTrue(queued["is_active"])
+        self.assertEqual(queued["text"], "")
+        self.assertEqual(queued["activity_count"], 0)
+
+        handler._set_chat_generating("test", user_ts="generating-turn")
+        generating = handler._chat_draft_snapshot("test")
+        self.assertTrue(generating["is_active"])
+        self.assertEqual(generating["text"], "")
+        self.assertEqual(generating["activity_count"], 0)
+
+    def test_terminal_reply_state_is_not_active_even_when_interrupted_text_is_retained(self):
+        handler = object.__new__(PushHandler)
+        handler.state = types.SimpleNamespace(
+            chat_draft_lock=threading.Lock(),
+            chat_drafts={
+                "test": {
+                    "is_active": True,
+                    "text": "already visible",
+                    "user_ts": "u1",
+                }
+            },
+            chat_reply_states={},
+        )
+
+        handler._set_chat_interrupted("test", user_ts="u1", ttl_sec=15)
+        interrupted = handler._chat_draft_snapshot("test")
+        self.assertFalse(interrupted["is_active"])
+        self.assertEqual(interrupted["text"], "already visible")
+
+        handler._set_chat_completed("test", user_ts="u1", ttl_sec=15)
+        completed = handler._chat_draft_snapshot("test")
+        self.assertFalse(completed["is_active"])
 
 
 if __name__ == "__main__":
