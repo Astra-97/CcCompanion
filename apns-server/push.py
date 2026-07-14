@@ -370,21 +370,32 @@ class _CodexRunRegistry:
         self._lock = threading.Lock()
         self._runs: dict[str, dict[str, Any]] = {}
 
-    def start(self, *, source: str, session_id: str | None, cwd: Path) -> tuple[str, threading.Event] | None:
+    def start(
+        self,
+        *,
+        source: str,
+        session_id: str | None,
+        cwd: Path,
+        cancel_event: threading.Event | None = None,
+        contact_id: str | None = None,
+        user_ts: str | None = None,
+    ) -> tuple[str, threading.Event] | None:
         with self._lock:
             if self._runs:
                 return None
             run_id = f"{int(time.time() * 1000)}-{os.getpid()}"
-            cancel_event = threading.Event()
+            resolved_cancel_event = cancel_event or threading.Event()
             self._runs[run_id] = {
                 "run_id": run_id,
                 "source": source,
                 "session_id": session_id,
                 "cwd": str(cwd),
                 "started_at": time.time(),
-                "cancel_event": cancel_event,
+                "cancel_event": resolved_cancel_event,
+                "contact_id": str(contact_id or ""),
+                "user_ts": str(user_ts or ""),
             }
-            return run_id, cancel_event
+            return run_id, resolved_cancel_event
 
     def finish(self, run_id: str) -> None:
         with self._lock:
@@ -397,11 +408,23 @@ class _CodexRunRegistry:
             item = max(self._runs.values(), key=lambda run: float(run.get("started_at") or 0))
             return dict(item)
 
-    def cancel_latest(self) -> dict[str, Any] | None:
+    def cancel_latest(
+        self,
+        *,
+        source: str | None = None,
+        contact_id: str | None = None,
+        user_ts: str | None = None,
+    ) -> dict[str, Any] | None:
         with self._lock:
-            if not self._runs:
+            candidates = [
+                run for run in self._runs.values()
+                if (source is None or str(run.get("source") or "") == source)
+                and (contact_id is None or str(run.get("contact_id") or "") == contact_id)
+                and (user_ts is None or str(run.get("user_ts") or "") == user_ts)
+            ]
+            if not candidates:
                 return None
-            item = max(self._runs.values(), key=lambda run: float(run.get("started_at") or 0))
+            item = max(candidates, key=lambda run: float(run.get("started_at") or 0))
             event = item.get("cancel_event")
             if isinstance(event, threading.Event):
                 event.set()
@@ -1195,6 +1218,8 @@ class ServerState:
         self.kairos_queue_path = contact_history_dir / "kairos_queue.json"
         self.kairos_queue: deque[dict[str, Any]] = self._load_kairos_queue()
         self.kairos_queue_worker_running = False
+        self.kairos_active_task: dict[str, Any] | None = None
+        self.kairos_active_task_cancel: threading.Event | None = None
         self.kairos_pending_run_path = contact_history_dir / "kairos_pending_run.json"
         self._recover_pending_kairos_run()
         # 书房 v1 (2026-05-09) — vault-aware project dashboard. read-only db (indexer 写)
@@ -5727,7 +5752,122 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.exception("codex/sessions failed")
             self._send_json(500, {"ok": False, "error": str(e)})
 
+    def _cancel_kairos_pending_task(
+        self,
+        contact_id: str,
+        user_ts: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Cancel one exact/current Kairos task without touching another Codex run."""
+        target_contact = str(contact_id or "kairos").strip().lower() or "kairos"
+        target_user_ts = str(user_ts or "").strip()
+        cancelled: dict[str, Any] | None = None
+        remaining_for_contact: list[dict[str, Any]] = []
+        active_for_contact = False
+        with self.state.kairos_queue_lock:
+            active = self.state.kairos_active_task
+            active_for_contact = bool(
+                isinstance(active, dict)
+                and str(active.get("contact_id") or "kairos").strip().lower() == target_contact
+            )
+            active_matches = bool(
+                isinstance(active, dict)
+                and str(active.get("contact_id") or "kairos").strip().lower() == target_contact
+                and (not target_user_ts or str(active.get("user_ts") or "") == target_user_ts)
+            )
+            if active_matches:
+                event = self.state.kairos_active_task_cancel
+                if isinstance(event, threading.Event):
+                    event.set()
+                cancelled = dict(active)
+                cancelled["cancel_kind"] = "active_task"
+            else:
+                items = list(self.state.kairos_queue)
+                matching_indexes = [
+                    idx for idx, item in enumerate(items)
+                    if str(item.get("contact_id") or "kairos").strip().lower() == target_contact
+                    and (not target_user_ts or str(item.get("user_ts") or "") == target_user_ts)
+                ]
+                if matching_indexes:
+                    idx = matching_indexes[-1]
+                    cancelled = dict(items.pop(idx))
+                    cancelled["cancel_kind"] = "queued_task"
+                    self.state.kairos_queue = deque(items)
+                    self.state.persist_kairos_queue_locked()
+            remaining_for_contact = [
+                dict(item) for item in self.state.kairos_queue
+                if str(item.get("contact_id") or "kairos").strip().lower() == target_contact
+            ]
+
+        if cancelled and cancelled.get("cancel_kind") == "queued_task":
+            cancelled_ts = str(cancelled.get("user_ts") or "")
+            mark_interrupted = not active_for_contact and not remaining_for_contact
+            cancelled["mark_interrupted"] = mark_interrupted
+            if remaining_for_contact and not active_for_contact:
+                next_task = remaining_for_contact[0]
+                self._set_chat_queued(
+                    target_contact,
+                    user_ts=str(next_task.get("user_ts") or ""),
+                    queued_at=str(next_task.get("queued_at") or ""),
+                    queue_position=1,
+                    source="cc-app:kairos",
+                )
+            elif mark_interrupted:
+                self._set_chat_interrupted(
+                    target_contact,
+                    user_ts=cancelled_ts,
+                    source="cc-app:kairos:cancelled-before-run",
+                )
+                self._set_typing_for_contact(target_contact, {"is_typing": False, "since": None})
+        return cancelled
+
     def _handle_codex_abort(self, body: dict[str, Any]):
+        contact_id = str(body.get("contact_id") or "").strip().lower()
+        cancel_pending = bool(body.get("cancel_pending"))
+        target_user_ts = str(body.get("user_ts") or "").strip() or None
+        if contact_id == "kairos" and cancel_pending:
+            pending = self._cancel_kairos_pending_task(contact_id, target_user_ts)
+            run = CODEX_RUNS.cancel_latest(
+                source="cc-app:kairos",
+                contact_id=contact_id,
+                user_ts=target_user_ts,
+            )
+            bridge_interrupted = self.state.codex_app_bridge.interrupt_active() if run else False
+            ok = bool(pending or run or bridge_interrupted)
+            resolved_user_ts = str(
+                (pending or {}).get("user_ts")
+                or (run or {}).get("user_ts")
+                or target_user_ts
+                or ""
+            )
+            should_mark_interrupted = bool(
+                run
+                or (pending or {}).get("cancel_kind") == "active_task"
+                or (pending or {}).get("mark_interrupted")
+            )
+            if ok and should_mark_interrupted:
+                self._set_chat_interrupted(
+                    contact_id,
+                    user_ts=resolved_user_ts,
+                    source="cc-app:kairos:cancelled",
+                    session_id=str((run or {}).get("session_id") or "") or None,
+                )
+                self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
+            action = "active_run" if run else (
+                str((pending or {}).get("cancel_kind") or "pending_task") if pending else "none"
+            )
+            self._send_json(200, {
+                "ok": ok,
+                "action": action,
+                "contact_id": contact_id,
+                "user_ts": resolved_user_ts or None,
+                "bridge_interrupted": bridge_interrupted,
+                "message": (
+                    "已请求中断 Kairos 当前生成。"
+                    if ok else "当前没有可中断的 Kairos 生成或排队消息。"
+                ),
+            })
+            return
+
         run = CODEX_RUNS.cancel_latest()
         bridge_interrupted = self.state.codex_app_bridge.interrupt_active()
         session_id, cwd = self._load_codex_target()
@@ -6104,6 +6244,9 @@ class PushHandler(BaseHTTPRequestHandler):
                     self.state.persist_kairos_queue_locked()
                     return
                 task = self.state.kairos_queue.popleft()
+                task_cancel_event = threading.Event()
+                self.state.kairos_active_task = task
+                self.state.kairos_active_task_cancel = task_cancel_event
                 self.state.persist_kairos_queue_locked()
                 for idx, queued in enumerate(self.state.kairos_queue, start=1):
                     self._set_chat_queued(
@@ -6113,7 +6256,14 @@ class PushHandler(BaseHTTPRequestHandler):
                         queue_position=idx,
                         source="cc-app:kairos",
                     )
-            self._process_kairos_task(task)
+            try:
+                self._process_kairos_task(task, task_cancel_event=task_cancel_event)
+            finally:
+                with self.state.kairos_queue_lock:
+                    active = self.state.kairos_active_task or {}
+                    if str(active.get("user_ts") or "") == str(task.get("user_ts") or ""):
+                        self.state.kairos_active_task = None
+                        self.state.kairos_active_task_cancel = None
 
     def _kairos_prompt_for_task(self, task: dict[str, Any]) -> str:
         text = str(task.get("text") or "").strip()
@@ -6135,14 +6285,20 @@ class PushHandler(BaseHTTPRequestHandler):
     def _is_codex_prompt_busy_answer(answer: str) -> bool:
         return str(answer or "").startswith("同一个 Kairos session 正在另一边生成中")
 
-    def _process_kairos_task(self, task: dict[str, Any]) -> None:
+    def _process_kairos_task(
+        self,
+        task: dict[str, Any],
+        *,
+        task_cancel_event: threading.Event | None = None,
+    ) -> None:
         contact_id = str(task.get("contact_id") or "kairos")
         text = str(task.get("text") or "")
         user_ts = str(task.get("user_ts") or "")
         queued_at = str(task.get("queued_at") or user_ts)
         chat = self._chat_for_contact(contact_id)
         run_id = None
-        cancel_event = None
+        cancel_event = task_cancel_event or threading.Event()
+        session_id: str | None = None
         assistant_appended = False
         source = "codex:kairos"
         activity_count = 0
@@ -6221,8 +6377,14 @@ class PushHandler(BaseHTTPRequestHandler):
 
         with lock:
             try:
+                if cancel_event.is_set():
+                    _append_interrupted_draft()
+                    return
                 session_id, cwd = self._load_codex_target()
                 while True:
+                    if cancel_event.is_set():
+                        _append_interrupted_draft()
+                        return
                     if time.monotonic() - wait_started_at >= max_queue_wait_sec:
                         _append_assistant("这条消息排队超过 15 分钟还没轮到，我先标记失败。你可以直接重发。")
                         return
@@ -6235,13 +6397,24 @@ class PushHandler(BaseHTTPRequestHandler):
                             activity_text="等上一条结束",
                             source="cc-app:kairos",
                         )
-                        time.sleep(1.0)
+                        cancel_event.wait(1.0)
                         continue
-                    run = CODEX_RUNS.start(source="cc-app:kairos", session_id=session_id, cwd=cwd)
+                    run = CODEX_RUNS.start(
+                        source="cc-app:kairos",
+                        session_id=session_id,
+                        cwd=cwd,
+                        cancel_event=cancel_event,
+                        contact_id=contact_id,
+                        user_ts=user_ts,
+                    )
                     if run is not None:
                         run_id, cancel_event = run
                         break
-                    time.sleep(1.0)
+                    cancel_event.wait(1.0)
+
+                if cancel_event.is_set():
+                    _append_interrupted_draft()
+                    return
 
                 started_at = self._set_chat_generating(
                     contact_id,
@@ -6467,8 +6640,18 @@ class PushHandler(BaseHTTPRequestHandler):
                         activity_text="等上一条结束",
                         source="cc-app:kairos",
                     )
-                    time.sleep(1.0)
-                    run = CODEX_RUNS.start(source="cc-app:kairos", session_id=session_id, cwd=cwd)
+                    cancel_event.wait(1.0)
+                    if cancel_event.is_set():
+                        _append_interrupted_draft()
+                        return
+                    run = CODEX_RUNS.start(
+                        source="cc-app:kairos",
+                        session_id=session_id,
+                        cwd=cwd,
+                        cancel_event=cancel_event,
+                        contact_id=contact_id,
+                        user_ts=user_ts,
+                    )
                     if run is not None:
                         run_id, cancel_event = run
                         self._set_chat_generating(
@@ -6480,7 +6663,7 @@ class PushHandler(BaseHTTPRequestHandler):
                             session_id=session_id,
                         )
                         continue
-                    time.sleep(1.0)
+                    cancel_event.wait(1.0)
 
                 if cancel_event and cancel_event.is_set():
                     _append_interrupted_draft()
