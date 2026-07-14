@@ -328,4 +328,106 @@ class XiaRuntimeStateTest(unittest.TestCase):
             self.assertTrue(self.runtime.has_transcript(temp, session))
 
 
+class XiaPrepareRuntimeTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        path = Path(__file__).parent / "xia_claude_channel" / "prepare_runtime.py"
+        spec = importlib.util.spec_from_file_location("xia_prepare_runtime_for_test", path)
+        cls.prepare = importlib.util.module_from_spec(spec); spec.loader.exec_module(cls.prepare)
+
+    def make_runtime(self):
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        template = root / "claude-home.json"
+        template.write_text('{"hasCompletedOnboarding":true}\n')
+        os.chmod(template, 0o644)
+        kwargs = dict(root=root, relay_uid=os.getuid(), relay_gid=os.getgid(),
+                      root_uid=os.getuid(), root_gid=os.getgid(), onboarding_template=template)
+        self.prepare.prepare_runtime(**kwargs)
+        return temporary, root, kwargs
+
+    def test_correct_config_dir_private_files_and_idempotent_no_overwrite(self):
+        temporary, root, kwargs = self.make_runtime()
+        try:
+            state = root / "var/lib/cc-xia-relay/channel-state"
+            config = root / "var/lib/cc-xia-relay/claude-channel-home/.claude/.claude.json"
+            wrong = root / "var/lib/cc-xia-relay/claude-channel-home/.claude.json"
+            self.assertTrue(config.is_file()); self.assertFalse(wrong.exists())
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            self.assertEqual((state / "channel.token").stat().st_mode & 0o777, 0o600)
+            customized = '{"hasCompletedOnboarding":true,"theme":"dark"}\n'
+            config.write_text(customized); os.chmod(config, 0o600)
+            self.prepare.prepare_runtime(**kwargs)
+            self.assertEqual(config.read_text(), customized)
+        finally:
+            temporary.cleanup()
+
+    def test_symlink_and_dangling_symlink_files_fail_closed(self):
+        for target_name, relative in [
+            ("token", "var/lib/cc-xia-relay/channel-state/channel.token"),
+            ("onboarding", "var/lib/cc-xia-relay/claude-channel-home/.claude/.claude.json"),
+        ]:
+            for dangling in (False, True):
+                with self.subTest(target=target_name, dangling=dangling):
+                    temporary, root, kwargs = self.make_runtime()
+                    try:
+                        target = root / relative
+                        target.unlink()
+                        destination = root / ("missing" if dangling else "victim")
+                        if not dangling:
+                            destination.write_text("do not touch")
+                        target.symlink_to(destination)
+                        with self.assertRaises(self.prepare.PrepareError):
+                            self.prepare.prepare_runtime(**kwargs)
+                        if not dangling:
+                            self.assertEqual(destination.read_text(), "do not touch")
+                    finally:
+                        temporary.cleanup()
+
+    def test_symlink_directory_wrong_permissions_and_wrong_owner_fail_closed(self):
+        temporary, root, kwargs = self.make_runtime()
+        try:
+            tmux = root / "var/lib/cc-xia-relay/channel-state/tmux"
+            tmux.rmdir(); tmux.symlink_to(root / "outside", target_is_directory=True)
+            with self.assertRaises(self.prepare.PrepareError):
+                self.prepare.prepare_runtime(**kwargs)
+        finally:
+            temporary.cleanup()
+
+        temporary, root, kwargs = self.make_runtime()
+        try:
+            token = root / "var/lib/cc-xia-relay/channel-state/channel.token"
+            os.chmod(token, 0o644)
+            with self.assertRaisesRegex(self.prepare.PrepareError, "permissions"):
+                self.prepare.prepare_runtime(**kwargs)
+            os.chmod(token, 0o600)
+            fd = os.open(token, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                with self.assertRaisesRegex(self.prepare.PrepareError, "owner"):
+                    self.prepare._validate_file_fd(
+                        fd, uid=os.getuid() + 1, gid=os.getgid(), mode=0o600,
+                        label="channel token", maximum=4096,
+                    )
+            finally:
+                os.close(fd)
+        finally:
+            temporary.cleanup()
+
+        temporary, root, kwargs = self.make_runtime()
+        try:
+            onboarding = root / "var/lib/cc-xia-relay/claude-channel-home/.claude/.claude.json"
+            os.chmod(onboarding, 0o644)
+            with self.assertRaisesRegex(self.prepare.PrepareError, "permissions"):
+                self.prepare.prepare_runtime(**kwargs)
+        finally:
+            temporary.cleanup()
+
+    def test_launcher_contract_checks_config_path_and_supervises_ready_channel(self):
+        launcher = (Path(__file__).parent / "xia_claude_channel" / "launcher.sh").read_text()
+        self.assertIn('$XIA_CHANNEL_HOME/.claude/.claude.json', launcher)
+        self.assertGreaterEqual(launcher.count("health_matches"), 3)
+        self.assertIn("health_failures >= 3", launcher)
+        self.assertIn("kill-session -t", launcher)
+
+
 if __name__ == "__main__": unittest.main()

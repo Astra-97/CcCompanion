@@ -18,10 +18,18 @@ Safety invariants:
 - corrupt durable state aborts startup instead of resetting dedupe fences;
 - fixed private tmux state and a genuinely read-only bound persona workspace.
 
-`prepare-runtime.sh` creates only private directories and a token. It does not
-copy credentials, install/start a service, change the backend flag, or touch
-Xiaoke/Kairos state. Deployment must follow `docs/xia-relay-control.md` and an
-independent review. The default backend transport remains `relay`.
+`prepare-runtime.sh` creates only private directories, a token, and the minimal
+non-secret `hasCompletedOnboarding` Claude HOME marker needed by an isolated
+TUI at `.claude/.claude.json` beneath the dedicated `CLAUDE_CONFIG_DIR`. It
+never overwrites an existing marker and never copies root/Xiaoke settings or
+credentials. An isolated OAuth credential snapshot must still be provisioned
+manually at
+`claude-channel-home/.claude/.credentials.json`; never commit or automate that
+copy. The script does not install/start a service or change the backend flag.
+Run it only while the optional channel service is stopped; unsafe links,
+ownership, or permissions fail closed.
+Deployment must follow `docs/xia-relay-control.md` and an independent review.
+The default backend transport remains `relay`.
 
 Tests:
 

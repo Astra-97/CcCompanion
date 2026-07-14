@@ -83,12 +83,15 @@ const httpServer = http.createServer((req, res) => {
   }))
 })
 httpServer.listen(PORT, HOST)
-await mcp.connect(new StdioServerTransport())
+const mcpTransport = new StdioServerTransport()
+mcpTransport.onclose = () => handleMcpDisconnect('Claude channel stdio transport closed')
+mcpTransport.onerror = () => handleMcpDisconnect('Claude channel stdio transport failed')
+await mcp.connect(mcpTransport)
 mcpConnected = true
 
-process.on('SIGTERM', shutdown)
-process.on('SIGINT', shutdown)
-process.stdin.on('end', shutdown)
+process.on('SIGTERM', () => shutdown(0))
+process.on('SIGINT', () => shutdown(0))
+process.stdin.on('end', () => handleMcpDisconnect('Claude channel stdin ended'))
 
 async function route(req, res) {
   const url = new URL(req.url || '/', `http://${req.headers.host || `${HOST}:${PORT}`}`)
@@ -127,6 +130,7 @@ async function route(req, res) {
       if (record.status === 'accepted') {
         record.status = 'running'; record.updated_at = now(); saveLedger()
       }
+      if (record.status === 'uncertain') throw httpError(409, 'request_uncertain', record.error || 'request completion is uncertain')
     } catch (error) {
       record.status = 'uncertain'; record.error = 'channel notification failed after durable admission'
       record.updated_at = now(); saveLedger(); wake(record.request_id)
@@ -221,14 +225,18 @@ function normalizeMessage(body) {
 async function notifyClaude(record) {
   if (!mcpConnected) throw new Error('Claude channel MCP is not connected')
   const content = record.handoff ? `${record.handoff}\n\n[Current user message]\n${record.text}` : record.text
-  const grantMeta = {
+  const typedGrant = {
     contact_id: CONTACT, provider: PROVIDER, request_id: record.request_id,
     client_id: record.client_id, epoch: record.epoch, lease: record.lease,
     generation: record.generation,
   }
+  // Claude's Development Channel schema requires every direct meta value to
+  // be a string. Keep a typed JSON copy for the Stop hook's exact-grant parser.
+  const channelMeta = Object.fromEntries(Object.entries(typedGrant).map(([key, value]) => [key, String(value)]))
+  channelMeta.metadata_json = JSON.stringify(typedGrant)
   await mcp.notification({
     method: 'notifications/claude/channel',
-    params: { content, meta: { ...grantMeta, metadata_json: JSON.stringify(grantMeta) } },
+    params: { content, meta: channelMeta },
   })
 }
 
@@ -259,20 +267,25 @@ function publicRecord(record, duplicate) {
   return result
 }
 
-function recoverInterruptedRequests() {
+function markActiveRequestsUncertain(reason) {
   let changed = false
   for (const record of Object.values(ledger.records || {})) {
     if (['accepted', 'running'].includes(record.status)) {
-      record.status = 'uncertain'; record.error = 'channel process restarted during an admitted request'; record.updated_at = now(); changed = true
+      record.status = 'uncertain'; record.error = reason; record.updated_at = now(); changed = true
       record.text = ''; record.handoff = ''
+      wake(record.request_id)
     }
   }
   if (changed) {
-    control = { ...control, requires_fresh: true, draining: true, bootstrap_token: '', stale_reason: 'interrupted admitted request' }
+    control = { ...control, requires_fresh: true, draining: true, bootstrap_token: '', stale_reason: reason }
     atomicJson(CONTROL_PATH, control)
     saveLedger()
   }
   return changed
+}
+
+function recoverInterruptedRequests() {
+  return markActiveRequestsUncertain('channel process restarted during an admitted request')
 }
 
 function pruneAndSave() {
@@ -398,6 +411,34 @@ function sendJson(res, status, value) { if (res.writableEnded) return; res.write
 function now() { return new Date().toISOString() }
 function waitFor(requestId, ms) { return new Promise(resolveWait => { const list = waiters.get(requestId) || new Set(); const cleanup = done => { list.delete(done); if (list.size === 0 && waiters.get(requestId) === list) waiters.delete(requestId) }; const timer = setTimeout(() => { cleanup(done); resolveWait() }, ms); timer.unref?.(); const done = () => { clearTimeout(timer); cleanup(done); resolveWait() }; list.add(done); waiters.set(requestId, list) }) }
 function wake(requestId) { const list = waiters.get(requestId); if (!list) return; waiters.delete(requestId); for (const fn of list) fn() }
-function shutdown() { if (shuttingDown) return; shuttingDown = true; mcpConnected = false; httpServer.close(() => process.exit(0)); setTimeout(() => process.exit(0), 1000).unref?.() }
+function handleMcpDisconnect(reason) {
+  if (shuttingDown) return
+  shuttingDown = true
+  mcpConnected = false
+  try {
+    markActiveRequestsUncertain(`${reason} during an admitted request`)
+  } catch {
+    // The next process re-runs durable recovery. Either way this process must
+    // stop serving immediately and let systemd start a clean MCP connection.
+  }
+  httpServer.close()
+  terminateClaudeParent()
+  setTimeout(() => process.exit(1), 250)
+}
+
+function terminateClaudeParent() {
+  if (process.env.XIA_CHANNEL_TEST_NO_PARENT_KILL === '1') return
+  setTimeout(() => {
+    try { process.kill(process.ppid, 'SIGTERM') } catch {}
+  }, 25)
+}
+
+function shutdown(exitCode = 0) {
+  if (shuttingDown) return
+  shuttingDown = true
+  mcpConnected = false
+  httpServer.close(() => process.exit(exitCode))
+  setTimeout(() => process.exit(exitCode), 1000).unref?.()
+}
 
 export { completeRecord, exactGrant, normalizeMessage, publicRecord }

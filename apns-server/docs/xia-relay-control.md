@@ -61,7 +61,15 @@ MCP readiness within the bounded startup window exits fail-closed. A one-time
 operator preflight must confirm that the installed Claude version keeps the
 dedicated MCP reply tool available when built-ins are disabled. Credential
 snapshots are supplied explicitly; `prepare-runtime.sh` never copies
-`/root/.claude`.
+`/root/.claude`. It writes only a minimal non-secret
+`claude-channel-home/.claude/.claude.json` onboarding marker (the location
+selected by the launcher's `CLAUDE_CONFIG_DIR`) and never overwrites an
+existing one. The dedicated OAuth credential snapshot remains a separate,
+manual `0600` provision at `claude-channel-home/.claude/.credentials.json`.
+The root preparation pass validates every managed directory/file with no-follow
+opens, exact owner/mode checks, and no-replace publication. Stop the optional
+channel service before rerunning it; any symlink, unexpected owner, or relaxed
+permission is an operator-visible failure, not something the script repairs.
 
 The unit reuses the relay Linux UID only for operational simplicity. Its mount
 namespace makes `/var/lib/cc-xia-relay/state` (the old relay credentials and
@@ -223,10 +231,11 @@ cp -a apns-server/xia_claude_channel/. /opt/cc-xia-claude-channel/
 cd /opt/cc-xia-claude-channel
 npm ci --omit=dev --ignore-scripts
 chown -R root:root /opt/cc-xia-claude-channel
-chmod 0755 launcher.sh prepare-runtime.sh stop_hook.py runtime_state.py view.sh server.mjs
+chmod 0755 launcher.sh prepare-runtime.sh prepare_runtime.py stop_hook.py runtime_state.py view.sh server.mjs
 ./prepare-runtime.sh
-# Provision only the dedicated Claude credential snapshot as 0600 owned by
-# cc-xia-relay. Never copy root/Xiaoke settings or hooks.
+# prepare-runtime.sh installs only non-secret onboarding state. Separately
+# provision the dedicated Claude credential snapshot as 0600 owned by
+# cc-xia-relay. Never copy root/Xiaoke settings, hooks, or full config.
 install -o root -g root -m 0644 \
   /root/CcCompanion/apns-server/deploy/cc-xia-claude-channel.service \
   /etc/systemd/system/cc-xia-claude-channel.service
@@ -242,6 +251,12 @@ Stop hook; reply and fallback dedupe; the reply MCP remains available with
 idle boundary, use the operator-only config helper to select `channel`; it
 persists an epoch fence, revoke, and `needs_handoff` before the normal delayed
 backend restart.
+
+As a disconnect smoke, terminate only the channel MCP child while watching the
+dedicated tmux session. The request admitted before the disconnect must become
+terminal-uncertain, authenticated health must disappear, the isolated parent
+Claude TUI must exit, and the launcher must create a new healthy session. Do
+not kill or inspect Xiaoke's tmux socket during this check.
 
 Transport configuration is copy-on-write. A config-file fsync/replace failure
 restores the in-process transport selection; the already persisted external

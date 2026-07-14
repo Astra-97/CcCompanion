@@ -20,7 +20,13 @@ for path in "$XIA_CHANNEL_HOME" "$XIA_CHANNEL_STATE_DIR" "$XIA_CHANNEL_TMUX_TMPD
 done
 test -r "$XIA_CHANNEL_STATE_DIR/channel.token" || { echo "missing private channel token" >&2; exit 78; }
 test -r "$XIA_CHANNEL_HOME/.claude/.credentials.json" || { echo "missing isolated Claude credential snapshot" >&2; exit 78; }
+test -r "$XIA_CHANNEL_HOME/.claude/.claude.json" || { echo "missing isolated Claude onboarding state" >&2; exit 78; }
 test -r "$XIA_CHANNEL_WORKSPACE/CLAUDE.md" || { echo "missing read-only Xia persona workspace" >&2; exit 78; }
+
+health_matches() {
+  /usr/bin/curl -fsS --max-time 1 -H "X-Auth-Token: $(<"$XIA_CHANNEL_STATE_DIR/channel.token")" \
+    http://127.0.0.1:8821/health | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); g=int(sys.argv[1]); s=sys.argv[2]; m=sys.argv[3]; raise SystemExit(0 if d.get("ready") and int(d.get("generation",-1))==g and d.get("session_id")==s and str(d.get("model") or "")==m else 1)' "$generation" "$session_id" "$model" 2>/dev/null
+}
 
 while :; do
   readarray -t values < <(/usr/bin/python3 - "$XIA_CHANNEL_STATE_DIR/control.json" <<'PY'
@@ -81,15 +87,16 @@ PY
   # No automated pane keystrokes: a changed Claude confirmation screen is a
   # fail-closed readiness timeout, never a blind Enter into arbitrary TUI text.
   TMUX_TMPDIR="$XIA_CHANNEL_TMUX_TMPDIR" /usr/bin/tmux -L "$XIA_CHANNEL_TMUX_SOCKET" kill-session -t "$XIA_CHANNEL_TMUX_SESSION" 2>/dev/null || true
-  HOME="$XIA_CHANNEL_HOME" XDG_CONFIG_HOME="$XIA_CHANNEL_HOME/.config" \
+  HOME="$XIA_CHANNEL_HOME" CLAUDE_CONFIG_DIR="$XIA_CHANNEL_HOME/.claude" \
+    XDG_CONFIG_HOME="$XIA_CHANNEL_HOME/.config" \
+    SHELL=/bin/bash \
     TMUX_TMPDIR="$XIA_CHANNEL_TMUX_TMPDIR" \
     /usr/bin/tmux -L "$XIA_CHANNEL_TMUX_SOCKET" new-session -d -s "$XIA_CHANNEL_TMUX_SESSION" -c "$runtime" "$quoted_cmd"
 
   deadline=$((SECONDS + XIA_CHANNEL_START_TIMEOUT))
   ready=0
   while (( SECONDS < deadline )); do
-    if /usr/bin/curl -fsS --max-time 1 -H "X-Auth-Token: $(<"$XIA_CHANNEL_STATE_DIR/channel.token")" \
-      http://127.0.0.1:8821/health | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); g=int(sys.argv[1]); s=sys.argv[2]; m=sys.argv[3]; raise SystemExit(0 if d.get("ready") and int(d.get("generation",-1))==g and d.get("session_id")==s and str(d.get("model") or "")==m else 1)' "$generation" "$session_id" "$model" 2>/dev/null; then
+    if health_matches; then
       ready=1; break
     fi
     TMUX_TMPDIR="$XIA_CHANNEL_TMUX_TMPDIR" /usr/bin/tmux -L "$XIA_CHANNEL_TMUX_SOCKET" has-session -t "$XIA_CHANNEL_TMUX_SESSION" 2>/dev/null || break
@@ -102,6 +109,20 @@ PY
   fi
   /usr/bin/python3 "$XIA_CHANNEL_INSTALL_DIR/runtime_state.py" write-marker \
     "$XIA_CHANNEL_STATE_DIR/current-session.json" "$generation" "$session_id" "$model"
-  while TMUX_TMPDIR="$XIA_CHANNEL_TMUX_TMPDIR" /usr/bin/tmux -L "$XIA_CHANNEL_TMUX_SOCKET" has-session -t "$XIA_CHANNEL_TMUX_SESSION" 2>/dev/null; do sleep 1; done
+  health_failures=0
+  while TMUX_TMPDIR="$XIA_CHANNEL_TMUX_TMPDIR" /usr/bin/tmux -L "$XIA_CHANNEL_TMUX_SOCKET" has-session -t "$XIA_CHANNEL_TMUX_SESSION" 2>/dev/null; do
+    sleep 1
+    if health_matches; then
+      health_failures=0
+    else
+      health_failures=$((health_failures + 1))
+      if (( health_failures >= 3 )); then
+        echo "Claude channel health disappeared; terminating the dedicated TUI for a clean restart" >&2
+        TMUX_TMPDIR="$XIA_CHANNEL_TMUX_TMPDIR" /usr/bin/tmux -L "$XIA_CHANNEL_TMUX_SOCKET" \
+          kill-session -t "$XIA_CHANNEL_TMUX_SESSION" 2>/dev/null || true
+        break
+      fi
+    fi
+  done
   sleep 1
 done
