@@ -2344,8 +2344,14 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path == "/rp/list":
             self._handle_rp_list()
             return
-        if self.path == "/ai-chat/config":
-            self._handle_ai_chat_config_get()
+        if self.path == "/ai-chat/provider":
+            self._handle_ai_chat_provider_get()
+            return
+        if self.path.startswith("/ai-chat/relay-model"):
+            self._handle_ai_chat_relay_model_get()
+            return
+        if self.path == "/ai-chat/persona":
+            self._handle_ai_chat_persona_get()
             return
         if self.path.startswith("/ai-chat/history"):
             self._handle_ai_chat_history()
@@ -2780,6 +2786,15 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_appearance_assets_upload()
             return
 
+        if self.path == "/ai-chat/persona":
+            try:
+                persona_length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                persona_length = 0
+            if persona_length <= 0 or persona_length > 16 * 1024 * 1024:
+                self._send_json(413, {"ok": False, "error": "persona request is too large"})
+                return
+
         try:
             body = self._read_body()
         except Exception as e:
@@ -3010,8 +3025,12 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_notion_append(body)
         elif self.path == "/notion/search":
             self._handle_notion_search(body)
-        elif self.path == "/ai-chat/config":
-            self._handle_ai_chat_config_post(body)
+        elif self.path == "/ai-chat/provider":
+            self._handle_ai_chat_provider_post(body)
+        elif self.path == "/ai-chat/relay-model":
+            self._handle_ai_chat_relay_model_post(body)
+        elif self.path == "/ai-chat/persona":
+            self._handle_ai_chat_persona_post(body)
         elif self.path == "/ai-chat/send":
             self._handle_ai_chat_send(body)
         elif self.path == "/ai-chat/stream":
@@ -3020,10 +3039,6 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_voice_call_tts(body)
         elif self.path == "/voice/push":
             self._handle_voice_push(body)
-        elif self.path == "/ai-chat/system-prompt":
-            self._handle_ai_chat_system_prompt(body)
-        elif self.path == "/ai-chat/models":
-            self._handle_ai_chat_models(body)
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -4085,56 +4100,95 @@ class PushHandler(BaseHTTPRequestHandler):
 
     # ---------- AI chat handlers ----------
 
-    def _handle_ai_chat_config_get(self):
-        if not self._check_auth():
-            self._send_json(401, {"error": "auth required"})
-            return
-        self._send_json(200, {"ok": True, "config": self.state.ai_chat.get_config(mask_key=True)})
-
-    def _handle_ai_chat_config_post(self, body: dict[str, Any]):
+    def _handle_ai_chat_provider_get(self):
         if not self._check_auth():
             self._send_json(401, {"error": "auth required"})
             return
         try:
-            cfg = self.state.ai_chat.update_config(body)
-            self._send_json(200, {"ok": True, "config": cfg})
-        except (ValueError, TypeError) as e:
-            self._send_json(400, {"error": str(e)})
-        except Exception as e:
-            logger.exception("ai_chat config update fail")
-            self._send_json(500, {"error": str(e)})
-
-    def _handle_ai_chat_system_prompt(self, body: dict[str, Any]):
-        if not self._check_auth():
-            self._send_json(401, {"error": "auth required"})
-            return
-        prompt = body.get("system_prompt")
-        if prompt is None:
-            self._send_json(400, {"error": "system_prompt required"})
-            return
-        try:
-            cfg = self.state.ai_chat.set_system_prompt(str(prompt))
-            self._send_json(200, {"ok": True, "config": cfg})
-        except Exception as e:
-            logger.exception("ai_chat system_prompt update fail")
-            self._send_json(500, {"error": str(e)})
-
-    def _handle_ai_chat_models(self, body: dict[str, Any]):
-        if not self._check_auth():
-            self._send_json(401, {"error": "auth required"})
-            return
-        try:
-            result = self.state.ai_chat.fetch_models(
-                api_url=str(body.get("api_url") or ""),
-                api_key=str(body.get("api_key") or ""),
-            )
-            status = 200 if result.get("ok") else 400
+            result = self.state.ai_chat.relay_provider_status()
+            status = 200 if result.get("ok") else 503
             self._send_json(status, result)
-        except (ValueError, TypeError) as e:
-            self._send_json(400, {"error": str(e)})
         except Exception as e:
-            logger.exception("ai_chat models fetch fail")
-            self._send_json(500, {"error": str(e)})
+            logger.exception("ai_chat provider status fail")
+            self._send_json(503, {"ok": False, "error": str(e)})
+
+    def _handle_ai_chat_provider_post(self, body: dict[str, Any]):
+        if not self._check_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        provider = str(body.get("provider") or "").strip()
+        try:
+            result = self.state.ai_chat.switch_relay_provider(provider)
+            self._send_json(200, result)
+        except ValueError as e:
+            self._send_json(400, {"ok": False, "error": str(e)})
+        except Exception as e:
+            # Do not import relay implementation into the HTTP surface. Busy
+            # is deliberately recognized by its stable manager message.
+            message = str(e)
+            status = 409 if "while a turn is active" in message else 503
+            if status != 409:
+                logger.exception("ai_chat provider switch fail")
+            self._send_json(status, {"ok": False, "error": message})
+
+    def _handle_ai_chat_relay_model_get(self):
+        if not self._check_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        provider = self._query_params().get("provider", [None])[0]
+        try:
+            self._send_json(200, self.state.ai_chat.relay_model_status(provider))
+        except ValueError as e:
+            self._send_json(400, {"ok": False, "error": str(e)})
+        except Exception as e:
+            logger.exception("ai_chat relay model status fail")
+            self._send_json(503, {"ok": False, "error": str(e)})
+
+    def _handle_ai_chat_relay_model_post(self, body: dict[str, Any]):
+        if not self._check_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        try:
+            result = self.state.ai_chat.select_relay_model(
+                str(body.get("provider") or ""), str(body.get("model") or "")
+            )
+            self._send_json(200, result)
+        except ValueError as e:
+            self._send_json(400, {"ok": False, "error": str(e)})
+        except Exception as e:
+            message = str(e)
+            status = 409 if "while a turn is active" in message else 503
+            if status != 409:
+                logger.exception("ai_chat relay model update fail")
+            self._send_json(status, {"ok": False, "error": message})
+
+    def _handle_ai_chat_persona_get(self):
+        if not self._check_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        try:
+            self._send_json(200, self.state.ai_chat.persona_status())
+        except Exception as e:
+            logger.exception("ai_chat persona status fail")
+            self._send_json(500, {"ok": False, "error": str(e)})
+
+    def _handle_ai_chat_persona_post(self, body: dict[str, Any]):
+        if not self._check_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        try:
+            result = self.state.ai_chat.apply_persona_composition(
+                body.get("files"), body.get("custom_text", "")
+            )
+            self._send_json(200, result)
+        except ValueError as e:
+            self._send_json(400, {"ok": False, "error": str(e)})
+        except Exception as e:
+            message = str(e)
+            status = 409 if "while a turn is active" in message else 500
+            if status != 409:
+                logger.exception("ai_chat persona apply fail")
+            self._send_json(status, {"ok": False, "error": message})
 
     def _handle_ai_chat_send(self, body: dict[str, Any]):
         if not self._check_auth():
@@ -4169,10 +4223,20 @@ class PushHandler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
 
+        client_connected = True
+
         def emit(event: dict[str, Any]) -> None:
+            nonlocal client_connected
+            if not client_connected:
+                return
             data = json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n"
-            self.wfile.write(data)
-            self.wfile.flush()
+            try:
+                self.wfile.write(data)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                # Keep consuming the authoritative upstream turn and persist
+                # its final result even if the phone disconnects mid-stream.
+                client_connected = False
 
         try:
             result = self.state.ai_chat.send_message_stream(text, emit, client_message_id=client_message_id)
@@ -4185,9 +4249,23 @@ class PushHandler(BaseHTTPRequestHandler):
                 }
                 if result.get("thinking"):
                     done["thinking"] = result.get("thinking", "")
+                if result.get("provider"):
+                    done["provider"] = result.get("provider", "")
+                if result.get("activities"):
+                    done["activities"] = result.get("activities", [])
+                if result.get("warning"):
+                    done["warning"] = result.get("warning", "")
                 emit(done)
             else:
-                emit({"type": "error", "ok": False, "error": result.get("error", "AI回复失败")})
+                error_event = {
+                    "type": "error",
+                    "ok": False,
+                    "error": result.get("error", "AI回复失败"),
+                }
+                for key in ("code", "terminal", "retryable"):
+                    if key in result:
+                        error_event[key] = result[key]
+                emit(error_event)
         except (BrokenPipeError, ConnectionResetError):
             logger.info("ai_chat stream client disconnected")
         except Exception as e:
@@ -8364,75 +8442,12 @@ class PushHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec})
 
     def _handle_ai_chat_upload(self):
-        """Raw upload for the custom AI chat."""
-        import uuid as _uuid
-        from urllib.parse import urlparse, parse_qs, unquote
-
-        qs = parse_qs(urlparse(self.path).query)
-        filename = (
-            qs.get("filename", [None])[0]
-            or self.headers.get("X-Filename")
-            or "upload.bin"
-        )
-        text = (
-            qs.get("text", [None])[0]
-            or self.headers.get("X-Text")
-            or ""
-        )
-
-        try:
-            if filename:
-                filename = unquote(filename)
-        except Exception:
-            pass
-
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-        except Exception:
-            length = 0
-        if length <= 0 or length > 50 * 1024 * 1024:
-            self._send_json(400, {"error": "invalid content-length (max 50MB)"})
-            return
-
-        ext = Path(filename).suffix.lower()
-        image_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
-        atype = "image" if ext in image_exts else "file"
-
-        stored_name = f"{_uuid.uuid4().hex}{ext}"
-        stored_path = self.state.attachments_dir / stored_name
-
-        try:
-            with stored_path.open("wb") as f:
-                remaining = length
-                while remaining > 0:
-                    chunk = self.rfile.read(min(remaining, 65536))
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    remaining -= len(chunk)
-        except Exception as e:
-            logger.exception("ai chat upload write fail")
-            self._send_json(500, {"error": f"write fail: {e}"})
-            return
-
-        attachment_url = f"/attachments/{stored_name}"
-        result = self.state.ai_chat.send_attachment(
-            user_text=text,
-            attachment_url=attachment_url,
-            attachment_type=atype,
-            attachment_filename=filename,
-            local_path=str(stored_path),
-        )
-        if not result.get("ok"):
-            self._send_json(502, result)
-            return
-        self._send_json(200, {
-            "ok": True,
-            "contact_id": self.state.ai_chat.contact_id,
-            "attachment_url": attachment_url,
-            "attachment_type": atype,
-            "attachment_filename": filename,
-            "result": result,
+        """Reject before storing bytes until a safe relay attachment bridge exists."""
+        self.close_connection = True
+        self._send_json(415, {
+            "ok": False,
+            "unsupported": True,
+            "error": "夏以昼的隔离会话目前只支持文字；旧附件历史仍可查看",
         })
 
     def _run_stackchan_voice_helper(self, args: list[str], *, timeout: int) -> tuple[bool, dict[str, Any]]:

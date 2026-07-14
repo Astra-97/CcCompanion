@@ -1,10 +1,4 @@
-"""
-AI Chat module — manage chat sessions with a custom AI character
-via any OpenAI-compatible chat completions API.
-
-Config:  state/ai_chat_config.json
-History: state/ai_chat_history.jsonl   (one JSON line per message)
-"""
+"""Xia Yizhou relay runtime with authoritative legacy-compatible history."""
 from __future__ import annotations
 
 import json
@@ -12,43 +6,57 @@ import logging
 import os
 import re
 import threading
-import urllib.request
-import urllib.error
+import shutil
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlparse
+from typing import Any, Callable
+
+from ai_session_relay_proxy import (
+    AISessionRelayProxy,
+    RelayBusyError,
+    RelayError,
+    RelayRequestUncertain,
+    RelayRequestTerminal,
+    build_authoritative_handoff,
+    normalize_provider,
+    validate_request_id,
+    validate_loopback_url,
+)
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_CONFIG: dict[str, Any] = {
-    "api_url": "https://api.deepseek.com/v1/chat/completions",
-    "api_key": "",
-    "model": "deepseek-chat",
-    "system_prompt": "",
-    "nickname": "AI",
+    "nickname": "夏以昼",
     "contact_id": "ai-custom",
-    "max_context_messages": 20,
-    "enabled": False,
-    "memory_enabled": True,
-    "memory_mcp_url": "https://memory.xiaonancaleb.xyz/mcp",
-    "memory_category": "xiayizhou",
-    "memory_max_results": 5,
+    # chat_only relies on a restricted relay deployment. Full autonomous mode
+    # has a separate explicit opt-in and is never implied by enabling relay.
+    "relay_enabled": True,
+    "relay_execution_mode": "chat_only",
+    "relay_autonomous_tools_opt_in": False,
+    "relay_url": "http://127.0.0.1:8900",
+    "relay_models": {"claude": "", "codex": ""},
 }
 
 
 class AIChatManager:
-    """Thread-safe AI chat manager with JSONL history and OpenAI-compat API calls."""
+    """Thread-safe relay manager; old ai_chat_history.jsonl remains authoritative."""
 
     def __init__(self, state_dir: str | Path):
         self._state_dir = Path(state_dir)
         self._state_dir.mkdir(parents=True, exist_ok=True)
-        self._config_path = self._state_dir / "ai_chat_config.json"
+        # Deliberately separate from the retired private legacy config.
+        # ai_chat_config.json is left untouched as private legacy state.
+        self._config_path = self._state_dir / "ai_relay_config.json"
         self._history_path = self._state_dir / "ai_chat_history.jsonl"
+        self._request_state_path = self._state_dir / "ai_relay_request_state.json"
         self._lock = threading.Lock()
         self._send_lock = threading.Lock()
-        self._config: dict[str, Any] = dict(_DEFAULT_CONFIG)
+        self._route_lock = threading.RLock()
+        self._config: dict[str, Any] = json.loads(json.dumps(_DEFAULT_CONFIG))
+        self._relay = AISessionRelayProxy(self._state_dir)
         self._load_config()
+        self._recover_persona_transaction()
 
     # ---- config ----
 
@@ -59,10 +67,6 @@ class AIChatManager:
                     stored = json.load(f)
                 if isinstance(stored, dict):
                     filtered = {k: v for k, v in stored.items() if k in _DEFAULT_CONFIG}
-                    for k in ("api_url", "memory_mcp_url"):
-                        url = filtered.get(k, "")
-                        if url and urlparse(str(url)).scheme != "https":
-                            filtered.pop(k, None)
                     self._config.update(filtered)
             except Exception:
                 logger.exception("ai_chat: failed to load config, using defaults")
@@ -71,71 +75,54 @@ class AIChatManager:
         tmp = self._config_path.with_suffix(".tmp")
         with tmp.open("w", encoding="utf-8") as f:
             json.dump(self._config, f, ensure_ascii=False, indent=2)
-        tmp.replace(self._config_path)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, self._config_path)
         try:
             os.chmod(self._config_path, 0o600)
         except OSError:
             pass
+        self._fsync_dir(self._state_dir)
 
-    def get_config(self, mask_key: bool = True) -> dict[str, Any]:
-        """Return config dict.  When *mask_key* is True the api_key is masked."""
-        cfg = dict(self._config)
-        if mask_key and cfg.get("api_key"):
-            key = cfg["api_key"]
-            if len(key) > 8:
-                cfg["api_key"] = key[:4] + "****" + key[-4:]
-            else:
-                cfg["api_key"] = "****"
-        return cfg
+    def relay_config_snapshot(self) -> dict[str, Any]:
+        return dict(self._config)
 
-    @staticmethod
-    def _validate_url(url: str) -> str:
-        parsed = urlparse(url)
-        if parsed.scheme not in ("https",):
-            raise ValueError(f"api_url must use https, got {parsed.scheme!r}")
-        if not parsed.hostname:
-            raise ValueError("api_url has no hostname")
-        return url
-
-    def update_config(self, partial: dict[str, Any]) -> dict[str, Any]:
-        """Merge *partial* into current config and persist.  Returns masked config."""
+    def configure_relay(self, partial: dict[str, Any]) -> dict[str, Any]:
+        """Operator-only relay config helper; there is no remote config endpoint."""
         with self._lock:
             for k, v in partial.items():
                 if k not in _DEFAULT_CONFIG:
                     continue
-                if k == "api_url":
-                    self._validate_url(str(v))
-                    self._config[k] = str(v)
-                elif k == "api_key":
-                    self._config[k] = str(v)
-                elif k == "model":
-                    self._config[k] = str(v)[:200]
-                elif k == "system_prompt":
-                    self._config[k] = str(v)[:50000]
-                elif k == "nickname":
+                if k == "nickname":
                     self._config[k] = str(v)[:100]
                 elif k == "contact_id":
                     self._config[k] = re.sub(r"[^a-z0-9_-]", "", str(v).lower())[:50] or "ai-custom"
-                elif k == "max_context_messages":
-                    self._config[k] = max(1, min(int(v), 200))
-                elif k == "memory_max_results":
-                    self._config[k] = max(0, min(int(v), 20))
-                elif k in ("enabled", "memory_enabled"):
+                elif k in ("relay_enabled", "relay_autonomous_tools_opt_in"):
                     self._config[k] = bool(v)
-                elif k == "memory_mcp_url":
-                    self._validate_url(str(v))
-                    self._config[k] = str(v)
-                elif k == "memory_category":
-                    self._config[k] = str(v)[:100]
+                elif k == "relay_execution_mode":
+                    mode = str(v).strip().lower()
+                    if mode not in {"chat_only", "autonomous"}:
+                        raise ValueError("relay_execution_mode must be 'chat_only' or 'autonomous'")
+                    self._config[k] = mode
+                elif k == "relay_url":
+                    self._config[k] = validate_loopback_url(v)
+                elif k == "relay_models" and isinstance(v, dict):
+                    self._config[k] = {
+                        provider: self._validate_model_id(v.get(provider, ""), allow_empty=True)
+                        for provider in ("claude", "codex")
+                    }
             self._save_config()
-        return self.get_config(mask_key=True)
-
-    def set_system_prompt(self, prompt: str) -> dict[str, Any]:
-        return self.update_config({"system_prompt": prompt})
+            if self._relay_ready:
+                self._relay.sync_persona(
+                    self._compiled_persona(),
+                    str(self._config.get("relay_execution_mode") or "chat_only"),
+                )
+        return self.relay_config_snapshot()
 
     @property
     def enabled(self) -> bool:
-        return bool(self._config.get("enabled"))
+        return self._relay_ready
 
     @property
     def contact_id(self) -> str:
@@ -145,7 +132,516 @@ class AIChatManager:
     def nickname(self) -> str:
         return str(self._config.get("nickname") or "AI")
 
+    @property
+    def _relay_ready(self) -> bool:
+        if not self._config.get("relay_enabled"):
+            return False
+        mode = str(self._config.get("relay_execution_mode") or "chat_only")
+        return mode == "chat_only" or bool(self._config.get("relay_autonomous_tools_opt_in"))
+
+    def _ensure_persona_recovered(self) -> None:
+        journal = self._persona_dir / ".apply-journal.json"
+        if journal.exists():
+            self._recover_persona_transaction()
+        if journal.exists():
+            raise RelayError(
+                "persona transaction recovery is pending; relay chat and controls are temporarily unavailable"
+            )
+
+    def relay_provider_status(self) -> dict[str, Any]:
+        with self._route_lock:
+            self._ensure_persona_recovered()
+        if not self._config.get("relay_enabled"):
+            return {
+                "ok": False,
+                "mode": "relay",
+                "enabled": False,
+                "provider": "",
+                "turn_active": self._send_lock.locked(),
+                "error": "Xia relay is disabled",
+            }
+        mode = str(self._config.get("relay_execution_mode") or "chat_only")
+        if mode == "autonomous" and not self._config.get("relay_autonomous_tools_opt_in"):
+            return {
+                "ok": False,
+                "mode": "relay",
+                "enabled": False,
+                "provider": "",
+                "turn_active": False,
+                "execution_mode": mode,
+                "error": "autonomous relay mode requires explicit tools opt-in",
+            }
+        status = self._relay.status(str(self._config.get("relay_url") or ""))
+        status["turn_active"] = bool(status.get("turn_active") or self._send_lock.locked())
+        return {
+            **status,
+            "mode": "relay",
+            "enabled": True,
+            "execution_mode": mode,
+            "current_model": self._selected_relay_model(str(status.get("provider") or "claude")),
+        }
+
+    def switch_relay_provider(self, provider: str) -> dict[str, Any]:
+        provider = normalize_provider(provider)
+        if not self._relay_ready:
+            raise RelayError("Xia relay is not ready")
+        # Serialize the decision with turn admission. This makes 409 reliable
+        # instead of racing the first bytes of a new chat request.
+        with self._route_lock:
+            self._ensure_persona_recovered()
+            if self._send_lock.locked() or self._relay.turn_active:
+                raise RelayBusyError("cannot switch provider while a turn is active")
+            result = self._relay.switch_provider(
+                str(self._config.get("relay_url") or ""), provider
+            )
+        return {
+            **result,
+            "mode": "relay",
+            "enabled": True,
+            "execution_mode": str(self._config.get("relay_execution_mode") or "chat_only"),
+            "current_model": self._selected_relay_model(provider),
+        }
+
+    @staticmethod
+    def _validate_model_id(value: Any, *, allow_empty: bool = False) -> str:
+        model = str(value or "").strip()
+        if not model and allow_empty:
+            return ""
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}", model):
+            raise ValueError("model must be a simple model id (max 200 characters)")
+        return model
+
+    def _selected_relay_model(self, provider: str) -> str:
+        models = self._config.get("relay_models")
+        return str(models.get(provider, "")) if isinstance(models, dict) else ""
+
+    def relay_model_status(self, provider: str | None = None) -> dict[str, Any]:
+        with self._route_lock:
+            self._ensure_persona_recovered()
+        if not self._relay_ready:
+            raise RelayError("relay is not enabled")
+        provider = normalize_provider(provider or self._relay.status(
+            str(self._config.get("relay_url") or "")
+        ).get("provider"))
+        selected = self._selected_relay_model(provider)
+        dynamic = self._relay.list_models(str(self._config.get("relay_url") or ""), provider)
+        choices = [{"id": "", "label": "CLI 默认", "source": "default"}]
+        seen = {""}
+        if provider == "claude":
+            for alias, label in (
+                ("fable", "Fable（CLI 别名）"),
+                ("opus", "Opus（CLI 别名）"),
+                ("sonnet", "Sonnet（CLI 别名）"),
+            ):
+                seen.add(alias)
+                choices.append({"id": alias, "label": label, "source": "alias"})
+        for item in dynamic.get("models", []):
+            model_id = str(item.get("id") or "")
+            if provider == "claude" and model_id == "default":
+                continue
+            if model_id and model_id not in seen:
+                seen.add(model_id)
+                choices.append({**item, "source": "relay"})
+        if selected and selected not in seen:
+            choices.append({"id": selected, "label": selected, "source": "configured"})
+        return {
+            "ok": True,
+            "provider": provider,
+            "current_model": selected,
+            "models": choices,
+            "dynamic": bool(dynamic.get("dynamic")),
+            "custom_allowed": provider == "claude",
+            "turn_active": self._send_lock.locked() or self._relay.turn_active,
+        }
+
+    def select_relay_model(self, provider: str, model: str) -> dict[str, Any]:
+        provider = normalize_provider(provider)
+        model = self._validate_model_id(model, allow_empty=True)
+        if not self._relay_ready:
+            raise RelayError("relay is not enabled")
+        with self._route_lock:
+            self._ensure_persona_recovered()
+            if self._send_lock.locked() or self._relay.turn_active:
+                raise RelayBusyError("cannot change model while a turn is active")
+            status = self.relay_model_status(provider)
+            allowed = {str(item.get("id") or "") for item in status["models"]}
+            if provider == "codex" and model not in allowed:
+                raise ValueError("Codex model must be selected from the relay model list")
+            models = dict(self._config.get("relay_models") or {})
+            models[provider] = model
+            self._config["relay_models"] = models
+            self._save_config()
+        return self.relay_model_status(provider)
+
+    @property
+    def _persona_dir(self) -> Path:
+        return self._state_dir / "ai_persona"
+
+    @staticmethod
+    def _fsync_dir(path: Path) -> None:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    @classmethod
+    def _ensure_private_dir(cls, path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        os.chmod(path, 0o700)
+
+    @classmethod
+    def _atomic_private_write(cls, path: Path, data: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+        cls._fsync_dir(path.parent)
+
+    def _remove_tree_durable(self, path: Path) -> None:
+        if path.exists():
+            shutil.rmtree(path)
+            self._fsync_dir(path.parent)
+
+    def _unlink_durable(self, path: Path) -> None:
+        if path.exists():
+            path.unlink()
+            self._fsync_dir(path.parent)
+
+    def _load_persona_manifest(self) -> dict[str, Any]:
+        path = self._persona_dir / "current" / "manifest.json"
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(value, dict) and isinstance(value.get("files"), list):
+                return value
+        except Exception:
+            pass
+        return {"files": [], "custom_text": "", "updated_at": ""}
+
+    def _compiled_persona_from_dir(self, root: Path) -> str:
+        try:
+            manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        except Exception:
+            return ""
+        parts: list[str] = []
+        files_dir = root / "files"
+        for item in manifest.get("files", []):
+            if not isinstance(item, dict):
+                continue
+            file_id = str(item.get("id") or "")
+            name = str(item.get("filename") or "persona")
+            if not re.fullmatch(r"[a-f0-9]{32}", file_id):
+                continue
+            try:
+                text = (files_dir / f"{file_id}.txt").read_text(encoding="utf-8").strip()
+            except Exception:
+                continue
+            if text:
+                parts.append(f"## Persona file: {name}\n\n{text}")
+        custom = str(manifest.get("custom_text") or "").strip()
+        if custom:
+            parts.append("## Custom persona override (highest priority)\n\n" + custom)
+        return "\n\n".join(parts)
+
+    def _compiled_persona(self) -> str:
+        return self._compiled_persona_from_dir(self._persona_dir / "current")
+
+    def _recover_persona_transaction(self) -> None:
+        journal = self._persona_dir / ".apply-journal.json"
+        if not journal.exists():
+            return
+        try:
+            record = json.loads(journal.read_text(encoding="utf-8"))
+            txid = str(record.get("transaction_id") or "")
+            phase = str(record.get("phase") or "")
+            if not re.fullmatch(r"[a-f0-9]{32}", txid):
+                raise ValueError("invalid persona transaction id")
+            if not re.fullmatch(r"\.stage-[a-f0-9]{32}", str(record.get("stage") or "")):
+                raise ValueError("invalid persona stage journal entry")
+            if not re.fullmatch(r"\.backup-[a-f0-9]{32}", str(record.get("backup") or "")):
+                raise ValueError("invalid persona backup journal entry")
+            stage = self._persona_dir / str(record["stage"])
+            backup = self._persona_dir / str(record["backup"])
+            if stage.parent != self._persona_dir or backup.parent != self._persona_dir:
+                raise ValueError("invalid persona journal path")
+            current = self._persona_dir / "current"
+            current_manifest = self._load_persona_manifest() if current.exists() else {}
+            committed = phase in {"refresh_inflight", "refresh_committed", "local_committed"}
+            committed = committed or current_manifest.get("transaction_id") == txid
+            mode = str(self._config.get("relay_execution_mode") or "chat_only")
+            if not committed:
+                if not current.exists() and backup.exists():
+                    os.replace(backup, current)
+                    self._fsync_dir(self._persona_dir)
+                self._relay.sync_persona(
+                    self._compiled_persona(), mode,
+                )
+                self._remove_tree_durable(stage)
+                self._remove_tree_durable(backup)
+                self._unlink_durable(journal)
+                return
+
+            # refresh_inflight is intentionally treated as committed: a crash
+            # can happen after the relay accepted refresh but before the next
+            # journal write. Repeating refresh is safe and ensures a fresh
+            # same-provider session even if the request never reached it.
+            staged_root = stage if stage.exists() else current
+            self._relay.sync_persona(self._compiled_persona_from_dir(staged_root), mode)
+            if phase == "refresh_inflight":
+                self._relay.refresh_sessions(str(self._config.get("relay_url") or ""))
+            if stage.exists():
+                if current.exists() and not backup.exists():
+                    os.replace(current, backup)
+                    self._fsync_dir(self._persona_dir)
+                if not current.exists():
+                    os.replace(stage, current)
+                    self._fsync_dir(self._persona_dir)
+            if current.exists():
+                self._remove_tree_durable(stage)
+                self._remove_tree_durable(backup)
+                self._unlink_durable(journal)
+        except Exception:
+            logger.exception("ai_chat: persona transaction recovery failed")
+
+    def persona_status(self) -> dict[str, Any]:
+        manifest = self._load_persona_manifest()
+        files = []
+        for item in manifest.get("files", []):
+            if isinstance(item, dict):
+                files.append({
+                    "id": str(item.get("id") or ""),
+                    "filename": str(item.get("filename") or ""),
+                    "size": int(item.get("size") or 0),
+                })
+        return {
+            "ok": True,
+            "files": files,
+            "custom_text": str(manifest.get("custom_text") or ""),
+            "updated_at": str(manifest.get("updated_at") or ""),
+            "total_size": sum(item["size"] for item in files)
+                + len(str(manifest.get("custom_text") or "").encode("utf-8")),
+            "turn_active": self._send_lock.locked() or self._relay.turn_active,
+        }
+
+    @staticmethod
+    def _validate_persona_text(filename: str, text: str) -> tuple[str, bytes]:
+        clean_name = Path(filename).name[:200]
+        if Path(clean_name).suffix.lower() not in {".md", ".txt"}:
+            raise ValueError("persona files must be .md or .txt")
+        if "\x00" in text:
+            raise ValueError("persona file contains binary data")
+        data = text.encode("utf-8")
+        if not data or len(data) > 256 * 1024:
+            raise ValueError("each persona file must be 1 byte to 256 KiB")
+        return clean_name, data
+
+    def apply_persona_composition(
+        self,
+        files: Any,
+        custom_text: Any,
+        *,
+        _fault: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(files, list):
+            raise ValueError("files must be an ordered list")
+        custom = str(custom_text or "")
+        custom_bytes = custom.encode("utf-8")
+        if len(custom_bytes) > 512 * 1024:
+            raise ValueError("custom persona text exceeds 512 KiB")
+        current = self._load_persona_manifest()
+        current_by_id = {
+            str(item.get("id")): item for item in current.get("files", [])
+            if isinstance(item, dict) and item.get("id")
+        }
+        prepared: list[tuple[dict[str, Any], bytes]] = []
+        total = len(custom_bytes)
+        for raw in files:  # no count cap; byte limits bound resource use
+            if not isinstance(raw, dict):
+                raise ValueError("each persona file must be an object")
+            existing_id = str(raw.get("id") or "")
+            if existing_id:
+                old = current_by_id.get(existing_id)
+                if old is None or not re.fullmatch(r"[a-f0-9]{32}", existing_id):
+                    raise ValueError("unknown persona file id")
+                source = self._persona_dir / "current" / "files" / f"{existing_id}.txt"
+                data = source.read_bytes()
+                meta = {"id": existing_id, "filename": str(old.get("filename") or "persona.txt"), "size": len(data)}
+            else:
+                name, data = self._validate_persona_text(
+                    str(raw.get("filename") or "persona.md"), str(raw.get("content") or "")
+                )
+                meta = {"id": uuid.uuid4().hex, "filename": name, "size": len(data)}
+            total += len(data)
+            if total > 2 * 1024 * 1024:
+                raise ValueError("combined persona text exceeds 2 MiB")
+            prepared.append((meta, data))
+
+        with self._route_lock:
+            if self._send_lock.locked() or self._relay.turn_active:
+                raise RelayBusyError("cannot apply persona while a turn is active")
+            self._ensure_persona_recovered()
+            self._ensure_private_dir(self._persona_dir)
+            txid = uuid.uuid4().hex
+            stage = self._persona_dir / f".stage-{txid}"
+            backup = self._persona_dir / f".backup-{uuid.uuid4().hex}"
+            current_dir = self._persona_dir / "current"
+            old_compiled = self._compiled_persona()
+            journal = self._persona_dir / ".apply-journal.json"
+            mode = str(self._config.get("relay_execution_mode") or "chat_only")
+            external_commit = False
+
+            def checkpoint(name: str) -> None:
+                if _fault is not None:
+                    _fault(name)
+
+            def write_journal(phase: str) -> None:
+                self._atomic_private_write(
+                    journal,
+                    json.dumps({
+                        "version": 1,
+                        "transaction_id": txid,
+                        "phase": phase,
+                        "stage": stage.name,
+                        "backup": backup.name,
+                    }, sort_keys=True).encode("utf-8"),
+                )
+
+            def finish_local_commit() -> None:
+                current_txid = ""
+                if current_dir.exists():
+                    try:
+                        current_txid = str(json.loads(
+                            (current_dir / "manifest.json").read_text(encoding="utf-8")
+                        ).get("transaction_id") or "")
+                    except Exception:
+                        pass
+                if current_txid != txid and stage.exists():
+                    if current_dir.exists() and not backup.exists():
+                        os.replace(current_dir, backup)
+                        self._fsync_dir(self._persona_dir)
+                    if not current_dir.exists():
+                        os.replace(stage, current_dir)
+                        self._fsync_dir(self._persona_dir)
+                write_journal("local_committed")
+
+            try:
+                (stage / "files").mkdir(parents=True)
+                os.chmod(stage, 0o700)
+                os.chmod(stage / "files", 0o700)
+                self._fsync_dir(self._persona_dir)
+                manifest_files = []
+                for meta, data in prepared:
+                    self._atomic_private_write(stage / "files" / f"{meta['id']}.txt", data)
+                    manifest_files.append(meta)
+                manifest = {
+                    "files": manifest_files,
+                    "custom_text": custom,
+                    "updated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+                    "transaction_id": txid,
+                }
+                self._atomic_private_write(
+                    stage / "manifest.json", json.dumps(manifest, ensure_ascii=False).encode("utf-8")
+                )
+                self._fsync_dir(stage / "files")
+                self._fsync_dir(stage)
+                write_journal("prepared")
+                checkpoint("after_journal")
+                compiled_parts = [f"## Persona file: {meta['filename']}\n\n{data.decode('utf-8').strip()}" for meta, data in prepared]
+                if custom.strip():
+                    compiled_parts.append("## Custom persona override (highest priority)\n\n" + custom.strip())
+                compiled = "\n\n".join(compiled_parts)
+                self._relay.sync_persona(compiled, mode)
+                write_journal("workspace_synced")
+                checkpoint("after_workspace_sync")
+
+                # The relay refresh is the external commit boundary. The
+                # active manifest still points at the old persona here.
+                write_journal("refresh_inflight")
+                self._relay.refresh_sessions(str(self._config.get("relay_url") or ""))
+                external_commit = True
+                write_journal("refresh_committed")
+                checkpoint("after_refresh_commit")
+
+                if current_dir.exists():
+                    os.replace(current_dir, backup)
+                    self._fsync_dir(self._persona_dir)
+                checkpoint("after_backup_rename")
+                os.replace(stage, current_dir)
+                self._fsync_dir(self._persona_dir)
+                write_journal("local_committed")
+            except Exception:
+                if external_commit:
+                    # Never claim failure or restore the old persona after the
+                    # relay has discarded its old sessions. Complete the local
+                    # pointer swap and leave a recoverable journal on failure.
+                    logger.exception("ai_chat: post-refresh persona commit repair")
+                    finish_local_commit()
+                else:
+                    if not current_dir.exists() and backup.exists():
+                        os.replace(backup, current_dir)
+                        self._fsync_dir(self._persona_dir)
+                    self._remove_tree_durable(stage)
+                    self._remove_tree_durable(backup)
+                    self._relay.sync_persona(old_compiled, mode)
+                    self._unlink_durable(journal)
+                    raise
+
+            # Cleanup is post-commit maintenance. Any failure leaves a journal
+            # for startup recovery but must not turn a successful apply into a
+            # reported failure or roll the relay workspace back.
+            backup_clean = False
+            try:
+                checkpoint("before_backup_cleanup")
+                self._remove_tree_durable(backup)
+                backup_clean = True
+            except Exception:
+                logger.exception("ai_chat: persona backup cleanup deferred")
+            if backup_clean:
+                try:
+                    checkpoint("before_journal_unlink")
+                    self._unlink_durable(journal)
+                except Exception:
+                    logger.exception("ai_chat: persona journal cleanup deferred")
+        return self.persona_status()
+
     # ---- history ----
+
+    def _load_request_states(self) -> dict[str, dict[str, Any]]:
+        try:
+            value = json.loads(self._request_state_path.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                return {
+                    str(key): item for key, item in value.items()
+                    if isinstance(item, dict)
+                }
+        except Exception:
+            pass
+        return {}
+
+    def _set_request_state(
+        self, client_message_id: str, status: str, *, visible_output: bool = False, error: str = ""
+    ) -> None:
+        if not client_message_id:
+            return
+        with self._lock:
+            states = self._load_request_states()
+            states[client_message_id] = {
+                "status": status,
+                "visible_output": bool(visible_output),
+                "error": str(error)[:500],
+                "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            if len(states) > 2000:
+                states = dict(list(states.items())[-2000:])
+            self._atomic_private_write(
+                self._request_state_path,
+                json.dumps(states, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+            )
 
     def _append_history(self, role: str, text: str, thinking: str = "", **extra: Any) -> str:
         """Append a message to the JSONL history file.  Returns the ISO ts."""
@@ -165,6 +661,8 @@ class AIChatManager:
             "attachment_filename",
             "image",
             "files",
+            "provider",
+            "tools",
         ):
             value = extra.get(key)
             if value:
@@ -195,7 +693,24 @@ class AIChatManager:
                 if rec.get("thinking"):
                     result["thinking"] = rec.get("thinking", "")
                 return result
-        return {"ok": False, "duplicate": True, "error": "duplicate client message already in progress"}
+        state = self._load_request_states().get(client_message_id, {})
+        status = str(state.get("status") or "")
+        visible = bool(state.get("visible_output"))
+        if status in {"pending", "failed"} and not visible:
+            # The send lock guarantees no active request can reach here. A
+            # pending record is therefore stale after a process interruption.
+            # Retrying is best-effort UX, not proof that the isolated engine
+            # never accepted the earlier request.
+            return {"_retry": True, "user_ts": records[user_index].get("ts", "")}
+        if status == "failed" or visible:
+            return {
+                "ok": False,
+                "duplicate": True,
+                "terminal": True,
+                "retryable": False,
+                "error": str(state.get("error") or "previous relay attempt failed after visible output"),
+            }
+        return {"_retry": True, "user_ts": records[user_index].get("ts", "")}
 
     def read_history(self, since: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
         """Return history records, optionally filtered by *since* timestamp."""
@@ -219,109 +734,24 @@ class AIChatManager:
         limit = max(1, min(int(limit), 10000))
         return out[-limit:]
 
-    def _recent_messages(self, n: int) -> list[dict[str, str]]:
-        """Return the last *n* messages formatted for the OpenAI messages array."""
-        records = self.read_history(limit=n)
-        return [{"role": r["role"], "content": r["text"]} for r in records]
-
-    # ---- models discovery ----
-
-    def fetch_models(self, api_url: str = "", api_key: str = "") -> dict[str, Any]:
-        """Fetch available models from an OpenAI-compatible /models endpoint."""
-        url = api_url or self._config.get("api_url", "")
-        key = api_key or self._config.get("api_key", "")
-        if not url or not key:
-            return {"ok": False, "error": "api_url and api_key required"}
-        self._validate_url(url)
-        models_url = url.split("/chat/completions")[0].rstrip("/") + "/models"
-        req = urllib.request.Request(
-            models_url,
-            headers={
-                "Authorization": f"Bearer {key}",
-                "User-Agent": "ai-chat/1.0",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            return {"ok": False, "error": f"HTTP {e.code}"}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
-        data = body.get("data", body.get("models", []))
-        if isinstance(data, list):
-            model_ids = [m.get("id", "") if isinstance(m, dict) else str(m) for m in data]
-            model_ids = [m for m in model_ids if m]
-            return {"ok": True, "models": sorted(model_ids)}
-        return {"ok": True, "models": []}
-
-    # ---- memory (via memory-mcp) ----
-
-    def _fetch_memories(self, query: str) -> list[str]:
-        """Semantic-search the memory-mcp for relevant memories. Returns list of text snippets."""
-        if not self._config.get("memory_enabled"):
-            return []
-        mcp_url = self._config.get("memory_mcp_url", "")
-        category = self._config.get("memory_category", "xiayizhou")
-        limit = int(self._config.get("memory_max_results", 5))
-        if not mcp_url:
-            return []
-        try:
-            _mcp_headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/event-stream",
-                "User-Agent": "ai-chat/1.0",
-            }
-            init_payload = json.dumps({
-                "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "ai-chat", "version": "1.0"},
-                },
-            }).encode("utf-8")
-            req = urllib.request.Request(mcp_url, data=init_payload, headers=_mcp_headers)
-            with urllib.request.urlopen(req, timeout=10) as init_resp:
-                init_resp.read()
-
-            search_payload = json.dumps({
-                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                "params": {
-                    "name": "semantic_search",
-                    "arguments": {"query": query, "limit": limit},
-                },
-            }).encode("utf-8")
-            req2 = urllib.request.Request(mcp_url, data=search_payload, headers=_mcp_headers)
-            with urllib.request.urlopen(req2, timeout=15) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-            content = body.get("result", {}).get("content", [])
-            if not content:
-                return []
-            raw_text = content[0].get("text", "")
-            memories_list = json.loads(raw_text) if raw_text.startswith("[") else []
-            results = []
-            for mem in memories_list:
-                cat = mem.get("category", "")
-                if category and cat != category:
-                    continue
-                text = mem.get("content", "")[:500]
-                if text:
-                    results.append(text)
-            return results[:limit]
-        except Exception:
-            logger.debug("ai_chat: memory fetch failed", exc_info=True)
-            return []
-
-    # ---- API call ----
+    # ---- relay calls ----
 
     def send_message(self, user_text: str, client_message_id: str = "") -> dict[str, Any]:
         """Send *user_text*, call the AI API, store both sides, return result dict.
         Serialized per-session to prevent interleaving."""
-        if not self.enabled:
-            return {"ok": False, "error": "ai chat is not enabled"}
+        if not self._relay_ready:
+            return {"ok": False, "error": "Xia relay is not ready"}
 
-        with self._send_lock:
+        with self._route_lock:
+            try:
+                self._ensure_persona_recovered()
+            except RelayError as exc:
+                return {"ok": False, "error": str(exc), "retryable": True}
+            self._send_lock.acquire()
+        try:
             return self._send_message_locked(user_text, client_message_id=client_message_id)
+        finally:
+            self._send_lock.release()
 
     def send_attachment(
         self,
@@ -331,414 +761,233 @@ class AIChatManager:
         attachment_filename: str,
         local_path: str,
     ) -> dict[str, Any]:
-        """Store an uploaded attachment in AI chat history and notify the AI."""
-        if not self.enabled:
-            return {"ok": False, "error": "ai chat is not enabled"}
-
-        display_text = user_text.strip() or f"[用户发了{'图片' if attachment_type == 'image' else '文件'}: {attachment_filename}]"
-        prompt = display_text
-        prompt += (
-            f"\n\n[用户上传了{'图片' if attachment_type == 'image' else '文件'}: {attachment_filename}]"
-            f"\n附件 URL: {attachment_url}"
-        )
-        if local_path:
-            prompt += f"\n服务端本地路径: {local_path}"
-
-        with self._send_lock:
-            return self._send_attachment_locked(
-                display_text=display_text,
-                prompt=prompt,
-                attachment_url=attachment_url,
-                attachment_type=attachment_type,
-                attachment_filename=attachment_filename,
-            )
+        """Reject new files until the restricted relay has a safe byte bridge."""
+        return {
+            "ok": False,
+            "unsupported": True,
+            "error": "夏以昼的隔离会话目前只支持文字；新图片和文件尚未接入安全附件桥",
+        }
 
     def _send_message_locked(self, user_text: str, client_message_id: str = "") -> dict[str, Any]:
-
-        api_url = self._config.get("api_url", "")
-        api_key = self._config.get("api_key", "")
-        model = self._config.get("model", "")
-        system_prompt = self._config.get("system_prompt", "")
-        max_ctx = int(self._config.get("max_context_messages", 20))
-
-        if not api_url or not api_key or not model:
-            return {"ok": False, "error": "ai chat not configured (missing api_url / api_key / model)"}
-
-        duplicate = self._find_client_message_result(client_message_id)
-        if duplicate is not None:
-            return duplicate
-
-        # Fetch relevant memories
-        memories = self._fetch_memories(user_text)
-
-        # Build messages array
-        messages: list[dict[str, str]] = []
-        if system_prompt:
-            now = datetime.now(timezone.utc).astimezone()
-            time_block = f"\n\n## 当前时间\n{now.strftime('%Y年%m月%d日 %H:%M %A')}"
-            mem_block = ""
-            if memories:
-                mem_block = "\n\n## 相关记忆\n" + "\n---\n".join(memories)
-            messages.append({"role": "system", "content": system_prompt + time_block + mem_block})
-        messages.extend(self._recent_messages(max_ctx))
-        messages.append({"role": "user", "content": user_text})
-
-        # Store user message
-        user_ts = self._append_history("user", user_text, client_message_id=client_message_id)
-
-        # Call API
-        try:
-            reply_text, thinking = self._call_api(api_url, api_key, model, messages)
-        except Exception as e:
-            logger.exception("ai_chat: API call failed")
-            return {"ok": False, "error": str(e), "ts": user_ts}
-
-        # Store assistant reply
-        reply_ts = self._append_history("assistant", reply_text, thinking=thinking, client_message_id=client_message_id)
-
-        result = {"ok": True, "reply": reply_text, "ts": reply_ts}
-        if thinking:
-            result["thinking"] = thinking
-        return result
+        return self._send_message_relay_locked(
+            user_text, lambda _event: None, client_message_id=client_message_id
+        )
 
     def send_message_stream(self, text: str, emit: Any, client_message_id: str = "") -> dict[str, Any]:
         """Send a message and emit newline-JSON stream events while the reply arrives."""
         text = text.strip()
         if not text:
             return {"ok": False, "error": "empty message"}
-        with self._send_lock:
+        if not self._relay_ready:
+            return {"ok": False, "error": "Xia relay is not ready"}
+        with self._route_lock:
+            try:
+                self._ensure_persona_recovered()
+            except RelayError as exc:
+                return {"ok": False, "error": str(exc), "retryable": True}
+            self._send_lock.acquire()
+        try:
             return self._send_message_stream_locked(text, emit, client_message_id=client_message_id)
+        finally:
+            self._send_lock.release()
 
     def _send_message_stream_locked(self, user_text: str, emit: Any, client_message_id: str = "") -> dict[str, Any]:
-        api_url = self._config.get("api_url", "")
-        api_key = self._config.get("api_key", "")
-        model = self._config.get("model", "")
-        system_prompt = self._config.get("system_prompt", "")
-        max_ctx = int(self._config.get("max_context_messages", 20))
+        return self._send_message_relay_locked(
+            user_text, emit, client_message_id=client_message_id
+        )
 
-        if not api_url or not api_key or not model:
-            return {"ok": False, "error": "ai chat not configured (missing api_url / api_key / model)"}
-
+    def _send_message_relay_locked(
+        self,
+        user_text: str,
+        emit: Any,
+        *,
+        client_message_id: str = "",
+        history_user_text: str | None = None,
+        history_user_extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Drive the isolated relay while retaining local history authority."""
+        if not client_message_id:
+            client_message_id = "server_" + uuid.uuid4().hex
+        client_message_id = validate_request_id(client_message_id)
         duplicate = self._find_client_message_result(client_message_id)
-        if duplicate is not None:
+        retry_existing = bool(duplicate and duplicate.get("_retry"))
+        if duplicate is not None and not retry_existing:
             if duplicate.get("ok") and duplicate.get("reply"):
                 emit({"type": "delta", "text": duplicate.get("reply", "")})
                 if duplicate.get("thinking"):
                     emit({"type": "thinking_delta", "text": duplicate.get("thinking", "")})
             return duplicate
 
-        memories = self._fetch_memories(user_text)
-
-        messages: list[dict[str, str]] = []
-        if system_prompt:
-            now = datetime.now(timezone.utc).astimezone()
-            time_block = f"\n\n## 当前时间\n{now.strftime('%Y年%m月%d日 %H:%M %A')}"
-            mem_block = ""
-            if memories:
-                mem_block = "\n\n## 相关记忆\n" + "\n---\n".join(memories)
-            messages.append({"role": "system", "content": system_prompt + time_block + mem_block})
-        messages.extend(self._recent_messages(max_ctx))
-        messages.append({"role": "user", "content": user_text})
-
-        user_ts = self._append_history("user", user_text, client_message_id=client_message_id)
-        emit({"type": "user", "ts": user_ts, "text": user_text})
-
-        try:
-            reply_text, thinking = self._call_api_stream(api_url, api_key, model, messages, emit)
-        except Exception as e:
-            logger.exception("ai_chat: streaming API call failed")
-            return {"ok": False, "error": str(e), "ts": user_ts}
-
-        reply_ts = self._append_history("assistant", reply_text, thinking=thinking, client_message_id=client_message_id)
-        result = {"ok": True, "reply": reply_text, "ts": reply_ts}
-        if thinking:
-            result["thinking"] = thinking
-        return result
-
-    def _send_attachment_locked(
-        self,
-        display_text: str,
-        prompt: str,
-        attachment_url: str,
-        attachment_type: str,
-        attachment_filename: str,
-    ) -> dict[str, Any]:
-        api_url = self._config.get("api_url", "")
-        api_key = self._config.get("api_key", "")
-        model = self._config.get("model", "")
-        system_prompt = self._config.get("system_prompt", "")
-        max_ctx = int(self._config.get("max_context_messages", 20))
-
-        if not api_url or not api_key or not model:
-            return {"ok": False, "error": "ai chat not configured (missing api_url / api_key / model)"}
-
-        memories = self._fetch_memories(prompt)
-
-        messages: list[dict[str, str]] = []
-        if system_prompt:
-            now = datetime.now(timezone.utc).astimezone()
-            time_block = f"\n\n## 当前时间\n{now.strftime('%Y年%m月%d日 %H:%M %A')}"
-            mem_block = ""
-            if memories:
-                mem_block = "\n\n## 相关记忆\n" + "\n---\n".join(memories)
-            messages.append({"role": "system", "content": system_prompt + time_block + mem_block})
-        messages.extend(self._recent_messages(max_ctx))
-        messages.append({"role": "user", "content": prompt})
-
-        user_ts = self._append_history(
-            "user",
-            display_text,
-            attachment_url=attachment_url,
-            attachment_type=attachment_type,
-            attachment_filename=attachment_filename,
+        prior_history = self.read_history(limit=200)
+        if retry_existing and client_message_id:
+            prior_history = [
+                record for record in prior_history
+                if not (
+                    record.get("role") == "user"
+                    and record.get("client_message_id") == client_message_id
+                )
+            ]
+        handoff = build_authoritative_handoff(prior_history)
+        execution_mode = str(self._config.get("relay_execution_mode") or "chat_only")
+        self._relay.sync_persona(
+            self._compiled_persona(), execution_mode
         )
+        relay_url = str(self._config.get("relay_url") or "")
+        status = self._relay.status(relay_url)
+        provider = normalize_provider(status.get("provider"))
+        selected_model = self._selected_relay_model(provider)
 
-        try:
-            reply_text, thinking = self._call_api(api_url, api_key, model, messages)
-        except Exception as e:
-            logger.exception("ai_chat: attachment API call failed")
-            return {"ok": False, "error": str(e), "ts": user_ts}
-
-        reply_ts = self._append_history("assistant", reply_text, thinking=thinking)
-
-        result = {"ok": True, "reply": reply_text, "ts": reply_ts}
-        if thinking:
-            result["thinking"] = thinking
-        return result
-
-    def _call_api(
-        self,
-        api_url: str,
-        api_key: str,
-        model: str,
-        messages: list[dict[str, str]],
-    ) -> str:
-        """POST to an OpenAI-compatible chat/completions endpoint.  Returns reply text."""
-        def _chat_completions_url(url: str) -> str:
-            stripped = url.rstrip("/")
-            if stripped.endswith("/chat/completions"):
-                return stripped
-            return stripped + "/chat/completions"
-
-        def _preview(raw: bytes, limit: int = 300) -> str:
-            text = raw.decode("utf-8", errors="replace")
-            text = re.sub(r"\s+", " ", text).strip()
-            return text[:limit]
-
-        payload_obj: dict[str, Any] = {"model": model, "messages": messages}
-        if (urlparse(api_url).hostname or "").endswith("openrouter.ai"):
-            payload_obj["reasoning"] = {"enabled": True, "exclude": False}
-            payload_obj["include_reasoning"] = True
-        payload = json.dumps(payload_obj, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(
-            _chat_completions_url(api_url),
-            data=payload,
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                status = resp.getcode()
-                content_type = resp.headers.get("Content-Type", "")
-                raw = resp.read()
-                try:
-                    body = json.loads(raw.decode("utf-8"))
-                except json.JSONDecodeError as e:
-                    preview = _preview(raw)
-                    logger.warning(
-                        "ai_chat: API non-JSON response status=%s content_type=%r bytes=%d preview=%r",
-                        status,
-                        content_type,
-                        len(raw),
-                        preview,
-                    )
-                    detail = preview or "<empty body>"
-                    raise RuntimeError(
-                        f"API returned non-JSON response (HTTP {status}, {content_type or 'unknown content type'}, "
-                        f"{len(raw)} bytes): {detail}"
-                    ) from e
-        except urllib.error.HTTPError as e:
-            raw = e.read()
-            content_type = e.headers.get("Content-Type", "") if e.headers else ""
-            preview = _preview(raw)
-            logger.warning(
-                "ai_chat: API HTTP %d content_type=%r bytes=%d preview=%r",
-                e.code,
-                content_type,
-                len(raw),
-                preview,
+        self._set_request_state(client_message_id, "pending", visible_output=False)
+        if retry_existing:
+            user_ts = str(duplicate.get("user_ts") or "")
+        else:
+            user_ts = self._append_history(
+                "user",
+                history_user_text if history_user_text is not None else user_text,
+                client_message_id=client_message_id,
+                **(history_user_extra or {}),
             )
-            detail = f": {preview}" if preview else ""
-            raise RuntimeError(f"API returned HTTP {e.code}{detail}") from e
-        except urllib.error.URLError as e:
-            raise RuntimeError(f"API request failed: {e.reason}") from e
+            emit({
+                "type": "user",
+                "ts": user_ts,
+                "text": history_user_text if history_user_text is not None else user_text,
+            })
+        activities_by_id: dict[str, dict[str, Any]] = {}
+        visible_output = False
 
-        choices = body.get("choices")
-        if not choices or not isinstance(choices, list):
-            raise RuntimeError(f"unexpected API response shape: {json.dumps(body, ensure_ascii=False)[:300]}")
-        message = choices[0].get("message", {})
-        content = str(message.get("content", "")).strip()
-        if not content:
-            raise RuntimeError("模型返回了空回复")
-        thinking = str(
-            message.get("reasoning")
-            or message.get("reasoning_content")
-            or message.get("thoughts")
-            or ""
-        ).strip()
-        if not thinking:
-            reasoning_details = message.get("reasoning_details")
-            if isinstance(reasoning_details, list):
-                parts: list[str] = []
-                for item in reasoning_details:
-                    if not isinstance(item, dict):
-                        continue
-                    text = item.get("text") or item.get("content")
-                    if text:
-                        parts.append(str(text))
-                thinking = "\n".join(parts).strip()
-        return content, thinking
+        def relay_emit(event: dict[str, Any]) -> None:
+            nonlocal visible_output
+            if not visible_output and event.get("type") in {"delta", "thinking_delta", "activity"}:
+                visible_output = True
+                self._set_request_state(client_message_id, "pending", visible_output=True)
+            activity = event.get("activity")
+            if isinstance(activity, dict):
+                activity_id = str(activity.get("id") or "")
+                if activity_id:
+                    activities_by_id[activity_id] = {**activities_by_id.get(activity_id, {}), **activity}
+            emit(event)
 
-    def _call_api_stream(
-        self,
-        api_url: str,
-        api_key: str,
-        model: str,
-        messages: list[dict[str, str]],
-        emit: Any,
-    ) -> tuple[str, str]:
-        """POST to chat/completions with stream=true and emit incremental chunks."""
-        def _chat_completions_url(url: str) -> str:
-            stripped = url.rstrip("/")
-            if stripped.endswith("/chat/completions"):
-                return stripped
-            return stripped + "/chat/completions"
-
-        def _preview(raw: bytes, limit: int = 300) -> str:
-            text = raw.decode("utf-8", errors="replace")
-            text = re.sub(r"\s+", " ", text).strip()
-            return text[:limit]
-
-        payload_obj: dict[str, Any] = {"model": model, "messages": messages, "stream": True}
-        if (urlparse(api_url).hostname or "").endswith("openrouter.ai"):
-            payload_obj["reasoning"] = {"enabled": True, "exclude": False}
-            payload_obj["include_reasoning"] = True
-        payload = json.dumps(payload_obj, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(
-            _chat_completions_url(api_url),
-            data=payload,
-            headers={
-                "Accept": "text/event-stream, application/json",
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-            method="POST",
-        )
-
-        reply_parts: list[str] = []
-        thinking_parts: list[str] = []
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                content_type = resp.headers.get("Content-Type", "")
-                if "text/event-stream" not in content_type and "application/x-ndjson" not in content_type:
-                    raw = resp.read()
-                    preview = _preview(raw)
-                    logger.warning(
-                        "ai_chat: API stream non-stream response status=%s content_type=%r bytes=%d preview=%r",
-                        resp.getcode(),
-                        content_type,
-                        len(raw),
-                        preview,
-                    )
-                    try:
-                        body = json.loads(raw.decode("utf-8"))
-                    except json.JSONDecodeError as e:
-                        detail = preview or "<empty body>"
-                        raise RuntimeError(
-                            f"API returned non-stream response (HTTP {resp.getcode()}, "
-                            f"{content_type or 'unknown content type'}, {len(raw)} bytes): {detail}"
-                        ) from e
-                    choices = body.get("choices")
-                    if not choices or not isinstance(choices, list):
-                        raise RuntimeError(f"unexpected API response shape: {json.dumps(body, ensure_ascii=False)[:300]}")
-                    message = choices[0].get("message", {})
-                    content = str(message.get("content", "")).strip()
-                    thinking = str(message.get("reasoning") or message.get("reasoning_content") or "").strip()
-                    if content:
-                        emit({"type": "delta", "text": content})
-                    if thinking:
-                        emit({"type": "thinking_delta", "text": thinking})
-                    if not content:
-                        raise RuntimeError("模型返回了空回复")
-                    return content, thinking
-
-                for raw_line in resp:
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line:
-                        continue
-                    if line.startswith(":"):
-                        continue
-                    if line.startswith("data:"):
-                        line = line[5:].strip()
-                    if not line:
-                        continue
-                    if line == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(line)
-                    except json.JSONDecodeError:
-                        logger.debug("ai_chat: ignored non-json stream line: %r", line[:200])
-                        continue
-                    choices = chunk.get("choices")
-                    if not choices or not isinstance(choices, list):
-                        continue
-                    delta = choices[0].get("delta") or {}
-                    content_piece = delta.get("content")
-                    if content_piece:
-                        text = str(content_piece)
-                        reply_parts.append(text)
-                        emit({"type": "delta", "text": text})
-                    thinking_piece = (
-                        delta.get("reasoning")
-                        or delta.get("reasoning_content")
-                        or delta.get("thoughts")
-                    )
-                    if thinking_piece:
-                        text = str(thinking_piece)
-                        thinking_parts.append(text)
-                        emit({"type": "thinking_delta", "text": text})
-                    reasoning_details = delta.get("reasoning_details")
-                    if isinstance(reasoning_details, list):
-                        for item in reasoning_details:
-                            if not isinstance(item, dict):
-                                continue
-                            detail_text = item.get("text") or item.get("content")
-                            if detail_text:
-                                text = str(detail_text)
-                                thinking_parts.append(text)
-                                emit({"type": "thinking_delta", "text": text})
-        except urllib.error.HTTPError as e:
-            raw = e.read()
-            content_type = e.headers.get("Content-Type", "") if e.headers else ""
-            preview = _preview(raw)
-            logger.warning(
-                "ai_chat: API stream HTTP %d content_type=%r bytes=%d preview=%r",
-                e.code,
-                content_type,
-                len(raw),
-                preview,
+            final = self._relay.stream_turn(
+                relay_url,
+                provider=provider,
+                text=user_text,
+                handoff=handoff,
+                execution_mode=execution_mode,
+                model=selected_model,
+                request_id=client_message_id,
+                emit=relay_emit,
             )
-            detail = f": {preview}" if preview else ""
-            raise RuntimeError(f"API returned HTTP {e.code}{detail}") from e
-        except urllib.error.URLError as e:
-            raise RuntimeError(f"API request failed: {e.reason}") from e
+            # Close the replay window as soon as the proxy returns an
+            # authoritative done. If the process dies before history append,
+            # the same client ID becomes terminal instead of replaying a
+            # model turn whose upstream side effects are unknowable.
+            visible_output = True
+            self._set_request_state(
+                client_message_id,
+                "final_received",
+                visible_output=True,
+                error="relay final received but history commit is incomplete",
+            )
+        except RelayRequestUncertain as exc:
+            logger.warning("ai_chat: relay request is terminal-ambiguous id=%s", client_message_id[:32])
+            message = "上一轮已被隔离会话接收，但完成状态不确定；请把内容作为一条新消息发送"
+            self._set_request_state(
+                client_message_id, "failed", visible_output=True, error=message
+            )
+            return {
+                "ok": False,
+                "error": message,
+                "code": exc.code,
+                "ts": user_ts,
+                "terminal": True,
+                "retryable": False,
+            }
+        except RelayRequestTerminal as exc:
+            logger.warning("ai_chat: relay request ended without usable final id=%s", client_message_id[:32])
+            message = "上一轮已经结束，但没有可恢复的完整回复；请把内容作为一条新消息发送"
+            self._set_request_state(
+                client_message_id, "failed", visible_output=True, error=message
+            )
+            return {
+                "ok": False,
+                "error": message,
+                "code": exc.code,
+                "ts": user_ts,
+                "terminal": True,
+                "retryable": False,
+            }
+        except Exception as exc:
+            logger.exception("ai_chat: relay stream failed")
+            self._set_request_state(
+                client_message_id, "failed", visible_output=visible_output, error=str(exc)
+            )
+            return {
+                "ok": False,
+                "error": str(exc),
+                "ts": user_ts,
+                "terminal": visible_output,
+                "retryable": not visible_output,
+            }
 
-        reply_text = "".join(reply_parts).strip()
-        thinking = "".join(thinking_parts).strip()
+        reply_text = str(final.get("reply") or "").strip()
+        thinking = str(final.get("thinking") or "")
+        final_activities = final.get("activities")
+        if isinstance(final_activities, list):
+            for activity in final_activities:
+                if isinstance(activity, dict) and activity.get("id"):
+                    activity = dict(activity)
+                    activity.setdefault(
+                        "name", str(activity.get("title") or activity.get("kind") or "tool")
+                    )
+                    activity_id = str(activity["id"])
+                    activities_by_id[activity_id] = {
+                        **activities_by_id.get(activity_id, {}), **activity
+                    }
         if not reply_text:
-            raise RuntimeError("模型返回了空回复")
-        return reply_text, thinking
+            error = str(final.get("error") or "relay returned an empty final reply")
+            self._set_request_state(
+                client_message_id, "failed", visible_output=visible_output, error=error
+            )
+            return {
+                "ok": False,
+                "error": error,
+                "ts": user_ts,
+                "terminal": visible_output,
+                "retryable": not visible_output,
+            }
+        tools = json.dumps(list(activities_by_id.values()), ensure_ascii=False) if activities_by_id else ""
+        try:
+            reply_ts = self._append_history(
+                "assistant",
+                reply_text,
+                thinking=thinking,
+                client_message_id=client_message_id,
+                provider=provider,
+                tools=tools,
+            )
+        except Exception as exc:
+            logger.exception("ai_chat: relay final history commit failed")
+            self._set_request_state(
+                client_message_id, "failed", visible_output=True, error=str(exc)
+            )
+            return {
+                "ok": False,
+                "error": "relay final was received but could not be committed to history",
+                "ts": user_ts,
+                "terminal": True,
+                "retryable": False,
+            }
+        result = {
+            "ok": True,
+            "reply": reply_text,
+            "ts": reply_ts,
+            "provider": provider,
+            "activities": list(activities_by_id.values()),
+        }
+        if thinking:
+            result["thinking"] = thinking
+        if final.get("error"):
+            result["warning"] = str(final["error"])
+        self._set_request_state(client_message_id, "completed", visible_output=True)
+        return result
