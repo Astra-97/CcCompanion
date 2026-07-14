@@ -4,6 +4,72 @@
 thread behind `ai-session-relay`. Kairos and Xiaoke routes, pointers, workspaces,
 and sessions are not read or changed by this integration.
 
+## Optional long-lived Claude channel transport
+
+Claude may use either transport while Codex continues to use the existing
+long-lived app-server relay:
+
+- `claude_transport=relay` (default and rollback): official `-p + stream-json`
+  driver already shipped with the isolated relay.
+- `claude_transport=channel`: a dedicated long-lived interactive Claude TUI in
+  tmux socket `cc-xia-claude`, connected only to the Xia Development Channel on
+  loopback port 8821. The App intentionally receives one final `done` and no
+  Claude text deltas. This does not change the Android API contract.
+
+The channel is not the Xiaoke POC on port 8810. It fixes contact/provider to
+`ai-custom/claude`, has no CcCompanion global write token, and cannot call
+`/chat/append`. `AIChatManager` remains the only writer of
+`ai_chat_history.jsonl`: it durably records the user, grants one request with a
+stable backend client id plus provider epoch and random lease, waits for the
+channel's durable result, then appends exactly one assistant row.
+
+Each grant is matched on request id, client id, epoch, lease, provider, contact,
+and Claude generation. The model cannot choose a contact. Wrong/stale/revoked
+grants fail closed. A reply-tool/Stop-hook race completes the ledger only once;
+the Stop hook accepts only exact metadata from its own current channel turn and
+extracts assistant text blocks, never raw thinking. A completed result survives
+a backend/channel restart. An accepted/running request interrupted by a channel
+crash becomes terminal-uncertain and is never automatically replayed.
+
+During rotation the old process first persists `draining` and
+`requires_fresh`, immediately reports `ready=false`, and refuses messages.
+Only a newly launched process whose generation, model, session id, and
+one-time bootstrap token exactly match durable control may become ready.
+Existing malformed ledger/control files abort startup; only missing files may
+be initialized. Replies and total ledger bytes are bounded and old terminal
+entries are compacted.
+
+Normal service restarts resume the same explicit Claude session. Model or
+persona changes increment a durable generation and require a fresh native
+session before another Claude turn; the old generation cannot answer. Provider
+round trips retain the session but add one bounded authoritative handoff on the
+first turn back, covering conversation that occurred in Codex. Persona remains
+read-only in the isolated workspace and is compiled into both `CLAUDE.md` and
+`AGENTS.md`.
+
+Tracked deployment templates live in `xia_claude_channel/` and
+`deploy/cc-xia-claude-channel.service`. The launcher uses the existing dedicated
+`cc-xia-relay` account but separate `channel-state`, `claude-channel-home`, tmux
+socket, MCP config, token, and credential snapshot. It loads no Telegram/root
+configuration, disables built-in tools and slash commands, strictly loads only
+the dedicated reply MCP, and has a Xia-only Stop hook. The systemd unit uses
+private paths and memory/OOM limits. The operator view helper is capture-only.
+
+Development Channels are experimental. The launcher never sends blind tmux
+keystrokes to accept a changed confirmation page: failure to reach authenticated
+MCP readiness within the bounded startup window exits fail-closed. A one-time
+operator preflight must confirm that the installed Claude version keeps the
+dedicated MCP reply tool available when built-ins are disabled. Credential
+snapshots are supplied explicitly; `prepare-runtime.sh` never copies
+`/root/.claude`.
+
+The unit reuses the relay Linux UID only for operational simplicity. Its mount
+namespace makes `/var/lib/cc-xia-relay/state` (the old relay credentials and
+pointers) inaccessible. The only persona view is a real read-only bind mount
+from `state/ai_relay_workspace` to the channel workspace. Channel HOME/state
+remain separate, and `TMUX_TMPDIR` is fixed inside channel state so
+`PrivateTmp` cannot hide the socket from the capture-only view helper.
+
 ## State boundaries
 
 - Authoritative chat archive: `state/ai_chat_history.jsonl` (unchanged).
@@ -138,6 +204,54 @@ again with the same ID.
 5. Build Android only in GitHub Actions. From Xia chat, open `⋮` →
    `夏以昼控制`, verify provider/model/persona controls, then make one turn on
 each provider and confirm Kairos/Xiaoke session pointers are unchanged.
+
+For the optional channel, install dependencies from the committed lockfile,
+prepare private state, provision only the isolated Claude credential snapshot,
+and start the channel service while `claude_transport` is still `relay`. Verify
+unauthenticated requests are 401, exact-grant reply and Stop fallback dedupe,
+fresh/resume behavior, and the capture-only TUI view. Then, while no Xia turn is
+active, atomically select `channel` and restart only the CcCompanion backend by
+the normal delayed procedure. Rollback is the reverse idle transition to
+`relay`, followed by epoch revoke; retain both channel state and authoritative
+history for audit/recovery.
+
+Reproducible channel installation sequence (only after review):
+
+```bash
+install -d -o root -g root -m 0755 /opt/cc-xia-claude-channel
+cp -a apns-server/xia_claude_channel/. /opt/cc-xia-claude-channel/
+cd /opt/cc-xia-claude-channel
+npm ci --omit=dev --ignore-scripts
+chown -R root:root /opt/cc-xia-claude-channel
+chmod 0755 launcher.sh prepare-runtime.sh stop_hook.py runtime_state.py view.sh server.mjs
+./prepare-runtime.sh
+# Provision only the dedicated Claude credential snapshot as 0600 owned by
+# cc-xia-relay. Never copy root/Xiaoke settings or hooks.
+install -o root -g root -m 0644 \
+  /root/CcCompanion/apns-server/deploy/cc-xia-claude-channel.service \
+  /etc/systemd/system/cc-xia-claude-channel.service
+systemctl daemon-reload
+systemctl start cc-xia-claude-channel.service
+```
+
+Keep `claude_transport=relay` during smoke. Verify unauthenticated health is
+401; authenticated health reports the exact generation/session and ready;
+`metadata_json` appears as the escaped opening-tag attribute consumed by the
+Stop hook; reply and fallback dedupe; the reply MCP remains available with
+`--tools ""`; and the read-only view reaches the fixed private socket. At an
+idle boundary, use the operator-only config helper to select `channel`; it
+persists an epoch fence, revoke, and `needs_handoff` before the normal delayed
+backend restart.
+
+Transport configuration is copy-on-write. A config-file fsync/replace failure
+restores the in-process transport selection; the already persisted external
+epoch fence is intentionally retained as a conservative revoke/handoff signal
+and cannot activate the candidate transport by itself.
+
+Rollback uses the same idle helper to select `relay`. It refuses unresolved
+channel requests, raises/revokes the epoch fence, and makes the next engine
+turn consume authoritative history. Stop the channel service only after the
+flag is confirmed as relay. Never delete channel state or chat history.
 
 ## Current attachment boundary
 

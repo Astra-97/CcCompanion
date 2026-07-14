@@ -24,6 +24,14 @@ from ai_session_relay_proxy import (
     validate_request_id,
     validate_loopback_url,
 )
+from xia_claude_channel import (
+    XiaClaudeChannelClient,
+    XiaChannelError,
+    XiaChannelStale,
+    XiaChannelUncertain,
+    XiaChannelUnavailable,
+    validate_channel_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +45,12 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "relay_autonomous_tools_opt_in": False,
     "relay_url": "http://127.0.0.1:8900",
     "relay_models": {"claude": "", "codex": ""},
+    # Rollout/rollback switch. Production remains on the existing -p relay
+    # until the isolated channel service has passed its operator preflight.
+    "claude_transport": "relay",
+    "claude_channel_url": "http://127.0.0.1:8821",
+    "claude_channel_token_file": "/var/lib/cc-xia-relay/channel-state/channel.token",
+    "claude_channel_timeout_seconds": 900,
 }
 
 
@@ -51,12 +65,16 @@ class AIChatManager:
         self._config_path = self._state_dir / "ai_relay_config.json"
         self._history_path = self._state_dir / "ai_chat_history.jsonl"
         self._request_state_path = self._state_dir / "ai_relay_request_state.json"
+        self._channel_route_state_path = self._state_dir / "ai_channel_route_state.json"
+        self._channel_client_id_path = self._state_dir / "ai_channel_client_id"
         self._lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._route_lock = threading.RLock()
         self._config: dict[str, Any] = json.loads(json.dumps(_DEFAULT_CONFIG))
         self._relay = AISessionRelayProxy(self._state_dir)
         self._load_config()
+        self._channel = self._make_channel_client()
+        self._ensure_channel_route_state()
         self._recover_persona_transaction()
 
     # ---- config ----
@@ -91,34 +109,82 @@ class AIChatManager:
 
     def configure_relay(self, partial: dict[str, Any]) -> dict[str, Any]:
         """Operator-only relay config helper; there is no remote config endpoint."""
-        with self._lock:
+        with self._route_lock:
+            if self._send_lock.locked() or self._relay.turn_active:
+                raise RelayBusyError("cannot change relay configuration while a turn is active")
+            original = json.loads(json.dumps(self._config))
+            candidate = json.loads(json.dumps(self._config))
             for k, v in partial.items():
                 if k not in _DEFAULT_CONFIG:
                     continue
                 if k == "nickname":
-                    self._config[k] = str(v)[:100]
+                    candidate[k] = str(v)[:100]
                 elif k == "contact_id":
-                    self._config[k] = re.sub(r"[^a-z0-9_-]", "", str(v).lower())[:50] or "ai-custom"
+                    candidate[k] = re.sub(r"[^a-z0-9_-]", "", str(v).lower())[:50] or "ai-custom"
                 elif k in ("relay_enabled", "relay_autonomous_tools_opt_in"):
-                    self._config[k] = bool(v)
+                    candidate[k] = bool(v)
                 elif k == "relay_execution_mode":
                     mode = str(v).strip().lower()
                     if mode not in {"chat_only", "autonomous"}:
                         raise ValueError("relay_execution_mode must be 'chat_only' or 'autonomous'")
-                    self._config[k] = mode
+                    candidate[k] = mode
                 elif k == "relay_url":
-                    self._config[k] = validate_loopback_url(v)
+                    candidate[k] = validate_loopback_url(v)
+                elif k == "claude_transport":
+                    transport = str(v).strip().lower()
+                    if transport not in {"relay", "channel"}:
+                        raise ValueError("claude_transport must be 'relay' or 'channel'")
+                    candidate[k] = transport
+                elif k == "claude_channel_url":
+                    candidate[k] = validate_channel_url(v)
+                elif k == "claude_channel_token_file":
+                    candidate[k] = str(Path(str(v)).expanduser())
+                elif k == "claude_channel_timeout_seconds":
+                    candidate[k] = max(1, min(int(v), 1800))
                 elif k == "relay_models" and isinstance(v, dict):
-                    self._config[k] = {
+                    candidate[k] = {
                         provider: self._validate_model_id(v.get(provider, ""), allow_empty=True)
                         for provider in ("claude", "codex")
                     }
-            self._save_config()
-            if self._relay_ready:
-                self._relay.sync_persona(
-                    self._compiled_persona(),
-                    str(self._config.get("relay_execution_mode") or "chat_only"),
-                )
+            old_transport = str(original.get("claude_transport") or "relay")
+            new_transport = str(candidate.get("claude_transport") or "relay")
+            if old_transport != new_transport:
+                states = self._load_request_states()
+                if any(
+                    item.get("channel_lease") and item.get("status") in {"pending", "final_received"}
+                    for item in states.values() if isinstance(item, dict)
+                ):
+                    raise RelayBusyError("cannot change Claude transport with an unresolved channel request")
+            replacement_channel = self._make_channel_client(candidate)
+            if old_transport != new_transport:
+                route = self._load_channel_route_state()
+                relay_status = self._relay.status(str(candidate.get("relay_url") or ""))
+                fence = max(int(route.get("last_epoch") or 0), int(relay_status.get("epoch") or 0)) + 1
+                route["last_epoch"] = fence
+                route["relay_epoch"] = int(relay_status.get("epoch") or 0)
+                route["needs_handoff"] = True
+                # This conservative fence intentionally survives a later
+                # config-file write failure; it cannot activate a transport,
+                # and only forces a revoke/handoff on the still-active one.
+                self._save_channel_route_state(route)
+                revoke_client = self._channel if old_transport == "channel" else replacement_channel
+                try:
+                    revoke_client.revoke(epoch=fence, reason="Claude transport changed")
+                except XiaChannelError:
+                    logger.warning("ai_chat: transport-change channel revoke deferred")
+            with self._lock:
+                self._config = candidate
+                try:
+                    self._save_config()
+                except Exception:
+                    self._config = original
+                    raise
+                self._channel = replacement_channel
+                if self._relay_ready:
+                    self._relay.sync_persona(
+                        self._compiled_persona(),
+                        str(self._config.get("relay_execution_mode") or "chat_only"),
+                    )
         return self.relay_config_snapshot()
 
     @property
@@ -139,6 +205,61 @@ class AIChatManager:
             return False
         mode = str(self._config.get("relay_execution_mode") or "chat_only")
         return mode == "chat_only" or bool(self._config.get("relay_autonomous_tools_opt_in"))
+
+    @property
+    def _claude_uses_channel(self) -> bool:
+        return str(self._config.get("claude_transport") or "relay") == "channel"
+
+    def _make_channel_client(self, config: dict[str, Any] | None = None) -> XiaClaudeChannelClient:
+        config = config or self._config
+        return XiaClaudeChannelClient(
+            str(config.get("claude_channel_url") or "http://127.0.0.1:8821"),
+            token_file=str(config.get("claude_channel_token_file") or ""),
+            timeout_seconds=min(30, int(config.get("claude_channel_timeout_seconds") or 900)),
+        )
+
+    def _channel_client_id(self) -> str:
+        try:
+            value = self._channel_client_id_path.read_text(encoding="ascii").strip()
+            if re.fullmatch(r"xia-backend-[a-f0-9]{32}", value):
+                return value
+        except Exception:
+            pass
+        value = "xia-backend-" + uuid.uuid4().hex
+        self._atomic_private_write(self._channel_client_id_path, (value + "\n").encode("ascii"))
+        return value
+
+    def _load_channel_route_state(self) -> dict[str, Any]:
+        try:
+            value = json.loads(self._channel_route_state_path.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                return {
+                    "generation": max(1, int(value.get("generation") or 1)),
+                    "stale": bool(value.get("stale", True)),
+                    "needs_handoff": bool(value.get("needs_handoff", True)),
+                    "last_epoch": max(0, int(value.get("last_epoch") or 0)),
+                    "relay_epoch": int(value.get("relay_epoch", -1)),
+                }
+        except Exception:
+            pass
+        return {"generation": 1, "stale": True, "needs_handoff": True, "last_epoch": 0, "relay_epoch": -1}
+
+    def _save_channel_route_state(self, state: dict[str, Any]) -> None:
+        self._atomic_private_write(
+            self._channel_route_state_path,
+            json.dumps(state, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+        )
+
+    def _ensure_channel_route_state(self) -> None:
+        if not self._channel_route_state_path.exists():
+            self._save_channel_route_state(self._load_channel_route_state())
+
+    def _mark_claude_generation_stale(self) -> None:
+        state = self._load_channel_route_state()
+        state["generation"] = max(1, int(state.get("generation") or 1)) + 1
+        state["stale"] = True
+        state["needs_handoff"] = True
+        self._save_channel_route_state(state)
 
     def _ensure_persona_recovered(self) -> None:
         journal = self._persona_dir / ".apply-journal.json"
@@ -174,12 +295,24 @@ class AIChatManager:
             }
         status = self._relay.status(str(self._config.get("relay_url") or ""))
         status["turn_active"] = bool(status.get("turn_active") or self._send_lock.locked())
+        channel_status: dict[str, Any] = {"transport": "relay", "ready": True}
+        if self._claude_uses_channel:
+            try:
+                channel_status = {"transport": "channel", **self._channel.health()}
+            except XiaChannelError as exc:
+                channel_status = {"transport": "channel", "ready": False, "error": str(exc)}
+            # Preserve the existing Android contract: its Claude availability
+            # indicator must represent the selected transport, not the unused
+            # -p relay CLI sitting beside an unavailable channel.
+            status["claude_available"] = bool(channel_status.get("ready"))
         return {
             **status,
             "mode": "relay",
             "enabled": True,
             "execution_mode": mode,
             "current_model": self._selected_relay_model(str(status.get("provider") or "claude")),
+            "claude_transport": str(self._config.get("claude_transport") or "relay"),
+            "claude_channel": channel_status,
         }
 
     def switch_relay_provider(self, provider: str) -> dict[str, Any]:
@@ -192,15 +325,32 @@ class AIChatManager:
             self._ensure_persona_recovered()
             if self._send_lock.locked() or self._relay.turn_active:
                 raise RelayBusyError("cannot switch provider while a turn is active")
+            if provider == "claude" and self._claude_uses_channel:
+                health = self._channel.health()
+                if not health.get("ready"):
+                    raise RelayError("Xia Claude channel is not ready")
             result = self._relay.switch_provider(
                 str(self._config.get("relay_url") or ""), provider
             )
+            if result.get("changed"):
+                state = self._load_channel_route_state()
+                state["needs_handoff"] = True
+                state["last_epoch"] = max(int(state.get("last_epoch") or 0), int(result.get("epoch") or 0)) + 1
+                state["relay_epoch"] = int(result.get("epoch") or 0)
+                self._save_channel_route_state(state)
+                if self._claude_uses_channel:
+                    try:
+                        self._channel.revoke(epoch=int(state["last_epoch"]), reason="provider changed")
+                    except XiaChannelError:
+                        # The next Claude admission repeats this epoch fence.
+                        logger.warning("ai_chat: channel revoke deferred until next Claude turn")
         return {
             **result,
             "mode": "relay",
             "enabled": True,
             "execution_mode": str(self._config.get("relay_execution_mode") or "chat_only"),
             "current_model": self._selected_relay_model(provider),
+            "claude_transport": str(self._config.get("claude_transport") or "relay"),
         }
 
     @staticmethod
@@ -269,6 +419,12 @@ class AIChatManager:
             if provider == "codex" and model not in allowed:
                 raise ValueError("Codex model must be selected from the relay model list")
             models = dict(self._config.get("relay_models") or {})
+            changed = str(models.get(provider) or "") != model
+            if provider == "claude" and changed:
+                # Mark stale before the config commit: a failed config write may
+                # cause one harmless fresh old-model session, never an old
+                # session answering after a successful new-model selection.
+                self._mark_claude_generation_stale()
             models[provider] = model
             self._config["relay_models"] = models
             self._save_config()
@@ -566,6 +722,14 @@ class AIChatManager:
                 write_journal("workspace_synced")
                 checkpoint("after_workspace_sync")
 
+                # A long-lived Claude TUI cannot reliably hot-reload its
+                # project persona. Invalidate it before the persona refresh
+                # commit; rollback may cause one harmless fresh old-persona
+                # session, but success can never leave the old session live.
+                write_journal("channel_stale_inflight")
+                self._mark_claude_generation_stale()
+                write_journal("channel_stale_committed")
+
                 # The relay refresh is the external commit boundary. The
                 # active manifest still points at the old persona here.
                 write_journal("refresh_inflight")
@@ -631,18 +795,24 @@ class AIChatManager:
         return {}
 
     def _set_request_state(
-        self, client_message_id: str, status: str, *, visible_output: bool = False, error: str = ""
+        self, client_message_id: str, status: str, *, visible_output: bool = False, error: str = "",
+        **metadata: Any,
     ) -> None:
         if not client_message_id:
             return
         with self._lock:
             states = self._load_request_states()
+            existing = states.get(client_message_id, {})
             states[client_message_id] = {
+                **existing,
                 "status": status,
                 "visible_output": bool(visible_output),
                 "error": str(error)[:500],
                 "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
+            for key in ("channel_epoch", "channel_lease", "channel_generation"):
+                if key in metadata:
+                    states[client_message_id][key] = metadata[key]
             if len(states) > 2000:
                 states = dict(list(states.items())[-2000:])
             self._atomic_private_write(
@@ -696,6 +866,8 @@ class AIChatManager:
                     "duplicate": True,
                     "reply": rec.get("text", ""),
                     "ts": rec.get("ts", ""),
+                    "provider": "claude" if rec.get("provider") == "claude-channel" else rec.get("provider", ""),
+                    "transport": "channel" if rec.get("provider") == "claude-channel" else "relay",
                 }
                 if rec.get("thinking"):
                     result["thinking"] = rec.get("thinking", "")
@@ -703,6 +875,11 @@ class AIChatManager:
         state = self._load_request_states().get(client_message_id, {})
         status = str(state.get("status") or "")
         visible = bool(state.get("visible_output"))
+        if status == "final_received" and state.get("channel_lease"):
+            # Channel results are durable outside this process. A backend
+            # crash after result receipt but before assistant-history append
+            # must retrieve the cached result with the same exact grant.
+            return {"_retry": True, "user_ts": records[user_index].get("ts", "")}
         if status in {"pending", "failed"} and not visible:
             # The send lock guarantees no active request can reach here. A
             # pending record is therefore stale after a process interruption.
@@ -819,7 +996,7 @@ class AIChatManager:
         duplicate = self._find_client_message_result(client_message_id)
         retry_existing = bool(duplicate and duplicate.get("_retry"))
         if duplicate is not None and not retry_existing:
-            if duplicate.get("ok") and duplicate.get("reply"):
+            if duplicate.get("ok") and duplicate.get("reply") and duplicate.get("transport") != "channel":
                 emit({"type": "delta", "text": duplicate.get("reply", "")})
                 if duplicate.get("thinking"):
                     emit({"type": "thinking_delta", "text": duplicate.get("thinking", "")})
@@ -861,6 +1038,17 @@ class AIChatManager:
             })
         activities_by_id: dict[str, dict[str, Any]] = {}
         visible_output = False
+
+        if provider == "claude" and self._claude_uses_channel:
+            return self._send_message_channel_admitted(
+                user_text=user_text,
+                client_message_id=client_message_id,
+                user_ts=user_ts,
+                handoff=handoff,
+                selected_model=selected_model,
+                retry_existing=retry_existing,
+                emit=emit,
+            )
 
         def relay_emit(event: dict[str, Any]) -> None:
             nonlocal visible_output
@@ -998,3 +1186,112 @@ class AIChatManager:
             result["warning"] = str(final["error"])
         self._set_request_state(client_message_id, "completed", visible_output=True)
         return result
+
+    def _send_message_channel_admitted(
+        self,
+        *,
+        user_text: str,
+        client_message_id: str,
+        user_ts: str,
+        handoff: str,
+        selected_model: str,
+        retry_existing: bool,
+        emit: Any,
+    ) -> dict[str, Any]:
+        """Wait for one durable channel result; intentionally emit no deltas."""
+        route = self._load_channel_route_state()
+        generation = max(1, int(route.get("generation") or 1))
+        states = self._load_request_states()
+        previous = states.get(client_message_id, {}) if retry_existing else {}
+        lease = str(previous.get("channel_lease") or uuid.uuid4().hex)
+        epoch = int(previous.get("channel_epoch") or 0)
+        saved_relay_epoch = int(route.get("relay_epoch", -1))
+        current_relay_epoch = saved_relay_epoch
+        if not epoch:
+            status = self._relay.status(str(self._config.get("relay_url") or ""))
+            current_relay_epoch = int(status.get("epoch") or 0)
+            epoch = max(0, current_relay_epoch, int(route.get("last_epoch") or 0))
+        previous_generation = int(previous.get("channel_generation") or generation)
+        if retry_existing and previous_generation != generation:
+            message = "Claude 会话世代已更新，上一轮结果无法安全重放；请作为新消息发送"
+            self._set_request_state(client_message_id, "failed", visible_output=True, error=message)
+            return {"ok": False, "error": message, "code": "request_uncertain", "terminal": True, "retryable": False, "ts": user_ts}
+
+        self._set_request_state(
+            client_message_id, "pending", visible_output=False,
+            channel_epoch=epoch, channel_lease=lease, channel_generation=generation,
+        )
+        try:
+            # Repeating the fence on every Claude admission safely catches a
+            # provider switch that happened while the channel was offline.
+            self._channel.revoke(epoch=epoch, reason="Claude turn admission")
+            ready = self._channel.ensure_generation(
+                generation=generation,
+                model=selected_model,
+                timeout_seconds=min(180, int(self._config.get("claude_channel_timeout_seconds") or 900)),
+                on_wait=lambda: emit({"type": "keepalive"}),
+            )
+            include_handoff = bool(
+                route.get("needs_handoff") or route.get("stale") or ready.get("fresh")
+                or current_relay_epoch != saved_relay_epoch
+            )
+
+            def mark_admitted() -> None:
+                # Consume the one-shot handoff at durable channel admission,
+                # not after local history append. A backend crash can retrieve
+                # this request without injecting the same history into the
+                # already-running native session a second time.
+                route["stale"] = False
+                route["needs_handoff"] = False
+                route["last_epoch"] = epoch
+                route["relay_epoch"] = current_relay_epoch
+                self._save_channel_route_state(route)
+
+            final = self._channel.send_and_wait(
+                request_id=client_message_id,
+                client_id=self._channel_client_id(),
+                epoch=epoch,
+                lease=lease,
+                generation=generation,
+                text=user_text,
+                handoff=handoff if include_handoff else "",
+                timeout_seconds=int(self._config.get("claude_channel_timeout_seconds") or 900),
+                on_admitted=mark_admitted,
+                on_wait=lambda: emit({"type": "keepalive"}),
+            )
+            reply_text = str(final.get("reply") or "").strip()
+            if not reply_text:
+                raise XiaChannelUncertain("channel completed without a usable final reply")
+            # The channel ledger is now authoritative for this request. Close
+            # the replay window before local history append.
+            self._set_request_state(
+                client_message_id, "final_received", visible_output=True,
+                error="channel final received but history commit is incomplete",
+            )
+            reply_ts = self._append_history(
+                "assistant", reply_text, client_message_id=client_message_id,
+                provider="claude-channel",
+            )
+            self._set_request_state(client_message_id, "completed", visible_output=True)
+            return {
+                "ok": True, "reply": reply_text, "ts": reply_ts,
+                "provider": "claude", "activities": [],
+            }
+        except (XiaChannelUncertain, XiaChannelStale) as exc:
+            self._mark_claude_generation_stale()
+            message = "Claude 长期会话已接收这一轮，但完成状态无法确认；请作为一条新消息发送"
+            self._set_request_state(client_message_id, "failed", visible_output=True, error=message)
+            return {
+                "ok": False, "error": message, "code": getattr(exc, "code", "request_uncertain"),
+                "ts": user_ts, "terminal": True, "retryable": False,
+            }
+        except XiaChannelUnavailable as exc:
+            self._set_request_state(client_message_id, "failed", visible_output=False, error=str(exc))
+            return {"ok": False, "error": str(exc), "ts": user_ts, "terminal": False, "retryable": True}
+        except Exception as exc:
+            logger.exception("ai_chat: Claude channel turn failed")
+            # Once submit could have happened, generic channel failures are
+            # terminal. The channel client uses Unavailable only for failures
+            # before an HTTP response, so conservatively do not replay here.
+            self._set_request_state(client_message_id, "failed", visible_output=True, error=str(exc))
+            return {"ok": False, "error": str(exc), "ts": user_ts, "terminal": True, "retryable": False}

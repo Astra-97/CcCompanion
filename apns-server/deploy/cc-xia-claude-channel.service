@@ -1,0 +1,43 @@
+[Unit]
+Description=CC Companion Xia-only Claude Development Channel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cc-xia-relay
+Group=cc-xia-relay
+ExecStart=/opt/cc-xia-claude-channel/launcher.sh
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/cc-xia-relay/channel-state /var/lib/cc-xia-relay/claude-channel-home
+BindReadOnlyPaths=/root/CcCompanion/apns-server/state/ai_relay_workspace:/var/lib/cc-xia-relay/workspace
+ReadOnlyPaths=/opt/cc-xia-claude-channel
+InaccessiblePaths=/var/lib/cc-xia-relay/state
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryHigh=900M
+MemoryMax=1200M
+OOMScoreAdjust=300
+
+[Install]
+WantedBy=multi-user.target

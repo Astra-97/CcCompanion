@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": ["mcp__xia-companion__reply"],
+    "deny": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch"]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/opt/cc-xia-claude-channel/stop_hook.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

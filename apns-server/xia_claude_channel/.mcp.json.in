@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "xia-companion": {
+      "command": "/usr/bin/node",
+      "args": ["@INSTALL_DIR@/server.mjs"],
+      "env": {
+        "XIA_CHANNEL_HOST": "127.0.0.1",
+        "XIA_CHANNEL_PORT": "8821",
+        "XIA_CHANNEL_STATE_DIR": "@STATE_DIR@",
+        "XIA_CHANNEL_TOKEN_FILE": "@TOKEN_FILE@",
+        "XIA_CHANNEL_GENERATION": "@GENERATION@",
+        "XIA_CHANNEL_SESSION_ID": "@SESSION_ID@",
+        "XIA_CHANNEL_MODEL": "@MODEL@",
+        "XIA_CHANNEL_BOOTSTRAP_TOKEN": "@BOOTSTRAP_TOKEN@"
+      }
+    }
+  }
+}
