@@ -23,9 +23,17 @@ and sessions are not read or changed by this integration.
 - Retired `state/ai_chat_config.json` is deliberately neither read, migrated,
   overwritten, nor deleted. It may contain private legacy credentials.
 
-The persona API has no file-count limit. Each text file is limited to 256 KiB,
-custom text to 512 KiB, and the combined UTF-8 text to 2 MiB. These byte limits
-bound resource use while allowing any number of small files.
+The persona API accepts ordered `.md`, `.txt`, `.yaml`, and `.yml` UTF-8 plain
+text files and has no file-count limit. YAML is preserved as text and is never
+parsed or executed. Each file is limited to 256 KiB, custom text to 512 KiB,
+and the combined UTF-8 text to 2 MiB. These byte limits bound resource use while
+allowing any number of small files.
+
+Android accepts the registered/common YAML MIME variants `application/yaml`,
+`text/yaml`, and `application/x-yaml`. Providers that report a missing or
+generic MIME fall back to the allowlisted filename suffix, strict UTF-8 decode,
+and binary-control rejection; an arbitrary binary MIME or suffix is not
+accepted.
 
 ## Execution safety prerequisite
 

@@ -269,6 +269,37 @@ class RelayManagerTest(unittest.TestCase):
         self.assertEqual(self.manager.persona_status()["files"], reordered["files"])
         self.assertEqual(self.manager._relay.refresh_sessions.call_count, 2)
 
+    def test_persona_accepts_yaml_as_plain_text_without_parsing_or_execution(self):
+        self.manager._relay = self._local_persona_relay()
+        yaml_text = "name: 夏以昼\ninstructions:\n  - 保持克制\n"
+        status = self.manager.apply_persona_composition(
+            [
+                {"filename": "base.yaml", "content": yaml_text},
+                {"filename": "override.YML", "content": "tone: gentle\n"},
+            ],
+            "最后覆盖",
+        )
+        self.assertEqual(
+            [item["filename"] for item in status["files"]],
+            ["base.yaml", "override.YML"],
+        )
+        compiled = (Path(self.temp.name) / "ai_relay_workspace" / "CLAUDE.md").read_text()
+        self.assertIn(yaml_text.strip(), compiled)
+        self.assertLess(compiled.index("name: 夏以昼"), compiled.index("tone: gentle"))
+        self.assertLess(compiled.index("tone: gentle"), compiled.index("最后覆盖"))
+        with self.assertRaisesRegex(ValueError, "binary data"):
+            self.manager.apply_persona_composition(
+                [{"filename": "binary.yaml", "content": "name: ok\u0001payload"}], ""
+            )
+        with self.assertRaisesRegex(ValueError, "binary data"):
+            self.manager.apply_persona_composition(
+                [{"filename": "unicode-control.yml", "content": "name: ok\u0085payload"}], ""
+            )
+        with self.assertRaisesRegex(ValueError, "must be"):
+            self.manager.apply_persona_composition(
+                [{"filename": "persona.json", "content": "{}"}], ""
+            )
+
     def test_persona_journal_recovery_finishes_staged_atomic_apply(self):
         self.manager._relay = self._local_persona_relay()
         self.manager.apply_persona_composition(

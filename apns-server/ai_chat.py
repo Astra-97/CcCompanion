@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import shutil
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -431,9 +432,15 @@ class AIChatManager:
     @staticmethod
     def _validate_persona_text(filename: str, text: str) -> tuple[str, bytes]:
         clean_name = Path(filename).name[:200]
-        if Path(clean_name).suffix.lower() not in {".md", ".txt"}:
-            raise ValueError("persona files must be .md or .txt")
-        if "\x00" in text:
+        if Path(clean_name).suffix.lower() not in {".md", ".txt", ".yaml", ".yml"}:
+            raise ValueError("persona files must be .md, .txt, .yaml, or .yml")
+        # YAML persona files are treated only as UTF-8 plain text. They are
+        # never parsed or executed; reject binary control bytes before the
+        # unchanged byte-budget and atomic composition path sees the content.
+        if any(
+            char not in "\t\n\r" and unicodedata.category(char) == "Cc"
+            for char in text
+        ):
             raise ValueError("persona file contains binary data")
         data = text.encode("utf-8")
         if not data or len(data) > 256 * 1024:
