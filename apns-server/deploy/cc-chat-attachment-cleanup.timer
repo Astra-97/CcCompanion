@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily CcCompanion chat attachment retention cleanup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=1h
+Unit=cc-chat-attachment-cleanup.service
+
+[Install]
+WantedBy=timers.target

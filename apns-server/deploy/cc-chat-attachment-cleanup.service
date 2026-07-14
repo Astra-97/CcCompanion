@@ -1,0 +1,16 @@
+[Unit]
+Description=Delete expired CcCompanion chat attachment binaries
+ConditionPathIsDirectory=/root/CcCompanion/apns-server/tokens/attachments
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 /root/CcCompanion/apns-server/scripts/cleanup_chat_attachments.py --root /root/CcCompanion/apns-server/tokens/attachments --older-than-days 30 --max-files 1000 --max-scan 100000 --max-recovery 1000 --apply
+TimeoutStartSec=5min
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/root/CcCompanion/apns-server/tokens/attachments
