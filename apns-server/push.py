@@ -1813,6 +1813,12 @@ class PushHandler(BaseHTTPRequestHandler):
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self.state.chat_draft_lock:
+            draft = self.state.chat_drafts.get(contact_id)
+            if isinstance(draft, dict) and not bool(draft.get("is_active")):
+                draft_user_ts = str(draft.get("user_ts") or "")
+                next_user_ts = str(user_ts or "")
+                if next_user_ts and draft_user_ts and draft_user_ts != next_user_ts:
+                    self.state.chat_drafts.pop(contact_id, None)
             self.state.chat_reply_states[contact_id] = {
                 "reply_state": "queued",
                 "status_text": "已排队",
@@ -1918,13 +1924,30 @@ class PushHandler(BaseHTTPRequestHandler):
         contact_id: str,
         *,
         user_ts: str | None = None,
+        final_ts: str | None = None,
         source: str | None = None,
         session_id: str | None = None,
         ttl_sec: float = 15.0,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self.state.chat_draft_lock:
-            self.state.chat_drafts.pop(contact_id, None)
+            draft = self.state.chat_drafts.get(contact_id)
+            if isinstance(draft, dict):
+                draft_user_ts = str(draft.get("user_ts") or "")
+                if not user_ts or not draft_user_ts or draft_user_ts == str(user_ts):
+                    draft.update({
+                        "is_active": False,
+                        "reply_state": "interrupted",
+                        "status_text": "已中断",
+                        "updated_at": now,
+                        "completed_at": now,
+                        "final_ts": final_ts or str(draft.get("final_ts") or ""),
+                        "expires_at": time.time() + ttl_sec,
+                    })
+                else:
+                    # Never freeze an older/different turn under the cancelled
+                    # turn's state identity.
+                    self.state.chat_drafts.pop(contact_id, None)
             self.state.chat_reply_states[contact_id] = {
                 "reply_state": "interrupted",
                 "status_text": "已中断",
@@ -1932,7 +1955,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 "source": source or "",
                 "session_id": session_id or "",
                 "user_ts": user_ts or "",
-                "final_ts": "",
+                "final_ts": final_ts or "",
                 "queued_at": "",
                 "started_at": "",
                 "completed_at": now,
@@ -1949,6 +1972,13 @@ class PushHandler(BaseHTTPRequestHandler):
         with self.state.chat_draft_lock:
             draft = dict(self.state.chat_drafts.get(contact_id) or {})
             reply_state = dict(self.state.chat_reply_states.get(contact_id) or {})
+            if (
+                draft
+                and not bool(draft.get("is_active"))
+                and float(draft.get("expires_at") or 0) < time.time()
+            ):
+                self.state.chat_drafts.pop(contact_id, None)
+                draft = {}
             if (
                 reply_state.get("reply_state") in {"completed", "interrupted"}
                 and float(reply_state.get("expires_at") or 0) < time.time()
@@ -5839,12 +5869,14 @@ class PushHandler(BaseHTTPRequestHandler):
                 or target_user_ts
                 or ""
             )
-            should_mark_interrupted = bool(
-                run
-                or (pending or {}).get("cancel_kind") == "active_task"
-                or (pending or {}).get("mark_interrupted")
-            )
-            if ok and should_mark_interrupted:
+            cancel_kind = str((pending or {}).get("cancel_kind") or "")
+            # An active worker owns the live draft and will persist that exact
+            # partial text before transitioning to interrupted.  Clearing the
+            # draft here races the worker and loses everything the App already
+            # displayed.  Only a queued task with no worker can be finalized
+            # eagerly in the request handler.
+            should_mark_interrupted = bool((pending or {}).get("mark_interrupted"))
+            if ok and should_mark_interrupted and not run and cancel_kind != "active_task":
                 self._set_chat_interrupted(
                     contact_id,
                     user_ts=resolved_user_ts,
@@ -5853,7 +5885,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 )
                 self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
             action = "active_run" if run else (
-                str((pending or {}).get("cancel_kind") or "pending_task") if pending else "none"
+                (cancel_kind or "pending_task") if pending else "none"
             )
             self._send_json(200, {
                 "ok": ok,
@@ -6342,13 +6374,19 @@ class PushHandler(BaseHTTPRequestHandler):
             if draft_text:
                 message = (
                     draft_text
-                    + "\n\n[这条回复被主动中断，以上是已经生成的草稿。]"
+                    + "\n\n[已停止]"
                 )
             else:
                 message = "已中断当前生成。"
-            chat.append(role="assistant", text=message, source=f"{source}:interrupted")
+            interrupted_rec = chat.append(role="assistant", text=message, source=f"{source}:interrupted")
             assistant_appended = True
-            self._set_chat_interrupted(contact_id, user_ts=user_ts, source=source, session_id=session_id)
+            self._set_chat_interrupted(
+                contact_id,
+                user_ts=user_ts,
+                final_ts=str(interrupted_rec.get("ts") or ""),
+                source=source,
+                session_id=session_id,
+            )
             self.state.clear_kairos_pending_run(user_ts)
 
         def _append_uncertain_draft(detail: str) -> None:

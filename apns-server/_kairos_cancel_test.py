@@ -152,6 +152,11 @@ class KairosCancelTest(unittest.TestCase):
             self.assertEqual(handler.responses[-1][1]["action"], "active_run")
             self.assertTrue(event.is_set())
             self.assertEqual(handler.state.codex_app_bridge.interrupt_calls, 1)
+            self.assertEqual(
+                handler.interrupted,
+                [],
+                "the abort handler must leave the live draft for the worker to persist",
+            )
         finally:
             push.CODEX_RUNS.finish(run[0])
 
@@ -166,6 +171,57 @@ class KairosCancelTest(unittest.TestCase):
 
         self.assertEqual(handler.state.contact_chats["kairos"].records[-1]["role"], "assistant")
         self.assertTrue(handler.interrupted)
+
+    def test_interrupted_snapshot_freezes_draft_until_short_expiry(self):
+        handler = object.__new__(PushHandler)
+        handler.state = types.SimpleNamespace(
+            chat_draft_lock=threading.Lock(),
+            chat_drafts={"test": {"is_active": True, "text": "already visible", "user_ts": "u1"}},
+            chat_reply_states={},
+        )
+
+        handler._set_chat_interrupted("test", user_ts="u1", final_ts="a-final", ttl_sec=15)
+        snapshot = handler._chat_draft_snapshot("test")
+
+        self.assertFalse(snapshot["is_active"])
+        self.assertEqual(snapshot["text"], "already visible")
+        self.assertEqual(snapshot["reply_state"], "interrupted")
+        self.assertEqual(snapshot["final_ts"], "a-final")
+
+        handler.state.chat_drafts["test"]["expires_at"] = 0
+        handler.state.chat_reply_states["test"]["expires_at"] = 0
+        expired = handler._chat_draft_snapshot("test")
+        self.assertEqual(expired["reply_state"], "idle")
+        self.assertEqual(expired["text"], "")
+
+    def test_interrupted_state_never_relabels_a_different_turn_draft(self):
+        handler = object.__new__(PushHandler)
+        handler.state = types.SimpleNamespace(
+            chat_draft_lock=threading.Lock(),
+            chat_drafts={"test": {"is_active": True, "text": "older", "user_ts": "old"}},
+            chat_reply_states={},
+        )
+
+        handler._set_chat_interrupted("test", user_ts="new")
+
+        self.assertNotIn("test", handler.state.chat_drafts)
+        self.assertEqual(handler.state.chat_reply_states["test"]["user_ts"], "new")
+
+    def test_new_queued_turn_drops_previous_interrupted_draft(self):
+        handler = object.__new__(PushHandler)
+        handler.state = types.SimpleNamespace(
+            chat_draft_lock=threading.Lock(),
+            chat_drafts={"test": {"is_active": True, "text": "stopped text", "user_ts": "old"}},
+            chat_reply_states={},
+        )
+        handler._set_chat_interrupted("test", user_ts="old")
+
+        handler._set_chat_queued("test", user_ts="new")
+        snapshot = handler._chat_draft_snapshot("test")
+
+        self.assertEqual(snapshot["reply_state"], "queued")
+        self.assertEqual(snapshot["user_ts"], "new")
+        self.assertEqual(snapshot["text"], "")
 
 
 if __name__ == "__main__":
