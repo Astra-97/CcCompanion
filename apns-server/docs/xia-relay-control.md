@@ -47,6 +47,27 @@ first turn back, covering conversation that occurred in Codex. Persona remains
 read-only in the isolated workspace and is compiled into both `CLAUDE.md` and
 `AGENTS.md`.
 
+All generations use the single stable project directory
+`channel-state/runtime`. Workspace trust is therefore a one-time operator
+preflight, not a prompt repeated for every model/persona rotation. Before
+publishing new MCP/settings content, the launcher terminates and confirms the
+old dedicated tmux session is gone. Before kill it captures pane PIDs, process
+groups, descendants, and Linux process start times. Publication remains blocked
+until the session query is authoritative, every captured identity/group is
+gone, and loopback port 8821 is unreachable. A missing socket is an explicit
+no-session state; a stale/inaccessible socket, query error, or failed
+`kill-session` is fail-closed. A short post-kill query disconnect merely keeps
+the gate closed; once the recorded tmux server identity is gone, its unchanged
+stale socket may be safely retired so explicit socket absence can be observed.
+Only after this stop gate passes does the helper read/create durable control.
+It atomically writes the exact new generation/session/model/bootstrap
+configuration, rereads control as a CAS-style check, and returns that same
+single snapshot to the launcher command. It never carries a pre-stop snapshot
+across a concurrent rotation. Claude then starts in the same project path. On
+first use of this layout, stopped legacy `runtime-N`
+directories are removed without following links; an abnormal legacy entry
+fails closed.
+
 Tracked deployment templates live in `xia_claude_channel/` and
 `deploy/cc-xia-claude-channel.service`. The launcher uses the existing dedicated
 `cc-xia-relay` account but separate `channel-state`, `claude-channel-home`, tmux
@@ -70,6 +91,9 @@ The root preparation pass validates every managed directory/file with no-follow
 opens, exact owner/mode checks, and no-replace publication. Stop the optional
 channel service before rerunning it; any symlink, unexpected owner, or relaxed
 permission is an operator-visible failure, not something the script repairs.
+Successful generation rotation stays inside the launcher's supervision loop;
+it must not increment systemd `NRestarts`. Only a launcher-level preflight or
+unrecoverable supervision failure exits the unit for `Restart=on-failure`.
 
 The unit reuses the relay Linux UID only for operational simplicity. Its mount
 namespace makes `/var/lib/cc-xia-relay/state` (the old relay credentials and
@@ -257,6 +281,12 @@ dedicated tmux session. The request admitted before the disconnect must become
 terminal-uncertain, authenticated health must disappear, the isolated parent
 Claude TUI must exit, and the launcher must create a new healthy session. Do
 not kill or inspect Xiaoke's tmux socket during this check.
+
+For a rotation smoke, record the stable tmux working directory and
+`systemctl show cc-xia-claude-channel.service -p NRestarts` before changing the
+model/persona. After the fresh generation is ready, the working directory must
+still end in `channel-state/runtime`, authenticated health must report the new
+generation and bootstrap-cleared ready state, and `NRestarts` must be unchanged.
 
 Transport configuration is copy-on-write. A config-file fsync/replace failure
 restores the in-process transport selection; the already persisted external

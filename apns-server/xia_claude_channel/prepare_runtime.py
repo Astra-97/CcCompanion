@@ -203,6 +203,9 @@ def prepare_runtime(*, root: Path, relay_uid: int, relay_gid: int, root_uid: int
         tmux_fd = _ensure_dir(state_fd, "tmux", uid=relay_uid, gid=relay_gid, mode=0o700,
                               label="channel tmux state")
         opened.append(tmux_fd)
+        tmux_user_fd = _ensure_dir(tmux_fd, f"tmux-{relay_uid}", uid=relay_uid, gid=relay_gid, mode=0o700,
+                                   label="channel tmux user socket directory")
+        opened.append(tmux_user_fd)
         home_fd = _ensure_dir(relay_fd, "claude-channel-home", uid=relay_uid, gid=relay_gid, mode=0o700,
                               label="Claude channel HOME")
         opened.append(home_fd)
@@ -238,6 +241,7 @@ def prepare_runtime(*, root: Path, relay_uid: int, relay_gid: int, root_uid: int
             (lib_fd, "cc-xia-relay", relay_fd, "relay runtime root"),
             (relay_fd, "channel-state", state_fd, "channel state"),
             (state_fd, "tmux", tmux_fd, "channel tmux state"),
+            (tmux_fd, f"tmux-{relay_uid}", tmux_user_fd, "channel tmux user socket directory"),
             (relay_fd, "claude-channel-home", home_fd, "Claude channel HOME"),
             (home_fd, ".claude", config_fd, "Claude config directory"),
             (relay_fd, "workspace", workspace_fd, "read-only workspace mountpoint"),

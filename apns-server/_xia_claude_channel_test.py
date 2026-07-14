@@ -1,6 +1,10 @@
 import json
 import os
+import socket
+import signal
 import stat
+import subprocess
+import time
 import tempfile
 import unittest
 import importlib.util
@@ -327,6 +331,236 @@ class XiaRuntimeStateTest(unittest.TestCase):
             marker.unlink()
             self.assertTrue(self.runtime.has_transcript(temp, session))
 
+    def test_fresh_generations_share_stable_trusted_project_and_publish_new_config(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install = root / "install"; install.mkdir()
+            (install / ".mcp.json.in").write_text(json.dumps({"mcpServers": {"xia-companion": {
+                "command": "@INSTALL_DIR@/server.mjs", "env": {
+                    "state": "@STATE_DIR@", "token": "@TOKEN_FILE@", "generation": "@GENERATION@",
+                    "session": "@SESSION_ID@", "model": "@MODEL@", "bootstrap": "@BOOTSTRAP_TOKEN@",
+                }}}}))
+            (install / "settings.json").write_text('{"permissions":{"allow":[]}}\n')
+            state = root / "state"; state.mkdir(mode=0o700)
+            workspace = root / "workspace"; workspace.mkdir(); (workspace / "CLAUDE.md").write_text("persona")
+            legacy = state / "runtime-1"; legacy.mkdir(mode=0o700); (legacy / "old").write_text("old")
+
+            first = self.runtime.prepare_runtime_workspace(
+                install, state, workspace, 1, "00000000-0000-4000-8000-000000000001", "opus", "",
+            )
+            self.assertEqual(first, state / "runtime")
+            self.assertFalse(legacy.exists())
+            self.assertEqual(first.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((first / ".mcp.json").stat().st_mode & 0o777, 0o600)
+            trust_identity = str(first.resolve())
+
+            second = self.runtime.prepare_runtime_workspace(
+                install, state, workspace, 2, "00000000-0000-4000-8000-000000000002", "sonnet", "bootstrap-2",
+            )
+            self.assertEqual(str(second.resolve()), trust_identity)
+            config = json.loads((second / ".mcp.json").read_text())["mcpServers"]["xia-companion"]
+            self.assertEqual(config["env"]["generation"], "2")
+            self.assertEqual(config["env"]["session"], "00000000-0000-4000-8000-000000000002")
+            self.assertEqual(config["env"]["model"], "sonnet")
+            self.assertEqual(config["env"]["bootstrap"], "bootstrap-2")
+            self.assertEqual((second / "CLAUDE.md").resolve(), (workspace / "CLAUDE.md").resolve())
+            self.assertFalse((state / "runtime-2").exists())
+
+    def test_unsafe_legacy_runtime_symlink_is_not_cleaned_or_followed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); state = root / "state"; state.mkdir(mode=0o700)
+            victim = root / "victim"; victim.mkdir(); (victim / "keep").write_text("safe")
+            (state / "runtime-9").symlink_to(victim, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "unsafe legacy"):
+                self.runtime._cleanup_legacy_runtimes(state)
+            self.assertEqual((victim / "keep").read_text(), "safe")
+
+    def _tmux_socket(self, root):
+        path = Path(root) / "tmux.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); listener.bind(str(path))
+        return listener, path
+
+    def test_kill_session_failure_never_calls_runtime_prepare(self):
+        with tempfile.TemporaryDirectory() as temp:
+            listener, path = self._tmux_socket(temp)
+            prepare = mock.Mock(return_value=Path(temp) / "runtime")
+            def runner(args, **_kwargs):
+                command = args[3]
+                if command == "has-session": return subprocess.CompletedProcess(args, 0, "", "")
+                if command == "list-panes": return subprocess.CompletedProcess(args, 0, "123\n", "")
+                if command == "kill-session": return subprocess.CompletedProcess(args, 1, "", "denied")
+                raise AssertionError(command)
+            try:
+                with mock.patch.object(self.runtime, "_capture_process_guard", return_value={"identities": {}, "pgrps": {}}):
+                    with self.assertRaisesRegex(RuntimeError, "kill-session failed"):
+                        self.runtime.prepare_after_stop(
+                            lambda: self.runtime.stop_dedicated_tui(
+                                path, "xia-claude", runner=runner,
+                                server_guard_capture=lambda *_args, **_kwargs: {"pid": 9, "starttime": 1, "socket_dev": 1, "socket_ino": 1},
+                            ), prepare,
+                        )
+                prepare.assert_not_called()
+            finally:
+                listener.close()
+
+    def test_has_session_connection_failure_never_calls_runtime_prepare(self):
+        with tempfile.TemporaryDirectory() as temp:
+            listener, path = self._tmux_socket(temp)
+            prepare = mock.Mock(return_value=Path(temp) / "runtime")
+            def runner(args, **_kwargs):
+                command = args[3]
+                if command in {"has-session", "list-sessions"}:
+                    return subprocess.CompletedProcess(args, 1, "", "connection refused")
+                raise AssertionError(command)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "session query failed"):
+                    self.runtime.prepare_after_stop(
+                        lambda: self.runtime.stop_dedicated_tui(path, "xia-claude", runner=runner), prepare,
+                    )
+                prepare.assert_not_called()
+            finally:
+                listener.close()
+
+    def test_session_disappears_but_old_process_and_health_delay_prepare(self):
+        with tempfile.TemporaryDirectory() as temp:
+            listener, path = self._tmux_socket(temp)
+            killed = False
+            def runner(args, **_kwargs):
+                nonlocal killed
+                command = args[3]
+                if command == "has-session":
+                    return subprocess.CompletedProcess(args, 1 if killed else 0, "", "")
+                if command == "list-panes": return subprocess.CompletedProcess(args, 0, "123\n", "")
+                if command == "kill-session":
+                    killed = True
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                if command == "list-sessions": return subprocess.CompletedProcess(args, 0, "", "")
+                raise AssertionError(command)
+            prepare = mock.Mock(return_value=Path(temp) / "runtime")
+            alive = mock.Mock(side_effect=[True, False])
+            port = mock.Mock(side_effect=[True, False])
+            sleeps = mock.Mock()
+            try:
+                with mock.patch.object(self.runtime, "_capture_process_guard", return_value={"identities": {}, "pgrps": {}}), \
+                        mock.patch.object(self.runtime, "_process_guard_alive", side_effect=alive):
+                    result = self.runtime.prepare_after_stop(
+                        lambda: self.runtime.stop_dedicated_tui(
+                            path, "xia-claude", runner=runner, port_probe=port,
+                            monotonic=mock.Mock(side_effect=[0.0, 0.1]), sleeper=sleeps,
+                            server_guard_capture=lambda *_args, **_kwargs: {"pid": 9, "starttime": 1, "socket_dev": 1, "socket_ino": 1},
+                        ), prepare,
+                    )
+                self.assertEqual(result, Path(temp) / "runtime")
+                self.assertEqual(alive.call_count, 2); self.assertEqual(port.call_count, 2)
+                sleeps.assert_called_once_with(0.1); prepare.assert_called_once()
+            finally:
+                listener.close()
+
+    def test_process_starttime_distinguishes_live_process_from_pid_reuse(self):
+        guard = {"identities": {123: (123, 1000)}, "pgrps": {123: 1000}}
+        live = lambda pid: (1, 123, 1000) if pid == 123 else None
+        reused = lambda pid: (1, 123, 2000) if pid == 123 else None
+        self.assertTrue(self.runtime._process_guard_alive(guard, proc_reader=live))
+        self.assertFalse(self.runtime._process_guard_alive(guard, proc_reader=reused))
+
+    def test_post_kill_query_connection_failure_waits_then_succeeds(self):
+        with tempfile.TemporaryDirectory() as temp:
+            listener, path = self._tmux_socket(temp)
+            killed = False; post_probes = 0
+            def runner(args, **_kwargs):
+                nonlocal killed, post_probes
+                command = args[3]
+                if command == "has-session":
+                    return subprocess.CompletedProcess(args, 1 if killed else 0, "", "")
+                if command == "list-panes": return subprocess.CompletedProcess(args, 0, "123\n", "")
+                if command == "kill-session": killed = True; return subprocess.CompletedProcess(args, 0, "", "")
+                if command == "list-sessions":
+                    post_probes += 1
+                    return subprocess.CompletedProcess(args, 1 if post_probes == 1 else 0, "", "temporary")
+                raise AssertionError(command)
+            prepare = mock.Mock(return_value=Path(temp) / "runtime")
+            try:
+                with mock.patch.object(self.runtime, "_capture_process_guard", return_value={"identities": {}, "pgrps": {}}), \
+                        mock.patch.object(self.runtime, "_process_guard_alive", return_value=False):
+                    result = self.runtime.prepare_after_stop(
+                        lambda: self.runtime.stop_dedicated_tui(
+                            path, "xia-claude", runner=runner, port_probe=lambda *_: False,
+                            monotonic=mock.Mock(side_effect=[0.0, 0.1]), sleeper=lambda _delay: None,
+                            server_guard_capture=lambda *_args, **_kwargs: {"pid": 9, "starttime": 1, "socket_dev": 1, "socket_ino": 1},
+                            stale_socket_retire=lambda *_args, **_kwargs: False,
+                        ), prepare,
+                    )
+                self.assertEqual(result, Path(temp) / "runtime")
+                self.assertEqual(post_probes, 2); prepare.assert_called_once()
+            finally:
+                listener.close()
+
+    def test_control_is_read_after_stop_and_new_generation_drives_publish_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); state = root / "state"; state.mkdir(mode=0o700)
+            first = {"version": 1, "generation": 1, "session_id": "00000000-0000-4000-8000-000000000001",
+                     "model": "opus", "bootstrap_token": "old"}
+            second = {"version": 1, "generation": 2, "session_id": "00000000-0000-4000-8000-000000000002",
+                      "model": "sonnet", "bootstrap_token": "new"}
+            (state / "control.json").write_text(json.dumps(first))
+            published = []
+            def stop(): (state / "control.json").write_text(json.dumps(second))
+            def prepare(_install, _state, _workspace, generation, session_id, model, bootstrap):
+                published.append((generation, session_id, model, bootstrap)); return state / "runtime"
+            result = self.runtime.prepare_controlled_runtime_after_stop(
+                root / "socket", "xia-claude", root / "install", state, root / "workspace",
+                stop_action=stop, prepare_action=prepare,
+            )
+            self.assertEqual(published, [(2, second["session_id"], "sonnet", "new")])
+            self.assertEqual(result["generation"], 2); self.assertEqual(result["session_id"], second["session_id"])
+            self.assertEqual(result["model"], "sonnet"); self.assertEqual(result["bootstrap_token"], "new")
+
+    def test_real_tmux_sleep_pane_stops_and_allows_prepare(self):
+        with tempfile.TemporaryDirectory() as temp:
+            socket_path = Path(temp) / "tmux.sock"
+            prepare = mock.Mock(return_value=Path(temp) / "runtime")
+            for attempt in range(10):
+                session = f"xia-real-stop-{attempt}"
+                subprocess.run(["/usr/bin/tmux", "-S", str(socket_path), "new-session", "-d", "-s", session,
+                                "/bin/sleep", "30"], check=True)
+                try:
+                    result = self.runtime.prepare_after_stop(
+                        lambda: self.runtime.stop_dedicated_tui(
+                            socket_path, session, timeout=2, port_probe=lambda *_: False,
+                        ), prepare,
+                    )
+                    self.assertEqual(result, Path(temp) / "runtime")
+                finally:
+                    subprocess.run(["/usr/bin/tmux", "-S", str(socket_path), "kill-server"], capture_output=True)
+            self.assertEqual(prepare.call_count, 10)
+
+    def test_real_tmux_ignore_hup_pane_times_out_without_prepare(self):
+        with tempfile.TemporaryDirectory() as temp:
+            socket_path = Path(temp) / "tmux.sock"; session = "xia-real-stubborn"
+            code = "import signal,time; signal.signal(signal.SIGHUP,signal.SIG_IGN); signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(30)"
+            subprocess.run(["/usr/bin/tmux", "-S", str(socket_path), "new-session", "-d", "-s", session,
+                            "/usr/bin/python3", "-c", code], check=True)
+            pane_pid = int(subprocess.run(
+                ["/usr/bin/tmux", "-S", str(socket_path), "list-panes", "-t", session, "-F", "#{pane_pid}"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip())
+            time.sleep(0.1)
+            prepare = mock.Mock(return_value=Path(temp) / "runtime")
+            try:
+                with self.assertRaisesRegex(RuntimeError, "did not fully exit"):
+                    self.runtime.prepare_after_stop(
+                        lambda: self.runtime.stop_dedicated_tui(
+                            socket_path, session, timeout=0.3, port_probe=lambda *_: False,
+                        ), prepare,
+                    )
+                prepare.assert_not_called()
+            finally:
+                identity = self.runtime._proc_stat(pane_pid)
+                if identity is not None and identity[1] != os.getpgrp():
+                    try: os.killpg(identity[1], signal.SIGKILL)
+                    except ProcessLookupError: pass
+                subprocess.run(["/usr/bin/tmux", "-S", str(socket_path), "kill-server"], capture_output=True)
+
 
 class XiaPrepareRuntimeTest(unittest.TestCase):
     @classmethod
@@ -355,6 +589,7 @@ class XiaPrepareRuntimeTest(unittest.TestCase):
             self.assertTrue(config.is_file()); self.assertFalse(wrong.exists())
             self.assertEqual(config.stat().st_mode & 0o777, 0o600)
             self.assertEqual((state / "channel.token").stat().st_mode & 0o777, 0o600)
+            self.assertEqual((state / "tmux" / f"tmux-{os.getuid()}").stat().st_mode & 0o777, 0o700)
             customized = '{"hasCompletedOnboarding":true,"theme":"dark"}\n'
             config.write_text(customized); os.chmod(config, 0o600)
             self.prepare.prepare_runtime(**kwargs)
@@ -388,6 +623,7 @@ class XiaPrepareRuntimeTest(unittest.TestCase):
         temporary, root, kwargs = self.make_runtime()
         try:
             tmux = root / "var/lib/cc-xia-relay/channel-state/tmux"
+            (tmux / f"tmux-{os.getuid()}").rmdir()
             tmux.rmdir(); tmux.symlink_to(root / "outside", target_is_directory=True)
             with self.assertRaises(self.prepare.PrepareError):
                 self.prepare.prepare_runtime(**kwargs)
@@ -424,10 +660,22 @@ class XiaPrepareRuntimeTest(unittest.TestCase):
 
     def test_launcher_contract_checks_config_path_and_supervises_ready_channel(self):
         launcher = (Path(__file__).parent / "xia_claude_channel" / "launcher.sh").read_text()
+        runtime_state = (Path(__file__).parent / "xia_claude_channel" / "runtime_state.py").read_text()
         self.assertIn('$XIA_CHANNEL_HOME/.claude/.claude.json', launcher)
         self.assertGreaterEqual(launcher.count("health_matches"), 3)
         self.assertIn("health_failures >= 3", launcher)
-        self.assertIn("kill-session -t", launcher)
+        self.assertIn('"kill-session", "-t"', runtime_state)
+        self.assertIn('runtime"', launcher)
+        self.assertNotIn('runtime-$generation', launcher)
+        loop_start = launcher.index("while :; do")
+        guarded_publish = launcher.index("runtime_state.py\" prepare-after-stop", loop_start)
+        start_tui = launcher.index('new-session -d', guarded_publish)
+        self.assertLess(guarded_publish, start_tui)
+        monitor = launcher[launcher.index("health_failures=0"):]
+        self.assertIn('runtime_state.py" stop-tui', monitor)
+        self.assertIn("|| exit 75", monitor)
+        self.assertIn("break", monitor)
+        self.assertNotIn("systemctl", monitor)
 
 
 if __name__ == "__main__": unittest.main()

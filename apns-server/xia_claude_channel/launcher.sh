@@ -22,6 +22,9 @@ test -r "$XIA_CHANNEL_STATE_DIR/channel.token" || { echo "missing private channe
 test -r "$XIA_CHANNEL_HOME/.claude/.credentials.json" || { echo "missing isolated Claude credential snapshot" >&2; exit 78; }
 test -r "$XIA_CHANNEL_HOME/.claude/.claude.json" || { echo "missing isolated Claude onboarding state" >&2; exit 78; }
 test -r "$XIA_CHANNEL_WORKSPACE/CLAUDE.md" || { echo "missing read-only Xia persona workspace" >&2; exit 78; }
+tmux_uid="$(id -u)"
+tmux_socket_path="$XIA_CHANNEL_TMUX_TMPDIR/tmux-$tmux_uid/$XIA_CHANNEL_TMUX_SOCKET"
+test -d "$XIA_CHANNEL_TMUX_TMPDIR/tmux-$tmux_uid" || { echo "missing private tmux socket directory" >&2; exit 78; }
 
 health_matches() {
   /usr/bin/curl -fsS --max-time 1 -H "X-Auth-Token: $(<"$XIA_CHANNEL_STATE_DIR/channel.token")" \
@@ -29,48 +32,22 @@ health_matches() {
 }
 
 while :; do
-  readarray -t values < <(/usr/bin/python3 - "$XIA_CHANNEL_STATE_DIR/control.json" <<'PY'
-import json, os, pathlib, sys, uuid
-p = pathlib.Path(sys.argv[1])
-d = json.loads(p.read_text()) if p.exists() else {}
-generation = int(d.get("generation") or 1)
-session_id = str(d.get("session_id") or uuid.uuid4())
-model = str(d.get("model") or "")
-if not p.exists() or not d.get("session_id"):
-    d = {"version": 1, "generation": generation, "session_id": session_id, "model": model,
-         "requires_fresh": False, "draining": False, "bootstrap_token": ""}
-    tmp = p.with_suffix(".tmp")
-    with tmp.open("w") as f:
-        f.write(json.dumps(d) + "\n"); f.flush(); os.fsync(f.fileno())
-    os.chmod(tmp, 0o600); os.replace(tmp, p)
-    fd = os.open(p.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try: os.fsync(fd)
-    finally: os.close(fd)
-requires_fresh = bool(d.get("requires_fresh", False)); draining = bool(d.get("draining", False))
-bootstrap_token = str(d.get("bootstrap_token") or "")
-print(generation); print(session_id); print(model); print(bootstrap_token)
-PY
-  )
-  generation=${values[0]}
-  session_id=${values[1]}
-  model=${values[2]}
-  bootstrap_token=${values[3]}
-  runtime="$XIA_CHANNEL_STATE_DIR/runtime-$generation"
-  mkdir -p "$runtime"
-  chmod 700 "$runtime"
-  sed \
-    -e "s|@INSTALL_DIR@|$XIA_CHANNEL_INSTALL_DIR|g" \
-    -e "s|@STATE_DIR@|$XIA_CHANNEL_STATE_DIR|g" \
-    -e "s|@TOKEN_FILE@|$XIA_CHANNEL_STATE_DIR/channel.token|g" \
-    -e "s|@GENERATION@|$generation|g" \
-    -e "s|@SESSION_ID@|$session_id|g" \
-    -e "s|@MODEL@|$model|g" \
-    -e "s|@BOOTSTRAP_TOKEN@|$bootstrap_token|g" \
-    "$XIA_CHANNEL_INSTALL_DIR/.mcp.json.in" > "$runtime/.mcp.json"
-  chmod 600 "$runtime/.mcp.json"
-  mkdir -p "$runtime/.claude"
-  install -m 600 "$XIA_CHANNEL_INSTALL_DIR/settings.json" "$runtime/.claude/settings.json"
-  ln -sfn "$XIA_CHANNEL_WORKSPACE/CLAUDE.md" "$runtime/CLAUDE.md"
+  # Runtime publication is gated on authoritative tmux queries, kill success,
+  # captured /proc identities, and an unreachable old MCP port. The helper
+  # reads control only after that gate, publishes it, rechecks it, and returns
+  # the one snapshot used by this Claude command.
+  snapshot="$(/usr/bin/python3 "$XIA_CHANNEL_INSTALL_DIR/runtime_state.py" prepare-after-stop \
+    "$tmux_socket_path" "$XIA_CHANNEL_TMUX_SESSION" "$XIA_CHANNEL_INSTALL_DIR" \
+    "$XIA_CHANNEL_STATE_DIR" "$XIA_CHANNEL_WORKSPACE")"
+  readarray -t values < <(/usr/bin/python3 -c \
+    'import json,sys; d=json.load(sys.stdin); print(d["runtime"]); print(d["generation"]); print(d["session_id"]); print(d["model"]); print(d["bootstrap_token"])' \
+    <<<"$snapshot")
+  runtime=${values[0]}
+  generation=${values[1]}
+  session_id=${values[2]}
+  model=${values[3]}
+  bootstrap_token=${values[4]}
+  [[ "$runtime" == "$XIA_CHANNEL_STATE_DIR/runtime" ]] || { echo "unexpected runtime path" >&2; exit 75; }
 
   resume=0
   [[ "$(/usr/bin/python3 "$XIA_CHANNEL_INSTALL_DIR/runtime_state.py" mode "$XIA_CHANNEL_HOME" "$session_id")" == "resume" ]] && resume=1
@@ -84,14 +61,13 @@ PY
     [[ -n "$model" ]] && cmd+=(--model "$model")
   fi
   printf -v quoted_cmd '%q ' "${cmd[@]}"
-  # No automated pane keystrokes: a changed Claude confirmation screen is a
-  # fail-closed readiness timeout, never a blind Enter into arbitrary TUI text.
-  TMUX_TMPDIR="$XIA_CHANNEL_TMUX_TMPDIR" /usr/bin/tmux -L "$XIA_CHANNEL_TMUX_SOCKET" kill-session -t "$XIA_CHANNEL_TMUX_SESSION" 2>/dev/null || true
+  # No automated pane keystrokes: the one-time stable-workspace trust remains
+  # an operator preflight, never a blind Enter into arbitrary TUI text.
   HOME="$XIA_CHANNEL_HOME" CLAUDE_CONFIG_DIR="$XIA_CHANNEL_HOME/.claude" \
     XDG_CONFIG_HOME="$XIA_CHANNEL_HOME/.config" \
     SHELL=/bin/bash \
     TMUX_TMPDIR="$XIA_CHANNEL_TMUX_TMPDIR" \
-    /usr/bin/tmux -L "$XIA_CHANNEL_TMUX_SOCKET" new-session -d -s "$XIA_CHANNEL_TMUX_SESSION" -c "$runtime" "$quoted_cmd"
+    /usr/bin/tmux -S "$tmux_socket_path" new-session -d -s "$XIA_CHANNEL_TMUX_SESSION" -c "$runtime" "$quoted_cmd"
 
   deadline=$((SECONDS + XIA_CHANNEL_START_TIMEOUT))
   ready=0
@@ -99,18 +75,19 @@ PY
     if health_matches; then
       ready=1; break
     fi
-    TMUX_TMPDIR="$XIA_CHANNEL_TMUX_TMPDIR" /usr/bin/tmux -L "$XIA_CHANNEL_TMUX_SOCKET" has-session -t "$XIA_CHANNEL_TMUX_SESSION" 2>/dev/null || break
+    TMUX_TMPDIR="$XIA_CHANNEL_TMUX_TMPDIR" /usr/bin/tmux -S "$tmux_socket_path" has-session -t "$XIA_CHANNEL_TMUX_SESSION" 2>/dev/null || break
     sleep 0.5
   done
   if (( ! ready )); then
     echo "Claude channel did not become ready; confirmation/credential/CLI preflight failed closed" >&2
-    TMUX_TMPDIR="$XIA_CHANNEL_TMUX_TMPDIR" /usr/bin/tmux -L "$XIA_CHANNEL_TMUX_SOCKET" kill-session -t "$XIA_CHANNEL_TMUX_SESSION" 2>/dev/null || true
+    /usr/bin/python3 "$XIA_CHANNEL_INSTALL_DIR/runtime_state.py" stop-tui \
+      "$tmux_socket_path" "$XIA_CHANNEL_TMUX_SESSION" || true
     exit 75
   fi
   /usr/bin/python3 "$XIA_CHANNEL_INSTALL_DIR/runtime_state.py" write-marker \
     "$XIA_CHANNEL_STATE_DIR/current-session.json" "$generation" "$session_id" "$model"
   health_failures=0
-  while TMUX_TMPDIR="$XIA_CHANNEL_TMUX_TMPDIR" /usr/bin/tmux -L "$XIA_CHANNEL_TMUX_SOCKET" has-session -t "$XIA_CHANNEL_TMUX_SESSION" 2>/dev/null; do
+  while TMUX_TMPDIR="$XIA_CHANNEL_TMUX_TMPDIR" /usr/bin/tmux -S "$tmux_socket_path" has-session -t "$XIA_CHANNEL_TMUX_SESSION" 2>/dev/null; do
     sleep 1
     if health_matches; then
       health_failures=0
@@ -118,8 +95,8 @@ PY
       health_failures=$((health_failures + 1))
       if (( health_failures >= 3 )); then
         echo "Claude channel health disappeared; terminating the dedicated TUI for a clean restart" >&2
-        TMUX_TMPDIR="$XIA_CHANNEL_TMUX_TMPDIR" /usr/bin/tmux -L "$XIA_CHANNEL_TMUX_SOCKET" \
-          kill-session -t "$XIA_CHANNEL_TMUX_SESSION" 2>/dev/null || true
+        /usr/bin/python3 "$XIA_CHANNEL_INSTALL_DIR/runtime_state.py" stop-tui \
+          "$tmux_socket_path" "$XIA_CHANNEL_TMUX_SESSION" || exit 75
         break
       fi
     fi
