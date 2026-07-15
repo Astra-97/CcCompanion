@@ -216,6 +216,9 @@ class XiaokeStopTest(unittest.TestCase):
         stop_thread.start()
         self.assertTrue(entered.wait(2))
 
+        self.assertTrue(handler.state.typing_state["stopping"])
+        self.assertIsNot(handler.state.typing_state.get("completed"), True)
+
         handler._handle_chat_send({"contact_id": "xiaoke", "text": "new turn"})
 
         self.assertEqual(handler.responses[-1][0], 409)
@@ -271,6 +274,25 @@ class XiaokeStopTest(unittest.TestCase):
         self.assertFalse(matched)
         self.assertTrue(handler.state.typing_state["is_typing"])
         self.assertEqual(handler.state.typing_state["since"], "new-turn")
+
+    def test_exact_natural_completion_retains_terminal_turn_identity(self) -> None:
+        handler = self.handler(user_ts="turn-1", session="cctg", transport="tmux")
+
+        matched = handler._complete_xiaoke_turn_if_match("a" * 32, "cctg")
+
+        self.assertTrue(matched)
+        self.assertEqual(handler.state.typing_state, {
+            "is_typing": False,
+            "since": "turn-1",
+            "session": "cctg",
+            "transport": "tmux",
+            "turn_token": "a" * 32,
+            "completed": True,
+        })
+        self.assertEqual(
+            handler.state.contact_typing_states["xiaoke"],
+            handler.state.typing_state,
+        )
 
     def test_exact_long_tmux_turn_does_not_expire_after_120_seconds(self) -> None:
         state = {

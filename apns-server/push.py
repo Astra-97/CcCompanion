@@ -1991,7 +1991,16 @@ class PushHandler(BaseHTTPRequestHandler):
                 stopping["completed_at"] = time.time()
                 self.state.xiaoke_stopping_claim = stopping
                 return True
-            value = {"is_typing": False, "since": None}
+            # Retain the completed turn's identity so clients can dismiss Stop
+            # only when this exact terminal payload matches their tracked turn.
+            value = {
+                "is_typing": False,
+                "since": str(active.get("since") or ""),
+                "session": str(active.get("session") or ""),
+                "transport": "tmux",
+                "turn_token": token,
+                "completed": True,
+            }
             self.state.typing_state = value
             self.state.contact_typing_states["xiaoke"] = value
             return True
