@@ -71,6 +71,98 @@ if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
     exit 0
 fi
 
+# Correlate this callback's assistant text with its own real user turn.  A
+# delayed callback must never borrow the newest marker from a later turn.  If
+# the transcript does not contain one unique match, omit identity fail-closed:
+# history may still be appended, but it cannot complete a newer active turn.
+TURN_IDENTITY=$(printf '%s' "$DIRECT_LAST" | python3 -c '
+import json, re, sys, time
+
+direct = sys.stdin.read().replace("\r\n", "\n").strip()
+if not direct:
+    sys.exit(0)
+
+path = sys.argv[1]
+pattern = re.compile(r"\[CCC_APP_TURN:([0-9a-f]{32}):([A-Za-z0-9_.:-]{1,80})\]")
+
+def texts(content):
+    if isinstance(content, str):
+        return [content]
+    if not isinstance(content, list):
+        return []
+    return [
+        block.get("text", "") for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    ]
+
+def tool_result_only(content):
+    return (
+        isinstance(content, list)
+        and bool(content)
+        and all(
+            isinstance(block, dict) and block.get("type") == "tool_result"
+            for block in content
+        )
+    )
+
+def normalized(value):
+    return value.replace("\r\n", "\n").strip()
+
+def resolve(lines):
+    current = None
+    assistant_parts = []
+    matches = set()
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        kind = obj.get("type")
+        content = obj.get("message", {}).get("content", [])
+        if kind == "user":
+            if tool_result_only(content):
+                continue
+            match = pattern.search("\n".join(texts(content)))
+            current = (match.group(1), match.group(2)) if match else None
+            assistant_parts = []
+            continue
+        if kind != "assistant" or current is None:
+            continue
+        event = normalized("\n".join(texts(content)))
+        if not event:
+            continue
+        assistant_parts.append(event)
+        candidates = {
+            event,
+            "".join(assistant_parts),
+            "\n".join(assistant_parts),
+            "\n\n".join(assistant_parts),
+        }
+        if any(normalized(candidate) == direct for candidate in candidates):
+            matches.add(current)
+    return matches
+
+# Give Claude time to flush the assistant row.  Re-read instead of trusting a
+# potentially stale snapshot; ambiguity after a later flush remains fail-closed.
+lines = []
+for attempt in range(5):
+    try:
+        with open(path, encoding="utf-8") as transcript:
+            lines = transcript.readlines()
+    except Exception:
+        sys.exit(0)
+    if attempt < 4:
+        time.sleep(0.2)
+
+matches = resolve(lines)
+if len(matches) == 1:
+    token, session = next(iter(matches))
+    print(token)
+    print(session)
+' "$TRANSCRIPT_PATH" 2>/dev/null)
+TURN_TOKEN=$(echo "$TURN_IDENTITY" | sed -n '1p')
+TURN_SESSION=$(echo "$TURN_IDENTITY" | sed -n '2p')
+
 # Prefer stdin last_assistant_message (新版 Claude Code 直接给), fallback transcript
 if [ -n "$DIRECT_LAST" ]; then
     LAST_ASSISTANT="$DIRECT_LAST"
@@ -134,15 +226,25 @@ if [ -z "$LAST_ASSISTANT" ]; then
 fi
 
 # POST 到 /chat/append
-PAYLOAD=$(ASSISTANT_TEXT="$LAST_ASSISTANT" python3 -c '
+PAYLOAD=$(ASSISTANT_TEXT="$LAST_ASSISTANT" TURN_TOKEN="$TURN_TOKEN" TURN_SESSION="$TURN_SESSION" python3 -c '
 import json, os, datetime
 ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-print(json.dumps({
+payload = {
     "role": "assistant",
     "text": os.environ["ASSISTANT_TEXT"],
     "source": "ccc-stop-hook",
     "ts": ts,
-}))
+}
+token = os.environ.get("TURN_TOKEN", "").strip()
+session = os.environ.get("TURN_SESSION", "").strip()
+if token and session:
+    payload["turn_token"] = token
+    payload["session_id"] = session
+    payload["metadata"] = {
+        "xiaoke_turn_token": token,
+        "xiaoke_session_id": session,
+    }
+print(json.dumps(payload))
 ')
 
 # retry transient network errors (000/502/503/504), don't retry 401 (auth)

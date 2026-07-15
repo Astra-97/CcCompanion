@@ -44,6 +44,7 @@ For security, this server ships with `strict_auth = true` and `allow_remote_cont
 | GET    | `/health`             | Health probe                               | none          |
 | GET    | `/version`            | Server version                             | none          |
 | POST   | `/chat/send`          | iPhone sends a chat message                | shared_secret |
+| POST   | `/chat/stop`          | Stop the exact active XiaoKe App turn      | shared_secret |
 | GET    | `/chat/history`       | iPhone fetches history                     | shared_secret |
 | GET    | `/chain/sessions`     | List tmux sessions                         | shared_secret |
 | POST   | `/chain/new_session`  | Create new tmux session                    | shared_secret |
@@ -53,6 +54,14 @@ For security, this server ships with `strict_auth = true` and `allow_remote_cont
 | POST   | `/register-device-token` | iPhone reports its APNs device token   | none (公开)   |
 | GET    | `/tool/schedule`      | List tool-dispatcher rules + run state      | shared_secret |
 | POST   | `/tool/trigger`       | Manually fire a rule now (test/on-demand)   | shared_secret |
+
+XiaoKe Stop requires the matching repository Stop hook from
+`claude_hooks/ccc_stop_hook.sh`. `/chat/send` injects an opaque per-turn marker;
+the hook returns that marker with the tmux session so a late completion can
+only clear its own turn. Deploy `push.py` and the hook together. Copy the hook
+to the configured Claude hook path and keep it executable; do not enable the
+Android Stop control against a backend that has not installed the correlated
+hook.
 
 ### 小克·工具版 (tool-version dispatcher)
 
