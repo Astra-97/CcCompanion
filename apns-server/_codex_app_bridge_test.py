@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 from codex_app_bridge import CodexActiveTurnError, CodexAppBridge
 
@@ -361,6 +362,48 @@ class CodexAppBridgeTest(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(holder["result"].status, "interrupted")
         self.assertIn("turn/interrupt", self.methods())
+
+    def test_zero_runtime_limit_survives_wall_clock_jump_until_explicit_cancel(self):
+        cancel_event = threading.Event()
+        holder = {}
+        monotonic_now = [100.0]
+
+        def run_slow():
+            with mock.patch(
+                "codex_app_bridge.time.monotonic",
+                side_effect=lambda: monotonic_now[0],
+            ):
+                holder["result"] = self.bridge.run_turn(
+                    thread_id=None,
+                    cwd=self.root,
+                    prompt="slow",
+                    model="gpt-test",
+                    effort="high",
+                    cancel_event=cancel_event,
+                    max_runtime_sec=0,
+                )
+
+        worker = threading.Thread(target=run_slow)
+        worker.start()
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if self.bridge.snapshot().get("turn_id"):
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("fake turn did not start")
+
+        # Simulate far more than the former 900-second wall-clock ceiling.
+        monotonic_now[0] += 901.0
+        time.sleep(0.3)
+        self.assertTrue(worker.is_alive())
+        self.assertNotIn("turn/interrupt", self.methods())
+
+        cancel_event.set()
+        worker.join(timeout=2.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(holder["result"].status, "interrupted")
+        self.assertEqual(self.methods().count("turn/interrupt"), 1)
 
     def test_server_requests_receive_nonblocking_responses(self):
         responses = []

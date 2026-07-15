@@ -361,7 +361,7 @@ class CodexAppBridge:
         on_activity: ActivityCallback | None = None,
         on_thread: ThreadCallback | None = None,
         marker_provider: MarkerProvider | None = None,
-        max_runtime_sec: float = 900.0,
+        max_runtime_sec: float = 0,
     ) -> CodexTurnResult:
         if not self._turn_gate.acquire(blocking=False):
             raise CodexActiveTurnError()
@@ -517,7 +517,12 @@ class CodexAppBridge:
         cancel_event: threading.Event | None,
         max_runtime_sec: float,
     ) -> CodexTurnResult:
-        deadline = time.monotonic() + max_runtime_sec
+        runtime_limit_sec = float(max_runtime_sec)
+        deadline = (
+            time.monotonic() + runtime_limit_sec
+            if runtime_limit_sec > 0
+            else None
+        )
         interrupt_deadline: float | None = None
         reconnected = False
         while True:
@@ -531,8 +536,8 @@ class CodexAppBridge:
                 )
                 connection_lost = active.connection_lost
                 now = time.monotonic()
-                remaining = deadline - now
-                if cancel_requested or remaining <= 0:
+                remaining = deadline - now if deadline is not None else None
+                if cancel_requested or (remaining is not None and remaining <= 0):
                     if interrupt_deadline is None:
                         interrupt_deadline = now + self.interrupt_grace_sec
                     if now >= interrupt_deadline:
@@ -543,7 +548,7 @@ class CodexAppBridge:
                     wait_for = 0.2
                     if interrupt_deadline is not None:
                         wait_for = min(wait_for, max(0.01, interrupt_deadline - now))
-                    elif remaining > 0:
+                    elif remaining is not None and remaining > 0:
                         wait_for = min(wait_for, remaining)
                     active.condition.wait(timeout=wait_for)
                     continue

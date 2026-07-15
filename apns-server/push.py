@@ -6699,7 +6699,12 @@ class PushHandler(BaseHTTPRequestHandler):
                                 on_activity=_on_activity,
                                 on_thread=_on_thread,
                                 marker_provider=self._codex_rollout_marker,
-                                max_runtime_sec=900,
+                                # Interactive Kairos turns can legitimately run while
+                                # agents, builds, or reviews are still making progress.
+                                # A zero wall-clock limit leaves explicit Stop/cancel as
+                                # the only interruption path; the separate auto-forge
+                                # handoff remains bounded above.
+                                max_runtime_sec=0,
                             )
                             thread_id = bridge_result.thread_id
                             answer = bridge_result.text
@@ -6742,7 +6747,7 @@ class PushHandler(BaseHTTPRequestHandler):
                                 on_update=_on_update,
                                 on_activity=_on_activity,
                                 image_paths=image_paths,
-                                max_runtime_sec=900,
+                                max_runtime_sec=0,
                             )
                             _harvest_mcp_session_activities(session_marker, thread_id or session_id)
                             bridge_status = None
@@ -6757,7 +6762,7 @@ class PushHandler(BaseHTTPRequestHandler):
                             on_update=_on_update,
                             on_activity=_on_activity,
                             image_paths=image_paths,
-                            max_runtime_sec=900,
+                            max_runtime_sec=0,
                         )
                         _harvest_mcp_session_activities(session_marker, thread_id or session_id)
                         bridge_status = None
