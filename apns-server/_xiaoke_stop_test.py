@@ -344,6 +344,49 @@ class XiaokeStopTest(unittest.TestCase):
             injected_text.split(":", 2)[1],
         )
 
+    def test_channel_enabled_app_turn_still_uses_synchronous_tmux_stop_path(self) -> None:
+        handler = self.send_handler()
+        # Production may retain a deprecated Claude conversation UUID here;
+        # it must never be treated as a tmux target.
+        handler.state.active_session = "09e039bb-817e-4674-addd-b28aee740e69"
+        handler._channel_transport_enabled_for = lambda _contact: True
+        channel_calls = []
+        injection_calls = []
+        handler._send_to_channel_transport = lambda **kwargs: (
+            channel_calls.append(kwargs) or (True, "", {"queued": True})
+        )
+        handler._inject_to_session = lambda *args, **kwargs: (
+            injection_calls.append((args, kwargs)) or TmuxInjectionResult(True)
+        )
+
+        handler._handle_chat_send({"contact_id": "xiaoke", "text": "hello"})
+
+        self.assertEqual(channel_calls, [])
+        self.assertEqual(len(injection_calls), 1)
+        self.assertEqual(injection_calls[0][0][0], "cctg")
+        self.assertTrue(injection_calls[0][1]["force_direct_tmux"])
+        self.assertRegex(injection_calls[0][0][1], r"^\[CCC_APP_TURN:[0-9a-f]{32}:cctg\]\n")
+        self.assertEqual(handler.responses[-1][0], 200)
+        turn = handler.responses[-1][1]["turn"]
+        self.assertEqual(turn, {
+            "contact_id": "xiaoke",
+            "user_ts": "turn-1",
+            "session": "cctg",
+            "transport": "tmux",
+        })
+        self.assertEqual(handler.state.typing_state["session"], "cctg")
+        self.assertEqual(handler.state.typing_state["transport"], "tmux")
+
+        with patch(
+            "push.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ) as run:
+            handler._handle_chat_stop(self.request())
+
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], ["tmux", "send-keys", "-t", "cctg", "C-c"])
+        self.assertTrue(handler.responses[-1][1]["stopped"])
+
     def test_history_failure_releases_only_its_send_reservation(self) -> None:
         handler = self.handler(active=False)
         handler.state.contact_chats = {"xiaoke": types.SimpleNamespace(

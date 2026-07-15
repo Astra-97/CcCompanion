@@ -1636,7 +1636,7 @@ class ServerState:
         ts_prefix = "[" + _dt.now().strftime("%Y-%m-%d %H:%M:%S") + "]"
         injected = f"{ts_prefix} {text}"
 
-        # 1) inject — channel transport first (same as _handle_chat_send).
+        # 1) inject — scheduled triggers remain channel-transport first.
         if self.channel_transport_enabled and contact_id in self.channel_transport_contacts:
             message_id = f"tool:{rule_id}:{int(time.time())}"
             metadata = {
@@ -5647,7 +5647,10 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.exception("xiaoke history append failed")
             self._send_json(500, {"ok": False, "error": f"history append failed: {exc}"})
             return
-        target_session = (self.state.active_session or self.state.default_session).strip()
+        # ``active_session`` is the deprecated chain/session pointer and may be
+        # a Claude conversation UUID.  XiaoKe's terminal identity is the
+        # configured tmux session name.
+        target_session = str(self.state.default_session or "").strip()
         turn_marker = f"[CCC_APP_TURN:{turn_token}:{target_session}]"
         # 包 quote 进注入文本 (主 session 收到 channel tag 内含 quote 上下文 + 时间戳跟 wechat 一致)
         from datetime import datetime as _dt
@@ -5670,46 +5673,13 @@ class PushHandler(BaseHTTPRequestHandler):
                 injected = f"{turn_marker}\n{ts_prefix} {tts_hint}[引用 \"{rec['quoted_text']}\"]\n{loc_str}"
                 if text:
                     injected = f"{injected}\n{text}"
-        if self._channel_transport_enabled_for(contact_id):
-            if not self._activate_xiaoke_send_reservation(
-                turn_token=turn_token,
-                user_ts=str(rec.get("ts") or ""),
-                session="",
-                transport="channel",
-            ):
-                self._send_json(409, {"ok": False, "error": "xiaoke_send_reservation_lost"})
-                return
-            message_id = self._channel_message_id(body, contact_id, injected, quoted_ts)
-            ok, err, _channel_response = self._send_to_channel_transport(
-                message_id=message_id,
-                contact_id=contact_id,
-                text=injected,
-                quoted_ts=quoted_ts,
-                user_record=rec,
-            )
-            if ok:
-                self._send_json(200, {
-                    "ok": True,
-                    "record": rec,
-                    "transport": "channel",
-                    "message_id": message_id,
-                })
-                return
-            logger.warning(
-                "channel transport failed contact_id=%s message_id=%s error=%s",
-                contact_id,
-                message_id,
-                err,
-            )
-            if not self.state.channel_transport_fallback_to_tmux:
-                self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
-                self._send_json(502, {
-                    "ok": False,
-                    "record": rec,
-                    "transport": "channel",
-                    "error": err or "channel transport failed",
-                })
-                return
+        # App-originated XiaoKe text turns deliberately bypass the development
+        # channel even when it is enabled.  POST /messages acknowledges only
+        # that a notification was queued; it does not provide a synchronous
+        # boundary proving that this exact prompt has reached the Claude TUI.
+        # The direct tmux path below holds the exact-turn lock through paste +
+        # Enter, so the App exposes Stop only after a literal C-c can be safely
+        # bound to this turn and session.
         # 注入文本到 active tmux session
         # 2026-05-14 build 200 — 不依赖 ~/scripts/bus_send.py (Opia 内部 file, ccc 公开版用户没有)
         # 如果 bus_send.py 存在 用它走 bus dispatcher 路由 (Opia 内部多 agent 协调用)
@@ -5817,7 +5787,7 @@ class PushHandler(BaseHTTPRequestHandler):
 
         lock = self.state.xiaoke_stop_lock
         with lock:
-            configured_session = str(self.state.active_session or self.state.default_session).strip()
+            configured_session = str(self.state.default_session or "").strip()
             if session != configured_session:
                 self._send_json(409, {
                     "ok": False,
@@ -5930,7 +5900,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     not current.get("is_typing")
                     and str(stopping.get("user_ts") or "") == user_ts
                     and str(stopping.get("session") or "") == session
-                    and str(self.state.active_session or self.state.default_session).strip() == session
+                    and str(self.state.default_session or "").strip() == session
                 ):
                     completion_won = bool(stopping.get("completed"))
                     value = {"is_typing": False, "since": None} if completion_won else claimed
