@@ -10,6 +10,37 @@ DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 LEGACY_RUNTIME_RE = re.compile(r"runtime-[0-9]+\Z")
 TMUX = "/usr/bin/tmux"
 
+
+class _TmuxQueryTransient(RuntimeError):
+    """The captured tmux server/socket is disappearing after a successful kill."""
+
+
+_TRANSIENT_TMUX_ERRORS = (
+    "no server running on",
+    "connection refused",
+    "connection reset",
+    "broken pipe",
+    "lost server",
+    "server exited unexpectedly",
+)
+
+
+def _tmux_failure_is_transient(result: subprocess.CompletedProcess) -> bool:
+    detail = f"{result.stderr or ''}\n{result.stdout or ''}".lower()
+    if "permission denied" in detail or "operation not permitted" in detail:
+        return False
+    return any(message in detail for message in _TRANSIENT_TMUX_ERRORS)
+
+
+def _tmux_query_error(*results: subprocess.CompletedProcess) -> type[RuntimeError]:
+    # Successful probes are not relevant. Every failed command must
+    # independently identify a known connection-loss transition; one unknown,
+    # empty, malformed, or permission result makes the whole query hard-fail.
+    failed = [result for result in results if result.returncode != 0]
+    if failed and all(_tmux_failure_is_transient(result) for result in failed):
+        return _TmuxQueryTransient
+    return RuntimeError
+
 def has_transcript(home: str | Path, session_id: str) -> bool:
     root = Path(home) / ".claude" / "projects"
     if not root.is_dir() or not session_id:
@@ -158,7 +189,8 @@ def _query_session_pids(socket_path: Path, session: str, *, runner=subprocess.ru
     if probe.returncode == 0:
         panes = _run_tmux(socket_path, "list-panes", "-t", session, "-F", "#{pane_pid}", runner=runner)
         if panes.returncode != 0:
-            raise RuntimeError("dedicated tmux pane query failed")
+            error = _tmux_query_error(panes)
+            raise error("dedicated tmux pane query failed")
         try:
             pids = [int(line) for line in panes.stdout.splitlines() if line.strip()]
         except ValueError as error:
@@ -176,7 +208,8 @@ def _query_session_pids(socket_path: Path, session: str, *, runner=subprocess.ru
     if listing.returncode != 0:
         if not _socket_present(socket_path):
             return None
-        raise RuntimeError("dedicated tmux session query failed")
+        error = _tmux_query_error(probe, listing)
+        raise error("dedicated tmux session query failed")
     names = {line.strip() for line in listing.stdout.splitlines() if line.strip()}
     if session in names:
         raise RuntimeError("dedicated tmux session probe was inconsistent")
@@ -294,13 +327,21 @@ def stop_dedicated_tui(socket_path: str | Path, session: str, *, host: str = "12
         try:
             remaining = _query_session_pids(path, session, runner=runner)
             query_authoritative = True
-        except RuntimeError:
+        except _TmuxQueryTransient:
             # After a successful kill, tmux may briefly leave a socket whose
             # server is already disappearing. This is not success and not a
-            # reason to publish: keep the gate closed until an authoritative
-            # absence or explicit socket disappearance is observed.
-            remaining = None
-            query_authoritative = stale_socket_retire(path, server_guard, proc_reader=proc_reader)
+            # reason to publish. Catch only known connection-loss outcomes;
+            # permission, malformed-response, and consistency errors remain
+            # hard failures. Keep the gate closed until an authoritative
+            # absence or the captured server's socket is safely retired.
+            stale_socket_retire(path, server_guard, proc_reader=proc_reader)
+            # Even a safely retired stale socket is observed as absent on the
+            # next pass. Never publish from the same pass whose tmux query
+            # failed.
+            if monotonic() >= deadline:
+                raise RuntimeError("old Claude/TUI/MCP did not fully exit before runtime replacement")
+            sleeper(0.1)
+            continue
         processes_alive = _process_guard_alive(guard, proc_reader=proc_reader)
         channel_open = port_probe(host, port)
         if query_authoritative and remaining is None and not processes_alive and not channel_open:

@@ -4,6 +4,7 @@ import socket
 import signal
 import stat
 import subprocess
+import threading
 import time
 import tempfile
 import unittest
@@ -471,12 +472,17 @@ class XiaRuntimeStateTest(unittest.TestCase):
                 nonlocal killed, post_probes
                 command = args[3]
                 if command == "has-session":
-                    return subprocess.CompletedProcess(args, 1 if killed else 0, "", "")
+                    return subprocess.CompletedProcess(
+                        args, 1 if killed else 0, "", "connection refused" if killed else "",
+                    )
                 if command == "list-panes": return subprocess.CompletedProcess(args, 0, "123\n", "")
                 if command == "kill-session": killed = True; return subprocess.CompletedProcess(args, 0, "", "")
                 if command == "list-sessions":
                     post_probes += 1
-                    return subprocess.CompletedProcess(args, 1 if post_probes == 1 else 0, "", "temporary")
+                    return subprocess.CompletedProcess(
+                        args, 1 if post_probes == 1 else 0, "",
+                        "connection refused" if post_probes == 1 else "",
+                    )
                 raise AssertionError(command)
             prepare = mock.Mock(return_value=Path(temp) / "runtime")
             try:
@@ -494,6 +500,76 @@ class XiaRuntimeStateTest(unittest.TestCase):
                 self.assertEqual(post_probes, 2); prepare.assert_called_once()
             finally:
                 listener.close()
+
+    def test_post_kill_permission_failure_fails_closed_without_prepare(self):
+        with tempfile.TemporaryDirectory() as temp:
+            listener, path = self._tmux_socket(temp)
+            killed = False
+            def runner(args, **_kwargs):
+                nonlocal killed
+                command = args[3]
+                if command == "has-session":
+                    if killed:
+                        return subprocess.CompletedProcess(args, 1, "", "permission denied")
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                if command == "list-panes": return subprocess.CompletedProcess(args, 0, "123\n", "")
+                if command == "kill-session": killed = True; return subprocess.CompletedProcess(args, 0, "", "")
+                if command == "list-sessions":
+                    return subprocess.CompletedProcess(args, 1, "", "permission denied")
+                raise AssertionError(command)
+            prepare = mock.Mock(return_value=Path(temp) / "runtime")
+            try:
+                with mock.patch.object(self.runtime, "_capture_process_guard", return_value={"identities": {}, "pgrps": {}}):
+                    with self.assertRaisesRegex(RuntimeError, "session query failed"):
+                        self.runtime.prepare_after_stop(
+                            lambda: self.runtime.stop_dedicated_tui(
+                                path, "xia-claude", runner=runner,
+                                server_guard_capture=lambda *_args, **_kwargs: {
+                                    "pid": 9, "starttime": 1, "socket_dev": 1, "socket_ino": 1,
+                                },
+                            ), prepare,
+                        )
+                prepare.assert_not_called()
+            finally:
+                listener.close()
+
+    def _assert_mixed_post_kill_query_failure_does_not_prepare(self, listing_stderr):
+        with tempfile.TemporaryDirectory() as temp:
+            listener, path = self._tmux_socket(temp)
+            killed = False
+            def runner(args, **_kwargs):
+                nonlocal killed
+                command = args[3]
+                if command == "has-session":
+                    return subprocess.CompletedProcess(
+                        args, 1 if killed else 0, "", "connection refused" if killed else "",
+                    )
+                if command == "list-panes": return subprocess.CompletedProcess(args, 0, "123\n", "")
+                if command == "kill-session": killed = True; return subprocess.CompletedProcess(args, 0, "", "")
+                if command == "list-sessions":
+                    return subprocess.CompletedProcess(args, 1, "", listing_stderr)
+                raise AssertionError(command)
+            prepare = mock.Mock(return_value=Path(temp) / "runtime")
+            try:
+                with mock.patch.object(self.runtime, "_capture_process_guard", return_value={"identities": {}, "pgrps": {}}):
+                    with self.assertRaisesRegex(RuntimeError, "session query failed"):
+                        self.runtime.prepare_after_stop(
+                            lambda: self.runtime.stop_dedicated_tui(
+                                path, "xia-claude", runner=runner,
+                                server_guard_capture=lambda *_args, **_kwargs: {
+                                    "pid": 9, "starttime": 1, "socket_dev": 1, "socket_ino": 1,
+                                },
+                            ), prepare,
+                        )
+                prepare.assert_not_called()
+            finally:
+                listener.close()
+
+    def test_post_kill_transient_probe_plus_unknown_listing_fails_closed(self):
+        self._assert_mixed_post_kill_query_failure_does_not_prepare("unexpected tmux failure")
+
+    def test_post_kill_transient_probe_plus_malformed_listing_fails_closed(self):
+        self._assert_mixed_post_kill_query_failure_does_not_prepare("protocol error: malformed response")
 
     def test_control_is_read_after_stop_and_new_generation_drives_publish_snapshot(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -544,6 +620,9 @@ class XiaRuntimeStateTest(unittest.TestCase):
                 ["/usr/bin/tmux", "-S", str(socket_path), "list-panes", "-t", session, "-F", "#{pane_pid}"],
                 check=True, capture_output=True, text=True,
             ).stdout.strip())
+            pane_identity = self.runtime._proc_stat(pane_pid)
+            self.assertIsNotNone(pane_identity)
+            self.assertNotEqual(pane_identity[1], os.getpgrp())
             time.sleep(0.1)
             prepare = mock.Mock(return_value=Path(temp) / "runtime")
             try:
@@ -555,9 +634,77 @@ class XiaRuntimeStateTest(unittest.TestCase):
                     )
                 prepare.assert_not_called()
             finally:
-                identity = self.runtime._proc_stat(pane_pid)
-                if identity is not None and identity[1] != os.getpgrp():
-                    try: os.killpg(identity[1], signal.SIGKILL)
+                current = self.runtime._proc_stat(pane_pid)
+                if current is not None and current[2] == pane_identity[2]:
+                    try: os.killpg(pane_identity[1], signal.SIGKILL)
+                    except ProcessLookupError: pass
+                subprocess.run(["/usr/bin/tmux", "-S", str(socket_path), "kill-server"], capture_output=True)
+
+    def test_real_tmux_rotate_during_process_and_port_drain_publishes_latest_control(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); socket_path = root / "tmux.sock"; session = "xia-real-rotate"
+            state = root / "state"; state.mkdir(mode=0o700)
+            first = {"version": 1, "generation": 1, "session_id": "00000000-0000-4000-8000-000000000001",
+                     "model": "opus", "bootstrap_token": "old"}
+            second = {"version": 1, "generation": 2, "session_id": "00000000-0000-4000-8000-000000000002",
+                      "model": "sonnet", "bootstrap_token": "new"}
+            (state / "control.json").write_text(json.dumps(first))
+            with socket.socket() as reservation:
+                reservation.bind(("127.0.0.1", 0)); port = reservation.getsockname()[1]
+            code = (
+                "import signal,socket,time; "
+                "signal.signal(signal.SIGHUP,signal.SIG_IGN); "
+                "s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); "
+                f"s.bind(('127.0.0.1',{port})); s.listen(); time.sleep(30)"
+            )
+            subprocess.run(["/usr/bin/tmux", "-S", str(socket_path), "new-session", "-d", "-s", session,
+                            "/usr/bin/python3", "-c", code], check=True)
+            pane_pid = int(subprocess.run(
+                ["/usr/bin/tmux", "-S", str(socket_path), "list-panes", "-t", session, "-F", "#{pane_pid}"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip())
+            identity = self.runtime._proc_stat(pane_pid)
+            self.assertIsNotNone(identity); pane_pgrp = identity[1]
+            self.assertNotEqual(pane_pgrp, os.getpgrp())
+            deadline = time.monotonic() + 2
+            while not self.runtime._port_open("127.0.0.1", port):
+                if time.monotonic() >= deadline: self.fail("test pane did not open its port")
+                time.sleep(0.01)
+
+            rotated_while_draining = []
+            def rotate_after_tmux_disappears():
+                while subprocess.run(
+                    ["/usr/bin/tmux", "-S", str(socket_path), "has-session", "-t", session],
+                    capture_output=True,
+                ).returncode == 0:
+                    time.sleep(0.01)
+                rotated_while_draining.append(self.runtime._port_open("127.0.0.1", port))
+                (state / "control.json").write_text(json.dumps(second))
+                os.killpg(pane_pgrp, signal.SIGTERM)
+
+            rotator = threading.Thread(target=rotate_after_tmux_disappears, daemon=True)
+            rotator.start()
+            published = []
+            def prepare(_install, _state, _workspace, generation, session_id, model, bootstrap):
+                published.append((generation, session_id, model, bootstrap,
+                                  self.runtime._port_open("127.0.0.1", port)))
+                return state / "runtime"
+            try:
+                result = self.runtime.prepare_controlled_runtime_after_stop(
+                    socket_path, session, root / "install", state, root / "workspace",
+                    stop_action=lambda: self.runtime.stop_dedicated_tui(
+                        socket_path, session, port=port, timeout=2,
+                    ),
+                    prepare_action=prepare,
+                )
+                rotator.join(timeout=2); self.assertFalse(rotator.is_alive())
+                self.assertEqual(rotated_while_draining, [True])
+                self.assertEqual(published, [(2, second["session_id"], "sonnet", "new", False)])
+                self.assertEqual(result["generation"], 2)
+            finally:
+                current = self.runtime._proc_stat(pane_pid)
+                if current is not None and current[2] == identity[2]:
+                    try: os.killpg(pane_pgrp, signal.SIGKILL)
                     except ProcessLookupError: pass
                 subprocess.run(["/usr/bin/tmux", "-S", str(socket_path), "kill-server"], capture_output=True)
 
