@@ -39,6 +39,8 @@ class XiaokeStopTest(unittest.TestCase):
             xiaoke_stopping_claim={},
             xiaoke_send_reservation={},
             contact_chats={"xiaoke": object()},
+            channel_transport_enabled=False,
+            channel_transport_contacts=["xiaoke"],
         )
         handler.responses = []
         handler.interrupted = []
@@ -228,6 +230,62 @@ class XiaokeStopTest(unittest.TestCase):
         stop_thread.join(2)
         self.assertFalse(stop_thread.is_alive())
         self.assertEqual(run.call_count, 1)
+
+    def test_busy_send_queues_via_channel_instead_of_409(self) -> None:
+        """转发/生成中发消息：turn active 时经 channel transport 排队而不是 409。"""
+        handler = self.handler()  # active turn
+        handler.state.channel_transport_enabled = True
+        append_calls = []
+        handler._chat_for_contact = lambda _contact: types.SimpleNamespace(
+            append=lambda **record: append_calls.append(record) or {**record, "ts": "queued-1"}
+        )
+        channel_calls = []
+        handler._send_to_channel_transport = lambda **kwargs: (
+            channel_calls.append(kwargs) or (True, "", {"queued": True})
+        )
+        injection_calls = []
+        handler._inject_to_session = lambda *args, **kwargs: (
+            injection_calls.append((args, kwargs)) or TmuxInjectionResult(True)
+        )
+        typing_before = dict(handler.state.typing_state)
+
+        handler._handle_chat_send({"contact_id": "xiaoke", "text": "[转发自Kairos]\nhello"})
+
+        status, payload = handler.responses[-1]
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["queued"])
+        self.assertEqual(payload["transport"], "channel")
+        self.assertNotIn("turn", payload)
+        self.assertEqual(len(append_calls), 1)
+        self.assertEqual(append_calls[0]["text"], "[转发自Kairos]\nhello")
+        self.assertEqual(len(channel_calls), 1)
+        self.assertEqual(channel_calls[0]["text"], "[转发自Kairos]\nhello")
+        self.assertEqual(channel_calls[0]["contact_id"], "xiaoke")
+        # 排队不接管 turn：不注入 tmux、不动 typing_state、不占 reservation
+        self.assertEqual(injection_calls, [])
+        self.assertEqual(handler.state.typing_state, typing_before)
+        self.assertEqual(handler.state.xiaoke_send_reservation, {})
+
+    def test_busy_send_channel_failure_surfaces_502_without_tmux_fallback(self) -> None:
+        handler = self.handler()  # active turn
+        handler.state.channel_transport_enabled = True
+        handler._chat_for_contact = lambda _contact: types.SimpleNamespace(
+            append=lambda **record: {**record, "ts": "queued-1"}
+        )
+        handler._send_to_channel_transport = lambda **kwargs: (False, "boom", None)
+        injection_calls = []
+        handler._inject_to_session = lambda *args, **kwargs: (
+            injection_calls.append((args, kwargs)) or TmuxInjectionResult(True)
+        )
+
+        handler._handle_chat_send({"contact_id": "xiaoke", "text": "hello"})
+
+        status, payload = handler.responses[-1]
+        self.assertEqual(status, 502)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(injection_calls, [])
+        self.assertTrue(handler.state.typing_state["is_typing"])
 
     @patch("push.subprocess.run")
     def test_completion_during_failed_ctrl_c_is_not_resurrected(self, run) -> None:

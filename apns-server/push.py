@@ -5595,6 +5595,77 @@ class PushHandler(BaseHTTPRequestHandler):
             return False, self._redact_channel_error(err), response_json
         return True, "", response_json if isinstance(response_json, dict) else {"response": response_json}
 
+    def _queue_xiaoke_busy_chat_send(
+        self,
+        *,
+        body: dict[str, Any],
+        contact_id: str,
+        text: str,
+        quoted_ts: Any,
+        location: Any,
+        source: str,
+        busy_error: str,
+        busy_reason: str,
+    ) -> None:
+        """XiaoKe 忙时（App turn 进行中 / Stop 还没收尾）的排队投递路径。
+
+        直接 tmux 注入必须独占一个可 Stop 的 exact turn，忙时不可用。改走
+        channel transport（POST /messages）排队 —— 与 Telegram 消息、附件
+        hint 在生成中到达时的行为一致：channel 只排队通知、不碰正在生成的
+        TUI，也不接管 Stop 语义（本条消息没有 Stop 按钮，response 不带
+        turn 对象）。channel 不可用或投递失败时不 fallback 直注 tmux（会
+        绕开 turn 追踪），保持旧的 409 / surface 502。
+        修复：转发消息到正在生成的小克会直接 409「转发失败」。
+        """
+        if not self._channel_transport_enabled_for(contact_id):
+            self._send_json(409, {
+                "ok": False,
+                "error": busy_error,
+                "reason": busy_reason,
+            })
+            return
+        chat = self._chat_for_contact(contact_id)
+        try:
+            rec = chat.append(
+                role="user",
+                text=text,
+                source=source,
+                quoted_ts=quoted_ts,
+                location=location,
+            )
+        except Exception as exc:
+            logger.exception("xiaoke busy-queue history append failed")
+            self._send_json(500, {"ok": False, "error": f"history append failed: {exc}"})
+            return
+        message_id = self._channel_message_id(body, contact_id, text, quoted_ts)
+        ok, err, _channel_response = self._send_to_channel_transport(
+            message_id=message_id,
+            contact_id=contact_id,
+            text=text,
+            quoted_ts=quoted_ts,
+            user_record=rec,
+        )
+        if not ok:
+            logger.warning(
+                "xiaoke busy-queue channel transport failed contact_id=%s message_id=%s error=%s",
+                contact_id, message_id, err,
+            )
+            # 历史已 append；忙时不能 fallback 直注 tmux，只能 surface 失败。
+            self._send_json(502, {
+                "ok": False,
+                "error": f"channel transport queue failed: {err}",
+                "record": rec,
+            })
+            return
+        self._send_json(200, {
+            "ok": True,
+            "contact_id": contact_id,
+            "record": rec,
+            "queued": True,
+            "transport": "channel",
+            "message_id": message_id,
+        })
+
     def _handle_chat_send(self, body: dict[str, Any]):
         """iPhone 发消息进来 → 写 user 条 + 调 bus_send.py 注入主 session"""
         contact_id = self._contact_id_from_body(body)
@@ -5619,28 +5690,37 @@ class PushHandler(BaseHTTPRequestHandler):
         # Check and reserve under one lock before history append.  Concurrent
         # App sends therefore have a single winner, and Stop's in-flight
         # barrier cannot expose a false idle window.
+        busy_error = ""
+        busy_reason = ""
         with self.state.xiaoke_stop_lock:
             current_turn = dict(self.state.typing_state or {})
             stopping = dict(self.state.xiaoke_stopping_claim or {})
             reservation = dict(self.state.xiaoke_send_reservation or {})
             if stopping:
-                self._send_json(409, {
-                    "ok": False,
-                    "error": "xiaoke_turn_stopping",
-                    "reason": "The current XiaoKe interrupt is still settling",
-                })
-                return
-            if reservation or current_turn.get("is_typing"):
-                self._send_json(409, {
-                    "ok": False,
-                    "error": "xiaoke_turn_active",
-                    "reason": "Stop the current XiaoKe reply before sending another message",
-                })
-                return
-            self.state.xiaoke_send_reservation = {
-                "turn_token": turn_token,
-                "reserved_at": time.time(),
-            }
+                busy_error = "xiaoke_turn_stopping"
+                busy_reason = "The current XiaoKe interrupt is still settling"
+            elif reservation or current_turn.get("is_typing"):
+                busy_error = "xiaoke_turn_active"
+                busy_reason = "Stop the current XiaoKe reply before sending another message"
+            else:
+                self.state.xiaoke_send_reservation = {
+                    "turn_token": turn_token,
+                    "reserved_at": time.time(),
+                }
+        if busy_error:
+            # 忙时不再直接 409：改走 channel transport 排队投递（转发 /
+            # 生成中发消息都会排队，channel 不可用时内部保持旧 409）。
+            self._queue_xiaoke_busy_chat_send(
+                body=body,
+                contact_id=contact_id,
+                text=text,
+                quoted_ts=quoted_ts,
+                location=location,
+                source=source,
+                busy_error=busy_error,
+                busy_reason=busy_reason,
+            )
+            return
         # 写 user 历史
         chat = self._chat_for_contact(contact_id)
         try:
