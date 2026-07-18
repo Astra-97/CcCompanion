@@ -1798,6 +1798,21 @@ def _state_to_payload(body: dict[str, Any]) -> dict[str, Any]:
 
 # ---------- HTTP handler ----------
 
+# GET /attachments/<file> 的 MIME 推断表 (HEAD/GET 共用).
+# 2026-07-18 互动卡片地基: .html/.htm 声明为 text/html 让 app WebView 直接渲染;
+# 顺手补 .json/.csv。响应带 X-Content-Type-Options: nosniff, MIME 只认这张表。
+_ATTACHMENT_MIME_MAP = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".gif": "image/gif", ".webp": "image/webp",
+    ".heic": "image/heic", ".heif": "image/heif",
+    ".pdf": "application/pdf",
+    ".txt": "text/plain", ".md": "text/markdown",
+    ".html": "text/html; charset=utf-8", ".htm": "text/html; charset=utf-8",
+    ".json": "application/json", ".csv": "text/csv",
+    ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".wav": "audio/wav",
+    ".mp4": "video/mp4", ".mov": "video/quicktime",
+}
+
 
 class PushHandler(BaseHTTPRequestHandler):
     state: ServerState  # set by run_server before serving
@@ -3090,16 +3105,7 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
             return
         ext = target.suffix.lower()
-        mime_map = {
-            ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-            ".gif": "image/gif", ".webp": "image/webp",
-            ".heic": "image/heic", ".heif": "image/heif",
-            ".pdf": "application/pdf",
-            ".txt": "text/plain", ".md": "text/markdown",
-            ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".wav": "audio/wav",
-            ".mp4": "video/mp4", ".mov": "video/quicktime",
-        }
-        mime = mime_map.get(ext, "application/octet-stream")
+        mime = _ATTACHMENT_MIME_MAP.get(ext, "application/octet-stream")
         try:
             length = target.stat().st_size
         except Exception:
@@ -3110,6 +3116,7 @@ class PushHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(length))
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Cache-Control", "public, max-age=86400")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
 
     def do_POST(self):
@@ -3231,6 +3238,8 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_task_append_ephemeral(body)
         elif self.path == "/chat/send":
             self._handle_chat_send(body)
+        elif self.path == "/chat/card_action":
+            self._handle_chat_card_action(body)
         elif self.path == "/chat/stop":
             # Stopping the live Claude TUI is remote control.  The handler also
             # requires exact turn/session fencing before it emits any key.
@@ -5662,6 +5671,7 @@ class PushHandler(BaseHTTPRequestHandler):
         source: str,
         busy_error: str,
         busy_reason: str,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """XiaoKe 忙时（App turn 进行中 / Stop 还没收尾）的排队投递路径。
 
@@ -5688,6 +5698,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 source=source,
                 quoted_ts=quoted_ts,
                 location=location,
+                metadata=metadata,
             )
         except Exception as exc:
             logger.exception("xiaoke busy-queue history append failed")
@@ -5739,6 +5750,9 @@ class PushHandler(BaseHTTPRequestHandler):
         quoted_ts = body.get("quoted_ts") or None
         location = body.get("location") or None
         source = str(body.get("source") or self._source_for_request()).strip()
+        # 2026-07-18 互动卡片: /chat/card_action 复用本管线并靠 metadata 标
+        # {"via": "card", ...}; 普通 App 发消息不带 metadata, 行为不变。
+        metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else None
         if not text and not location:
             self._send_json(400, {"error": "text or location required"})
             return
@@ -5775,6 +5789,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 source=source,
                 busy_error=busy_error,
                 busy_reason=busy_reason,
+                metadata=metadata,
             )
             return
         # 写 user 历史
@@ -5786,6 +5801,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 source=source,
                 quoted_ts=quoted_ts,
                 location=location,
+                metadata=metadata,
             )
         except Exception as exc:
             self._release_xiaoke_send_reservation(turn_token)
@@ -5911,6 +5927,37 @@ class PushHandler(BaseHTTPRequestHandler):
                 "transport": "tmux",
             },
         })
+
+    def _handle_chat_card_action(self, body: dict[str, Any]) -> None:
+        """POST /chat/card_action — 互动卡片 (WebView HTML) 按钮结果回传。
+
+        2026-07-18 v1.9.79 互动卡片地基。app 端 WebView 拦截页面里的
+        ``companion://send?...`` scheme (或 JS interface), 由 app 持 shared_secret
+        调本端点 —— secret 绝不烧进 HTML 页面本身。
+
+        body: {"contact_id": "xiaoke", "text": "<结果码>", "card": "<卡片文件名或标题>"}
+        效果与用户在聊天里手发一条文本完全一致: 整体委托给 /chat/send 的
+        _handle_chat_send (同一入库 + turn_token 登记 + tmux/channel 注入 +
+        busy 排队管线), 仅在 record.metadata 里追加 {"via": "card", "card": ...}
+        标记来源。响应格式同 /chat/send (200 带 record+turn / busy 时 queued /
+        400/409/502 同语义)。
+        """
+        text = str(body.get("text") or "").strip()
+        if not text:
+            self._send_json(400, {"error": "text required"})
+            return
+        card = str(body.get("card") or "").strip()[:200]
+        meta_in = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+        metadata: dict[str, Any] = {**meta_in, "via": "card"}
+        if card:
+            metadata["card"] = card
+        forward = dict(body)
+        forward["text"] = text
+        forward["metadata"] = metadata
+        forward.pop("card", None)
+        if not forward.get("source"):
+            forward["source"] = self._source_for_request("card")
+        self._handle_chat_send(forward)
 
     def _handle_chat_stop(self, body: dict[str, Any]) -> None:
         """Stop exactly one active XiaoKe App turn in its dedicated Claude TUI.
@@ -8850,6 +8897,17 @@ class PushHandler(BaseHTTPRequestHandler):
         metadata = body.get("metadata") or None
         if metadata and not isinstance(metadata, dict):
             metadata = None
+        # 2026-07-18 互动卡片: metadata.card_title (可选字符串) 标记这条附件是
+        # 互动卡片, app 端据此渲染卡片样式并在点开时用 WebView 打开 attachment_url。
+        # metadata 本身走 chat_history 原样入库 + /chat/poll /chat/history 原样下发
+        # (透传, 老 app 不认识该字段时按普通文件消息展示, 向后兼容)。
+        # 这里只做轻量归一: 非法类型/空白剔除, 超长截断, 保证下发的一定是干净字符串。
+        if metadata and "card_title" in metadata:
+            _ct = metadata.get("card_title")
+            if isinstance(_ct, str) and _ct.strip():
+                metadata = {**metadata, "card_title": _ct.strip()[:200]}
+            else:
+                metadata = {k: v for k, v in metadata.items() if k != "card_title"} or None
 
         rec = chat.append(
             role=role,
@@ -9348,16 +9406,7 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         # MIME 简单推断
         ext = target.suffix.lower()
-        mime_map = {
-            ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-            ".gif": "image/gif", ".webp": "image/webp",
-            ".heic": "image/heic", ".heif": "image/heif",
-            ".pdf": "application/pdf",
-            ".txt": "text/plain", ".md": "text/markdown",
-            ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".wav": "audio/wav",
-            ".mp4": "video/mp4", ".mov": "video/quicktime",
-        }
-        mime = mime_map.get(ext, "application/octet-stream")
+        mime = _ATTACHMENT_MIME_MAP.get(ext, "application/octet-stream")
         try:
             length = target.stat().st_size
         except Exception:
@@ -9368,6 +9417,7 @@ class PushHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(length))
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Cache-Control", "public, max-age=86400")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         try:
             with target.open("rb") as f:
