@@ -153,10 +153,16 @@ XIAOKE_STALE_COMPLETION_GRACE_SECONDS = 120.0
 KAIROS_TERMINAL_ALIAS = "kairos"
 KAIROS_TERMINAL_OWNER_OPTION = "@ccc_kairos_terminal_owner"
 KAIROS_TERMINAL_OWNER_VALUE = "cccompanion:qiaokairos:v1"
+KAIROS_TERMINAL_READY_OPTION = "@ccc_kairos_terminal_ready"
+KAIROS_TERMINAL_READY_VALUE = "cccompanion:qiaokairos:ready:v1"
 
 
 class KairosTerminalUnavailable(RuntimeError):
     """Safe, user-facing failure while opening the current Kairos console."""
+
+
+class KairosTerminalNotReady(KairosTerminalUnavailable):
+    """The owned console is alive but still waiting for the prompt lock."""
 
 
 class KairosTerminalBridge:
@@ -200,6 +206,26 @@ class KairosTerminalBridge:
             KAIROS_TERMINAL_OWNER_OPTION,
         ])
         return result.returncode == 0 and result.stdout.rstrip("\r\n") == KAIROS_TERMINAL_OWNER_VALUE
+
+    def _pane_status_locked(self) -> tuple[str, bool]:
+        """Return the exact pane id and whether tmux reports it dead."""
+        result = self._run_tmux([
+            "tmux", "display-message", "-p", "-t", self.tmux_session,
+            "#{pane_id}|#{pane_dead}",
+        ])
+        if result.returncode != 0:
+            raise KairosTerminalUnavailable("Kairos 终端 pane 状态不可用")
+        fields = result.stdout.rstrip("\r\n").split("|", 1)
+        if len(fields) != 2 or not re.fullmatch(r"%[0-9]+", fields[0]) or fields[1] not in {"0", "1"}:
+            raise KairosTerminalUnavailable("Kairos 终端 pane 状态异常")
+        return fields[0], fields[1] == "1"
+
+    def _is_ready_locked(self, pane_id: str) -> bool:
+        result = self._run_tmux([
+            "tmux", "show-options", "-pv", "-t", pane_id,
+            KAIROS_TERMINAL_READY_OPTION,
+        ])
+        return result.returncode == 0 and result.stdout.rstrip("\r\n") == KAIROS_TERMINAL_READY_VALUE
 
     def _schedule_reaper_locked(self, delay: float | None = None) -> None:
         if self._timer is not None:
@@ -251,7 +277,14 @@ class KairosTerminalBridge:
             if exists:
                 if not self._owns_session_locked():
                     raise KairosTerminalUnavailable("Kairos 终端名称已被其他会话占用")
-            else:
+                _pane_id, pane_dead = self._pane_status_locked()
+                if pane_dead:
+                    # An exact-owner remain-on-exit pane cannot be treated as
+                    # a live waiting console.  Revalidate ownership in
+                    # _terminate_locked, remove it, and recreate below.
+                    self._terminate_locked()
+                    exists = False
+            if not exists:
                 if not self.command.is_file() or not os.access(self.command, os.X_OK):
                     raise KairosTerminalUnavailable("Kairos 终端入口未安装")
                 try:
@@ -276,7 +309,13 @@ class KairosTerminalBridge:
                     raise KairosTerminalUnavailable("Kairos 终端归属标记失败")
                 launch = self._run_tmux([
                     "tmux", "respawn-pane", "-k", "-t", self.tmux_session,
-                    str(self.command), "--no-wait",
+                    # Match the normal ``qiaokairos`` console behaviour: wait
+                    # for the shared prompt lock instead of exiting when an
+                    # App reply currently owns it.  The waiting supervisor
+                    # remains inside this owned tmux session, so capture stays
+                    # useful and release/idle cleanup can still SIGHUP it.
+                    "/usr/bin/env", "CCC_KAIROS_TERMINAL_BRIDGE=1",
+                    str(self.command),
                 ])
                 if launch.returncode != 0:
                     self._may_be_present = True
@@ -286,6 +325,32 @@ class KairosTerminalBridge:
             self._checked_existing = True
             self._touch_locked()
             return self.tmux_session
+
+    def require_ready(self) -> str:
+        """Return the exact live pane only after qiaokairos owns the lock.
+
+        Capture is allowed during the waiting phase, but no input may enter its
+        PTY until qiaokairos has acquired and revalidated the shared session
+        pointer and published the exact pane-scoped readiness marker.
+        """
+        with self._lock:
+            if not self._has_session_locked():
+                self._may_be_present = False
+                self._checked_existing = True
+                raise KairosTerminalUnavailable("Kairos 终端会话不存在")
+            if not self._owns_session_locked():
+                raise KairosTerminalUnavailable("Kairos 终端归属校验失败")
+            pane_id, pane_dead = self._pane_status_locked()
+            if pane_dead:
+                self._terminate_locked()
+                raise KairosTerminalUnavailable("Kairos 终端 pane 已退出")
+            if not self._is_ready_locked(pane_id):
+                self._touch_locked()
+                raise KairosTerminalNotReady(
+                    "Kairos 正在回复；等待当前回复结束后即可操作终端"
+                )
+            self._touch_locked()
+            return pane_id
 
     def release(self) -> bool:
         with self._lock:
@@ -10683,15 +10748,29 @@ class PushHandler(BaseHTTPRequestHandler):
 
     # ---------- tmux 终端 endpoints ----------
 
-    def _resolve_terminal_session(self, requested: str) -> tuple[str, str, bool]:
+    def _resolve_terminal_session(
+        self,
+        requested: str,
+        *,
+        require_ready: bool = False,
+    ) -> tuple[str, str, bool]:
         """Return (physical tmux target, public identity, is_kairos)."""
         if requested.strip().lower() == KAIROS_TERMINAL_ALIAS:
             physical = self.state.kairos_terminal.ensure()
+            if require_ready:
+                physical = self.state.kairos_terminal.require_ready()
             return physical, KAIROS_TERMINAL_ALIAS, True
         # Selecting any regular tmux pane hands the shared Codex lock back to
         # the App before XiaoKe input/capture proceeds.
         self.state.kairos_terminal.release()
         return requested, requested, False
+
+    def _send_kairos_terminal_not_ready(self, exc: KairosTerminalNotReady) -> None:
+        self._send_json(423, {
+            "error": str(exc),
+            "target": KAIROS_TERMINAL_ALIAS,
+            "state": "waiting",
+        })
 
     def _finish_kairos_terminal_failure(self, *, buffer_name: str | None = None) -> None:
         """Best-effort private-buffer cleanup, exact-owner release, then 503."""
@@ -10769,10 +10848,18 @@ class PushHandler(BaseHTTPRequestHandler):
                 else:
                     self._send_json(404, {"error": result.stderr.strip() or "session not found"})
                 return
+            content = result.stdout
+            if is_kairos and not content.strip():
+                # Closing the create/capture race matters to the Android UI:
+                # an owned pane can exist a few milliseconds before Python or
+                # Codex paints it.  Never report a successful but blank Kairos
+                # terminal; the next poll will replace this startup notice
+                # with qiaokairos/Codex output.
+                content = "正在连接 Kairos 终端；如当前回复尚未结束，将等待后自动进入…\n"
             self._send_json(200, {
                 "ok": True,
                 "session": public_session,
-                "content": result.stdout
+                "content": content
             })
         except Exception as e:
             if is_kairos:
@@ -10807,7 +10894,13 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": f"key '{key_name}' not in allowed list", "allowed": sorted(allowed_keys)})
             return
         try:
-            session, public_session, is_kairos = self._resolve_terminal_session(requested_session)
+            session, public_session, is_kairos = self._resolve_terminal_session(
+                requested_session,
+                require_ready=True,
+            )
+        except KairosTerminalNotReady as exc:
+            self._send_kairos_terminal_not_ready(exc)
+            return
         except KairosTerminalUnavailable as exc:
             self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
             return
@@ -10845,7 +10938,13 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": f"key not in whitelist: {special_key}"})
                 return
             try:
-                session, public_session, is_kairos = self._resolve_terminal_session(str(requested_session))
+                session, public_session, is_kairos = self._resolve_terminal_session(
+                    str(requested_session),
+                    require_ready=True,
+                )
+            except KairosTerminalNotReady as exc:
+                self._send_kairos_terminal_not_ready(exc)
+                return
             except KairosTerminalUnavailable as exc:
                 self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
                 return
@@ -10871,7 +10970,13 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "keys or enter or key required"})
             return
         try:
-            session, public_session, is_kairos = self._resolve_terminal_session(str(requested_session))
+            session, public_session, is_kairos = self._resolve_terminal_session(
+                str(requested_session),
+                require_ready=True,
+            )
+        except KairosTerminalNotReady as exc:
+            self._send_kairos_terminal_not_ready(exc)
+            return
         except KairosTerminalUnavailable as exc:
             self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
             return
