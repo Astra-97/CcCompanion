@@ -219,11 +219,102 @@ class BridgeLifecycleTest(unittest.TestCase):
             return completed(0)
 
         bridge = KairosTerminalBridge(command=command, idle_seconds=60, runner=runner)
+        self.assertEqual(bridge.terminal_state(), ("%81", "waiting"))
+        with self.assertRaises(KairosTerminalUnavailable):
+            bridge.terminal_state(expected_pane="%82")
         with self.assertRaises(KairosTerminalNotReady):
             bridge.require_ready()
         state["ready"] = True
+        self.assertEqual(bridge.terminal_state(expected_pane="%81"), ("%81", "ready"))
         self.assertEqual(bridge.require_ready(), "%81")
         self.assertTrue(any(argv[-1] == KAIROS_TERMINAL_READY_OPTION for argv in calls))
+
+    def test_release_if_pane_does_not_kill_replacement(self) -> None:
+        tmp, command = self.executable()
+        self.addCleanup(tmp.cleanup)
+        calls: list[list[str]] = []
+
+        def runner(argv: list[str], **_kwargs: object) -> types.SimpleNamespace:
+            calls.append(argv)
+            action = argv[1]
+            if action == "has-session":
+                return completed(0)
+            if action == "show-options":
+                return completed(0, KAIROS_TERMINAL_OWNER_VALUE + "\n")
+            if action == "display-message":
+                return completed(0, "%92|0\n")
+            return completed(0)
+
+        bridge = KairosTerminalBridge(command=command, idle_seconds=60, runner=runner)
+        self.assertFalse(bridge.release_if_pane("%91"))
+        self.assertFalse(any(argv[1] in {"kill-pane", "kill-session"} for argv in calls))
+
+    def test_release_if_pane_kills_only_matching_exact_pane(self) -> None:
+        tmp, command = self.executable()
+        self.addCleanup(tmp.cleanup)
+        calls: list[list[str]] = []
+
+        def runner(argv: list[str], **_kwargs: object) -> types.SimpleNamespace:
+            calls.append(argv)
+            action = argv[1]
+            if action == "has-session":
+                return completed(0)
+            if action == "show-options":
+                return completed(0, KAIROS_TERMINAL_OWNER_VALUE + "\n")
+            if action == "display-message":
+                return completed(0, "%93|0\n")
+            return completed(0)
+
+        bridge = KairosTerminalBridge(command=command, idle_seconds=60, runner=runner)
+        self.assertTrue(bridge.release_if_pane("%93"))
+        self.assertIn(["tmux", "kill-pane", "-t", "%93"], calls)
+        self.assertFalse(any(argv[1] == "kill-session" for argv in calls))
+
+    def test_state_recheck_never_cleans_new_dead_replacement(self) -> None:
+        tmp, command = self.executable()
+        self.addCleanup(tmp.cleanup)
+        calls: list[list[str]] = []
+
+        def runner(argv: list[str], **_kwargs: object) -> types.SimpleNamespace:
+            calls.append(argv)
+            action = argv[1]
+            if action == "has-session":
+                return completed(0)
+            if action == "show-options":
+                return completed(0, KAIROS_TERMINAL_OWNER_VALUE + "\n")
+            if action == "display-message":
+                return completed(0, "%95|1\n")
+            return completed(0)
+
+        bridge = KairosTerminalBridge(command=command, idle_seconds=60, runner=runner)
+        with self.assertRaises(KairosTerminalUnavailable):
+            bridge.terminal_state(expected_pane="%94")
+        self.assertFalse(any(argv[1] in {"kill-pane", "kill-session"} for argv in calls))
+
+    def test_failed_exact_kill_reschedules_reaper_for_replacement(self) -> None:
+        tmp, command = self.executable()
+        self.addCleanup(tmp.cleanup)
+        calls: list[list[str]] = []
+        displays = iter(["%96|0\n", "%97|0\n"])
+
+        def runner(argv: list[str], **_kwargs: object) -> types.SimpleNamespace:
+            calls.append(argv)
+            action = argv[1]
+            if action == "has-session":
+                return completed(0)
+            if action == "show-options":
+                return completed(0, KAIROS_TERMINAL_OWNER_VALUE + "\n")
+            if action == "display-message":
+                return completed(0, next(displays, "%97|0\n"))
+            if action == "kill-pane":
+                return completed(1, stderr="pane changed")
+            return completed(0)
+
+        bridge = KairosTerminalBridge(command=command, idle_seconds=60, runner=runner)
+        self.addCleanup(bridge.release)
+        self.assertFalse(bridge.release_if_pane("%96"))
+        self.assertIsNotNone(bridge._timer)
+        self.assertTrue(any(argv[1] == "kill-pane" for argv in calls))
 
 
 class FakeBridge:
@@ -239,7 +330,9 @@ class FakeBridge:
         self.ready = ready
         self.ensure_calls = 0
         self.ready_calls = 0
+        self.state_calls: list[str | None] = []
         self.release_calls = 0
+        self.release_if_calls: list[str] = []
 
     def ensure(self) -> str:
         self.ensure_calls += 1
@@ -253,10 +346,22 @@ class FakeBridge:
             raise KairosTerminalNotReady("Kairos 正在回复；等待当前回复结束后即可操作终端")
         return "%42"
 
+    def terminal_state(self, *, expected_pane: str | None = None) -> tuple[str, str]:
+        self.state_calls.append(expected_pane)
+        if self.unavailable:
+            raise KairosTerminalUnavailable("Kairos 暂时不可用")
+        if expected_pane is not None and expected_pane != "%42":
+            raise KairosTerminalUnavailable("Kairos 终端 pane 已更换")
+        return "%42", "ready" if self.ready else "waiting"
+
     def release(self) -> bool:
         self.release_calls += 1
         if self.release_unavailable:
             raise KairosTerminalUnavailable("release failed")
+        return True
+
+    def release_if_pane(self, expected_pane: str) -> bool:
+        self.release_if_calls.append(expected_pane)
         return True
 
 
@@ -283,12 +388,70 @@ class HandlerRoutingTest(unittest.TestCase):
 
         self.assertEqual(handler.responses[-1], (
             200,
-            {"ok": True, "session": "kairos", "content": "kairos pane\n"},
+            {
+                "ok": True,
+                "session": "kairos",
+                "content": "kairos pane\n",
+                "state": "ready",
+            },
         ))
-        self.assertEqual(run.call_args.args[0][3], "ccc-kairos-terminal")
+        self.assertEqual(run.call_args.args[0][3], "%42")
         self.assertEqual(bridge.ensure_calls, 1)
         self.assertEqual(bridge.ready_calls, 0)
+        self.assertEqual(bridge.state_calls, [None, "%42"])
         self.assertEqual(bridge.release_calls, 0)
+
+    @mock.patch("push.subprocess.run")
+    def test_capture_reports_waiting_from_exact_pane_marker(self, run: mock.Mock) -> None:
+        run.return_value = completed(0, stdout="qiaokairos is waiting\n")
+        bridge = FakeBridge(ready=False)
+        handler = self.handler(bridge)
+
+        handler._handle_tmux_capture()
+
+        status, payload = handler.responses[-1]
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["state"], "waiting")
+        self.assertEqual(payload["content"], "qiaokairos is waiting\n")
+        self.assertEqual(bridge.state_calls, [None, "%42"])
+
+    @mock.patch("push.subprocess.run")
+    def test_capture_pane_replacement_fails_closed_and_releases(self, run: mock.Mock) -> None:
+        run.return_value = completed(0, stdout="stale pane output\n")
+
+        class ReplacedPaneBridge(FakeBridge):
+            def terminal_state(
+                self, *, expected_pane: str | None = None,
+            ) -> tuple[str, str]:
+                if expected_pane is not None:
+                    raise KairosTerminalUnavailable("Kairos 终端 pane 已更换")
+                return super().terminal_state(expected_pane=expected_pane)
+
+            def release_if_pane(self, expected_pane: str) -> bool:
+                self.release_if_calls.append(expected_pane)
+                return False
+
+        bridge = ReplacedPaneBridge()
+        handler = self.handler(bridge)
+
+        handler._handle_tmux_capture()
+
+        self.assertEqual(handler.responses[-1][0], 503)
+        self.assertEqual(handler.responses[-1][1]["target"], "kairos")
+        self.assertEqual(bridge.release_calls, 0)
+        self.assertEqual(bridge.release_if_calls, ["%42"])
+
+    @mock.patch("push.subprocess.run")
+    def test_capture_subprocess_failure_uses_exact_pane_cleanup(self, run: mock.Mock) -> None:
+        run.return_value = completed(1, stderr="capture failed")
+        bridge = FakeBridge()
+        handler = self.handler(bridge)
+
+        handler._handle_tmux_capture()
+
+        self.assertEqual(handler.responses[-1][0], 503)
+        self.assertEqual(bridge.release_calls, 0)
+        self.assertEqual(bridge.release_if_calls, ["%42"])
 
     @mock.patch("push.subprocess.run")
     def test_capture_never_reports_success_with_blank_kairos_content(self, run: mock.Mock) -> None:
@@ -301,9 +464,24 @@ class HandlerRoutingTest(unittest.TestCase):
         status, payload = handler.responses[-1]
         self.assertEqual(status, 200)
         self.assertEqual(payload["session"], "kairos")
-        self.assertIn("正在连接 Kairos", payload["content"])
+        self.assertEqual(payload["state"], "ready")
+        self.assertIn("终端已连接", payload["content"])
         self.assertTrue(payload["content"].strip())
         self.assertEqual(bridge.release_calls, 0)
+
+    @mock.patch("push.subprocess.run")
+    def test_blank_waiting_capture_returns_read_only_fallback(self, run: mock.Mock) -> None:
+        run.return_value = completed(0, stdout="\n")
+        bridge = FakeBridge(ready=False)
+        handler = self.handler(bridge)
+
+        handler._handle_tmux_capture()
+
+        status, payload = handler.responses[-1]
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["state"], "waiting")
+        self.assertIn("只读", payload["content"])
+        self.assertTrue(payload["content"].strip())
 
     @mock.patch("push.subprocess.run")
     def test_unavailable_kairos_never_falls_through_to_xiaoke(self, run: mock.Mock) -> None:
@@ -326,6 +504,7 @@ class HandlerRoutingTest(unittest.TestCase):
 
         self.assertEqual(bridge.release_calls, 1)
         self.assertEqual(handler.responses[-1][1]["session"], "cctg")
+        self.assertEqual(handler.responses[-1][1]["state"], "ready")
         self.assertIn("cctg", run.call_args.args[0])
 
     @mock.patch("push.subprocess.Popen")
@@ -395,7 +574,8 @@ class HandlerRoutingTest(unittest.TestCase):
     ) -> None:
         self.assertEqual(handler.responses[-1][0], 503)
         self.assertEqual(handler.responses[-1][1]["target"], "kairos")
-        self.assertEqual(bridge.release_calls, 1)
+        self.assertEqual(bridge.release_calls, 0)
+        self.assertEqual(bridge.release_if_calls, ["%42"])
         self.assertTrue(any(call.args[0][1] == "delete-buffer" for call in run.call_args_list))
 
     @mock.patch("push.subprocess.Popen")
@@ -443,7 +623,8 @@ class HandlerRoutingTest(unittest.TestCase):
         handler = self.handler(bridge)
         handler._handle_terminal_key({"session": "kairos", "key": "Escape"})
         self.assertEqual(handler.responses[-1][0], 503)
-        self.assertEqual(bridge.release_calls, 1)
+        self.assertEqual(bridge.release_calls, 0)
+        self.assertEqual(bridge.release_if_calls, ["%42"])
 
     def test_release_rejects_non_kairos_alias(self) -> None:
         bridge = FakeBridge()

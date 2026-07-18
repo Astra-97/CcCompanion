@@ -352,6 +352,37 @@ class KairosTerminalBridge:
             self._touch_locked()
             return pane_id
 
+    def terminal_state(self, *, expected_pane: str | None = None) -> tuple[str, str]:
+        """Return the exact live pane and its input state.
+
+        The pane-scoped readiness marker is the only authority for whether
+        qiaokairos currently owns the prompt lock.  ``expected_pane`` fences a
+        capture against a pane replacement between the capture and the state
+        read, so a response can never describe output from one pane with the
+        readiness of another.
+        """
+        with self._lock:
+            if not self._has_session_locked():
+                self._may_be_present = False
+                self._checked_existing = True
+                raise KairosTerminalUnavailable("Kairos 终端会话不存在")
+            if not self._owns_session_locked():
+                raise KairosTerminalUnavailable("Kairos 终端归属校验失败")
+            pane_id, pane_dead = self._pane_status_locked()
+            if expected_pane is not None and pane_id != expected_pane:
+                # Check identity before any cleanup: this may be a newer pane
+                # observed by an older capture request.
+                raise KairosTerminalUnavailable("Kairos 终端 pane 已更换")
+            if pane_dead:
+                if expected_pane is not None:
+                    self.release_if_pane(expected_pane)
+                else:
+                    self._terminate_locked()
+                raise KairosTerminalUnavailable("Kairos 终端 pane 已退出")
+            state = "ready" if self._is_ready_locked(pane_id) else "waiting"
+            self._touch_locked()
+            return pane_id, state
+
     def release(self) -> bool:
         with self._lock:
             if self._timer is not None:
@@ -360,6 +391,60 @@ class KairosTerminalBridge:
             if not self._may_be_present and self._checked_existing:
                 return False
             return self._terminate_locked()
+
+    def release_if_pane(self, expected_pane: str) -> bool:
+        """Release only the exact pane observed by an earlier operation.
+
+        Capture failures can race a later request that has already recreated
+        the reserved session. Targeting the pane id itself prevents an old
+        request from killing that newer owned console merely because it reused
+        the same tmux session name and owner marker.
+        """
+        if not re.fullmatch(r"%[0-9]+", expected_pane):
+            raise KairosTerminalUnavailable("Kairos 终端 pane 身份异常")
+        with self._lock:
+            if not self._has_session_locked():
+                self._may_be_present = False
+                self._checked_existing = True
+                return False
+            if not self._owns_session_locked():
+                return False
+            pane_id, _pane_dead = self._pane_status_locked()
+            if pane_id != expected_pane:
+                return False
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            # kill-pane is deliberately exact-targeted. A concurrent pane
+            # replacement makes this fail harmlessly instead of killing the
+            # newer session by its reusable name.
+            result = self._run_tmux(["tmux", "kill-pane", "-t", expected_pane])
+            if result.returncode != 0:
+                # If the exact pane vanished after validation, cleanup is
+                # already complete from this request's perspective. Do not
+                # fall back to a session-name kill.
+                try:
+                    current_pane, _dead = self._pane_status_locked()
+                except KairosTerminalUnavailable:
+                    try:
+                        still_exists = self._has_session_locked()
+                    except Exception:
+                        still_exists = True
+                    self._may_be_present = still_exists
+                    self._checked_existing = True
+                    if still_exists:
+                        self._touch_locked()
+                    return False
+                if current_pane != expected_pane:
+                    self._may_be_present = True
+                    self._touch_locked()
+                    return False
+                self._may_be_present = True
+                self._touch_locked()
+                raise KairosTerminalUnavailable("Kairos 终端释放失败")
+            self._may_be_present = False
+            self._checked_existing = True
+            return True
 
 
 def _should_expire_chat_typing(contact_id: str, state: dict[str, Any], age_seconds: float) -> bool:
@@ -10772,7 +10857,12 @@ class PushHandler(BaseHTTPRequestHandler):
             "state": "waiting",
         })
 
-    def _finish_kairos_terminal_failure(self, *, buffer_name: str | None = None) -> None:
+    def _finish_kairos_terminal_failure(
+        self,
+        *,
+        buffer_name: str | None = None,
+        expected_pane: str | None = None,
+    ) -> None:
         """Best-effort private-buffer cleanup, exact-owner release, then 503."""
         if buffer_name:
             try:
@@ -10784,7 +10874,13 @@ class PushHandler(BaseHTTPRequestHandler):
                 logger.exception("failed to clear Kairos terminal input buffer")
         release_confirmed = True
         try:
-            self.state.kairos_terminal.release()
+            # No exact pane means the pre-operation state check failed. It is
+            # safer to leave cleanup to the idle reaper than to release a
+            # possibly newer pane by the reusable session name. Every path
+            # that did obtain a pane uses exact-targeted cleanup, including
+            # input failures after require_ready().
+            if expected_pane is not None:
+                self.state.kairos_terminal.release_if_pane(expected_pane)
         except KairosTerminalUnavailable:
             release_confirmed = False
             logger.exception("Kairos terminal operation failed and release was not confirmed")
@@ -10838,32 +10934,53 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
             return
         try:
+            terminal_state = "ready"
+            capture_pane: str | None = None
+            if is_kairos:
+                # Capture the exact owned pane, not merely its reusable tmux
+                # session name. Re-check the same pane afterwards so the JSON
+                # state and content belong to one physical console.
+                capture_pane, _state_before_capture = self.state.kairos_terminal.terminal_state()
+                session = capture_pane
             result = subprocess.run(
                 ["tmux", "capture-pane", "-t", session, "-p", "-S", str(-lines)],
                 capture_output=True, text=True, timeout=3
             )
             if result.returncode != 0:
                 if is_kairos:
-                    self._finish_kairos_terminal_failure()
+                    self._finish_kairos_terminal_failure(
+                        expected_pane=capture_pane,
+                    )
                 else:
                     self._send_json(404, {"error": result.stderr.strip() or "session not found"})
                 return
             content = result.stdout
+            if is_kairos:
+                _same_pane, terminal_state = self.state.kairos_terminal.terminal_state(
+                    expected_pane=capture_pane,
+                )
             if is_kairos and not content.strip():
                 # Closing the create/capture race matters to the Android UI:
                 # an owned pane can exist a few milliseconds before Python or
                 # Codex paints it.  Never report a successful but blank Kairos
                 # terminal; the next poll will replace this startup notice
                 # with qiaokairos/Codex output.
-                content = "正在连接 Kairos 终端；如当前回复尚未结束，将等待后自动进入…\n"
+                content = (
+                    "Kairos 正在回复；终端当前只读，回复结束后自动恢复输入。\n"
+                    if terminal_state == "waiting"
+                    else "Kairos 终端已连接，正在等待终端输出…\n"
+                )
             self._send_json(200, {
                 "ok": True,
                 "session": public_session,
-                "content": content
+                "content": content,
+                "state": terminal_state,
             })
         except Exception as e:
             if is_kairos:
-                self._finish_kairos_terminal_failure()
+                self._finish_kairos_terminal_failure(
+                    expected_pane=capture_pane,
+                )
             else:
                 self._send_json(500, {"error": str(e)})
 
@@ -10911,14 +11028,14 @@ class PushHandler(BaseHTTPRequestHandler):
             )
             if result.returncode != 0:
                 if is_kairos:
-                    self._finish_kairos_terminal_failure()
+                    self._finish_kairos_terminal_failure(expected_pane=session)
                 else:
                     self._send_json(500, {"error": result.stderr.strip() or "send-keys failed"})
                 return
             self._send_json(200, {"ok": True, "key": key_name, "session": public_session})
         except Exception as e:
             if is_kairos:
-                self._finish_kairos_terminal_failure()
+                self._finish_kairos_terminal_failure(expected_pane=session)
             else:
                 self._send_json(500, {"error": str(e)})
 
@@ -10955,14 +11072,14 @@ class PushHandler(BaseHTTPRequestHandler):
                 )
                 if result.returncode != 0:
                     if is_kairos:
-                        self._finish_kairos_terminal_failure()
+                        self._finish_kairos_terminal_failure(expected_pane=session)
                     else:
                         self._send_json(500, {"error": result.stderr.strip() or "send-keys failed"})
                     return
                 self._send_json(200, {"ok": True, "session": public_session, "key": special_key})
             except Exception as e:
                 if is_kairos:
-                    self._finish_kairos_terminal_failure()
+                    self._finish_kairos_terminal_failure(expected_pane=session)
                 else:
                     self._send_json(500, {"error": str(e)})
             return
@@ -11030,7 +11147,10 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "session": public_session})
         except Exception as e:
             if is_kairos:
-                self._finish_kairos_terminal_failure(buffer_name=buffer_name)
+                self._finish_kairos_terminal_failure(
+                    buffer_name=buffer_name,
+                    expected_pane=session,
+                )
             else:
                 self._send_json(500, {"error": str(e)})
 
