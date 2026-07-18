@@ -150,6 +150,151 @@ logger = logging.getLogger("cc-apns-server")
 
 
 XIAOKE_STALE_COMPLETION_GRACE_SECONDS = 120.0
+KAIROS_TERMINAL_ALIAS = "kairos"
+KAIROS_TERMINAL_OWNER_OPTION = "@ccc_kairos_terminal_owner"
+KAIROS_TERMINAL_OWNER_VALUE = "cccompanion:qiaokairos:v1"
+
+
+class KairosTerminalUnavailable(RuntimeError):
+    """Safe, user-facing failure while opening the current Kairos console."""
+
+
+class KairosTerminalBridge:
+    """Expose qiaokairos through one short-lived, dedicated tmux pane.
+
+    qiaokairos remains the authority for locating the active Codex rollout and
+    taking its per-session flock.  tmux only supplies the pseudo-terminal the
+    Android terminal API already knows how to capture and control.  The pane is
+    released when another terminal is selected or after polling goes idle, so
+    the normal App bridge can regain the same lock.
+    """
+
+    def __init__(
+        self,
+        *,
+        command: Path = Path("/usr/local/bin/qiaokairos"),
+        tmux_session: str = "ccc-kairos-terminal",
+        idle_seconds: float = 12.0,
+        runner: Any = subprocess.run,
+    ) -> None:
+        self.command = command
+        self.tmux_session = tmux_session
+        self.idle_seconds = max(1.0, float(idle_seconds))
+        self._run = runner
+        self._lock = threading.RLock()
+        self._timer: threading.Timer | None = None
+        self._last_activity = 0.0
+        self._may_be_present = False
+        self._checked_existing = False
+
+    def _run_tmux(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
+        return self._run(argv, capture_output=True, text=True, timeout=5)
+
+    def _has_session_locked(self) -> bool:
+        result = self._run_tmux(["tmux", "has-session", "-t", self.tmux_session])
+        return result.returncode == 0
+
+    def _owns_session_locked(self) -> bool:
+        result = self._run_tmux([
+            "tmux", "show-options", "-v", "-t", self.tmux_session,
+            KAIROS_TERMINAL_OWNER_OPTION,
+        ])
+        return result.returncode == 0 and result.stdout.rstrip("\r\n") == KAIROS_TERMINAL_OWNER_VALUE
+
+    def _schedule_reaper_locked(self, delay: float | None = None) -> None:
+        if self._timer is not None:
+            return
+        self._timer = threading.Timer(delay or self.idle_seconds, self._reap_if_idle)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _touch_locked(self) -> None:
+        self._last_activity = time.monotonic()
+        self._schedule_reaper_locked()
+
+    def _terminate_locked(self) -> bool:
+        # Ownership is re-read immediately before every kill. Never trust a
+        # previous observation: the original session may have exited and its
+        # name may already belong to an unrelated process.
+        if not self._owns_session_locked():
+            self._may_be_present = False
+            self._checked_existing = True
+            return False
+        result = self._run_tmux(["tmux", "kill-session", "-t", self.tmux_session])
+        if result.returncode != 0:
+            self._may_be_present = True
+            raise KairosTerminalUnavailable("Kairos 终端释放失败")
+        self._may_be_present = False
+        self._checked_existing = True
+        return True
+
+    def _reap_if_idle(self) -> None:
+        with self._lock:
+            self._timer = None
+            remaining = self.idle_seconds - (time.monotonic() - self._last_activity)
+            if remaining > 0:
+                self._schedule_reaper_locked(remaining)
+                return
+            try:
+                # tmux sends SIGHUP to the pane. qiaokairos forwards and reaps
+                # the Codex TUI before releasing the shared prompt flock.
+                self._terminate_locked()
+            except Exception:
+                logger.exception("failed to reap idle Kairos terminal")
+
+    def ensure(self) -> str:
+        with self._lock:
+            try:
+                exists = self._has_session_locked()
+            except Exception as exc:
+                raise KairosTerminalUnavailable("tmux 状态不可用") from exc
+            if exists:
+                if not self._owns_session_locked():
+                    raise KairosTerminalUnavailable("Kairos 终端名称已被其他会话占用")
+            else:
+                if not self.command.is_file() or not os.access(self.command, os.X_OK):
+                    raise KairosTerminalUnavailable("Kairos 终端入口未安装")
+                try:
+                    # Stage a harmless pane, mark the tmux *session* exactly,
+                    # verify the marker, then replace the pane with qiaokairos.
+                    # This avoids ever launching Codex in an unowned container.
+                    result = self._run_tmux([
+                        "tmux", "new-session", "-d", "-s", self.tmux_session,
+                        "-x", "160", "-y", "48", "/bin/sleep", "30",
+                    ])
+                except Exception as exc:
+                    raise KairosTerminalUnavailable("Kairos 终端启动失败") from exc
+                if result.returncode != 0:
+                    raise KairosTerminalUnavailable("Kairos 终端启动失败")
+                mark = self._run_tmux([
+                    "tmux", "set-option", "-t", self.tmux_session,
+                    KAIROS_TERMINAL_OWNER_OPTION, KAIROS_TERMINAL_OWNER_VALUE,
+                ])
+                if mark.returncode != 0 or not self._owns_session_locked():
+                    # Without the exact marker this process has no authority to
+                    # kill the staging pane; sleep exits on its own shortly.
+                    raise KairosTerminalUnavailable("Kairos 终端归属标记失败")
+                launch = self._run_tmux([
+                    "tmux", "respawn-pane", "-k", "-t", self.tmux_session,
+                    str(self.command), "--no-wait",
+                ])
+                if launch.returncode != 0:
+                    self._may_be_present = True
+                    self._terminate_locked()
+                    raise KairosTerminalUnavailable("Kairos 终端启动失败")
+            self._may_be_present = True
+            self._checked_existing = True
+            self._touch_locked()
+            return self.tmux_session
+
+    def release(self) -> bool:
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            if not self._may_be_present and self._checked_existing:
+                return False
+            return self._terminate_locked()
 
 
 def _should_expire_chat_typing(contact_id: str, state: dict[str, Any], age_seconds: float) -> bool:
@@ -1224,6 +1369,7 @@ class ServerState:
         self.allow_remote_control: bool = bool(server_cfg.get("allow_remote_control", False))
         self.allowed_ips: list[str] = list(server_cfg.get("allowed_ips", []) or [])
         self.default_session: str = server_cfg.get("default_session", "cc")
+        self.kairos_terminal = KairosTerminalBridge()
         self.channel_transport_enabled: bool = bool(server_cfg.get("channel_transport_enabled", False))
         self.channel_transport_url: str = str(
             server_cfg.get("channel_transport_url", "http://127.0.0.1:8810")
@@ -1740,6 +1886,10 @@ class ServerState:
             return None
 
     def shutdown(self):
+        try:
+            self.kairos_terminal.release()
+        except KairosTerminalUnavailable:
+            logger.exception("Kairos terminal did not confirm release during shutdown")
         self.codex_app_bridge.close()
         if self.client:
             self.client.close()
@@ -1799,7 +1949,7 @@ def _state_to_payload(body: dict[str, Any]) -> dict[str, Any]:
 # ---------- HTTP handler ----------
 
 # GET /attachments/<file> 的 MIME 推断表 (HEAD/GET 共用).
-# 2026-07-18 互动卡片地基: .html/.htm 声明为 text/html 让 app WebView 直接渲染;
+# 2026-07-18 互动卡片地基: HTML 及其同源样式/脚本声明浏览器认可的 MIME;
 # 顺手补 .json/.csv。响应带 X-Content-Type-Options: nosniff, MIME 只认这张表。
 _ATTACHMENT_MIME_MAP = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
@@ -1808,6 +1958,8 @@ _ATTACHMENT_MIME_MAP = {
     ".pdf": "application/pdf",
     ".txt": "text/plain", ".md": "text/markdown",
     ".html": "text/html; charset=utf-8", ".htm": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8",
     ".json": "application/json", ".csv": "text/csv",
     ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".wav": "audio/wav",
     ".mp4": "video/mp4", ".mov": "video/quicktime",
@@ -3352,6 +3504,13 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_todos_add(body)
         elif self.path == "/todos/edit":
             self._handle_todos_edit(body)
+        elif self.path == "/terminal/release":
+            # Only the reserved Kairos console can be released here. This is
+            # intentionally not a generic tmux-kill endpoint.
+            if not self.state.allow_remote_control:
+                self._send_json(403, {"error": "remote_control disabled"})
+                return
+            self._handle_terminal_release(body)
         elif self.path == "/terminal/key":
             # Virtual keyboard: send a special key (Escape, C-c, Tab, etc.) to tmux
             if not self.state.allow_remote_control:
@@ -10524,6 +10683,57 @@ class PushHandler(BaseHTTPRequestHandler):
 
     # ---------- tmux 终端 endpoints ----------
 
+    def _resolve_terminal_session(self, requested: str) -> tuple[str, str, bool]:
+        """Return (physical tmux target, public identity, is_kairos)."""
+        if requested.strip().lower() == KAIROS_TERMINAL_ALIAS:
+            physical = self.state.kairos_terminal.ensure()
+            return physical, KAIROS_TERMINAL_ALIAS, True
+        # Selecting any regular tmux pane hands the shared Codex lock back to
+        # the App before XiaoKe input/capture proceeds.
+        self.state.kairos_terminal.release()
+        return requested, requested, False
+
+    def _finish_kairos_terminal_failure(self, *, buffer_name: str | None = None) -> None:
+        """Best-effort private-buffer cleanup, exact-owner release, then 503."""
+        if buffer_name:
+            try:
+                subprocess.run(
+                    ["tmux", "delete-buffer", "-b", buffer_name],
+                    capture_output=True, text=True, timeout=3,
+                )
+            except Exception:
+                logger.exception("failed to clear Kairos terminal input buffer")
+        release_confirmed = True
+        try:
+            self.state.kairos_terminal.release()
+        except KairosTerminalUnavailable:
+            release_confirmed = False
+            logger.exception("Kairos terminal operation failed and release was not confirmed")
+        self._send_json(503, {
+            "error": (
+                "Kairos 终端操作失败"
+                if release_confirmed
+                else "Kairos 终端操作失败且未确认释放"
+            ),
+            "target": KAIROS_TERMINAL_ALIAS,
+        })
+
+    def _handle_terminal_release(self, body: dict[str, Any]) -> None:
+        target = str(body.get("target") or "").strip().lower()
+        if target != KAIROS_TERMINAL_ALIAS:
+            self._send_json(400, {"error": "target must be kairos"})
+            return
+        try:
+            released = self.state.kairos_terminal.release()
+        except KairosTerminalUnavailable as exc:
+            self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
+            return
+        self._send_json(200, {
+            "ok": True,
+            "target": KAIROS_TERMINAL_ALIAS,
+            "released": released,
+        })
+
     def _handle_tmux_sessions(self):
         try:
             result = subprocess.run(
@@ -10538,26 +10748,37 @@ class PushHandler(BaseHTTPRequestHandler):
     def _handle_tmux_capture(self):
         from urllib.parse import urlparse, parse_qs
         qs = parse_qs(urlparse(self.path).query)
-        session = qs.get("session", [self.state.default_session])[0]
+        requested_session = qs.get("session", [self.state.default_session])[0]
         try:
             lines = int(qs.get("lines", ["120"])[0])
         except Exception:
             lines = 120
+        try:
+            session, public_session, is_kairos = self._resolve_terminal_session(requested_session)
+        except KairosTerminalUnavailable as exc:
+            self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
+            return
         try:
             result = subprocess.run(
                 ["tmux", "capture-pane", "-t", session, "-p", "-S", str(-lines)],
                 capture_output=True, text=True, timeout=3
             )
             if result.returncode != 0:
-                self._send_json(404, {"error": result.stderr.strip() or "session not found"})
+                if is_kairos:
+                    self._finish_kairos_terminal_failure()
+                else:
+                    self._send_json(404, {"error": result.stderr.strip() or "session not found"})
                 return
             self._send_json(200, {
                 "ok": True,
-                "session": session,
+                "session": public_session,
                 "content": result.stdout
             })
         except Exception as e:
-            self._send_json(500, {"error": str(e)})
+            if is_kairos:
+                self._finish_kairos_terminal_failure()
+            else:
+                self._send_json(500, {"error": str(e)})
 
     def _handle_terminal_key(self, body: dict[str, Any]):
         """POST /terminal/key — send a special key directly via tmux send-keys.
@@ -10569,7 +10790,7 @@ class PushHandler(BaseHTTPRequestHandler):
         special/control keys (unlike /tmux/send which uses load-buffer for text).
         """
         key_name = str(body.get("key", "")).strip()
-        session = str(body.get("session", "cctg")).strip() or "cctg"
+        requested_session = str(body.get("session", "cctg")).strip() or "cctg"
         if not key_name:
             self._send_json(400, {"error": "key required"})
             return
@@ -10586,22 +10807,33 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": f"key '{key_name}' not in allowed list", "allowed": sorted(allowed_keys)})
             return
         try:
+            session, public_session, is_kairos = self._resolve_terminal_session(requested_session)
+        except KairosTerminalUnavailable as exc:
+            self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
+            return
+        try:
             result = subprocess.run(
                 ["tmux", "send-keys", "-t", session, key_name],
                 capture_output=True, text=True, timeout=3
             )
             if result.returncode != 0:
-                self._send_json(500, {"error": result.stderr.strip() or "send-keys failed"})
+                if is_kairos:
+                    self._finish_kairos_terminal_failure()
+                else:
+                    self._send_json(500, {"error": result.stderr.strip() or "send-keys failed"})
                 return
-            self._send_json(200, {"ok": True, "key": key_name, "session": session})
+            self._send_json(200, {"ok": True, "key": key_name, "session": public_session})
         except Exception as e:
-            self._send_json(500, {"error": str(e)})
+            if is_kairos:
+                self._finish_kairos_terminal_failure()
+            else:
+                self._send_json(500, {"error": str(e)})
 
     def _handle_tmux_send(self, body: dict[str, Any]):
         keys = body.get("keys", "")
         # 兜底 body 没传 session 时走当前 active_session 而不是写死 opia
         # (build 199 fix: /switch 后 iOS 没传 session 字段也能 follow active)
-        session = body.get("session") or self.state.active_session or self.state.default_session
+        requested_session = body.get("session") or self.state.active_session or self.state.default_session
         enter = bool(body.get("enter", True))
         # 2026-05-19 新增 key 字段: 真发特殊键 (Escape / Up / Down / Enter / Tab / C-c)
         # 跟 keys (文本) 区分 — keys 走 paste-buffer 文本注入 / key 走 send-keys 键名
@@ -10613,28 +10845,89 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": f"key not in whitelist: {special_key}"})
                 return
             try:
-                subprocess.run(["tmux", "send-keys", "-t", session, special_key], check=False)
-                self._send_json(200, {"ok": True, "session": session, "key": special_key})
+                session, public_session, is_kairos = self._resolve_terminal_session(str(requested_session))
+            except KairosTerminalUnavailable as exc:
+                self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
+                return
+            try:
+                result = subprocess.run(
+                    ["tmux", "send-keys", "-t", session, special_key],
+                    capture_output=True, text=True, timeout=3,
+                )
+                if result.returncode != 0:
+                    if is_kairos:
+                        self._finish_kairos_terminal_failure()
+                    else:
+                        self._send_json(500, {"error": result.stderr.strip() or "send-keys failed"})
+                    return
+                self._send_json(200, {"ok": True, "session": public_session, "key": special_key})
             except Exception as e:
-                self._send_json(500, {"error": str(e)})
+                if is_kairos:
+                    self._finish_kairos_terminal_failure()
+                else:
+                    self._send_json(500, {"error": str(e)})
             return
         if not keys and not enter:
             self._send_json(400, {"error": "keys or enter or key required"})
             return
         try:
+            session, public_session, is_kairos = self._resolve_terminal_session(str(requested_session))
+        except KairosTerminalUnavailable as exc:
+            self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
+            return
+        buffer_name: str | None = None
+        try:
             if keys:
                 # 用 load-buffer + paste-buffer 安全注入 (避免 - 开头被当 flag)
+                # Kairos uses a request-scoped buffer so concurrent XiaoKe
+                # input can never replace its payload between load and paste.
+                buffer_name = f"ccc-kairos-{secrets.token_hex(8)}" if is_kairos else None
+                load_argv = ["tmux", "load-buffer"]
+                if buffer_name:
+                    load_argv += ["-b", buffer_name]
+                load_argv.append("-")
                 p = subprocess.Popen(
-                    ["tmux", "load-buffer", "-"],
+                    load_argv,
                     stdin=subprocess.PIPE,
                 )
-                p.communicate(input=keys.encode("utf-8"))
-                subprocess.run(["tmux", "paste-buffer", "-t", session, "-p"], check=False)
+                try:
+                    p.communicate(input=keys.encode("utf-8"), timeout=3 if is_kairos else None)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.communicate()
+                    raise RuntimeError("tmux load-buffer timed out")
+                if is_kairos and p.returncode != 0:
+                    raise RuntimeError("tmux load-buffer failed")
+                paste_argv = ["tmux", "paste-buffer"]
+                if buffer_name:
+                    paste_argv += ["-b", buffer_name]
+                paste_argv += ["-t", session, "-p"]
+                if buffer_name:
+                    paste_argv.append("-d")
+                if is_kairos:
+                    paste = subprocess.run(
+                        paste_argv, capture_output=True, text=True, timeout=3,
+                    )
+                    if paste.returncode != 0:
+                        raise RuntimeError("tmux paste-buffer failed")
+                else:
+                    subprocess.run(paste_argv, check=False)
             if enter:
-                subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=False)
-            self._send_json(200, {"ok": True, "session": session})
+                if is_kairos:
+                    submit = subprocess.run(
+                        ["tmux", "send-keys", "-t", session, "Enter"],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    if submit.returncode != 0:
+                        raise RuntimeError("tmux send-keys Enter failed")
+                else:
+                    subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=False)
+            self._send_json(200, {"ok": True, "session": public_session})
         except Exception as e:
-            self._send_json(500, {"error": str(e)})
+            if is_kairos:
+                self._finish_kairos_terminal_failure(buffer_name=buffer_name)
+            else:
+                self._send_json(500, {"error": str(e)})
 
     # ---------- reminder 端点 ----------
 

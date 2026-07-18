@@ -8,9 +8,9 @@ morning greeting — using its own full context/memory.
 
 Design constraints (per spec):
 
-  * NO AI / NO LLM calls happen here. This module only matches wall-clock time
-    against static rules and fires a fixed trigger string. All "intelligence"
-    lives downstream in the Claude session that receives the trigger.
+  * NO AI / NO LLM calls happen here. This module matches wall-clock time
+    against static rules; the morning rule may append local `schedule-ctl`
+    output. All "intelligence" lives downstream in the Claude session.
   * Every dispatched trigger MUST be visible to the user in the chat history,
     just like a message they typed themselves. Delivery therefore goes through
     the server-provided callback, which writes a chat_history record AND injects
@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -57,6 +58,9 @@ except Exception:  # pragma: no cover - py<3.9 safety
     ZoneInfo = None  # type: ignore
 
 logger = logging.getLogger(__name__)
+
+SCHEDULE_CTL_PATH = "/usr/local/bin/schedule-ctl"
+SCHEDULE_CTL_TIMEOUT_SECONDS = 5
 
 # deliver(contact_id, text, rule_id) -> (ok: bool, error: str)
 DeliverFn = Callable[[str, str, str], "tuple[bool, str]"]
@@ -83,6 +87,27 @@ def _resolve_tz(name: str | None):
     except Exception:
         logger.warning("tool_dispatcher: unknown tz %r, using system local", name)
         return None
+
+
+def _today_schedule() -> str:
+    """Return today's schedule as one line; degrade to empty on any failure."""
+    try:
+        result = subprocess.run(
+            [SCHEDULE_CTL_PATH, "today"],
+            capture_output=True,
+            text=True,
+            timeout=SCHEDULE_CTL_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("tool_dispatcher: schedule-ctl today failed: %s", exc)
+        return ""
+    if result.returncode != 0:
+        logger.warning(
+            "tool_dispatcher: schedule-ctl today exited with status %d",
+            result.returncode,
+        )
+        return ""
+    return "；".join(line.strip() for line in result.stdout.splitlines() if line.strip())
 
 
 class ScheduleStore:
@@ -322,6 +347,10 @@ class ToolDispatcher:
                 logger.warning("tool_dispatcher: rule %r has empty text, skipping", rule_id)
                 self.store.mark_fired(rule_id, key)
                 continue
+            if rule_id == "morning_greeting":
+                schedule = _today_schedule()
+                if schedule:
+                    text += f" | 今日日程：{schedule}，早安里一并提醒她。"
 
             logger.info(
                 "tool_dispatcher: firing rule %r (occurrence=%s contact=%s)",

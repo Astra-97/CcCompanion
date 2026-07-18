@@ -70,6 +70,9 @@ class AttachmentMimeTest(unittest.TestCase):
         # HEAD handler 和 GET handler 共用 _ATTACHMENT_MIME_MAP — 防止两张表再漂移
         self.assertEqual(_ATTACHMENT_MIME_MAP[".html"], "text/html; charset=utf-8")
         self.assertEqual(_ATTACHMENT_MIME_MAP[".htm"], "text/html; charset=utf-8")
+        self.assertEqual(_ATTACHMENT_MIME_MAP[".css"], "text/css; charset=utf-8")
+        self.assertEqual(_ATTACHMENT_MIME_MAP[".js"], "text/javascript; charset=utf-8")
+        self.assertEqual(_ATTACHMENT_MIME_MAP[".mjs"], "text/javascript; charset=utf-8")
         self.assertEqual(_ATTACHMENT_MIME_MAP[".json"], "application/json")
         self.assertEqual(_ATTACHMENT_MIME_MAP[".csv"], "text/csv")
 
