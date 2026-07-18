@@ -73,14 +73,16 @@ fi
 
 # Correlate this callback's assistant text with its own real user turn.  A
 # delayed callback must never borrow the newest marker from a later turn.  If
-# the transcript does not contain one unique match, omit identity fail-closed:
-# history may still be appended, but it cannot complete a newer active turn.
+# the transcript does not contain one unique match, fail down instead of
+# silent: emit an EMPTY token plus the transcript session (taken from the last
+# marker anywhere in the transcript — all markers in one transcript name the
+# same tmux session).  The server treats an empty token as an end-of-turn
+# beacon that only stamps the active claim for a bounded grace expiry, never
+# an exact completion, so a mis-attributed beacon cannot kill a fresh turn.
 TURN_IDENTITY=$(printf '%s' "$DIRECT_LAST" | python3 -c '
 import json, re, sys, time
 
 direct = sys.stdin.read().replace("\r\n", "\n").strip()
-if not direct:
-    sys.exit(0)
 
 path = sys.argv[1]
 pattern = re.compile(r"\[CCC_APP_TURN:([0-9a-f]{32}):([A-Za-z0-9_.:-]{1,80})\]")
@@ -158,11 +160,22 @@ for attempt in range(5):
     if attempt < 4:
         time.sleep(0.2)
 
-matches = resolve(lines)
+matches = resolve(lines) if direct else set()
 if len(matches) == 1:
     token, session = next(iter(matches))
-    print(token)
-    print(session)
+else:
+    # No unique correlation (empty match set, ambiguous duplicates, or a
+    # marker-less terminal-typed turn).  Fall back to an empty token with the
+    # session named by the newest marker seen anywhere in this transcript.
+    # Raw-line findall is safe: marker characters never get JSON-escaped.
+    token = ""
+    session = ""
+    for line in lines:
+        found = pattern.findall(line)
+        if found:
+            session = found[-1][1]
+print(token)
+print(session)
 ' "$TRANSCRIPT_PATH" 2>/dev/null)
 TURN_TOKEN=$(echo "$TURN_IDENTITY" | sed -n '1p')
 TURN_SESSION=$(echo "$TURN_IDENTITY" | sed -n '2p')
@@ -224,9 +237,14 @@ print("\n\n".join(collected))
 ' 2>/dev/null)
 fi
 
-if [ -z "$LAST_ASSISTANT" ]; then
-    log "empty assistant text — skip"
+if [ -z "$LAST_ASSISTANT" ] && [ -z "$TURN_SESSION" ]; then
+    log "empty assistant text and no session identity — skip"
     exit 0
+fi
+if [ -z "$LAST_ASSISTANT" ]; then
+    # Still send a signal-only end-of-turn beacon so the server can release
+    # a stuck busy claim for this session (empty text, identity fields only).
+    log "empty assistant text — posting signal-only beacon (session=$TURN_SESSION)"
 fi
 
 # POST 到 /chat/append
@@ -241,7 +259,9 @@ payload = {
 }
 token = os.environ.get("TURN_TOKEN", "").strip()
 session = os.environ.get("TURN_SESSION", "").strip()
-if token and session:
+if session:
+    # token may be empty: end-of-turn beacon without an exact marker match.
+    # The server only stamps the active claim for grace expiry in that case.
     payload["turn_token"] = token
     payload["session_id"] = session
     payload["metadata"] = {

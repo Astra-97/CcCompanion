@@ -392,6 +392,90 @@ class XiaokeStopTest(unittest.TestCase):
         self.assertTrue(handler.state.typing_state["is_typing"])
         self.assertNotIn("stale_completion_at", handler.state.typing_state)
 
+    def test_empty_token_same_session_beacon_stamps_grace_then_expires(self) -> None:
+        handler = self.handler()
+
+        matched = handler._complete_xiaoke_turn_if_match("", "cctg")
+
+        self.assertFalse(matched)
+        state = handler.state.typing_state
+        # Never an immediate clear: a late beacon racing a fresh injection
+        # must leave the claim typing and only start the grace countdown.
+        self.assertTrue(state["is_typing"])
+        self.assertIsInstance(state.get("stale_completion_at"), float)
+        self.assertEqual(handler.state.contact_typing_states["xiaoke"], state)
+        # Inside the grace window the claim is still protected.
+        self.assertFalse(_should_expire_chat_typing("xiaoke", state, 3600))
+        # Once the grace window has passed the unresolved claim may expire.
+        expired = {**state, "stale_completion_at": time.time() - 121.0}
+        self.assertTrue(_should_expire_chat_typing("xiaoke", expired, 3600))
+
+    def test_empty_token_other_session_beacon_never_stamps(self) -> None:
+        handler = self.handler()
+
+        matched = handler._complete_xiaoke_turn_if_match("", "other-session")
+
+        self.assertFalse(matched)
+        self.assertTrue(handler.state.typing_state["is_typing"])
+        self.assertNotIn("stale_completion_at", handler.state.typing_state)
+
+    def test_repeated_empty_token_beacons_keep_earliest_stamp(self) -> None:
+        handler = self.handler()
+
+        handler._complete_xiaoke_turn_if_match("", "cctg")
+        first_stamp = handler.state.typing_state["stale_completion_at"]
+        time.sleep(0.02)
+        handler._complete_xiaoke_turn_if_match("", "cctg")
+
+        self.assertEqual(handler.state.typing_state["stale_completion_at"], first_stamp)
+
+    def test_exact_completion_still_wins_after_empty_token_beacon(self) -> None:
+        handler = self.handler()
+        handler._complete_xiaoke_turn_if_match("", "cctg")
+
+        matched = handler._complete_xiaoke_turn_if_match("a" * 32, "cctg")
+
+        self.assertTrue(matched)
+        self.assertFalse(handler.state.typing_state["is_typing"])
+        self.assertTrue(handler.state.typing_state["completed"])
+
+    def test_empty_token_beacon_on_idle_state_is_a_noop(self) -> None:
+        handler = self.handler(active=False)
+
+        matched = handler._complete_xiaoke_turn_if_match("", "cctg")
+
+        self.assertFalse(matched)
+        self.assertFalse(handler.state.typing_state["is_typing"])
+        self.assertNotIn("stale_completion_at", handler.state.typing_state)
+
+    def test_signal_only_append_stamps_claim_without_history_record(self) -> None:
+        handler = self.handler()
+        handler._check_auth = lambda: True
+        handler._contact_id_from_body = lambda _body: "xiaoke"
+        handler._source_for_request = lambda *_args: "ccc-stop-hook"
+        append_calls = []
+        handler._chat_for_contact = lambda _contact: types.SimpleNamespace(
+            append=lambda **record: append_calls.append(record) or {**record}
+        )
+
+        handler._handle_chat_append({
+            "role": "assistant",
+            "text": "",
+            "source": "ccc-stop-hook",
+            "turn_token": "",
+            "session_id": "cctg",
+            "metadata": {"xiaoke_turn_token": "", "xiaoke_session_id": "cctg"},
+        })
+
+        status, payload = handler.responses[-1]
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["signal_only"])
+        self.assertEqual(append_calls, [])
+        self.assertTrue(handler.state.typing_state["is_typing"])
+        self.assertIsInstance(
+            handler.state.typing_state.get("stale_completion_at"), float
+        )
+
     def test_concurrent_sends_reserve_before_history_and_only_one_injects(self) -> None:
         append_entered = threading.Event()
         release_append = threading.Event()
@@ -886,23 +970,62 @@ class XiaokeStopTest(unittest.TestCase):
         self.assertEqual(payload.get("turn_token"), active_token)
         self.assertEqual(payload.get("session_id"), "cctg")
 
-    def test_duplicate_assistant_text_across_turns_omits_identity(self) -> None:
+    def test_duplicate_assistant_text_across_turns_downgrades_to_beacon(self) -> None:
+        # Ambiguous correlation must never name an exact token, but it still
+        # proves a turn ended here — the hook downgrades to an empty-token
+        # sessionful beacon instead of staying silent.
         payload = self.run_repository_stop_hook([
             self.user_record(f"[CCC_APP_TURN:{'a' * 32}:cctg]\nold"),
             self.assistant_record("same answer"),
             self.user_record(f"[CCC_APP_TURN:{'b' * 32}:cctg]\nnew"),
             self.assistant_record("same answer"),
         ], "same answer")
-        self.assertNotIn("turn_token", payload)
-        self.assertNotIn("session_id", payload)
+        self.assertEqual(payload["turn_token"], "")
+        self.assertEqual(payload["session_id"], "cctg")
+        self.assertEqual(payload["metadata"]["xiaoke_turn_token"], "")
+        self.assertEqual(payload["metadata"]["xiaoke_session_id"], "cctg")
 
-    def test_missing_assistant_location_omits_identity(self) -> None:
+    def test_missing_assistant_location_downgrades_to_beacon(self) -> None:
         payload = self.run_repository_stop_hook([
             self.user_record(f"[CCC_APP_TURN:{'a' * 32}:cctg]\nhello"),
             self.assistant_record("different answer"),
         ], "not flushed")
+        self.assertEqual(payload["turn_token"], "")
+        self.assertEqual(payload["session_id"], "cctg")
+
+    def test_terminal_turn_after_app_turn_emits_sessionful_beacon(self) -> None:
+        # 02:53 incident, phase two: the user switched to typing in the
+        # terminal (no marker), so the resolver sees current=None for the
+        # final turn.  The hook must still emit an empty-token beacon carrying
+        # the session from the older marker so the stuck claim can expire.
+        payload = self.run_repository_stop_hook([
+            self.user_record(f"[CCC_APP_TURN:{'a' * 32}:cctg]\napp msg"),
+            self.assistant_record("app answer"),
+            self.user_record("terminal typed"),
+            self.assistant_record("terminal answer"),
+        ], "terminal answer")
+        self.assertEqual(payload["turn_token"], "")
+        self.assertEqual(payload["session_id"], "cctg")
+        self.assertEqual(payload["text"], "terminal answer")
+
+    def test_markerless_transcript_posts_without_identity(self) -> None:
+        # A CLI session that never received an App turn has no session to
+        # name; the payload must carry no identity fields at all.
+        payload = self.run_repository_stop_hook([
+            self.user_record("terminal typed"),
+            self.assistant_record("terminal answer"),
+        ], "terminal answer")
         self.assertNotIn("turn_token", payload)
         self.assertNotIn("session_id", payload)
+        self.assertNotIn("metadata", payload)
+
+    def test_empty_assistant_text_with_session_posts_signal_only_beacon(self) -> None:
+        payload = self.run_repository_stop_hook([
+            self.user_record(f"[CCC_APP_TURN:{'a' * 32}:cctg]\nhello"),
+        ], "")
+        self.assertEqual(payload["turn_token"], "")
+        self.assertEqual(payload["session_id"], "cctg")
+        self.assertEqual(payload["text"], "")
 
     def test_streamed_assistant_parts_survive_tool_result_rows(self) -> None:
         token = "a" * 32

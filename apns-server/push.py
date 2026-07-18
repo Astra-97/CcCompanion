@@ -1978,6 +1978,24 @@ class PushHandler(BaseHTTPRequestHandler):
             self.state.contact_typing_states["xiaoke"] = value
             return True
 
+    def _stamp_xiaoke_stale_completion_locked(self, target_session: str) -> None:
+        """Record proof that the CLI finished a turn in the claim's session.
+
+        Caller must hold ``xiaoke_stop_lock``.  Idempotent: a claim that is
+        already stamped keeps its earlier timestamp, so repeated beacons can
+        never push the grace deadline further out.
+        """
+        active = dict(self.state.typing_state or {})
+        if (
+            active.get("is_typing")
+            and str(active.get("session") or "") == target_session
+            and str(active.get("transport") or "") == "tmux"
+            and not active.get("stale_completion_at")
+        ):
+            active["stale_completion_at"] = time.time()
+            self.state.typing_state = active
+            self.state.contact_typing_states["xiaoke"] = active
+
     def _complete_xiaoke_turn_if_match(self, turn_token: str, session: str) -> bool:
         """Apply a Stop-hook completion only to its exact injected App turn.
 
@@ -1987,7 +2005,20 @@ class PushHandler(BaseHTTPRequestHandler):
         """
         token = str(turn_token or "").strip().lower()
         target_session = str(session or "").strip()
-        if not re.fullmatch(r"[0-9a-f]{32}", token) or not target_session:
+        if not target_session:
+            return False
+        if not re.fullmatch(r"[0-9a-f]{32}", token):
+            if token:
+                # Malformed identity can never name a turn; drop it.
+                return False
+            # Empty token is a sessionful end-of-turn beacon from a Stop hook
+            # that could not correlate a marker (message merged into a running
+            # turn, terminal-typed prompt, ambiguous transcript).  It proves
+            # the CLI finished *a* turn in that session, so stamp the active
+            # claim for the bounded grace expiry instead of completing it
+            # outright — a late beacon must never kill a freshly injected turn.
+            with self.state.xiaoke_stop_lock:
+                self._stamp_xiaoke_stale_completion_locked(target_session)
             return False
         lock = self.state.xiaoke_stop_lock
         with lock:
@@ -2001,15 +2032,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 # finished a turn there (it may be idle at a survey/interactive
                 # prompt now).  Record the event so the typing poll can expire
                 # the unresolved claim after a bounded grace window.
-                if (
-                    active.get("is_typing")
-                    and str(active.get("session") or "") == target_session
-                    and str(active.get("transport") or "") == "tmux"
-                    and not active.get("stale_completion_at")
-                ):
-                    active["stale_completion_at"] = time.time()
-                    self.state.typing_state = active
-                    self.state.contact_typing_states["xiaoke"] = active
+                self._stamp_xiaoke_stale_completion_locked(target_session)
                 return False
             stopping = dict(self.state.xiaoke_stopping_claim or {})
             if (
@@ -8733,18 +8756,6 @@ class PushHandler(BaseHTTPRequestHandler):
                 mentions = [m for m in explicit_mentions if m != sender_id]
             else:
                 mentions = sorted(self._detect_apples_mentions(text)) if text else None
-        if not text and not attachment_url and not thinking and not tools:
-            self._send_json(400, {"error": "text or attachment required"})
-            return
-
-        if not text and not attachment_url and (thinking or tools):
-            ok = chat.merge_thinking_to_last_assistant(thinking, tools)
-            if ok:
-                self._send_json(200, {"ok": True, "merged": True})
-            else:
-                self._send_json(200, {"ok": True, "merged": False, "reason": "no assistant record"})
-            return
-
         if role == "assistant" and contact_id == "xiaoke":
             # Claim completion before history/TTS work.  This shares XiaoKe's
             # Stop lock, so completion-vs-Ctrl-C has one deterministic winner:
@@ -8756,6 +8767,23 @@ class PushHandler(BaseHTTPRequestHandler):
             ).strip()
             hook_session = str(body.get("session_id") or metadata_in.get("xiaoke_session_id") or "").strip()
             self._complete_xiaoke_turn_if_match(hook_turn_token, hook_session)
+            if hook_session and not text and not attachment_url and not thinking and not tools:
+                # Signal-only end-of-turn beacon from the Stop hook: nothing
+                # to append, the identity was already consumed above.
+                self._send_json(200, {"ok": True, "signal_only": True})
+                return
+
+        if not text and not attachment_url and not thinking and not tools:
+            self._send_json(400, {"error": "text or attachment required"})
+            return
+
+        if not text and not attachment_url and (thinking or tools):
+            ok = chat.merge_thinking_to_last_assistant(thinking, tools)
+            if ok:
+                self._send_json(200, {"ok": True, "merged": True})
+            else:
+                self._send_json(200, {"ok": True, "merged": False, "reason": "no assistant record"})
+            return
 
         # 通用 chat/append dedupe (非 move) 防 ios_reply 等客户端 retry 重复入库
         # 2026-05-07 修 用户 catch "为什么发两遍". role=move 走下面坐标幂等不动.
