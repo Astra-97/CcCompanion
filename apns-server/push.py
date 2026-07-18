@@ -3026,6 +3026,10 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/notion/page/"):
             self._handle_notion_page_get()
             return
+        # --- Memory library proxy GET (read-only, stateless) ---
+        if self.path.startswith("/memory/"):
+            self._handle_memory_get()
+            return
         # --- AI status (chat header) GET — per-contact ---
         if self.path.startswith("/ai-status"):
             qs = self._query_params()
@@ -9618,6 +9622,105 @@ class PushHandler(BaseHTTPRequestHandler):
 
         status, resp = self._notion_request("GET", url)
         self._send_json(status, resp)
+
+    # ------------------------------------------------------------------
+    # Memory Library Proxy API (read-only forward to Singapore memory-mcp)
+    #
+    # V1 只读：app 只能看和搜，不缓存、不落盘任何记忆数据（纯转发）。
+    # token 从 /root/.codex/config.toml 提取，绝不进日志/响应。
+    # ------------------------------------------------------------------
+
+    _MEMORY_UPSTREAM_BASE = "https://memory.xiaonancaleb.xyz"
+    _MEMORY_CONFIG_PATH = Path("/root/.codex/config.toml")
+    # /memory/<name> -> upstream /api path (GET-only whitelist)
+    _MEMORY_ROUTES: dict[str, str] = {
+        "/memory/stats": "/api/stats",
+        "/memory/categories": "/api/categories",
+        "/memory/list": "/api/memories",
+        "/memory/semantic-search": "/api/semantic-search",
+        "/memory/board": "/api/board",
+    }
+    _MEMORY_ALLOWED_PARAMS = ("query", "category", "limit", "tag")
+    _memory_token_cache: str | None = None
+
+    @classmethod
+    def _memory_token(cls) -> str | None:
+        """Extract memory library bearer token from codex config (cached)."""
+        if cls._memory_token_cache:
+            return cls._memory_token_cache
+        try:
+            text = cls._MEMORY_CONFIG_PATH.read_text(encoding="utf-8")
+        except Exception:
+            return None
+        m = re.search(r'token=([^"&\s]+)', text)
+        if not m:
+            return None
+        cls._memory_token_cache = m.group(1)
+        return cls._memory_token_cache
+
+    def _handle_memory_get(self):
+        """GET /memory/* — read-only whitelist proxy to the memory library."""
+        from urllib.parse import urlparse, parse_qs, urlencode
+
+        parsed = urlparse(self.path)
+        upstream_path = self._MEMORY_ROUTES.get(parsed.path)
+        if not upstream_path:
+            self._send_json(404, {"error": "not found"})
+            return
+
+        token = self._memory_token()
+        if not token:
+            self._send_json(502, {"error": "memory token not configured"})
+            return
+
+        # Whitelist-filter query params (anti SSRF / abuse).
+        qs = parse_qs(parsed.query)
+        params: list[tuple[str, str]] = []
+        for key in self._MEMORY_ALLOWED_PARAMS:
+            values = qs.get(key)
+            if not values:
+                continue
+            value = str(values[0])[:500]
+            if key == "limit":
+                try:
+                    value = str(max(1, min(int(value), 200)))
+                except ValueError:
+                    continue
+            params.append((key, value))
+
+        url = self._MEMORY_UPSTREAM_BASE + upstream_path
+        if params:
+            url += "?" + urlencode(params)
+
+        status, payload = self._memory_request(url, token)
+        self._send_json(status, payload)
+
+    @staticmethod
+    def _memory_request(url: str, token: str) -> tuple[int, Any]:
+        """Forward one GET to the memory library. Never logs the token."""
+        import urllib.request
+        import urllib.error
+
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                # Cloudflare blocks python default UA — must impersonate curl.
+                "User-Agent": "curl/7.81.0",
+                "Accept": "application/json",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                raw = resp.read()
+                return resp.status, json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            logger.warning("memory proxy upstream http %s for %s", e.code, url.split("?")[0])
+            return 502, {"error": f"memory upstream http {e.code}"}
+        except Exception:
+            logger.warning("memory proxy upstream unreachable for %s", url.split("?")[0])
+            return 502, {"error": "memory upstream unreachable"}
 
     # ------------------------------------------------------------------
     # Appearance Settings Sync API (Android cloud backup)
