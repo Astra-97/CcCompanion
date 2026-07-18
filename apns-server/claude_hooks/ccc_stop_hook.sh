@@ -122,8 +122,12 @@ def resolve(lines):
         if kind == "user":
             if tool_result_only(content):
                 continue
-            match = pattern.search("\n".join(texts(content)))
-            current = (match.group(1), match.group(2)) if match else None
+            # Ctrl-C can restore an interrupted prompt into the CLI input, so
+            # the next injection submits one row carrying several markers.
+            # The last marker is the newest injected turn — the identity the
+            # server still tracks as active.
+            markers = pattern.findall("\n".join(texts(content)))
+            current = markers[-1] if markers else None
             assistant_parts = []
             continue
         if kind != "assistant" or current is None:

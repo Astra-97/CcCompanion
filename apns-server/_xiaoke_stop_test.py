@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import threading
 import tempfile
+import time
 import types
 import unittest
 from unittest.mock import MagicMock, patch
@@ -362,6 +363,34 @@ class XiaokeStopTest(unittest.TestCase):
         self.assertFalse(_should_expire_chat_typing("xiaoke", state, 121))
         self.assertFalse(_should_expire_chat_typing("xiaoke", state, 3600))
         self.assertTrue(_should_expire_chat_typing("kairos", state, 121))
+
+    def test_same_session_stale_completion_stamps_grace_then_expires(self) -> None:
+        handler = self.handler(user_ts="new-turn")
+        handler.state.typing_state["turn_token"] = "b" * 32
+        handler.state.contact_typing_states["xiaoke"] = handler.state.typing_state
+
+        matched = handler._complete_xiaoke_turn_if_match("a" * 32, "cctg")
+
+        self.assertFalse(matched)
+        state = handler.state.typing_state
+        self.assertTrue(state["is_typing"])
+        self.assertIsInstance(state.get("stale_completion_at"), float)
+        # Inside the grace window the exact turn is still protected.
+        self.assertFalse(_should_expire_chat_typing("xiaoke", state, 3600))
+        # Once the grace window has passed the unresolved claim may expire.
+        expired = {**state, "stale_completion_at": time.time() - 121.0}
+        self.assertTrue(_should_expire_chat_typing("xiaoke", expired, 3600))
+
+    def test_other_session_stale_completion_never_stamps_grace(self) -> None:
+        handler = self.handler(user_ts="new-turn")
+        handler.state.typing_state["turn_token"] = "b" * 32
+        handler.state.contact_typing_states["xiaoke"] = handler.state.typing_state
+
+        matched = handler._complete_xiaoke_turn_if_match("a" * 32, "other-session")
+
+        self.assertFalse(matched)
+        self.assertTrue(handler.state.typing_state["is_typing"])
+        self.assertNotIn("stale_completion_at", handler.state.typing_state)
 
     def test_concurrent_sends_reserve_before_history_and_only_one_injects(self) -> None:
         append_entered = threading.Event()
@@ -840,6 +869,22 @@ class XiaokeStopTest(unittest.TestCase):
         ], "old answer")
         self.assertEqual(payload.get("turn_token"), old_token)
         self.assertNotEqual(payload.get("turn_token"), new_token)
+
+    def test_interrupt_restored_prompt_row_resolves_last_marker(self) -> None:
+        # Ctrl-C restores the stopped prompt into the CLI input; the next
+        # injection appends after it, so one submitted user row carries both
+        # markers.  The completion must name the newest injected turn.
+        stopped_token = "a" * 32
+        active_token = "b" * 32
+        payload = self.run_repository_stop_hook([
+            self.user_record(
+                f"[CCC_APP_TURN:{stopped_token}:cctg]\nstopped prompt"
+                f"[CCC_APP_TURN:{active_token}:cctg]\nnew prompt"
+            ),
+            self.assistant_record("merged answer"),
+        ], "merged answer")
+        self.assertEqual(payload.get("turn_token"), active_token)
+        self.assertEqual(payload.get("session_id"), "cctg")
 
     def test_duplicate_assistant_text_across_turns_omits_identity(self) -> None:
         payload = self.run_repository_stop_hook([

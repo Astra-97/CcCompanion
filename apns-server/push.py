@@ -149,6 +149,9 @@ logging.basicConfig(
 logger = logging.getLogger("cc-apns-server")
 
 
+XIAOKE_STALE_COMPLETION_GRACE_SECONDS = 120.0
+
+
 def _should_expire_chat_typing(contact_id: str, state: dict[str, Any], age_seconds: float) -> bool:
     exact_xiaoke_turn = (
         contact_id == "xiaoke"
@@ -156,7 +159,19 @@ def _should_expire_chat_typing(contact_id: str, state: dict[str, Any], age_secon
         and bool(str(state.get("session") or ""))
         and bool(re.fullmatch(r"[0-9a-f]{32}", str(state.get("turn_token") or "")))
     )
-    return age_seconds > 120 and not exact_xiaoke_turn
+    if exact_xiaoke_turn:
+        # Exact turns end through their correlated Stop hook, never a cosmetic
+        # TTL.  One bounded exception: a completion callback for the same tmux
+        # session that named another turn proves the CLI already finished a
+        # turn there.  If nothing resolves the active claim within the grace
+        # window afterwards, treat the turn as ended instead of pinning the
+        # App on Stop and the ••• bubble forever.
+        try:
+            stale_at = float(state.get("stale_completion_at") or 0.0)
+        except (TypeError, ValueError):
+            stale_at = 0.0
+        return bool(stale_at) and time.time() - stale_at > XIAOKE_STALE_COMPLETION_GRACE_SECONDS
+    return age_seconds > 120
 
 
 AUTO_FORGE_CLAIM_HISTORY_LIMIT = 256
@@ -1981,6 +1996,20 @@ class PushHandler(BaseHTTPRequestHandler):
                 str(active.get("turn_token") or "").lower() != token
                 or str(active.get("session") or "") != target_session
             ):
+                # Never complete the active turn from another turn's callback.
+                # But a callback naming the same tmux session proves the CLI
+                # finished a turn there (it may be idle at a survey/interactive
+                # prompt now).  Record the event so the typing poll can expire
+                # the unresolved claim after a bounded grace window.
+                if (
+                    active.get("is_typing")
+                    and str(active.get("session") or "") == target_session
+                    and str(active.get("transport") or "") == "tmux"
+                    and not active.get("stale_completion_at")
+                ):
+                    active["stale_completion_at"] = time.time()
+                    self.state.typing_state = active
+                    self.state.contact_typing_states["xiaoke"] = active
                 return False
             stopping = dict(self.state.xiaoke_stopping_claim or {})
             if (
