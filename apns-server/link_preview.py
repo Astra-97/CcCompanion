@@ -38,7 +38,8 @@ XHS_HOSTS = {"xiaohongshu.com", "www.xiaohongshu.com", "xhslink.com", "www.xhsli
 MAX_TITLE = 300
 MAX_DESCRIPTION = 800
 MAX_PAGE_IMAGES = 6
-XHS_CACHE_SCHEMA_VERSION = 3
+GENERIC_CACHE_SCHEMA_VERSION = 3
+XHS_CACHE_SCHEMA_VERSION = 4
 DNS_WORKERS = 4
 DNS_QUEUE_SIZE = 8
 
@@ -734,7 +735,31 @@ def _xhs_note_id(base_url: str) -> str:
         path = urlsplit(base_url).path.rstrip("/")
     except ValueError:
         return ""
-    return path.rsplit("/", 1)[-1] if path else ""
+    if not path:
+        return ""
+    # XHS final URLs occasionally percent-encode otherwise ordinary note-id
+    # characters.  Match the decoded path component to structured state.
+    return unquote(path.rsplit("/", 1)[-1])
+
+
+def _xhs_initial_state_detail_maps(
+    parser: _HTMLTextExtractor,
+) -> tuple[dict[str, Any], ...]:
+    """Parse bounded XHS detail maps from every captured initial-state script."""
+    maps: list[dict[str, Any]] = []
+    for _script_type, script in parser.structured_scripts[:20]:
+        marker = re.search(r"(?:window\.)?__INITIAL_STATE__\s*=\s*", script)
+        if marker is None:
+            continue
+        source = _replace_js_undefined(script[marker.end() :].strip().rstrip(";"))
+        try:
+            state = json.loads(source)
+            detail_map = state.get("note", {}).get("noteDetailMap", {})
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(detail_map, dict):
+            maps.append(detail_map)
+    return tuple(maps)
 
 
 def _xhs_initial_state_notes(
@@ -744,21 +769,7 @@ def _xhs_initial_state_notes(
     """Read only XHS's known note.noteDetailMap.*.note objects."""
     notes: list[tuple[str, dict[str, Any]]] = []
     requested_note_id = _xhs_note_id(base_url)
-    for _script_type, script in parser.structured_scripts:
-        marker = re.search(r"(?:window\.)?__INITIAL_STATE__\s*=\s*", script)
-        if marker is None:
-            continue
-        source = script[marker.end() :].strip().rstrip(";")
-        # XHS currently emits JavaScript `undefined` values in an otherwise
-        # JSON document.  Replace only bare tokens outside quoted strings.
-        source = _replace_js_undefined(source)
-        try:
-            state = json.loads(source)
-            detail_map = state.get("note", {}).get("noteDetailMap", {})
-        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
-            continue
-        if not isinstance(detail_map, dict):
-            continue
+    for detail_map in _xhs_initial_state_detail_maps(parser):
         details: list[tuple[Any, Any]] = []
         if requested_note_id and requested_note_id in detail_map:
             details.append((requested_note_id, detail_map[requested_note_id]))
@@ -771,6 +782,8 @@ def _xhs_initial_state_notes(
             note = detail.get("note")
             if isinstance(note, dict):
                 notes.append((str(_detail_id), note))
+            if len(notes) >= 20:
+                return tuple(notes)
         if notes:
             break
     return tuple(notes)
@@ -783,9 +796,22 @@ def _xhs_initial_state_target_note(
     requested_note_id = _xhs_note_id(base_url)
     if not requested_note_id:
         return None
-    for detail_id, note in _xhs_initial_state_notes(parser, base_url):
-        if detail_id == requested_note_id or str(note.get("noteId") or note.get("id") or "") == requested_note_id:
-            return note
+    # Search every bounded INITIAL_STATE script for an exact id match.  The
+    # first state script can be an unrelated shell/bootstrap payload.
+    for detail_map in _xhs_initial_state_detail_maps(parser):
+        detail = detail_map.get(requested_note_id)
+        if isinstance(detail, dict) and isinstance(detail.get("note"), dict):
+            return detail["note"]
+        for detail_id, candidate in list(detail_map.items())[:20]:
+            if not isinstance(candidate, dict) or not isinstance(candidate.get("note"), dict):
+                continue
+            note = candidate["note"]
+            note_id = str(note.get("noteId") or note.get("id") or "")
+            if (
+                unquote(str(detail_id)) == requested_note_id
+                or unquote(note_id) == requested_note_id
+            ):
+                return note
     return None
 
 
@@ -832,6 +858,62 @@ def _is_xhs_platform_description(value: str) -> bool:
         "小红书年轻人的生活方式平台",
         "小红书你的生活指南",
     }
+
+
+# These are exact chrome/footer labels emitted by XHS, not broad content
+# keywords.  In particular, an author's sentence that merely mentions one of
+# these terms must survive the fallback path unchanged.
+_XHS_EXACT_BOILERPLATE_LINES = {
+    "创作中心",
+    "业务合作",
+    "创作中心 业务合作 发现 RED 直播 发布 通知",
+    "上海市互联网举报中心",
+    "网上有害信息举报专区",
+    "自营经营者信息",
+    "网络文化经营许可证",
+    "个性化推荐算法",
+    "行吟信息科技（上海）有限公司",
+    "|",
+    "更多",
+    "关于我们",
+    "加载中",
+}
+_XHS_BOILERPLATE_LINE_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"^(?:沪|京|粤|浙|苏|蜀|鲁|闽|津|渝|冀|豫|云|辽|黑|湘|皖|赣|新|桂|琼|晋|蒙|吉|贵|陕|甘|青|宁|藏)?\s*ICP\s*备\s*\d+(?:-\d+)?号?$",
+        r"^(?:20\d{2})?(?:沪|京|粤|浙|苏|蜀|鲁|闽|津|渝|冀|豫|云|辽|黑|湘|皖|赣|新|桂|琼|晋|蒙|吉|贵|陕|甘|青|宁|藏)公网安备\s*\d+号$",
+        r"^(?:增值电信业务经营许可证|网络文化经营许可证|互联网药品信息服务资格证书|医疗器械网络交易服务第三方平台备案)\s*[：:].+$",
+        r"^(?:违法(?:和)?不良信息举报|未成年人举报)\s*(?:电话|邮箱)\s*[：:].+$",
+        r"^个性化推荐算法\s+网信算备\S+$",
+        r"^©\s*20\d{2}(?:\s*[-–—]\s*20\d{2})?(?:\s+行吟信息科技（上海）有限公司)?$",
+        r"^(?:公司)?地址\s*[：:]\s*上海市.+$",
+        r"^(?:公司)?电话\s*[：:]\s*(?:\+?86[-\s]?)?[\d\s-]{7,}$",
+    )
+)
+
+
+def _clean_xhs_fallback_body(value: Any) -> str:
+    """Conservatively remove only known whole-line XHS page chrome."""
+    kept: list[str] = []
+    for raw_line in unescape(str(value or "")).splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line:
+            continue
+        if line in _XHS_EXACT_BOILERPLATE_LINES:
+            continue
+        if any(pattern.fullmatch(line) for pattern in _XHS_BOILERPLATE_LINE_PATTERNS):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _xhs_body_text(value: Any, *, authoritative_desc: Any = "") -> str:
+    """Use an exact target note desc, otherwise apply a narrow safe fallback."""
+    description = str(authoritative_desc or "").strip()
+    if description:
+        return description
+    return _clean_xhs_fallback_body(value)
 
 
 def _is_xhs_logo_url(url: str) -> bool:
@@ -894,6 +976,12 @@ def extract_html_page(requested_url: str, payload: HTTPPayload, *, max_text_char
     image_url = image_urls[0] if image_urls else ""
     source_urls = (requested_url, payload.url)
     body_text = "\n".join(parser.text_parts)
+    if is_xhs:
+        # The final URL, not the short/share URL, identifies the exact note.
+        # Never concatenate descriptions from recommendation notes in the same
+        # state payload.  With no exact desc, retain content via a deliberately
+        # narrow whole-line boilerplate filter.
+        body_text = _xhs_body_text(body_text, authoritative_desc=note_description)
     body_text = _redact_url_echoes(
         re.sub(r"(?:\n\s*){3,}", "\n\n", unescape(body_text)).strip(),
         *source_urls,
@@ -1340,18 +1428,34 @@ class LinkPreviewService:
             raw_images = []
         raw_images.insert(0, data.get("image_url") or data.get("image") or "")
         image_urls = _dedupe_image_values(raw_images, requested_url, xhs_only=provider == "xhs-api")
+        is_xhs = LinkPreviewService._is_xhs(requested_url) or provider == "xhs-api"
+        raw_description = data.get("description") or data.get("desc") or ""
+        body_text = data.get("body_text") or data.get("text") or data.get("content") or ""
+        if is_xhs:
+            # API adapters may expose the canonical note caption as `desc`.
+            # A renderer's generic `description` is not trusted as canonical;
+            # its visible text instead takes the same conservative fallback.
+            authoritative_desc = data.get("desc") or ""
+            body_text = _xhs_body_text(body_text, authoritative_desc=authoritative_desc)
+            if (
+                not body_text
+                and raw_description
+                and not _is_xhs_platform_description(str(raw_description))
+            ):
+                # Some adapters return only a real note summary.  It is a safe
+                # last-resort body, but the platform slogan is never promoted.
+                body_text = str(raw_description).strip()
         return ExtractedPage(
             requested_url=requested_url,
             final_url=final_url,
             title=_redact_url_echoes(data.get("title") or "", *source_urls)[:MAX_TITLE],
             description=_redact_url_echoes(
-                data.get("description") or data.get("desc") or "", *source_urls
+                raw_description, *source_urls
             )[:MAX_DESCRIPTION],
             site_name=_redact_url_echoes(data.get("site_name") or provider, *source_urls)[:100],
             image_url=image_urls[0] if image_urls else "",
             body_text=_redact_url_echoes(
-                data.get("body_text") or data.get("text") or data.get("content") or "",
-                *source_urls,
+                body_text, *source_urls,
             )[:max_chars],
             image_urls=image_urls,
             comments=_redact_url_echoes(comments, *source_urls)[:max_chars],
@@ -1543,7 +1647,7 @@ class LinkPreviewService:
             pass
         safe_host = _redact_url_echoes(host, *source_urls)
         meta_base: dict[str, Any] = {
-            "schema_version": XHS_CACHE_SCHEMA_VERSION,
+            "schema_version": XHS_CACHE_SCHEMA_VERSION if is_xhs else GENERIC_CACHE_SCHEMA_VERSION,
             "url": safe_requested_url,
             "final_url": safe_final_url,
             "title": _metadata_text(safe_title, MAX_TITLE),

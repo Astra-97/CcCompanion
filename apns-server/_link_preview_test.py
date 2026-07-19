@@ -312,6 +312,135 @@ class LinkPreviewTests(unittest.TestCase):
         )
         page = link_preview.extract_html_page("https://xhslink.com/o/note", payload, max_text_chars=1000)
         self.assertEqual(page.description, "日常监视是否重置，他一天不阴阳就浑身难受吗😂")
+        self.assertEqual(page.body_text, "日常监视是否重置，他一天不阴阳就浑身难受吗😂")
+
+    def test_xhs_exact_final_note_desc_replaces_repeated_page_footer(self):
+        caption = "Claude VS ChatGPT 顶级嘲讽 哈哈\n#claude"
+        state = json.dumps({
+            "note": {
+                "noteDetailMap": {
+                    "target": {"note": {"noteId": "target", "desc": caption}},
+                }
+            }
+        }, ensure_ascii=False)
+        html = f"""<html><body>
+        <main>wrong visible shell text</main>
+        <footer><div>创作中心</div><div>业务合作</div><div>发现</div><div>RED</div>
+        <div>营业执照</div><div>沪ICP备13030189号</div><div>沪公网安备 31010402002533号</div>
+        <div>违法和不良信息举报电话：021-12345678</div><div>地址：上海市黄浦区旧址</div>
+        <div>营业执照</div><div>沪ICP备13030189号</div></footer>
+        <script>window.__INITIAL_STATE__={state};</script></body></html>""".encode()
+        payload = link_preview.HTTPPayload(
+            "https://www.xiaohongshu.com/explore/target?xsec_token=secret-value",
+            200,
+            {"content-type": "text/html"},
+            html,
+        )
+        page = link_preview.extract_html_page(
+            "https://xhslink.com/o/share", payload, max_text_chars=1000
+        )
+        self.assertEqual(page.body_text, caption)
+        self.assertNotIn("ICP备", page.body_text)
+        self.assertNotIn("业务合作", page.body_text)
+
+    def test_xhs_multiple_notes_never_concatenate_non_target_desc(self):
+        state = json.dumps({
+            "note": {
+                "noteDetailMap": {
+                    "recommended": {"note": {"noteId": "recommended", "desc": "别人的正文"}},
+                    "target": {"note": {"noteId": "target", "desc": "目标正文"}},
+                    "another": {"note": {"desc": "第三篇正文"}},
+                }
+            }
+        }, ensure_ascii=False)
+        html = f"""<html><body>页面壳<script>window.__INITIAL_STATE__={state};</script></body></html>""".encode()
+        payload = link_preview.HTTPPayload(
+            "https://www.xiaohongshu.com/discovery/item/target",
+            200,
+            {"content-type": "text/html"},
+            html,
+        )
+        page = link_preview.extract_html_page(
+            "https://xhslink.com/o/share", payload, max_text_chars=1000
+        )
+        self.assertEqual(page.description, "目标正文")
+        self.assertEqual(page.body_text, "目标正文")
+        self.assertNotIn("别人的正文", page.body_text)
+
+    def test_xhs_missing_desc_fallback_only_removes_exact_boilerplate_lines(self):
+        state = json.dumps({
+            "note": {"noteDetailMap": {"target": {"note": {"noteId": "target"}}}}
+        })
+        html = f"""<html><body>
+        <article><p>今天终于拿到营业执照了，纪念一下</p><p>收到通知后我去直播了</p></article>
+        <footer><div>营业执照</div><div>通知</div><div>创作中心</div>
+        <div>网络文化经营许可证：沪网文〔2026〕1234-001号</div>
+        <div>公司电话：021-12345678</div></footer>
+        <script>window.__INITIAL_STATE__={state};</script></body></html>""".encode()
+        payload = link_preview.HTTPPayload(
+            "https://www.xiaohongshu.com/discovery/item/target",
+            200,
+            {"content-type": "text/html"},
+            html,
+        )
+        page = link_preview.extract_html_page(
+            "https://xhslink.com/o/share", payload, max_text_chars=1000
+        )
+        self.assertIn("今天终于拿到营业执照了，纪念一下", page.body_text)
+        self.assertIn("收到通知后我去直播了", page.body_text)
+        # Ambiguous one-word author lines are deliberately retained when no
+        # exact structured caption exists.
+        self.assertIn("\n营业执照\n", f"\n{page.body_text}\n")
+        self.assertIn("\n通知\n", f"\n{page.body_text}\n")
+        self.assertNotIn("网络文化经营许可证：", page.body_text)
+        self.assertNotIn("公司电话：", page.body_text)
+
+    def test_xhs_fallback_filters_real_footer_variants_without_eating_caption(self):
+        body = "\n".join((
+            "作者正文第一行",
+            "通知",
+            "直播",
+            "营业执照",
+            "2024沪公网安备 31010402002533号",
+            "|",
+            "违法不良信息举报电话：021-12345678",
+            "个性化推荐算法 网信算备310104123456789012340019号",
+            "© 2014-2026",
+            "行吟信息科技（上海）有限公司",
+            "更多",
+            "关于我们",
+            "加载中",
+        ))
+        cleaned = link_preview._clean_xhs_fallback_body(body)
+        self.assertEqual(cleaned, "作者正文第一行\n通知\n直播\n营业执照")
+
+    def test_xhs_encoded_final_note_id_can_match_second_initial_state_script(self):
+        first = json.dumps({
+            "note": {"noteDetailMap": {"recommended": {"note": {"desc": "别人的正文"}}}}
+        }, ensure_ascii=False)
+        second = json.dumps({
+            "note": {
+                "noteDetailMap": {
+                    "target-note": {"note": {"noteId": "target-note", "desc": "编码目标正文"}}
+                }
+            }
+        }, ensure_ascii=False)
+        html = f"""<html><body>页面壳
+        <script>window.__INITIAL_STATE__={first};</script>
+        <script>window.__INITIAL_STATE__={second};</script>
+        </body></html>""".encode()
+        payload = link_preview.HTTPPayload(
+            "https://www.xiaohongshu.com/explore/target%2Dnote",
+            200,
+            {"content-type": "text/html"},
+            html,
+        )
+        page = link_preview.extract_html_page(
+            "https://xhslink.com/o/share", payload, max_text_chars=1000
+        )
+        self.assertEqual(page.description, "编码目标正文")
+        self.assertEqual(page.body_text, "编码目标正文")
+        self.assertNotIn("别人的正文", page.body_text)
 
     def test_xhs_platform_slogan_is_not_used_without_note_description(self):
         slogans = ("3 亿人的生活经验，都在小红书", "生活经验，都在小红书！")
@@ -470,7 +599,9 @@ class LinkPreviewTests(unittest.TestCase):
                 "image_paths": [],
             }))
             preview = service.enrich(url).previews[0]
-            self.assertIn("fresh note", Path(preview["content_path"]).read_text())
+            persisted = Path(preview["content_path"]).read_text()
+            self.assertIn("fresh summary", persisted)
+            self.assertNotIn("stale", persisted)
             self.assertEqual(preview["description"], "fresh summary")
             self.assertEqual(preview["schema_version"], link_preview.XHS_CACHE_SCHEMA_VERSION)
 
@@ -656,6 +787,66 @@ class LinkPreviewTests(unittest.TestCase):
             preview = service.enrich("https://xhslink.com/o/note").previews[0]
             self.assertEqual(preview["provider"], "windows-render")
             self.assertEqual(preview["description"], "")
+
+    def test_xhs_windows_renderer_body_uses_conservative_footer_fallback(self):
+        rendered = link_preview.HTTPPayload(
+            "https://windows.example/preview",
+            200,
+            {"content-type": "application/json"},
+            json.dumps({
+                "title": "note",
+                "text": "作者写营业执照办理经历\n营业执照\n沪ICP备13030189号\n通知",
+            }, ensure_ascii=False).encode(),
+        )
+        page = link_preview.LinkPreviewService._adapter_page(
+            "https://xhslink.com/o/note", rendered, "windows-render", 1000
+        )
+        self.assertEqual(page.body_text, "作者写营业执照办理经历\n营业执照\n通知")
+
+    def test_xhs_adapters_use_real_description_only_as_safe_body_fallback(self):
+        for provider in ("xhs-api", "windows-render"):
+            with self.subTest(provider=provider):
+                payload = link_preview.HTTPPayload(
+                    "https://adapter.example/preview",
+                    200,
+                    {"content-type": "application/json"},
+                    json.dumps({"title": "note", "description": "只有摘要的真实正文"}, ensure_ascii=False).encode(),
+                )
+                page = link_preview.LinkPreviewService._adapter_page(
+                    "https://xhslink.com/o/note", payload, provider, 1000
+                )
+                self.assertEqual(page.body_text, "只有摘要的真实正文")
+
+    def test_xhs_adapters_never_promote_platform_description_to_body(self):
+        for provider in ("xhs-api", "windows-render"):
+            with self.subTest(provider=provider):
+                payload = link_preview.HTTPPayload(
+                    "https://adapter.example/preview",
+                    200,
+                    {"content-type": "application/json"},
+                    json.dumps({"title": "note", "description": "生活经验都在小红书"}, ensure_ascii=False).encode(),
+                )
+                page = link_preview.LinkPreviewService._adapter_page(
+                    "https://xhslink.com/o/note", payload, provider, 1000
+                )
+                self.assertEqual(page.body_text, "")
+
+    def test_xhs_api_desc_is_authoritative_over_rendered_page_shell(self):
+        adapter = link_preview.HTTPPayload(
+            "https://adapter.example/preview",
+            200,
+            {"content-type": "application/json"},
+            json.dumps({
+                "title": "note",
+                "desc": "真实 caption\n营业执照",
+                "text": "错误页面壳\n创作中心\n沪ICP备13030189号",
+            }, ensure_ascii=False).encode(),
+        )
+        page = link_preview.LinkPreviewService._adapter_page(
+            "https://xhslink.com/o/note", adapter, "xhs-api", 1000
+        )
+        self.assertEqual(page.description, "真实 caption\n营业执照")
+        self.assertEqual(page.body_text, "真实 caption\n营业执照")
 
     def test_xhs_adapter_is_preferred_and_comments_are_written(self):
         adapter = link_preview.HTTPPayload(
