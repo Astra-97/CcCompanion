@@ -293,6 +293,77 @@ class LinkPreviewTests(unittest.TestCase):
         self.assertEqual(len(page.image_urls), 6)
         self.assertTrue(page.image_urls[0].endswith("/0.jpg"))
 
+    def test_xhs_initial_state_note_description_replaces_platform_slogan(self):
+        state = json.dumps({
+            "note": {
+                "noteDetailMap": {
+                    "note": {"note": {"desc": "日常监视是否重置，他一天不阴阳就浑身难受吗😂"}}
+                }
+            }
+        }, ensure_ascii=False)
+        html = f"""<html><head>
+        <meta property='og:description' content='3 亿人的生活经验，都在小红书'>
+        </head><body>navigation<script>window.__INITIAL_STATE__={state};</script></body></html>""".encode()
+        payload = link_preview.HTTPPayload(
+            "https://www.xiaohongshu.com/discovery/item/note",
+            200,
+            {"content-type": "text/html"},
+            html,
+        )
+        page = link_preview.extract_html_page("https://xhslink.com/o/note", payload, max_text_chars=1000)
+        self.assertEqual(page.description, "日常监视是否重置，他一天不阴阳就浑身难受吗😂")
+
+    def test_xhs_platform_slogan_is_not_used_without_note_description(self):
+        slogans = ("3 亿人的生活经验，都在小红书", "生活经验，都在小红书！")
+        for slogan in slogans:
+            with self.subTest(slogan=slogan):
+                html = f"""<html><head><meta property='og:description' content='{slogan}'>
+                </head><body>navigation</body></html>""".encode()
+                payload = link_preview.HTTPPayload(
+                    "https://www.xiaohongshu.com/discovery/item/note",
+                    200,
+                    {"content-type": "text/html"},
+                    html,
+                )
+                page = link_preview.extract_html_page(
+                    "https://xhslink.com/o/note", payload, max_text_chars=1000
+                )
+                self.assertEqual(page.description, "")
+
+    def test_xhs_does_not_take_description_from_another_note(self):
+        state = json.dumps({
+            "note": {
+                "noteDetailMap": {
+                    "target": {"note": {"desc": ""}},
+                    "recommended": {"note": {"desc": "another note's description"}},
+                }
+            }
+        })
+        html = f"""<html><head>
+        <meta property='og:description' content='3 亿人的生活经验，都在小红书'>
+        </head><body>navigation<script>window.__INITIAL_STATE__={state};</script></body></html>""".encode()
+        payload = link_preview.HTTPPayload(
+            "https://www.xiaohongshu.com/discovery/item/target",
+            200,
+            {"content-type": "text/html"},
+            html,
+        )
+        page = link_preview.extract_html_page("https://xhslink.com/o/short", payload, max_text_chars=1000)
+        self.assertEqual(page.description, "")
+
+    def test_xhs_near_miss_user_description_is_preserved(self):
+        user_text = "打工人的生活经验都在小红书，我的可不在"
+        html = f"""<html><head><meta property='og:description' content='{user_text}'>
+        </head><body>navigation</body></html>""".encode()
+        payload = link_preview.HTTPPayload(
+            "https://www.xiaohongshu.com/discovery/item/note",
+            200,
+            {"content-type": "text/html"},
+            html,
+        )
+        page = link_preview.extract_html_page("https://xhslink.com/o/note", payload, max_text_chars=1000)
+        self.assertEqual(page.description, user_text)
+
     def test_js_undefined_normalizer_does_not_change_quoted_text(self):
         source = '{"literal":"x:undefined,", "missing": undefined}'
         normalized = link_preview._replace_js_undefined(source)
@@ -366,9 +437,14 @@ class LinkPreviewTests(unittest.TestCase):
             for secret in ("request-secret", "final-secret", "image-secret-one", "image-secret-two"):
                 self.assertNotIn(secret, combined)
 
-    def test_pre_upgrade_xhs_logo_cache_is_not_reused(self):
+    def test_pre_upgrade_xhs_cache_is_not_reused(self):
         url = "https://xhslink.com/o/old"
-        html = b"<html><body>fresh note</body></html>"
+        state = json.dumps({
+            "note": {"noteDetailMap": {"fresh": {"note": {"desc": "fresh summary"}}}}
+        })
+        html = f"""<html><head>
+        <meta property='og:description' content='3 亿人的生活经验，都在小红书'>
+        </head><body>fresh note<script>window.__INITIAL_STATE__={state};</script></body></html>""".encode()
         with tempfile.TemporaryDirectory() as td:
             service = link_preview.LinkPreviewService(
                 td,
@@ -385,13 +461,18 @@ class LinkPreviewTests(unittest.TestCase):
             key = service._url_key(url)
             text_path.write_text("stale")
             meta_path.write_text(json.dumps({
+                "schema_version": 2,
                 "cache_key": key,
                 "lease_until": time.time() + 1000,
-                "image_cache_url": "/attachments/link_image_" + "a" * 64 + ".png",
+                "description": "3 亿人的生活经验，都在小红书",
+                "image_cache_url": "",
+                "image_cache_urls": [],
+                "image_paths": [],
             }))
             preview = service.enrich(url).previews[0]
             self.assertIn("fresh note", Path(preview["content_path"]).read_text())
-            self.assertEqual(preview["schema_version"], 2)
+            self.assertEqual(preview["description"], "fresh summary")
+            self.assertEqual(preview["schema_version"], link_preview.XHS_CACHE_SCHEMA_VERSION)
 
     def test_multi_image_lease_protects_every_cached_image(self):
         with tempfile.TemporaryDirectory() as td:
@@ -548,6 +629,34 @@ class LinkPreviewTests(unittest.TestCase):
             result = service.enrich("https://example.com/private")
             self.assertEqual(result.previews[0]["provider"], "windows-render")
 
+    def test_xhs_windows_renderer_platform_summary_is_filtered(self):
+        bad = link_preview.HTTPPayload(
+            "https://www.xiaohongshu.com/discovery/item/note",
+            403,
+            {"content-type": "text/html"},
+            b"forbidden",
+        )
+        rendered = link_preview.HTTPPayload(
+            "https://windows.example/preview",
+            200,
+            {"content-type": "application/json"},
+            json.dumps({
+                "title": "note",
+                "description": "生活经验，都在小红书！",
+                "text": "full rendered note body",
+            }).encode(),
+        )
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(
+                td,
+                windows_api_url="https://windows.example/preview",
+                fetcher=QueueFetcher([bad]),
+                adapter_fetcher=QueueFetcher([rendered]),
+            )
+            preview = service.enrich("https://xhslink.com/o/note").previews[0]
+            self.assertEqual(preview["provider"], "windows-render")
+            self.assertEqual(preview["description"], "")
+
     def test_xhs_adapter_is_preferred_and_comments_are_written(self):
         adapter = link_preview.HTTPPayload(
             "https://adapter.example/preview",
@@ -564,6 +673,43 @@ class LinkPreviewTests(unittest.TestCase):
             self.assertEqual(bundle.previews[0]["provider"], "xhs-api")
             self.assertIn("comment", Path(bundle.previews[0]["content_path"]).read_text())
             self.assertEqual(fetcher.calls[0][1]["method"], "POST")
+
+    def test_xhs_adapter_filters_only_platform_summary(self):
+        cases = (
+            ("生活经验都在小红书", ""),
+            ("真实笔记正文", "真实笔记正文"),
+        )
+        for description, expected in cases:
+            with self.subTest(description=description), tempfile.TemporaryDirectory() as td:
+                adapter = link_preview.HTTPPayload(
+                    "https://adapter.example/preview",
+                    200,
+                    {"content-type": "application/json"},
+                    json.dumps({
+                        "title": "note",
+                        "description": description,
+                        "text": "note body",
+                    }).encode(),
+                )
+                service = link_preview.LinkPreviewService(
+                    td,
+                    xhs_api_url="https://adapter.example/preview",
+                    fetcher=QueueFetcher([adapter]),
+                )
+                preview = service.enrich("https://xhslink.com/o/note").previews[0]
+                self.assertEqual(preview["provider"], "xhs-api")
+                self.assertEqual(preview["description"], expected)
+
+    def test_non_xhs_page_keeps_same_description_text(self):
+        base_page = self._page("https://example.com/note")
+        page = link_preview.ExtractedPage(
+            **{**base_page.__dict__, "description": "生活经验都在小红书"}
+        )
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(td)
+            service._fetch_page = lambda url, deadline: page
+            preview = service.enrich("https://example.com/note").previews[0]
+            self.assertEqual(preview["description"], "生活经验都在小红书")
 
     def test_concurrent_same_url_fetches_once_and_reuses_file(self):
         html = b"<html><title>T</title><body>body</body></html>"

@@ -38,6 +38,7 @@ XHS_HOSTS = {"xiaohongshu.com", "www.xiaohongshu.com", "xhslink.com", "www.xhsli
 MAX_TITLE = 300
 MAX_DESCRIPTION = 800
 MAX_PAGE_IMAGES = 6
+XHS_CACHE_SCHEMA_VERSION = 3
 DNS_WORKERS = 4
 DNS_QUEUE_SIZE = 8
 
@@ -728,9 +729,21 @@ def _replace_js_undefined(source: str) -> str:
     return "".join(output)
 
 
-def _xhs_initial_state_images(parser: _HTMLTextExtractor, base_url: str) -> tuple[str, ...]:
-    """Read only XHS's known note.noteDetailMap.*.note.imageList path."""
-    values: list[Any] = []
+def _xhs_note_id(base_url: str) -> str:
+    try:
+        path = urlsplit(base_url).path.rstrip("/")
+    except ValueError:
+        return ""
+    return path.rsplit("/", 1)[-1] if path else ""
+
+
+def _xhs_initial_state_notes(
+    parser: _HTMLTextExtractor,
+    base_url: str,
+) -> tuple[tuple[str, dict[str, Any]], ...]:
+    """Read only XHS's known note.noteDetailMap.*.note objects."""
+    notes: list[tuple[str, dict[str, Any]]] = []
+    requested_note_id = _xhs_note_id(base_url)
     for _script_type, script in parser.structured_scripts:
         marker = re.search(r"(?:window\.)?__INITIAL_STATE__\s*=\s*", script)
         if marker is None:
@@ -746,24 +759,79 @@ def _xhs_initial_state_images(parser: _HTMLTextExtractor, base_url: str) -> tupl
             continue
         if not isinstance(detail_map, dict):
             continue
-        for detail in list(detail_map.values())[:20]:
+        details: list[tuple[Any, Any]] = []
+        if requested_note_id and requested_note_id in detail_map:
+            details.append((requested_note_id, detail_map[requested_note_id]))
+        details.extend(
+            item for item in list(detail_map.items())[:20] if str(item[0]) != requested_note_id
+        )
+        for _detail_id, detail in details:
             if not isinstance(detail, dict):
                 continue
             note = detail.get("note")
-            image_list = note.get("imageList") if isinstance(note, dict) else None
-            if not isinstance(image_list, list):
+            if isinstance(note, dict):
+                notes.append((str(_detail_id), note))
+        if notes:
+            break
+    return tuple(notes)
+
+
+def _xhs_initial_state_target_note(
+    parser: _HTMLTextExtractor,
+    base_url: str,
+) -> dict[str, Any] | None:
+    requested_note_id = _xhs_note_id(base_url)
+    if not requested_note_id:
+        return None
+    for detail_id, note in _xhs_initial_state_notes(parser, base_url):
+        if detail_id == requested_note_id or str(note.get("noteId") or note.get("id") or "") == requested_note_id:
+            return note
+    return None
+
+
+def _xhs_initial_state_description(parser: _HTMLTextExtractor, base_url: str) -> str:
+    """Prefer the note's own text over XHS's generic Open Graph slogan."""
+    note = _xhs_initial_state_target_note(parser, base_url)
+    if note is not None:
+        description = note.get("desc")
+        if isinstance(description, str):
+            return description.strip()
+    return ""
+
+
+def _xhs_initial_state_images(parser: _HTMLTextExtractor, base_url: str) -> tuple[str, ...]:
+    """Read only XHS's known note.noteDetailMap.*.note.imageList path."""
+    values: list[Any] = []
+    target = _xhs_initial_state_target_note(parser, base_url)
+    notes = (target,) if target is not None else tuple(
+        note for _detail_id, note in _xhs_initial_state_notes(parser, base_url)
+    )
+    for note in notes:
+        image_list = note.get("imageList")
+        if not isinstance(image_list, list):
+            continue
+        for image in image_list[:MAX_PAGE_IMAGES]:
+            if not isinstance(image, dict):
                 continue
-            for image in image_list[:MAX_PAGE_IMAGES]:
-                if not isinstance(image, dict):
-                    continue
-                preferred = image.get("urlDefault") or image.get("urlPre") or image.get("url")
-                if not preferred and isinstance(image.get("infoList"), list):
-                    for info in image["infoList"]:
-                        if isinstance(info, dict) and info.get("url"):
-                            preferred = info["url"]
-                            break
-                values.append(preferred)
+            preferred = image.get("urlDefault") or image.get("urlPre") or image.get("url")
+            if not preferred and isinstance(image.get("infoList"), list):
+                for info in image["infoList"]:
+                    if isinstance(info, dict) and info.get("url"):
+                        preferred = info["url"]
+                        break
+            values.append(preferred)
     return _dedupe_image_values(values, base_url, xhs_only=True)
+
+
+def _is_xhs_platform_description(value: str) -> bool:
+    """Recognize platform copy that must not masquerade as a note summary."""
+    compact = re.sub(r"[\s,，。.!！?？·\-—_]+", "", unescape(str(value or ""))).lower()
+    return compact in {
+        "3亿人的生活经验都在小红书",
+        "生活经验都在小红书",
+        "小红书年轻人的生活方式平台",
+        "小红书你的生活指南",
+    }
 
 
 def _is_xhs_logo_url(url: str) -> bool:
@@ -811,6 +879,11 @@ def extract_html_page(requested_url: str, payload: HTTPPayload, *, max_text_char
     generic_image = _safe_image_url(meta.get("og:image") or meta.get("twitter:image") or "", payload.url)
     is_xhs = LinkPreviewService._is_xhs(requested_url) or LinkPreviewService._is_xhs(payload.url)
     if is_xhs:
+        note_description = _xhs_initial_state_description(parser, payload.url)
+        if note_description:
+            description = note_description
+        elif _is_xhs_platform_description(description):
+            description = ""
         image_urls = _json_ld_article_images(parser, payload.url)
         if not image_urls:
             image_urls = _xhs_initial_state_images(parser, payload.url)
@@ -1215,9 +1288,9 @@ class LinkPreviewService:
             meta = self._read_sidecar(meta_path, key)
             if meta is None or self._lease_until(meta) <= 0:
                 return None
-            # XHS image selection changed from the generic OG logo to real
-            # note media.  Do not serve a pre-upgrade XHS sidecar until TTL.
-            if self._is_xhs(url) and meta.get("schema_version") != 2:
+            # XHS media and summary extraction have versioned semantics.  Do
+            # not serve a pre-upgrade sidecar until TTL.
+            if self._is_xhs(url) and meta.get("schema_version") != XHS_CACHE_SCHEMA_VERSION:
                 return None
             if not self._cached_image_paths_are_valid(meta):
                 return None
@@ -1432,6 +1505,8 @@ class LinkPreviewService:
         safe_image_urls = [item for item in safe_image_urls if item]
         safe_title = _redact_url_echoes(page.title, *source_urls)
         safe_description = _redact_url_echoes(page.description, *source_urls)
+        if is_xhs and _is_xhs_platform_description(safe_description):
+            safe_description = ""
         safe_site_name = _redact_url_echoes(page.site_name, *source_urls)
         safe_body_text = _redact_url_echoes(page.body_text, *source_urls)
         safe_comments = _redact_url_echoes(page.comments, *source_urls)
@@ -1468,7 +1543,7 @@ class LinkPreviewService:
             pass
         safe_host = _redact_url_echoes(host, *source_urls)
         meta_base: dict[str, Any] = {
-            "schema_version": 2,
+            "schema_version": XHS_CACHE_SCHEMA_VERSION,
             "url": safe_requested_url,
             "final_url": safe_final_url,
             "title": _metadata_text(safe_title, MAX_TITLE),
