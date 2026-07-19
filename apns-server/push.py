@@ -1798,6 +1798,18 @@ class ServerState:
         self.codex_home: str = server_cfg.get("codex_home", "/root/.codex")
         self.codex_model: str = server_cfg.get("codex_model", "gpt-5.5")
         self.codex_reasoning_effort: str = server_cfg.get("codex_reasoning_effort", "high")
+        self.kairos_semantic_memory_recall_enabled: bool = bool(
+            server_cfg.get("kairos_semantic_memory_recall_enabled", True)
+        )
+        try:
+            recall_timeout = float(server_cfg.get("kairos_semantic_memory_recall_timeout_sec", 2.5))
+        except (TypeError, ValueError):
+            recall_timeout = 2.5
+        self.kairos_semantic_memory_recall_timeout_sec: float = max(0.05, min(2.5, recall_timeout))
+        self.kairos_semantic_memory_recall: Any = None
+        self.kairos_semantic_memory_recall_init_attempted = False
+        self.kairos_semantic_memory_recall_lock = threading.Lock()
+        self.kairos_recall_card_lock = threading.Lock()
         self.codex_kairos_backend: str = str(
             server_cfg.get("codex_kairos_backend", "app-server") or "app-server"
         ).strip().lower()
@@ -2075,7 +2087,14 @@ class ServerState:
             return
         try:
             later = chat.read_since(since_ts=user_ts, limit=200, include_hidden=True)
-            if not any(rec.get("role") == "assistant" for rec in later):
+            if not any(
+                rec.get("role") == "assistant"
+                and not (
+                    isinstance(rec.get("metadata"), dict)
+                    and rec["metadata"].get("recall_card") is True
+                )
+                for rec in later
+            ):
                 draft_text = str(payload.get("draft_text") or "").strip()
                 if draft_text:
                     recovery_text = (
@@ -7617,6 +7636,139 @@ class PushHandler(BaseHTTPRequestHandler):
                         self.state.kairos_active_task = None
                         self.state.kairos_active_task_cancel = None
 
+    def _kairos_semantic_recall(self, query: str) -> Any:
+        """Return one shared structured recall, or ``None`` on every failure."""
+        if not self.state.kairos_semantic_memory_recall_enabled or not str(query or "").strip():
+            return None
+        try:
+            with self.state.kairos_semantic_memory_recall_lock:
+                client = self.state.kairos_semantic_memory_recall
+                if client is None and not self.state.kairos_semantic_memory_recall_init_attempted:
+                    self.state.kairos_semantic_memory_recall_init_attempted = True
+                    module_root = "/root/Windows-Codex-TG"
+                    if module_root not in sys.path:
+                        sys.path.insert(0, module_root)
+                    from semantic_memory_recall import SemanticMemoryRecall, SemanticMemoryRecallConfig
+
+                    client = SemanticMemoryRecall(
+                        SemanticMemoryRecallConfig(
+                            enabled=True,
+                            token_file=Path("/root/.codex/config.toml"),
+                            total_timeout_sec=self.state.kairos_semantic_memory_recall_timeout_sec,
+                        )
+                    )
+                    self.state.kairos_semantic_memory_recall = client
+            if client is None:
+                return None
+            result = client.recall_result(str(query))
+            context = str(getattr(result, "context", "") or "").strip()
+            items = getattr(result, "items", ())
+            if not context or not isinstance(items, (list, tuple)) or not items:
+                return None
+            return result
+        except Exception:
+            return None
+
+    @staticmethod
+    def _kairos_recall_card_exists(chat: ChatHistory, user_ts: str) -> bool:
+        if not user_ts:
+            return False
+        try:
+            # Use the physical tail rather than ``read_since``: two local
+            # appends may share one millisecond timestamp, while the turn
+            # marker in metadata remains exact and collision-free.
+            records = chat.tail(200)
+            for record in records:
+                metadata = record.get("metadata")
+                if (
+                    isinstance(metadata, dict)
+                    and metadata.get("recall_card") is True
+                    and str(metadata.get("kairos_user_ts") or "") == user_ts
+                ):
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _append_kairos_recall_card(
+        self,
+        chat: ChatHistory,
+        result: Any,
+        *,
+        user_ts: str,
+        source: str,
+        group: bool = False,
+    ) -> bool:
+        """Append one compact App card after a hit; never affect the main turn."""
+        try:
+            with self.state.kairos_recall_card_lock:
+                return self._append_kairos_recall_card_locked(
+                    chat,
+                    result,
+                    user_ts=user_ts,
+                    source=source,
+                    group=group,
+                )
+        except Exception:
+            return False
+
+    def _append_kairos_recall_card_locked(
+        self,
+        chat: ChatHistory,
+        result: Any,
+        *,
+        user_ts: str,
+        source: str,
+        group: bool = False,
+    ) -> bool:
+        try:
+            if self._kairos_recall_card_exists(chat, user_ts):
+                return False
+            raw_items = getattr(result, "items", ())
+            items: list[dict[str, str]] = []
+            for raw_item in raw_items[:3]:
+                if not isinstance(raw_item, dict):
+                    continue
+                item = {
+                    "date": str(raw_item.get("date") or "")[:10],
+                    "title": str(raw_item.get("title") or "")[:60],
+                    "snippet": str(raw_item.get("snippet") or "")[:80],
+                }
+                if any(item.values()):
+                    items.append(item)
+            if not items:
+                return False
+            # Chat polling is ``ts > since``.  Make the card's millisecond key
+            # strictly newer than its user turn even when a fake/local recall
+            # returns in the same clock tick.
+            try:
+                user_dt = datetime.fromisoformat(user_ts)
+                remaining = (user_dt + timedelta(milliseconds=1) - datetime.now(user_dt.tzinfo)).total_seconds()
+                if 0 < remaining <= 0.01:
+                    time.sleep(remaining)
+            except Exception:
+                pass
+            kwargs: dict[str, Any] = {}
+            if group:
+                kwargs.update(
+                    sender_id="kairos",
+                    sender_name=self._apples_member_name("kairos"),
+                )
+            chat.append(
+                role="assistant",
+                text=f"💭 浮现了 {len(items)} 条记忆（摘要见卡片）",
+                source=source,
+                metadata={
+                    "recall_card": True,
+                    "items": items,
+                    "kairos_user_ts": user_ts,
+                },
+                **kwargs,
+            )
+            return True
+        except Exception:
+            return False
+
     def _kairos_prompt_for_task(self, task: dict[str, Any]) -> str:
         text = str(task.get("text") or "").strip()
         attachment_lines = []
@@ -7800,6 +7952,17 @@ class PushHandler(BaseHTTPRequestHandler):
                 if run_id:
                     CODEX_RUNS.set_observer_phase(run_id, "starting")
                 prompt = self._kairos_prompt_for_task(task)
+                recall_result = self._kairos_semantic_recall(text)
+                if recall_result is not None:
+                    self._append_kairos_recall_card(
+                        chat,
+                        recall_result,
+                        user_ts=user_ts,
+                        source="memory-recall:kairos",
+                    )
+                    recall_context = str(getattr(recall_result, "context", "") or "").strip()
+                    if recall_context:
+                        prompt = f"{recall_context}\n\n{prompt}"
                 sys.path.insert(0, "/root/Windows-Codex-TG")
                 from codex_common import CodexRunner, SessionStore
 
@@ -8129,7 +8292,16 @@ class PushHandler(BaseHTTPRequestHandler):
         })
         self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec, "queued": True})
 
-    def _start_group_kairos_reply(self, chat: ChatHistory, text: str, sender_name: str = "Astra", hop_count: int = 0) -> None:
+    def _start_group_kairos_reply(
+        self,
+        chat: ChatHistory,
+        text: str,
+        sender_name: str = "Astra",
+        hop_count: int = 0,
+        *,
+        user_ts: str = "",
+        semantic_recall_allowed: bool = False,
+    ) -> None:
         self._clear_chat_draft("apples")
 
         def _worker():
@@ -8188,6 +8360,19 @@ class PushHandler(BaseHTTPRequestHandler):
                         f"{hop_hint}\n"
                         f"群聊消息：{text}"
                     )
+                    if semantic_recall_allowed:
+                        recall_result = self._kairos_semantic_recall(text)
+                        if recall_result is not None:
+                            self._append_kairos_recall_card(
+                                chat,
+                                recall_result,
+                                user_ts=user_ts,
+                                source="memory-recall:group:kairos",
+                                group=True,
+                            )
+                            recall_context = str(getattr(recall_result, "context", "") or "").strip()
+                            if recall_context:
+                                prompt = f"{recall_context}\n\n{prompt}"
                     sys.path.insert(0, "/root/Windows-Codex-TG")
                     from codex_common import CodexRunner
 
@@ -8479,7 +8664,14 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._set_typing_for_contact(
                     contact_id, {"is_typing": True, "since": rec["ts"], "member_id": "kairos"}
                 )
-                self._start_group_kairos_reply(chat, text, sender_name=sender_name, hop_count=next_hop)
+                self._start_group_kairos_reply(
+                    chat,
+                    text,
+                    sender_name=sender_name,
+                    hop_count=next_hop,
+                    user_ts=str(rec.get("ts") or ""),
+                    semantic_recall_allowed=sender_id_norm == "astra",
+                )
                 self._apples_record_global(sender_id_norm or "unknown")
                 routed.append("kairos")
 
