@@ -252,6 +252,172 @@ class LinkPreviewTests(unittest.TestCase):
         self.assertIn("Hello", page.body_text)
         self.assertNotIn("secret", page.body_text)
 
+    def test_xhs_prefers_article_jsonld_images_over_generic_logo(self):
+        article = {
+            "@context": "https://schema.org",
+            "@type": "Article",
+            "headline": "note",
+            "image": [
+                "https://sns-webpic-qc.xhscdn.com/one.jpg?imageView2=2",
+                {"@type": "ImageObject", "contentUrl": "https://sns-img-qc.xhscdn.com/two.webp"},
+            ],
+        }
+        html = f"""<html><head>
+        <meta property='og:image' content='https://picasso-static.xiaohongshu.com/fe-platform/logo.png'>
+        <script type='application/ld+json'>{json.dumps(article)}</script>
+        </head><body>note body</body></html>""".encode()
+        payload = link_preview.HTTPPayload(
+            "https://www.xiaohongshu.com/explore/note", 200, {"content-type": "text/html"}, html
+        )
+        page = link_preview.extract_html_page("https://xhslink.com/o/note", payload, max_text_chars=1000)
+        self.assertEqual(len(page.image_urls), 2)
+        self.assertEqual(page.image_url, page.image_urls[0])
+        self.assertTrue(all("xhscdn.com" in item for item in page.image_urls))
+        self.assertNotIn("logo", " ".join(page.image_urls))
+
+    def test_xhs_initial_state_known_note_path_is_bounded_fallback(self):
+        images = [
+            {"urlDefault": f"https://sns-webpic-qc.xhscdn.com/{index}.jpg"}
+            for index in range(8)
+        ]
+        state = json.dumps({"note": {"noteDetailMap": {"id": {"note": {"imageList": images}}}}})
+        # Include XHS's real-world non-JSON undefined token outside a string.
+        state = state[:-1] + ',"optional":undefined}'
+        html = f"""<html><head>
+        <meta property='og:image' content='https://picasso-static.xiaohongshu.com/fe-platform/logo.png'>
+        </head><body>note<script>window.__INITIAL_STATE__={state};</script></body></html>""".encode()
+        payload = link_preview.HTTPPayload(
+            "https://www.xiaohongshu.com/explore/note", 200, {"content-type": "text/html"}, html
+        )
+        page = link_preview.extract_html_page("https://xhslink.com/o/note", payload, max_text_chars=1000)
+        self.assertEqual(len(page.image_urls), 6)
+        self.assertTrue(page.image_urls[0].endswith("/0.jpg"))
+
+    def test_js_undefined_normalizer_does_not_change_quoted_text(self):
+        source = '{"literal":"x:undefined,", "missing": undefined}'
+        normalized = link_preview._replace_js_undefined(source)
+        self.assertEqual(json.loads(normalized), {"literal": "x:undefined,", "missing": None})
+
+    def test_xhs_rejects_uncontrolled_jsonld_image_hosts_and_logo(self):
+        article = {
+            "@type": "Article",
+            "image": [
+                "http://169.254.169.254/latest/meta-data",
+                "https://unrelated.example/tracker.jpg",
+                "javascript:alert(1)",
+            ],
+        }
+        html = f"""<html><head>
+        <meta property='og:image' content='https://picasso-static.xiaohongshu.com/fe-platform/logo.png'>
+        <script type='application/ld+json'>{json.dumps(article)}</script>
+        </head><body>note body</body></html>""".encode()
+        payload = link_preview.HTTPPayload(
+            "https://www.xiaohongshu.com/explore/note", 200, {"content-type": "text/html"}, html
+        )
+        page = link_preview.extract_html_page("https://xhslink.com/o/note", payload, max_text_chars=1000)
+        self.assertEqual(page.image_url, "")
+        self.assertEqual(page.image_urls, ())
+
+    def test_generic_page_keeps_cross_origin_og_image_fallback(self):
+        html = b"""<html><head><meta property='og:image' content='https://cdn.example.net/cover.jpg'>
+        </head><body>article</body></html>"""
+        payload = link_preview.HTTPPayload(
+            "https://example.com/article", 200, {"content-type": "text/html"}, html
+        )
+        page = link_preview.extract_html_page("https://example.com/article", payload, max_text_chars=1000)
+        self.assertEqual(page.image_urls, ("https://cdn.example.net/cover.jpg",))
+
+    def test_xhs_multi_images_are_cached_and_injected_without_query_secrets(self):
+        article = {
+            "@type": "Article",
+            "image": [
+                "https://sns-webpic-qc.xhscdn.com/one.jpg?token=image-secret-one",
+                "https://sns-webpic-qc.xhscdn.com/two.jpg?token=image-secret-two",
+            ],
+        }
+        html = f"""<html><head><script type='application/ld+json'>{json.dumps(article)}</script>
+        </head><body>note body</body></html>""".encode()
+        page_payload = link_preview.HTTPPayload(
+            "https://www.xiaohongshu.com/explore/note?token=final-secret",
+            200,
+            {"content-type": "text/html"},
+            html,
+        )
+        image_one = link_preview.HTTPPayload(
+            article["image"][0], 200, {"content-type": "image/jpeg"}, b"one"
+        )
+        image_two = link_preview.HTTPPayload(
+            article["image"][1], 200, {"content-type": "image/jpeg"}, b"two"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(
+                td, fetcher=QueueFetcher([page_payload, image_one, image_two]), lease_seconds=1000
+            )
+            bundle = service.enrich("https://xhslink.com/o/note?token=request-secret")
+            preview = bundle.previews[0]
+            self.assertEqual(len(preview["image_paths"]), 2)
+            self.assertEqual(preview["image_cache_url"], preview["image_cache_urls"][0])
+            self.assertTrue(all(Path(path).is_file() for path in preview["image_paths"]))
+            self.assertTrue(all(f"- 内容图片：{path}" in bundle.prompt_context for path in preview["image_paths"]))
+            self.assertIn("评论未抓取", bundle.prompt_context)
+            persisted = Path(preview["content_path"]).read_text()
+            sidecar = service._paths("https://xhslink.com/o/note?token=request-secret")[1].read_text()
+            combined = json.dumps(preview, ensure_ascii=False) + persisted + sidecar + bundle.prompt_context
+            for secret in ("request-secret", "final-secret", "image-secret-one", "image-secret-two"):
+                self.assertNotIn(secret, combined)
+
+    def test_pre_upgrade_xhs_logo_cache_is_not_reused(self):
+        url = "https://xhslink.com/o/old"
+        html = b"<html><body>fresh note</body></html>"
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(
+                td,
+                fetcher=QueueFetcher([
+                    link_preview.HTTPPayload(
+                        "https://www.xiaohongshu.com/explore/fresh",
+                        200,
+                        {"content-type": "text/html"},
+                        html,
+                    )
+                ]),
+            )
+            text_path, meta_path = service._paths(url)
+            key = service._url_key(url)
+            text_path.write_text("stale")
+            meta_path.write_text(json.dumps({
+                "cache_key": key,
+                "lease_until": time.time() + 1000,
+                "image_cache_url": "/attachments/link_image_" + "a" * 64 + ".png",
+            }))
+            preview = service.enrich(url).previews[0]
+            self.assertIn("fresh note", Path(preview["content_path"]).read_text())
+            self.assertEqual(preview["schema_version"], 2)
+
+    def test_multi_image_lease_protects_every_cached_image(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(td, lease_seconds=1000, cache_ttl_seconds=1)
+            page = self._page(
+                "https://example.com/page",
+                image_url="https://cdn.example.com/one.jpg",
+            )
+            page = link_preview.ExtractedPage(
+                **{**page.__dict__, "image_urls": (
+                    "https://cdn.example.com/one.jpg",
+                    "https://cdn.example.com/two.jpg",
+                )}
+            )
+            service._fetch_page = lambda url, deadline: page
+            service._download_image_candidate = lambda image_url, deadline, **_kwargs: (
+                Path(td) / f"link_image_{service._url_key(image_url)}.jpg",
+                image_url.encode(),
+            )
+            preview = service.enrich("https://example.com/page").previews[0]
+            old = time.time() - 100
+            for image_path in preview["image_paths"]:
+                os.utime(image_path, (old, old))
+            service._cleanup_cache()
+            self.assertTrue(all(Path(path).is_file() for path in preview["image_paths"]))
+
     def test_service_persists_atomic_private_text_and_metadata(self):
         html = b"<html><head><title>Preview</title></head><body>full article</body></html>"
         payload = link_preview.HTTPPayload(
@@ -279,6 +445,81 @@ class LinkPreviewTests(unittest.TestCase):
             link_preview._metadata_url("https://user:password@example.com:443/path"),
             "https://example.com/path",
         )
+
+    def test_url_secret_echoes_are_redacted_from_text_sidecar_and_prompt(self):
+        requested = (
+            "https://example.com/note?xsec_token=abc%252FDEF12345&q=cat"
+            "&slug=how-to-build-a-very-long-widget&article_id=0123456789abcdef"
+            "&utm_source=summer_campaign_2026_long#signature=frag-secret-987654"
+        )
+        final = (
+            "https://final-signature-value.example.com/final/abc%2FDEF12345"
+            "?sig=final-signature-value"
+        )
+        image_url = (
+            "https://cdn.example.com/media/image-query-secret/abc%252FDEF12345.jpg"
+            "?token=image-query-secret"
+        )
+        page = link_preview.ExtractedPage(
+            requested_url=requested,
+            final_url=final,
+            title=(
+                "decoded abc/DEF12345 plus how-to-build-a-very-long-widget "
+                "0123456789abcdef summer_campaign_2026_long"
+            ),
+            description="encoded abc%2FDEF12345 remains",
+            site_name="example abc%2FDEF12345",
+            image_url=image_url,
+            body_text=(
+                "raw abc%252FDEF12345 and xsec_token=abc%252FDEF12345 but ordinary cat remains; "
+                "how-to-build-a-very-long-widget 0123456789abcdef summer_campaign_2026_long"
+            ),
+            comments="frag-secret-987654 final-signature-value",
+            image_urls=(image_url,),
+        )
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(td)
+            service._fetch_page = lambda url, deadline: page
+            service._download_image_candidate = lambda url, deadline, **_kwargs: None
+            bundle = service.enrich(requested)
+            preview = bundle.previews[0]
+            persisted = Path(preview["content_path"]).read_text()
+            sidecar = service._paths(requested)[1].read_text()
+            combined = persisted + sidecar + bundle.prompt_context + json.dumps(preview)
+            for secret in (
+                "abc/DEF12345",
+                "abc%2FDEF12345",
+                "abc%252FDEF12345",
+                "frag-secret-987654",
+                "final-signature-value",
+                "image-query-secret",
+            ):
+                self.assertNotIn(secret.lower(), combined.lower())
+            self.assertIn("cat remains", persisted)
+            self.assertIn("how-to-build-a-very-long-widget", persisted)
+            self.assertIn("0123456789abcdef", persisted)
+            self.assertIn("summer_campaign_2026_long", persisted)
+            self.assertIn(link_preview._REDACTED_URL_SECRET, persisted)
+
+    def test_site_name_is_redacted_in_html_and_adapter_extraction(self):
+        url = "https://example.com/note?xsec_token=site-secret-123456"
+        html = b"""<html><head><meta property='og:site_name' content='site-secret-123456'>
+        </head><body>body</body></html>"""
+        page = link_preview.extract_html_page(
+            url,
+            link_preview.HTTPPayload(url, 200, {"content-type": "text/html"}, html),
+            max_text_chars=1000,
+        )
+        self.assertNotIn("site-secret-123456", page.site_name)
+
+        adapter_payload = link_preview.HTTPPayload(
+            "https://adapter.example",
+            200,
+            {"content-type": "application/json"},
+            json.dumps({"text": "body", "site_name": "site-secret-123456"}).encode(),
+        )
+        adapted = link_preview.LinkPreviewService._adapter_page(url, adapter_payload, "xhs-api", 1000)
+        self.assertNotIn("site-secret-123456", adapted.site_name)
 
     def test_failure_is_fail_open(self):
         with tempfile.TemporaryDirectory() as td:
@@ -559,7 +800,7 @@ class LinkPreviewTests(unittest.TestCase):
             image_key = service._url_key(image_url)
             image_path = Path(td) / f"link_image_{image_key}.jpg"
 
-            def stale_candidate(_url, _deadline):
+            def stale_candidate(_url, _deadline, **_kwargs):
                 # Both transactions prepare target+bytes before either enters
                 # the budget lock.  Page two deliberately remains stale until
                 # page one has committed the shared image and sidecar.
@@ -661,26 +902,240 @@ class LinkPreviewTests(unittest.TestCase):
             digest = link_preview.hashlib.sha256(image_url.encode()).hexdigest()
             self.assertEqual(result, f"/attachments/link_image_{digest}.jpg")
 
-    def test_metadata_merge_and_ai_prompt_path_injection(self):
-        bundle = link_preview.LinkPreviewBundle(
-            ({"title": "T", "content_path": "/safe/link.txt"},), "SAFE LINK CONTEXT"
+    def test_xhs_image_final_redirect_host_must_remain_allowlisted(self):
+        source = "https://sns-webpic-qc.xhscdn.com/source.jpg"
+        evil = link_preview.HTTPPayload(
+            "https://public-evil.example/tracker.jpg",
+            200,
+            {"content-type": "image/jpeg"},
+            b"evil",
         )
-        meta = link_preview.merge_preview_metadata({"via": "card"}, bundle)
-        self.assertEqual(meta["via"], "card")
-        self.assertEqual(meta["link_previews"][0]["content_path"], "/safe/link.txt")
+        allowed = link_preview.HTTPPayload(
+            "https://sns-img-qc.xhscdn.com/final.jpg",
+            200,
+            {"content-type": "image/jpeg"},
+            b"allowed",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            rejected = link_preview.LinkPreviewService(td, fetcher=QueueFetcher([evil]))
+            self.assertIsNone(
+                rejected._download_image_candidate(source, time.monotonic() + 1, xhs_only=True)
+            )
+            self.assertEqual(list(Path(td).glob("link_image_*")), [])
 
-        handler = object.__new__(push.PushHandler)
-        handler.state = type("State", (), {"attachments_dir": Path("/safe")})()
-        prompt = handler._kairos_prompt_for_task({"text": "hello", "link_context": bundle.prompt_context})
-        self.assertIn("SAFE LINK CONTEXT", prompt)
-        rebuilt = handler._link_context_from_record({"metadata": meta})
-        self.assertIn("/safe/link.txt", rebuilt)
-        self.assertIn("不可信", rebuilt)
+            accepted = link_preview.LinkPreviewService(td, fetcher=QueueFetcher([allowed]))
+            candidate = accepted._download_image_candidate(source, time.monotonic() + 1, xhs_only=True)
+            self.assertIsNotNone(candidate)
+            self.assertEqual(candidate[1], b"allowed")
+
+            generic = link_preview.LinkPreviewService(td, fetcher=QueueFetcher([evil]))
+            candidate = generic._download_image_candidate(source, time.monotonic() + 1, xhs_only=False)
+            self.assertIsNotNone(candidate)
+            self.assertEqual(candidate[1], b"evil")
+
+    def test_xhs_policy_never_reuses_generic_cache_of_same_source_url(self):
+        source = "https://sns-webpic-qc.xhscdn.com/source.jpg"
+        evil = link_preview.HTTPPayload(
+            "https://public-evil.example/tracker.jpg",
+            200,
+            {"content-type": "image/jpeg"},
+            b"evil",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            generic_fetcher = QueueFetcher([evil])
+            generic = link_preview.LinkPreviewService(root, fetcher=generic_fetcher)
+            generic_url = generic._cache_image(source, time.monotonic() + 1)
+            generic_path = root / Path(generic_url).name
+            self.assertTrue(generic_path.is_file())
+
+            xhs_fetcher = QueueFetcher([evil])
+            xhs = link_preview.LinkPreviewService(root, fetcher=xhs_fetcher)
+            self.assertIsNone(
+                xhs._download_image_candidate(source, time.monotonic() + 1, xhs_only=True)
+            )
+            self.assertEqual(len(xhs_fetcher.calls), 1)
+            xhs_key = xhs._image_url_key(source, xhs_only=True)
+            self.assertEqual(list(root.glob(f"link_image_{xhs_key}.*")), [])
+            self.assertTrue(generic_path.is_file())
+
+    def test_xhs_policy_cache_reuses_verified_image_and_inherits_page_leases(self):
+        source = "https://sns-webpic-qc.xhscdn.com/source.jpg"
+        allowed = link_preview.HTTPPayload(
+            "https://sns-img-qc.xhscdn.com/final.jpg",
+            200,
+            {"content-type": "image/jpeg"},
+            b"allowed",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fetcher = QueueFetcher([allowed])
+            service = link_preview.LinkPreviewService(
+                root,
+                fetcher=fetcher,
+                lease_seconds=1000,
+                cache_ttl_seconds=1,
+            )
+            service._fetch_page = lambda url, deadline: self._page(url, image_url=source)
+            first = service.enrich("https://www.xiaohongshu.com/explore/one").previews[0]
+            second = service.enrich("https://www.xiaohongshu.com/explore/two").previews[0]
+            self.assertEqual(len(fetcher.calls), 1)
+            self.assertEqual(first["image_paths"], second["image_paths"])
+            image_path = Path(first["image_paths"][0])
+            expected_key = service._image_url_key(source, xhs_only=True)
+            self.assertEqual(image_path.name, f"link_image_{expected_key}.jpg")
+            old = time.time() - 100
+            os.utime(image_path, (old, old))
+            service._cleanup_cache()
+            self.assertTrue(image_path.is_file())
+
+    def test_cache_hit_with_missing_image_is_refetched(self):
+        page_url = "https://example.com/page"
+        image_url = "https://cdn.example.com/image.jpg"
+        calls = []
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(td, lease_seconds=1000)
+            service._fetch_page = lambda url, deadline: (
+                calls.append(url) or self._page(url, image_url=image_url)
+            )
+            service._download_image_candidate = lambda url, deadline, **_kwargs: (
+                Path(td) / f"link_image_{service._url_key(url)}.jpg",
+                b"image",
+            )
+            first = service.enrich(page_url).previews[0]
+            Path(first["image_paths"][0]).unlink()
+            second = service.enrich(page_url).previews[0]
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(Path(second["image_paths"][0]).is_file())
+
+    def test_cache_hit_with_symlink_image_is_refetched_without_returning_symlink(self):
+        page_url = "https://example.com/page"
+        image_url = "https://cdn.example.com/image.jpg"
+        calls = []
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            service = link_preview.LinkPreviewService(root, lease_seconds=1000)
+            service._fetch_page = lambda url, deadline: (
+                calls.append(url) or self._page(url, image_url=image_url)
+            )
+            service._download_image_candidate = lambda url, deadline, **_kwargs: (
+                root / f"link_image_{service._url_key(url)}.jpg",
+                b"image",
+            )
+            first = service.enrich(page_url).previews[0]
+            cached_image = Path(first["image_paths"][0])
+            cached_image.unlink()
+            outside = root.parent / f"outside-{service._url_key(page_url)}.jpg"
+            outside.write_bytes(b"outside")
+            self.addCleanup(lambda: outside.unlink(missing_ok=True))
+            cached_image.symlink_to(outside)
+            second = service.enrich(page_url).previews[0]
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(second["image_paths"], [])
+            self.assertTrue(cached_image.is_symlink())
+
+    def test_cache_hit_with_mismatched_declared_image_path_is_refetched(self):
+        page_url = "https://example.com/page"
+        image_url = "https://cdn.example.com/image.jpg"
+        calls = []
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            service = link_preview.LinkPreviewService(root, lease_seconds=1000)
+            service._fetch_page = lambda url, deadline: (
+                calls.append(url) or self._page(url, image_url=image_url)
+            )
+            service._download_image_candidate = lambda url, deadline, **_kwargs: (
+                root / f"link_image_{service._url_key(url)}.jpg",
+                b"image",
+            )
+            service.enrich(page_url)
+            _text_path, meta_path = service._paths(page_url)
+            meta = json.loads(meta_path.read_text())
+            other = root / ("link_image_" + "9" * 64 + ".jpg")
+            other.write_bytes(b"other")
+            meta["image_paths"] = [str(other)]
+            meta_path.write_text(json.dumps(meta))
+            second = service.enrich(page_url).previews[0]
+            self.assertEqual(len(calls), 2)
+            self.assertNotEqual(second["image_paths"], [str(other)])
+
+    def test_metadata_merge_and_ai_prompt_path_injection(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            content_path = root / ("link_" + "b" * 64 + ".txt")
+            image_path = root / ("link_image_" + "a" * 64 + ".jpg")
+            content_path.write_text("body")
+            image_path.write_bytes(b"image")
+            bundle = link_preview.LinkPreviewBundle(
+                ({"title": "T", "content_path": str(content_path)},), "SAFE LINK CONTEXT"
+            )
+            meta = link_preview.merge_preview_metadata({"via": "card"}, bundle)
+            self.assertEqual(meta["via"], "card")
+            self.assertEqual(meta["link_previews"][0]["content_path"], str(content_path))
+
+            handler = object.__new__(push.PushHandler)
+            handler.state = type("State", (), {"attachments_dir": root})()
+            prompt = handler._kairos_prompt_for_task({"text": "hello", "link_context": bundle.prompt_context})
+            self.assertIn("SAFE LINK CONTEXT", prompt)
+            rebuilt = handler._link_context_from_record({"metadata": meta})
+            self.assertIn(str(content_path), rebuilt)
+            self.assertIn("不可信", rebuilt)
+            rebuilt_images = handler._link_context_from_record({
+                "metadata": {
+                    "link_previews": [{
+                        "content_path": str(content_path),
+                        "image_paths": [str(image_path), "/etc/shadow"],
+                        "comments_status": "not_fetched",
+                    }]
+                }
+            })
+            self.assertIn(str(image_path), rebuilt_images)
+            self.assertNotIn("/etc/shadow", rebuilt_images)
+            self.assertIn("评论未抓取", rebuilt_images)
         forged = link_preview.merge_preview_metadata(
             {"link_previews": [{"content_path": "/etc/shadow"}]},
             link_preview.LinkPreviewBundle(),
         )
         self.assertIsNone(forged)
+
+    def test_record_context_rejects_non_cache_missing_directory_and_symlink_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            upload = root / "user-upload.txt"
+            upload.write_text("user")
+            directory = root / ("link_" + "c" * 64 + ".txt")
+            directory.mkdir()
+            outside = root.parent / ("outside-" + "d" * 16 + ".txt")
+            outside.write_text("outside")
+            self.addCleanup(lambda: outside.unlink(missing_ok=True))
+            symlink = root / ("link_" + "d" * 64 + ".txt")
+            symlink.symlink_to(outside)
+            missing = root / ("link_" + "e" * 64 + ".txt")
+            image_directory = root / ("link_image_" + "1" * 64 + ".jpg")
+            image_directory.mkdir()
+            image_symlink = root / ("link_image_" + "2" * 64 + ".jpg")
+            image_symlink.symlink_to(outside)
+            image_missing = root / ("link_image_" + "3" * 64 + ".jpg")
+            valid_target = root / ("link_" + "f" * 64 + ".txt")
+            valid_target.write_text("valid only through canonical path")
+            alias = root.parent / ("attachments-alias-" + "4" * 16)
+            alias.symlink_to(root, target_is_directory=True)
+            self.addCleanup(lambda: alias.unlink(missing_ok=True))
+            parent_symlink_alias = alias / valid_target.name
+            handler = object.__new__(push.PushHandler)
+            handler.state = types.SimpleNamespace(attachments_dir=root)
+            record = {
+                "metadata": {
+                    "link_previews": [
+                        {"content_path": str(upload), "image_paths": [str(image_directory), str(image_symlink), str(image_missing)]},
+                        {"content_path": str(directory)},
+                        {"content_path": str(symlink)},
+                        {"content_path": str(missing)},
+                        {"content_path": str(parent_symlink_alias)},
+                    ]
+                }
+            }
+            self.assertEqual(handler._link_context_from_record(record), "")
 
     def test_kairos_send_attaches_metadata_and_queues_same_context(self):
         handler = object.__new__(push.PushHandler)
