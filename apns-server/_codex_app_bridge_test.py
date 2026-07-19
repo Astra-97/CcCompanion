@@ -137,7 +137,12 @@ for raw in sys.stdin:
             "params": {
                 "threadId": thread_id,
                 "turnId": active_turn,
-                "item": {"id": f"cmd-{turn_number}", "type": "commandExecution"},
+                "item": {
+                    "id": f"cmd-{turn_number}",
+                    "type": "commandExecution",
+                    "command": "printf SUPER_SECRET_OBSERVER_PAYLOAD",
+                    "cwd": "/private/observer/path",
+                },
             },
         })
         if text in {"slow", "stubborn", "delayed-start"}:
@@ -362,6 +367,64 @@ class CodexAppBridgeTest(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(holder["result"].status, "interrupted")
         self.assertIn("turn/interrupt", self.methods())
+
+    def test_observer_snapshot_is_live_bounded_and_contains_no_raw_payload(self):
+        cancel_event = threading.Event()
+        holder = {}
+
+        def run_slow():
+            holder["result"] = self.bridge.run_turn(
+                thread_id=None,
+                cwd=self.root,
+                prompt="slow",
+                model="gpt-test",
+                effort="high",
+                cancel_event=cancel_event,
+                max_runtime_sec=3.0,
+            )
+
+        worker = threading.Thread(target=run_slow)
+        worker.start()
+        deadline = time.time() + 2.0
+        observer = {}
+        while time.time() < deadline:
+            observer = self.bridge.observer_snapshot()
+            if any(
+                event.get("label") == "运行命令（参数与输出已隐藏）"
+                for event in observer.get("events", [])
+            ):
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("observer did not receive the fake command event")
+
+        encoded = json.dumps(observer, ensure_ascii=False)
+        self.assertTrue(observer["busy"])
+        self.assertEqual(observer["phase"], "正在处理")
+        self.assertNotIn("SUPER_SECRET_OBSERVER_PAYLOAD", encoded)
+        self.assertNotIn("/private/observer/path", encoded)
+        self.assertNotIn("thread-test", encoded)
+        self.assertNotIn("turn-", encoded)
+
+        with self.bridge._state_lock:
+            active = self.bridge._active
+        self.assertIsNotNone(active)
+        for index in range(60):
+            self.bridge._handle_item(
+                active,
+                {"id": f"extra-command-{index}", "type": "commandExecution"},
+                completed=False,
+            )
+        self.assertEqual(len(self.bridge.observer_snapshot()["events"]), 40)
+
+        cancel_event.set()
+        worker.join(timeout=3.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(holder["result"].status, "interrupted")
+        self.assertEqual(
+            self.bridge.observer_snapshot(),
+            {"busy": False, "phase": None, "events": []},
+        )
 
     def test_zero_runtime_limit_survives_wall_clock_jump_until_explicit_cancel(self):
         cancel_event = threading.Event()

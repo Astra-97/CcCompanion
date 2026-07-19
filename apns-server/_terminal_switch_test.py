@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -333,6 +334,10 @@ class FakeBridge:
         self.state_calls: list[str | None] = []
         self.release_calls = 0
         self.release_if_calls: list[str] = []
+        self.input_lock = threading.Lock()
+
+    def input_transaction(self):
+        return self.input_lock
 
     def ensure(self) -> str:
         self.ensure_calls += 1
@@ -365,14 +370,37 @@ class FakeBridge:
         return True
 
 
+class TrackingInputBridge(FakeBridge):
+    """Expose when a second handler has reached the shared input guard."""
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self.second_transaction_attempted = threading.Event()
+        self._transaction_count = 0
+        self._transaction_count_lock = threading.Lock()
+
+    def input_transaction(self):
+        with self._transaction_count_lock:
+            self._transaction_count += 1
+            if self._transaction_count >= 2:
+                self.second_transaction_attempted.set()
+        return super().input_transaction()
+
+
 class HandlerRoutingTest(unittest.TestCase):
-    def handler(self, bridge: FakeBridge, path: str = "/tmux/capture?session=kairos&lines=50") -> PushHandler:
+    def handler(
+        self,
+        bridge: FakeBridge,
+        path: str = "/tmux/capture?session=kairos&lines=50",
+        observer: object | None = None,
+    ) -> PushHandler:
         handler = object.__new__(PushHandler)
         handler.path = path
         handler.state = types.SimpleNamespace(
             default_session="cctg",
             active_session="cctg",
             kairos_terminal=bridge,
+            codex_app_bridge=observer,
         )
         handler.responses = []
         handler._send_json = lambda status, payload: handler.responses.append((status, payload))
@@ -414,6 +442,45 @@ class HandlerRoutingTest(unittest.TestCase):
         self.assertEqual(payload["state"], "waiting")
         self.assertEqual(payload["content"], "qiaokairos is waiting\n")
         self.assertEqual(bridge.state_calls, [None, "%42"])
+
+    @mock.patch("push.subprocess.run")
+    def test_waiting_capture_renders_only_redacted_live_observer(self, run: mock.Mock) -> None:
+        run.return_value = completed(0, stdout="qiaokairos raw waiting pane\n" + "\n" * 57)
+
+        class Observer:
+            @staticmethod
+            def observer_snapshot() -> dict[str, object]:
+                return {
+                    "busy": True,
+                    "phase": "正在处理",
+                    "events": [
+                        {"elapsed_seconds": 2, "label": "运行命令（参数与输出已隐藏）"},
+                        {"elapsed_seconds": 3, "label": "SECRET must not pass"},
+                    ],
+                }
+
+        bridge = FakeBridge(ready=False)
+        handler = self.handler(bridge, observer=Observer())
+
+        handler._handle_tmux_capture()
+
+        status, payload = handler.responses[-1]
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["state"], "waiting")
+        self.assertIn("实时观察", payload["content"])
+        self.assertIn("[00:02] 运行命令（参数与输出已隐藏）", payload["content"])
+        self.assertNotIn("SECRET", payload["content"])
+        self.assertNotIn("qiaokairos raw", payload["content"])
+
+    @mock.patch("push.subprocess.run")
+    def test_capture_trims_unused_tmux_bottom_rows(self, run: mock.Mock) -> None:
+        run.return_value = completed(0, stdout="line one\nline two\n" + "\n" * 57)
+        bridge = FakeBridge()
+        handler = self.handler(bridge)
+
+        handler._handle_tmux_capture()
+
+        self.assertEqual(handler.responses[-1][1]["content"], "line one\nline two\n")
 
     @mock.patch("push.subprocess.run")
     def test_capture_pane_replacement_fails_closed_and_releases(self, run: mock.Mock) -> None:
@@ -565,6 +632,244 @@ class HandlerRoutingTest(unittest.TestCase):
         handler._handle_tmux_send({"session": "kairos", "key": "Escape"})
         self.assertEqual(handler.responses[-1][0], 423)
         run.assert_not_called()
+
+    @mock.patch("push.subprocess.Popen")
+    @mock.patch("push.subprocess.run")
+    def test_concurrent_kairos_text_transactions_cannot_interleave(
+        self, run: mock.Mock, popen: mock.Mock,
+    ) -> None:
+        bridge = TrackingInputBridge()
+        first_handler = self.handler(bridge)
+        second_handler = self.handler(bridge)
+        first_load_started = threading.Event()
+        release_first_load = threading.Event()
+        second_load_started = threading.Event()
+        buffers: dict[str, str] = {}
+        operations: list[tuple[str, str]] = []
+
+        def make_process(argv: list[str], **_kwargs: object):
+            buffer_name = argv[argv.index("-b") + 1]
+
+            class Process:
+                returncode = 0
+
+                def communicate(self, *, input: bytes | None = None, timeout: float | None = None):
+                    del timeout
+                    text = (input or b"").decode("utf-8")
+                    buffers[buffer_name] = text
+                    operations.append(("load", text))
+                    if text == "first":
+                        first_load_started.set()
+                        self.assert_released()
+                    else:
+                        second_load_started.set()
+                    return b"", b""
+
+                def assert_released(self):
+                    if not release_first_load.wait(2.0):
+                        raise AssertionError("test did not release first load")
+
+                def kill(self):
+                    return None
+
+            return Process()
+
+        def run_tmux(argv: list[str], **_kwargs: object):
+            if argv[1] == "paste-buffer":
+                buffer_name = argv[argv.index("-b") + 1]
+                operations.append(("paste", buffers[buffer_name]))
+            elif argv[1] == "send-keys":
+                operations.append(("key", argv[-1]))
+            return completed(0)
+
+        popen.side_effect = make_process
+        run.side_effect = run_tmux
+        first = threading.Thread(target=lambda: first_handler._handle_tmux_send({
+            "session": "kairos", "keys": "first", "enter": True,
+        }))
+        second = threading.Thread(target=lambda: second_handler._handle_tmux_send({
+            "session": "kairos", "keys": "second", "enter": True,
+        }))
+        first.start()
+        self.assertTrue(first_load_started.wait(1.0))
+        second.start()
+        self.assertTrue(bridge.second_transaction_attempted.wait(1.0))
+        self.assertFalse(second_load_started.is_set())
+        self.assertEqual(bridge.ready_calls, 1)
+        release_first_load.set()
+        first.join(2.0)
+        second.join(2.0)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(bridge.ready_calls, 2)
+        self.assertEqual(operations, [
+            ("load", "first"),
+            ("paste", "first"),
+            ("key", "Enter"),
+            ("load", "second"),
+            ("paste", "second"),
+            ("key", "Enter"),
+        ])
+        self.assertEqual(first_handler.responses[-1][0], 200)
+        self.assertEqual(second_handler.responses[-1][0], 200)
+
+    @mock.patch("push.subprocess.Popen")
+    @mock.patch("push.subprocess.run")
+    def test_kairos_special_key_waits_for_text_paste_and_enter(
+        self, run: mock.Mock, popen: mock.Mock,
+    ) -> None:
+        bridge = TrackingInputBridge()
+        text_handler = self.handler(bridge)
+        key_handler = self.handler(bridge)
+        load_started = threading.Event()
+        release_load = threading.Event()
+        key_sent = threading.Event()
+        operations: list[str] = []
+        process = popen.return_value
+        process.returncode = 0
+
+        def communicate(*, input: bytes | None = None, timeout: float | None = None):
+            del input, timeout
+            operations.append("load")
+            load_started.set()
+            if not release_load.wait(2.0):
+                raise AssertionError("test did not release load")
+            return b"", b""
+
+        def run_tmux(argv: list[str], **_kwargs: object):
+            if argv[1] == "paste-buffer":
+                operations.append("paste")
+            elif argv[1] == "send-keys":
+                operations.append(str(argv[-1]))
+                if argv[-1] == "Escape":
+                    key_sent.set()
+            return completed(0)
+
+        process.communicate.side_effect = communicate
+        run.side_effect = run_tmux
+        text = threading.Thread(target=lambda: text_handler._handle_tmux_send({
+            "session": "kairos", "keys": "text", "enter": True,
+        }))
+        key = threading.Thread(target=lambda: key_handler._handle_terminal_key({
+            "session": "kairos", "key": "Escape",
+        }))
+        text.start()
+        self.assertTrue(load_started.wait(1.0))
+        key.start()
+        self.assertTrue(bridge.second_transaction_attempted.wait(1.0))
+        self.assertFalse(key_sent.is_set())
+        self.assertEqual(bridge.ready_calls, 1)
+        release_load.set()
+        text.join(2.0)
+        key.join(2.0)
+
+        self.assertFalse(text.is_alive())
+        self.assertFalse(key.is_alive())
+        self.assertEqual(operations, ["load", "paste", "Enter", "Escape"])
+        self.assertEqual(bridge.ready_calls, 2)
+
+    @mock.patch("push.subprocess.Popen")
+    @mock.patch("push.subprocess.run")
+    def test_non_kairos_key_is_not_blocked_by_non_kairos_text_load(
+        self, run: mock.Mock, popen: mock.Mock,
+    ) -> None:
+        bridge = FakeBridge()
+        text_handler = self.handler(bridge)
+        key_handler = self.handler(bridge)
+        load_started = threading.Event()
+        release_load = threading.Event()
+        key_sent = threading.Event()
+        process = popen.return_value
+        process.returncode = 0
+
+        def communicate(*, input: bytes | None = None, timeout: float | None = None):
+            del input, timeout
+            load_started.set()
+            if not release_load.wait(2.0):
+                raise AssertionError("test did not release load")
+            return b"", b""
+
+        def run_tmux(argv: list[str], **_kwargs: object):
+            if argv[1] == "send-keys" and argv[-1] == "Escape":
+                key_sent.set()
+            return completed(0)
+
+        process.communicate.side_effect = communicate
+        run.side_effect = run_tmux
+        text = threading.Thread(target=lambda: text_handler._handle_tmux_send({
+            "session": "cctg", "keys": "text", "enter": True,
+        }))
+        key = threading.Thread(target=lambda: key_handler._handle_terminal_key({
+            "session": "other-pane", "key": "Escape",
+        }))
+        text.start()
+        self.assertTrue(load_started.wait(1.0))
+        key.start()
+        self.assertTrue(key_sent.wait(0.5))
+        release_load.set()
+        text.join(2.0)
+        key.join(2.0)
+
+        self.assertFalse(text.is_alive())
+        self.assertFalse(key.is_alive())
+
+    @mock.patch("push.subprocess.Popen")
+    @mock.patch("push.subprocess.run")
+    def test_switch_to_regular_target_waits_for_kairos_input_transaction(
+        self, run: mock.Mock, popen: mock.Mock,
+    ) -> None:
+        bridge = TrackingInputBridge()
+        kairos_handler = self.handler(bridge)
+        regular_handler = self.handler(bridge)
+        load_started = threading.Event()
+        release_load = threading.Event()
+        regular_key_sent = threading.Event()
+        operations: list[str] = []
+        process = popen.return_value
+        process.returncode = 0
+
+        def communicate(*, input: bytes | None = None, timeout: float | None = None):
+            del input, timeout
+            operations.append("kairos-load")
+            load_started.set()
+            if not release_load.wait(2.0):
+                raise AssertionError("test did not release Kairos load")
+            return b"", b""
+
+        def run_tmux(argv: list[str], **_kwargs: object):
+            if argv[1] == "paste-buffer":
+                operations.append("kairos-paste")
+            elif argv[1] == "send-keys":
+                operations.append(str(argv[-1]))
+                if argv[-1] == "Escape":
+                    regular_key_sent.set()
+            return completed(0)
+
+        process.communicate.side_effect = communicate
+        run.side_effect = run_tmux
+        kairos = threading.Thread(target=lambda: kairos_handler._handle_tmux_send({
+            "session": "kairos", "keys": "text", "enter": True,
+        }))
+        regular = threading.Thread(target=lambda: regular_handler._handle_terminal_key({
+            "session": "cctg", "key": "Escape",
+        }))
+        kairos.start()
+        self.assertTrue(load_started.wait(1.0))
+        regular.start()
+        self.assertTrue(bridge.second_transaction_attempted.wait(1.0))
+        self.assertFalse(regular_key_sent.is_set())
+        self.assertEqual(bridge.release_calls, 0)
+        release_load.set()
+        kairos.join(2.0)
+        regular.join(2.0)
+
+        self.assertFalse(kairos.is_alive())
+        self.assertFalse(regular.is_alive())
+        self.assertEqual(bridge.release_calls, 1)
+        self.assertEqual(operations, [
+            "kairos-load", "kairos-paste", "Enter", "Escape",
+        ])
 
     def assert_kairos_input_failure_cleans_and_releases(
         self,

@@ -83,6 +83,8 @@ from codex_app_bridge import (
     CodexAppBridgeError,
     CodexPromptLockBusy,
     CodexThreadTokenUsage,
+    OBSERVER_EVENT_LABELS,
+    OBSERVER_PHASES,
     prompt_lock_is_busy,
 )
 from timeline import Timeline
@@ -157,6 +159,44 @@ KAIROS_TERMINAL_READY_OPTION = "@ccc_kairos_terminal_ready"
 KAIROS_TERMINAL_READY_VALUE = "cccompanion:qiaokairos:ready:v1"
 
 
+def _trim_terminal_capture(content: str) -> str:
+    """Drop tmux's unused bottom rows without changing meaningful layout."""
+    trimmed = str(content or "").rstrip(" \t\r\n")
+    return f"{trimmed}\n" if trimmed else ""
+
+
+def _format_kairos_observer(snapshot: dict[str, Any]) -> str:
+    """Render only the bridge's already-redacted observer fields."""
+    phase = str(snapshot.get("phase") or "正在处理")
+    if phase not in OBSERVER_PHASES:
+        phase = "正在处理"
+    lines = [
+        "Kairos 实时观察 · 只读",
+        "敏感参数、路径、内容与输出已隐藏",
+        "",
+        f"状态：{phase}",
+    ]
+    events = snapshot.get("events")
+    if isinstance(events, list):
+        for event in events[-40:]:
+            if not isinstance(event, dict):
+                continue
+            elapsed = event.get("elapsed_seconds")
+            label = event.get("label")
+            if not isinstance(elapsed, int) or isinstance(elapsed, bool):
+                continue
+            if not isinstance(label, str) or not label.strip():
+                continue
+            # Defense in depth: accept only labels from the fixed map, never
+            # arbitrary JSON text even if an observer provider is replaced.
+            if label not in OBSERVER_EVENT_LABELS:
+                continue
+            minutes, seconds = divmod(max(0, elapsed), 60)
+            lines.append(f"[{minutes:02d}:{seconds:02d}] {label}")
+    lines.extend(["", "回复结束后自动切回可输入终端。"])
+    return "\n".join(lines) + "\n"
+
+
 class KairosTerminalUnavailable(RuntimeError):
     """Safe, user-facing failure while opening the current Kairos console."""
 
@@ -188,10 +228,18 @@ class KairosTerminalBridge:
         self.idle_seconds = max(1.0, float(idle_seconds))
         self._run = runner
         self._lock = threading.RLock()
+        # Serialize one logical App input transaction for Kairos only.  The
+        # lifecycle lock above protects tmux ownership metadata; this separate
+        # lock spans ready revalidation through load/paste/Enter so concurrent
+        # HTTP handlers cannot splice their keystrokes together.
+        self._input_lock = threading.Lock()
         self._timer: threading.Timer | None = None
         self._last_activity = 0.0
         self._may_be_present = False
         self._checked_existing = False
+
+    def input_transaction(self):
+        return self._input_lock
 
     def _run_tmux(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
         return self._run(argv, capture_output=True, text=True, timeout=5)
@@ -10846,8 +10894,13 @@ class PushHandler(BaseHTTPRequestHandler):
                 physical = self.state.kairos_terminal.require_ready()
             return physical, KAIROS_TERMINAL_ALIAS, True
         # Selecting any regular tmux pane hands the shared Codex lock back to
-        # the App before XiaoKe input/capture proceeds.
-        self.state.kairos_terminal.release()
+        # the App before XiaoKe input/capture proceeds.  The release itself
+        # participates in the Kairos input transaction so a target switch
+        # cannot kill the exact pane between ready revalidation and Enter.
+        # The lock is released before regular-target I/O, so unrelated tmux
+        # targets are not serialized with each other.
+        with self.state.kairos_terminal.input_transaction():
+            self.state.kairos_terminal.release()
         return requested, requested, False
 
     def _send_kairos_terminal_not_ready(self, exc: KairosTerminalNotReady) -> None:
@@ -10898,11 +10951,12 @@ class PushHandler(BaseHTTPRequestHandler):
         if target != KAIROS_TERMINAL_ALIAS:
             self._send_json(400, {"error": "target must be kairos"})
             return
-        try:
-            released = self.state.kairos_terminal.release()
-        except KairosTerminalUnavailable as exc:
-            self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
-            return
+        with self.state.kairos_terminal.input_transaction():
+            try:
+                released = self.state.kairos_terminal.release()
+            except KairosTerminalUnavailable as exc:
+                self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
+                return
         self._send_json(200, {
             "ok": True,
             "target": KAIROS_TERMINAL_ALIAS,
@@ -10954,11 +11008,18 @@ class PushHandler(BaseHTTPRequestHandler):
                 else:
                     self._send_json(404, {"error": result.stderr.strip() or "session not found"})
                 return
-            content = result.stdout
+            content = _trim_terminal_capture(result.stdout)
             if is_kairos:
                 _same_pane, terminal_state = self.state.kairos_terminal.terminal_state(
                     expected_pane=capture_pane,
                 )
+                if terminal_state == "waiting":
+                    observer_provider = getattr(self.state, "codex_app_bridge", None)
+                    observer_snapshot = getattr(observer_provider, "observer_snapshot", None)
+                    if callable(observer_snapshot):
+                        safe_snapshot = observer_snapshot()
+                        if isinstance(safe_snapshot, dict) and safe_snapshot.get("busy") is True:
+                            content = _format_kairos_observer(safe_snapshot)
             if is_kairos and not content.strip():
                 # Closing the create/capture race matters to the Android UI:
                 # an owned pane can exist a few milliseconds before Python or
@@ -10985,6 +11046,14 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(500, {"error": str(e)})
 
     def _handle_terminal_key(self, body: dict[str, Any]):
+        requested_session = str(body.get("session", "cctg")).strip() or "cctg"
+        if requested_session.lower() == KAIROS_TERMINAL_ALIAS:
+            with self.state.kairos_terminal.input_transaction():
+                self._handle_terminal_key_transaction(body)
+            return
+        self._handle_terminal_key_transaction(body)
+
+    def _handle_terminal_key_transaction(self, body: dict[str, Any]):
         """POST /terminal/key — send a special key directly via tmux send-keys.
 
         Body: {"key": "Escape"} or {"key": "C-c"}, {"key": "Tab"}, etc.
@@ -11040,6 +11109,14 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(500, {"error": str(e)})
 
     def _handle_tmux_send(self, body: dict[str, Any]):
+        requested_session = body.get("session") or self.state.active_session or self.state.default_session
+        if str(requested_session).strip().lower() == KAIROS_TERMINAL_ALIAS:
+            with self.state.kairos_terminal.input_transaction():
+                self._handle_tmux_send_transaction(body)
+            return
+        self._handle_tmux_send_transaction(body)
+
+    def _handle_tmux_send_transaction(self, body: dict[str, Any]):
         keys = body.get("keys", "")
         # 兜底 body 没传 session 时走当前 active_session 而不是写死 opia
         # (build 199 fix: /switch 后 iOS 没传 session 字段也能 follow active)

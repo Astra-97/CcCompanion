@@ -26,6 +26,37 @@ ActivityCallback = Callable[[str], None]
 ThreadCallback = Callable[[str], None]
 MarkerProvider = Callable[[str], tuple[str, int, int] | None]
 
+OBSERVER_PHASE_LABELS = {
+    "preparing": "正在准备",
+    "starting": "正在启动",
+    "running": "正在处理",
+    "completed": "处理完成",
+    "interrupted": "已中断",
+    "failed": "处理失败",
+}
+OBSERVER_ITEM_LABELS = {
+    "agentMessage": "正在整理回复（内容已隐藏）",
+    "reasoning": "正在分析（思考内容已隐藏）",
+    "commandExecution": "运行命令（参数与输出已隐藏）",
+    "fileChange": "修改文件（路径与内容已隐藏）",
+    "mcpToolCall": "调用工具（名称与参数已隐藏）",
+    "dynamicToolCall": "调用工具（名称与参数已隐藏）",
+    "collabAgentToolCall": "调用协作代理（任务内容已隐藏）",
+    "subAgentActivity": "协作代理处理中（详情已隐藏）",
+    "webSearch": "搜索资料（查询内容已隐藏）",
+    "imageView": "查看图片（路径已隐藏）",
+    "imageGeneration": "生成图片（提示词已隐藏）",
+    "contextCompaction": "整理会话上下文（内容已隐藏）",
+    "sleep": "等待外部步骤完成",
+}
+OBSERVER_EVENT_LABELS = frozenset({
+    "已接收任务，正在准备",
+    "正在启动本轮处理",
+    "开始处理",
+    *OBSERVER_ITEM_LABELS.values(),
+})
+OBSERVER_PHASES = frozenset(OBSERVER_PHASE_LABELS.values())
+
 
 class CodexAppBridgeError(RuntimeError):
     """Base bridge failure with an explicit legacy-fallback safety signal."""
@@ -156,6 +187,8 @@ class _ActiveTurn:
     final_messages: OrderedDict[str, str] = field(default_factory=OrderedDict)
     completed_items: set[str] = field(default_factory=set)
     activity_items: set[str] = field(default_factory=set)
+    observer_events: list[tuple[int, str]] = field(default_factory=list)
+    observer_event_keys: set[str] = field(default_factory=set)
     pending_notifications: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     condition: threading.Condition = field(default_factory=threading.Condition)
 
@@ -319,6 +352,29 @@ class CodexAppBridge:
                 "started_at": active.started_at,
             }
 
+    def observer_snapshot(self) -> dict[str, Any]:
+        """Return a deliberately low-detail view suitable for the App terminal.
+
+        This is a separate API from :meth:`snapshot` so callers cannot
+        accidentally expose process/thread identifiers.  Observer events are
+        generated from an allowlist of app-server item *types* only; command
+        arguments, paths, tool parameters, model text, and user input never
+        enter this buffer.
+        """
+        with self._state_lock:
+            active = self._active
+        if active is None:
+            return {"busy": False, "phase": None, "events": []}
+        with active.condition:
+            return {
+                "busy": True,
+                "phase": self._observer_phase(active.phase),
+                "events": [
+                    {"elapsed_seconds": elapsed, "label": label}
+                    for elapsed, label in active.observer_events
+                ],
+            }
+
     def interrupt_active(self, *, timeout: float = 3.0) -> bool:
         with self._state_lock:
             active = self._active
@@ -389,6 +445,7 @@ class CodexAppBridge:
             )
             with self._state_lock:
                 self._active = active
+            self._record_observer_event(active, "已接收任务，正在准备", key="phase:preparing")
 
             if cancel_event is not None and cancel_event.is_set():
                 return self._interrupted_before_start(active)
@@ -448,6 +505,7 @@ class CodexAppBridge:
             }
             with active.condition:
                 active.phase = "starting"
+            self._record_observer_event(active, "正在启动本轮处理", key="phase:starting")
             try:
                 start_result = self._rpc_request("turn/start", params)
             except _RPCError as exc:
@@ -487,6 +545,7 @@ class CodexAppBridge:
                 active.pending_notifications.clear()
                 if active.status not in {"completed", "interrupted", "failed"}:
                     active.phase = "running"
+            self._record_observer_event(active, "开始处理", key="phase:running")
             for method, notification_params in pending_notifications:
                 self._handle_notification(method, notification_params)
             result = self._wait_for_turn(
@@ -1011,6 +1070,14 @@ class CodexAppBridge:
         if completed and item_type == "contextCompaction":
             with active.condition:
                 active.context_compacted = True
+        if not completed:
+            observer_label = self._observer_activity_label(item_type)
+            if observer_label:
+                self._record_observer_event(
+                    active,
+                    observer_label,
+                    key=f"item:{item_id}" if item_id else None,
+                )
         if item_type == "agentMessage":
             phase = item.get("phase")
             if completed and phase in {None, "final_answer"}:
@@ -1062,6 +1129,35 @@ class CodexAppBridge:
             "contextCompaction": "整理上下文",
             "sleep": "等待",
         }.get(item_type, "")
+
+    @staticmethod
+    def _observer_activity_label(item_type: str) -> str:
+        """Map only trusted item types to terminal-safe status text."""
+        return OBSERVER_ITEM_LABELS.get(str(item_type or ""), "")
+
+    @staticmethod
+    def _observer_phase(phase: str | None) -> str:
+        return OBSERVER_PHASE_LABELS.get(str(phase or ""), "正在处理")
+
+    @staticmethod
+    def _record_observer_event(
+        active: _ActiveTurn,
+        label: str,
+        *,
+        key: str | None = None,
+    ) -> None:
+        """Append bounded, pre-redacted observer text without raw payloads."""
+        with active.condition:
+            if key and key in active.observer_event_keys:
+                return
+            if key:
+                if len(active.observer_event_keys) >= 160:
+                    active.observer_event_keys.clear()
+                active.observer_event_keys.add(key)
+            elapsed = max(0, int(time.time() - active.started_at))
+            active.observer_events.append((elapsed, str(label)))
+            if len(active.observer_events) > 40:
+                del active.observer_events[:-40]
 
     @staticmethod
     def _safe_callback(callback: Callable[[str], None] | None, value: str) -> None:
