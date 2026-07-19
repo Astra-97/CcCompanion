@@ -144,6 +144,25 @@ tool_dispatcher_enabled = true
 tool_dispatcher_seed_default = true
 tool_dispatcher_tick_seconds = 20
 
+[link_preview]
+# 一期服务端链接预览：纯 HTTP 抓 OG/正文并把全文写进 attachments；不启动浏览器。
+enabled = true
+total_timeout_seconds = 15
+max_urls = 3
+max_download_bytes = 2000000
+max_text_chars = 120000
+cache_ttl_seconds = 21600
+# 已注入 AI 队列的全文路径保护期；服务端强制不低于 Kairos 900 秒队列窗口。
+lease_seconds = 21600
+max_cache_entries = 768
+max_cache_bytes = 256000000
+
+# 小红书 cookie/API 抓取器与 Windows Playwright 节点都是显式可选的 JSON
+# adapter，均接收 POST {"url":"..."}。未配置或离线时聊天会安全降级，不受影响。
+# xhs_api_url = "https://your-trusted-xhs-adapter.example/preview"
+# xhs_api_token_env = "CC_LINK_PREVIEW_XHS_TOKEN"
+# windows_api_url = "https://your-optional-windows-node.example/preview"
+
 [auth]
 # Android 首次登录接口 POST /login 使用。
 # 不要把真实用户名、密码、GitHub token commit 到仓库；真实值只写本机 config.toml。
