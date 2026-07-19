@@ -473,6 +473,68 @@ class HandlerRoutingTest(unittest.TestCase):
         self.assertNotIn("qiaokairos raw", payload["content"])
 
     @mock.patch("push.subprocess.run")
+    def test_waiting_capture_uses_generic_legacy_observer(self, run: mock.Mock) -> None:
+        run.return_value = completed(0, stdout="stale waiting pane\n")
+        registry = push._CodexRunRegistry()
+        active = registry.start(
+            source="cc-app:apples:kairos",
+            session_id="secret-session",
+            cwd=Path("/secret/workspace"),
+        )
+        self.assertIsNotNone(active)
+        registry.set_observer_phase(active[0], "running")
+        registry.publish_runner_activity(
+            active[0],
+            "调用 shell --token=NEVER-SHOW /secret/workspace",
+        )
+        bridge = FakeBridge(ready=False)
+        handler = self.handler(bridge, observer=None)
+
+        with mock.patch.object(push, "CODEX_RUNS", registry):
+            handler._handle_tmux_capture()
+
+        status, payload = handler.responses[-1]
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["state"], "waiting")
+        self.assertIn("调用工具（名称与参数已隐藏）", payload["content"])
+        self.assertNotIn("NEVER-SHOW", payload["content"])
+        self.assertNotIn("/secret", payload["content"])
+        self.assertNotIn("stale waiting pane", payload["content"])
+
+    @mock.patch("push.subprocess.run")
+    def test_app_server_observer_wins_over_generic_legacy_observer(self, run: mock.Mock) -> None:
+        run.return_value = completed(0, stdout="stale waiting pane\n")
+
+        class AppObserver:
+            @staticmethod
+            def observer_snapshot() -> dict[str, object]:
+                return {
+                    "busy": True,
+                    "phase": "正在处理",
+                    "events": [
+                        {"elapsed_seconds": 1, "label": "正在分析（思考内容已隐藏）"},
+                    ],
+                }
+
+        registry = push._CodexRunRegistry()
+        active = registry.start(
+            source="cc-app:apples:kairos",
+            session_id="legacy",
+            cwd=Path("/tmp"),
+        )
+        self.assertIsNotNone(active)
+        registry.publish_runner_activity(active[0], "调用 private-tool")
+        bridge = FakeBridge(ready=False)
+        handler = self.handler(bridge, observer=AppObserver())
+
+        with mock.patch.object(push, "CODEX_RUNS", registry):
+            handler._handle_tmux_capture()
+
+        content = handler.responses[-1][1]["content"]
+        self.assertIn("正在分析（思考内容已隐藏）", content)
+        self.assertNotIn("调用工具（名称与参数已隐藏）", content)
+
+    @mock.patch("push.subprocess.run")
     def test_capture_trims_unused_tmux_bottom_rows(self, run: mock.Mock) -> None:
         run.return_value = completed(0, stdout="line one\nline two\n" + "\n" * 57)
         bridge = FakeBridge()

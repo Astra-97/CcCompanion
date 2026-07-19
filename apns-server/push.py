@@ -84,6 +84,8 @@ from codex_app_bridge import (
     CodexPromptLockBusy,
     CodexThreadTokenUsage,
     OBSERVER_EVENT_LABELS,
+    OBSERVER_ITEM_LABELS,
+    OBSERVER_PHASE_LABELS,
     OBSERVER_PHASES,
     prompt_lock_is_busy,
 )
@@ -761,6 +763,7 @@ class _CodexRunRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._runs: dict[str, dict[str, Any]] = {}
+        self._observers: dict[str, dict[str, Any]] = {}
 
     def start(
         self,
@@ -787,11 +790,130 @@ class _CodexRunRegistry:
                 "contact_id": str(contact_id or ""),
                 "user_ts": str(user_ts or ""),
             }
+            # Keep the observer in a separate, deliberately low-detail store.
+            # Run metadata contains paths and identifiers needed by cancellation
+            # and must never be returned to the terminal observer.
+            self._observers[run_id] = {
+                "phase": OBSERVER_PHASE_LABELS["preparing"],
+                "events": [(0, "已接收任务，正在准备")],
+            }
             return run_id, resolved_cancel_event
 
     def finish(self, run_id: str) -> None:
         with self._lock:
             self._runs.pop(run_id, None)
+            self._observers.pop(run_id, None)
+
+    def set_observer_phase(self, run_id: str, phase: str) -> bool:
+        """Publish a phase selected only from the app-server allowlist."""
+        safe_phase = OBSERVER_PHASE_LABELS.get(str(phase or ""))
+        if not safe_phase:
+            return False
+        with self._lock:
+            observer = self._observers.get(run_id)
+            if observer is None:
+                return False
+            observer["phase"] = safe_phase
+            return True
+
+    def publish_observer_event(
+        self,
+        run_id: str,
+        item_type: str,
+    ) -> bool:
+        """Publish an event type without ever accepting display text.
+
+        Callers provide only an allowlisted category.  The fixed display label
+        is resolved before taking the lock, so prompts, paths, commands, tool
+        names and payloads cannot enter the observer state.
+        """
+        label = OBSERVER_ITEM_LABELS.get(str(item_type or ""))
+        if not label:
+            return False
+        return self._append_observer_label(run_id, label)
+
+    def publish_runner_activity(self, run_id: str, activity: str) -> bool:
+        """Collapse legacy ``CodexRunner`` activity to a safe fixed category.
+
+        ``CodexRunner`` labels can include a raw command or tool name.  Inspect
+        the prefix only long enough to choose a category; never retain the
+        supplied string.  Unknown text (including reasoning summaries) is
+        discarded.
+        """
+        value = str(activity or "").strip()
+        item_type = ""
+        fixed_prefixes = (
+            ("运行命令", "commandExecution"),
+            ("修改文件", "fileChange"),
+            ("调用协作代理", "collabAgentToolCall"),
+            ("协作代理处理中", "subAgentActivity"),
+            ("搜索网页", "webSearch"),
+            ("搜索资料", "webSearch"),
+            ("查看图片", "imageView"),
+            ("生成图片", "imageGeneration"),
+            ("整理会话上下文", "contextCompaction"),
+            ("整理上下文", "contextCompaction"),
+            ("等待", "sleep"),
+        )
+        for prefix, candidate in fixed_prefixes:
+            if value.startswith(prefix):
+                item_type = candidate
+                break
+        if not item_type and value.startswith(("调用 ", "处理 ")):
+            item_type = "dynamicToolCall"
+        if not item_type:
+            return False
+        # CodexRunner already suppresses adjacent identical activity strings.
+        # Preserve later occurrences of the same safe category so a long run
+        # remains visibly active; the 40-event cap bounds memory and output.
+        # No fragment of ``activity`` is stored.
+        return self.publish_observer_event(run_id, item_type)
+
+    def observer_snapshot(self) -> dict[str, Any]:
+        """Return the newest run's bounded, pre-redacted terminal view."""
+        with self._lock:
+            if not self._runs:
+                return {"busy": False, "phase": None, "events": []}
+            run_id, run = max(
+                self._runs.items(),
+                key=lambda item: float(item[1].get("started_at") or 0),
+            )
+            observer = self._observers.get(run_id)
+            if observer is None:
+                return {"busy": False, "phase": None, "events": []}
+            events = list(observer.get("events") or [])[-40:]
+            phase = observer.get("phase")
+        return {
+            "busy": True,
+            "phase": phase if phase in OBSERVER_PHASES else "正在处理",
+            "events": [
+                {"elapsed_seconds": elapsed, "label": label}
+                for elapsed, label in events
+                if isinstance(elapsed, int) and label in OBSERVER_EVENT_LABELS
+            ],
+        }
+
+    def _append_observer_label(
+        self,
+        run_id: str,
+        label: str,
+    ) -> bool:
+        if label not in OBSERVER_EVENT_LABELS:
+            return False
+        with self._lock:
+            run = self._runs.get(run_id)
+            observer = self._observers.get(run_id)
+            if run is None or observer is None:
+                return False
+            elapsed = max(0, int(time.time() - float(run.get("started_at") or time.time())))
+            events = observer.get("events")
+            if not isinstance(events, list):
+                events = []
+                observer["events"] = events
+            events.append((elapsed, label))
+            if len(events) > 40:
+                del events[:-40]
+            return True
 
     def latest(self) -> dict[str, Any] | None:
         with self._lock:
@@ -7675,6 +7797,8 @@ class PushHandler(BaseHTTPRequestHandler):
                     session_id=session_id,
                 )
                 self._set_typing_for_contact(contact_id, {"is_typing": True, "since": user_ts or started_at})
+                if run_id:
+                    CODEX_RUNS.set_observer_phase(run_id, "starting")
                 prompt = self._kairos_prompt_for_task(task)
                 sys.path.insert(0, "/root/Windows-Codex-TG")
                 from codex_common import CodexRunner, SessionStore
@@ -7718,6 +7842,9 @@ class PushHandler(BaseHTTPRequestHandler):
                     activity = str(activity_text or "").strip()
                     if not activity:
                         return
+                    if run_id:
+                        CODEX_RUNS.set_observer_phase(run_id, "running")
+                        CODEX_RUNS.publish_runner_activity(run_id, activity)
                     activity_count += 1
                     activity_items.append(activity)
                     task["activity_text"] = activity
@@ -7854,6 +7981,8 @@ class PushHandler(BaseHTTPRequestHandler):
                                 )
                                 return
                             logger.warning("kairos app-server pre-start failure; using legacy exec fallback")
+                            if run_id:
+                                CODEX_RUNS.set_observer_phase(run_id, "running")
                             session_marker = _codex_session_marker(session_id)
                             thread_id, answer, stderr_text, return_code = runner.run_prompt(
                                 prompt=prompt,
@@ -7869,6 +7998,8 @@ class PushHandler(BaseHTTPRequestHandler):
                             _harvest_mcp_session_activities(session_marker, thread_id or session_id)
                             bridge_status = None
                     else:
+                        if run_id:
+                            CODEX_RUNS.set_observer_phase(run_id, "running")
                         session_marker = _codex_session_marker(session_id)
                         thread_id, answer, stderr_text, return_code = runner.run_prompt(
                             prompt=prompt,
@@ -7910,6 +8041,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     )
                     if run is not None:
                         run_id, cancel_event = run
+                        CODEX_RUNS.set_observer_phase(run_id, "starting")
                         self._set_chat_generating(
                             contact_id,
                             user_ts=user_ts,
@@ -8032,6 +8164,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         )
                         return
                     run_id, cancel_event = run
+                    CODEX_RUNS.set_observer_phase(run_id, "starting")
                     if self._codex_session_busy(session_id):
                         chat.append(
                             role="assistant",
@@ -8079,6 +8212,12 @@ class PushHandler(BaseHTTPRequestHandler):
                             session_id=session_id,
                         )
 
+                    def _on_activity(activity_text: str) -> None:
+                        CODEX_RUNS.set_observer_phase(run_id, "running")
+                        CODEX_RUNS.publish_runner_activity(run_id, activity_text)
+
+                    CODEX_RUNS.set_observer_phase(run_id, "running")
+
                     thread_id, answer, stderr_text, return_code = runner.run_prompt(
                         prompt=prompt,
                         cwd=cwd,
@@ -8086,6 +8225,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         env_overrides=env_overrides,
                         cancel_event=cancel_event,
                         on_update=_on_update,
+                        on_activity=_on_activity,
                     )
                     if cancel_event.is_set():
                         chat.append(
@@ -11016,10 +11156,21 @@ class PushHandler(BaseHTTPRequestHandler):
                 if terminal_state == "waiting":
                     observer_provider = getattr(self.state, "codex_app_bridge", None)
                     observer_snapshot = getattr(observer_provider, "observer_snapshot", None)
+                    safe_snapshot: dict[str, Any] | None = None
                     if callable(observer_snapshot):
-                        safe_snapshot = observer_snapshot()
-                        if isinstance(safe_snapshot, dict) and safe_snapshot.get("busy") is True:
-                            content = _format_kairos_observer(safe_snapshot)
+                        candidate = observer_snapshot()
+                        if isinstance(candidate, dict) and candidate.get("busy") is True:
+                            safe_snapshot = candidate
+                    # The persistent app-server observer is more precise and
+                    # wins whenever it owns an active turn.  Group replies and
+                    # legacy/fallback exec runs are visible through the generic
+                    # registry without exposing their run metadata.
+                    if safe_snapshot is None:
+                        candidate = CODEX_RUNS.observer_snapshot()
+                        if isinstance(candidate, dict) and candidate.get("busy") is True:
+                            safe_snapshot = candidate
+                    if safe_snapshot is not None:
+                        content = _format_kairos_observer(safe_snapshot)
             if is_kairos and not content.strip():
                 # Closing the create/capture race matters to the Android UI:
                 # an owned pane can exist a few milliseconds before Python or

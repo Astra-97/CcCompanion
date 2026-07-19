@@ -120,6 +120,69 @@ class KairosCancelTest(unittest.TestCase):
         self.assertFalse(run[1].is_set())
         registry.finish(run[0])
 
+    def test_group_and_legacy_runner_observer_never_retains_raw_activity(self):
+        registry = _CodexRunRegistry()
+        sensitive = "调用 /bin/sh --token=TOPSECRET /private/user/file"
+        for source in ("cc-app:apples:kairos", "cc-app:kairos"):
+            run = registry.start(
+                source=source,
+                session_id="private-session",
+                cwd=Path("/private/workspace"),
+            )
+            self.assertIsNotNone(run)
+            run_id = run[0]
+            self.assertTrue(registry.set_observer_phase(run_id, "running"))
+            self.assertTrue(registry.publish_runner_activity(run_id, sensitive))
+            self.assertFalse(
+                registry.publish_runner_activity(run_id, "思考摘要：private user prompt")
+            )
+
+            snapshot = registry.observer_snapshot()
+            rendered = repr(snapshot)
+            self.assertTrue(snapshot["busy"])
+            self.assertEqual(snapshot["phase"], "正在处理")
+            self.assertIn("调用工具（名称与参数已隐藏）", rendered)
+            for forbidden in (
+                "TOPSECRET",
+                "/bin/sh",
+                "/private",
+                "private-session",
+                "private user prompt",
+            ):
+                self.assertNotIn(forbidden, rendered)
+            registry.finish(run_id)
+            self.assertFalse(registry.observer_snapshot()["busy"])
+
+    def test_generic_observer_is_thread_safe_and_bounded(self):
+        registry = _CodexRunRegistry()
+        run = registry.start(
+            source="cc-app:apples:kairos",
+            session_id="session",
+            cwd=Path("/tmp"),
+        )
+        self.assertIsNotNone(run)
+        run_id = run[0]
+
+        threads = [
+            threading.Thread(
+                target=registry.publish_observer_event,
+                args=(run_id, "commandExecution"),
+            )
+            for _ in range(80)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        snapshot = registry.observer_snapshot()
+        self.assertEqual(len(snapshot["events"]), 40)
+        self.assertTrue(all(
+            event["label"] == "运行命令（参数与输出已隐藏）"
+            for event in snapshot["events"]
+        ))
+        registry.finish(run_id)
+
     def test_http_200_ok_false_when_nothing_matches_and_bridge_is_untouched(self):
         handler = self.handler()
         handler._handle_codex_abort({"contact_id": "kairos", "cancel_pending": True, "user_ts": "missing"})
