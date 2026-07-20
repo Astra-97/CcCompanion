@@ -5,6 +5,7 @@ import io
 import os
 from pathlib import Path
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -1897,6 +1898,145 @@ class LinkPreviewTests(unittest.TestCase):
             self._serve_attachment("ordinary.jpg", head=False).headers["Cache-Control"],
             "public, max-age=86400",
         )
+
+    def test_xhs_cli_adapter_passes_upgraded_short_url_only_via_stdin(self):
+        adapter = {
+            "title": "note",
+            "body_text": "body",
+            "comments": ["作者：评论"],
+            "comments_fetched": True,
+            "comments_complete": True,
+        }
+        script = (
+            "import json,sys; json.load(sys.stdin); "
+            f"print({json.dumps(json.dumps(adapter, ensure_ascii=False))})"
+        )
+        command = [sys.executable, "-c", script]
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(td, xhs_cli_command=command)
+            bundle = service.enrich("http://xhslink.com/o/abc?xsec_token=opaque#fragment")
+        self.assertEqual(bundle.previews[0]["provider"], "xhs-cli")
+        self.assertEqual(bundle.previews[0]["comments_status"], "included")
+        self.assertNotIn("xhslink", " ".join(command))
+
+    def test_xhs_cli_url_rejects_userinfo_bad_port_and_host_suffix(self):
+        rejected = (
+            "https://user@xhslink.com/o/a",
+            "https://xhslink.com:444/o/a",
+            "https://xiaohongshu.com.evil.example/o/a",
+            "http://www.xiaohongshu.com/o/a",
+        )
+        for url in rejected:
+            with self.subTest(url=url), self.assertRaises(link_preview.LinkPreviewError):
+                link_preview.LinkPreviewService._xhs_cli_url(url)
+
+    def test_xhs_cli_timeout_large_output_and_failure_fall_back(self):
+        with tempfile.TemporaryDirectory() as td:
+            marker = Path(td) / "child-survived"
+            child = f"import time,pathlib; time.sleep(.4); pathlib.Path({str(marker)!r}).write_text('bad')"
+            parent = (
+                "import json,subprocess,sys,time; json.load(sys.stdin); "
+                f"subprocess.Popen([sys.executable,'-c',{child!r}]); time.sleep(5)"
+            )
+            service = link_preview.LinkPreviewService(
+                td, xhs_cli_command=[sys.executable, "-c", parent]
+            )
+            with self.assertRaises(link_preview.LinkPreviewError):
+                service._call_command_adapter("https://xhslink.com/o/a", time.monotonic() + 0.1)
+            time.sleep(0.5)
+            self.assertFalse(marker.exists(), "deadline must kill the adapter process group")
+
+            large = "import json,sys; json.load(sys.stdin); sys.stdout.write('x'*2000001)"
+            service = link_preview.LinkPreviewService(
+                td, xhs_cli_command=[sys.executable, "-c", large]
+            )
+            with self.assertRaises(link_preview.LinkPreviewError):
+                service._call_command_adapter("https://xhslink.com/o/a", time.monotonic() + 3)
+
+        api_payload = link_preview.HTTPPayload(
+            "https://adapter.example", 200, {"content-type": "application/json"},
+            json.dumps({"title": "api fallback", "text": "body"}).encode(),
+        )
+        command = [sys.executable, "-c", "import sys; sys.stdin.read(); raise SystemExit(2)"]
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(
+                td,
+                xhs_cli_command=command,
+                xhs_api_url="https://adapter.example/preview",
+                adapter_fetcher=QueueFetcher([api_payload]),
+            )
+            result = service.enrich("https://xhslink.com/o/a")
+        self.assertEqual(result.previews[0]["provider"], "xhs-api")
+
+    def test_xhs_cli_empty_comments_are_fetched_not_missing(self):
+        payload = link_preview.HTTPPayload(
+            "xhs-cli://adapter", 200, {"content-type": "application/json"},
+            json.dumps({
+                "title": "note", "body_text": "body", "comments": [],
+                "comments_fetched": True, "comments_complete": True,
+            }).encode(),
+        )
+        page = link_preview.LinkPreviewService._adapter_page(
+            "https://xhslink.com/o/a", payload, "xhs-cli", 1000
+        )
+        self.assertTrue(page.comments_fetched)
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(td)
+            service._fetch_page = lambda url, deadline: page
+            bundle = service.enrich("https://xhslink.com/o/a")
+            preview = bundle.previews[0]
+            content = Path(preview["content_path"]).read_text()
+        self.assertEqual(preview["comments_status"], "fetched_empty")
+        self.assertIn("评论抓取状态：已抓取，当前暂无评论", content)
+        self.assertIn("评论已抓取，当前返回为空", bundle.prompt_context)
+
+    def test_xhs_comment_scope_and_boolean_flags_are_strict(self):
+        partial_payload = link_preview.HTTPPayload(
+            "xhs-cli://adapter", 200, {"content-type": "application/json"},
+            json.dumps({
+                "title": "note", "body_text": "body", "comments": ["甲：首批"],
+                "comments_fetched": True, "comments_complete": False,
+            }).encode(),
+        )
+        partial = link_preview.LinkPreviewService._adapter_page(
+            "https://xhslink.com/o/a", partial_payload, "xhs-cli", 1000
+        )
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(td)
+            service._fetch_page = lambda url, deadline: partial
+            bundle = service.enrich("https://xhslink.com/o/a")
+            content = Path(bundle.previews[0]["content_path"]).read_text()
+        self.assertEqual(bundle.previews[0]["comments_status"], "included_partial")
+        self.assertIn("仅抓取首批", content)
+        self.assertIn("可能有更多评论或楼中楼", bundle.prompt_context)
+
+        false_string = link_preview.HTTPPayload(
+            "xhs-cli://adapter", 200, {"content-type": "application/json"},
+            json.dumps({
+                "title": "note", "body_text": "body", "comments": [],
+                "comments_fetched": "false", "comments_complete": "true",
+            }).encode(),
+        )
+        page = link_preview.LinkPreviewService._adapter_page(
+            "https://xhslink.com/o/a", false_string, "xhs-cli", 1000
+        )
+        self.assertFalse(page.comments_fetched)
+        self.assertFalse(page.comments_complete)
+
+    def test_xhs_cache_schema_upgrade_invalidates_previous_sidecar(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(td, cache_ttl_seconds=60)
+            url = "https://xhslink.com/o/cache"
+            text_path, meta_path = service._paths(url)
+            text_path.write_text("old")
+            meta_path.write_text(json.dumps({
+                "schema_version": 4,
+                "cache_key": service._url_key(url),
+                "lease_until": int(time.time() + 60),
+                "image_paths": [],
+            }))
+            self.assertIsNone(service._load_cache(url, time.monotonic() + 1))
+        self.assertEqual(link_preview.XHS_CACHE_SCHEMA_VERSION, 5)
 
 
 if __name__ == "__main__":

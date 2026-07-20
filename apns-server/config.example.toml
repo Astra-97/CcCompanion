@@ -159,6 +159,8 @@ max_cache_bytes = 256000000
 
 # 小红书 cookie/API 抓取器与 Windows Playwright 节点都是显式可选的 JSON
 # adapter，均接收 POST {"url":"..."}。未配置或离线时聊天会安全降级，不受影响。
+# 本机命令 adapter 仅接受 argv 数组；链接通过 stdin JSON 传入，不进入 argv。
+# xhs_cli_command = ["ssh", "memory-sg", "/home/ubuntu/xhs-login-bridge/export_note.py"]
 # xhs_api_url = "https://your-trusted-xhs-adapter.example/preview"
 # xhs_api_token_env = "CC_LINK_PREVIEW_XHS_TOKEN"
 # windows_api_url = "https://your-optional-windows-node.example/preview"

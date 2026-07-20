@@ -19,9 +19,12 @@ import os
 from pathlib import Path
 import queue
 import re
+import selectors
+import signal
 import socket
 import ssl
 import stat
+import subprocess
 import tempfile
 import threading
 import time
@@ -40,7 +43,7 @@ MAX_TITLE = 300
 MAX_DESCRIPTION = 800
 MAX_PAGE_IMAGES = 6
 GENERIC_CACHE_SCHEMA_VERSION = 3
-XHS_CACHE_SCHEMA_VERSION = 4
+XHS_CACHE_SCHEMA_VERSION = 5
 WECHAT_CACHE_SCHEMA_VERSION = 1
 DNS_WORKERS = 4
 DNS_QUEUE_SIZE = 8
@@ -77,6 +80,8 @@ class ExtractedPage:
     body_text: str
     image_urls: tuple[str, ...] = ()
     comments: str = ""
+    comments_fetched: bool = False
+    comments_complete: bool = False
     provider: str = "http"
 
 
@@ -1180,6 +1185,7 @@ class LinkPreviewService:
         max_cache_entries: int = 768,
         max_cache_bytes: int = 256_000_000,
         cleanup_grace_seconds: float = 30.0,
+        xhs_cli_command: list[str] | tuple[str, ...] | None = None,
         xhs_api_url: str = "",
         xhs_api_token: str = "",
         windows_api_url: str = "",
@@ -1200,6 +1206,16 @@ class LinkPreviewService:
         self.max_cache_entries = max(1, int(max_cache_entries))
         self.max_cache_bytes = max(1, int(max_cache_bytes))
         self.cleanup_grace_seconds = max(1.0, float(cleanup_grace_seconds))
+        if xhs_cli_command is None:
+            self.xhs_cli_command: tuple[str, ...] = ()
+        elif (
+            isinstance(xhs_cli_command, (list, tuple))
+            and 1 <= len(xhs_cli_command) <= 32
+            and all(isinstance(item, str) and 0 < len(item) <= 4096 for item in xhs_cli_command)
+        ):
+            self.xhs_cli_command = tuple(xhs_cli_command)
+        else:
+            raise ValueError("xhs_cli_command must be a non-empty argv array")
         self.xhs_api_url = str(xhs_api_url or "").strip()
         self.xhs_api_token = str(xhs_api_token or "")
         self.windows_api_url = str(windows_api_url or "").strip()
@@ -1583,8 +1599,10 @@ class LinkPreviewService:
         if not isinstance(raw_images, list):
             raw_images = []
         raw_images.insert(0, data.get("image_url") or data.get("image") or "")
-        image_urls = _dedupe_image_values(raw_images, requested_url, xhs_only=provider == "xhs-api")
-        is_xhs = LinkPreviewService._is_xhs(requested_url) or provider == "xhs-api"
+        image_urls = _dedupe_image_values(
+            raw_images, requested_url, xhs_only=provider in {"xhs-api", "xhs-cli"}
+        )
+        is_xhs = LinkPreviewService._is_xhs(requested_url) or provider in {"xhs-api", "xhs-cli"}
         raw_description = data.get("description") or data.get("desc") or ""
         body_text = data.get("body_text") or data.get("text") or data.get("content") or ""
         if is_xhs:
@@ -1615,6 +1633,9 @@ class LinkPreviewService:
             )[:max_chars],
             image_urls=image_urls,
             comments=_redact_url_echoes(comments, *source_urls)[:max_chars],
+            comments_fetched=data.get("comments_fetched") is True or bool(comments),
+            comments_complete=(data.get("comments_complete") is True)
+            and (data.get("comments_fetched") is True or bool(comments)),
             provider=provider,
         )
 
@@ -1635,12 +1656,134 @@ class LinkPreviewService:
         return self._adapter_page(url, payload, provider, self.max_text_chars)
 
     @staticmethod
+    def _xhs_cli_url(url: str) -> str:
+        """Validate the command adapter URL and upgrade legacy short HTTP links."""
+        try:
+            parts = urlsplit(url)
+            port = parts.port
+        except ValueError:
+            raise LinkPreviewError("invalid XHS adapter URL") from None
+        host = (parts.hostname or "").lower().rstrip(".")
+        if parts.username is not None or parts.password is not None:
+            raise LinkPreviewError("invalid XHS adapter URL")
+        if parts.scheme.lower() == "http" and host in {"xhslink.com", "www.xhslink.com"}:
+            if port not in (None, 80):
+                raise LinkPreviewError("invalid XHS adapter URL")
+            netloc = host
+            return urlunsplit(("https", netloc, parts.path, parts.query, ""))
+        if parts.scheme.lower() != "https" or port not in (None, 443):
+            raise LinkPreviewError("invalid XHS adapter URL")
+        if not (host in XHS_HOSTS or host.endswith(".xiaohongshu.com")):
+            raise LinkPreviewError("invalid XHS adapter URL")
+        return urlunsplit(("https", parts.netloc, parts.path, parts.query, ""))
+
+    def _call_command_adapter(self, url: str, deadline: float) -> ExtractedPage:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise LinkPreviewError("XHS command adapter timed out")
+        adapter_url = self._xhs_cli_url(url)
+        request_body = json.dumps({"url": adapter_url}, ensure_ascii=False).encode("utf-8")
+        output = self._read_command_adapter_output(request_body, deadline)
+        payload = HTTPPayload(
+            url="xhs-cli://adapter",
+            status=200,
+            headers={"content-type": "application/json"},
+            body=output,
+        )
+        return self._adapter_page(url, payload, "xhs-cli", self.max_text_chars)
+
+    @staticmethod
+    def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+
+    def _read_command_adapter_output(self, request_body: bytes, deadline: float) -> bytes:
+        max_output = min(self.max_download_bytes, 2_000_000)
+        try:
+            process = subprocess.Popen(
+                self.xhs_cli_command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=True,
+                shell=False,
+            )
+        except OSError as exc:
+            raise LinkPreviewError("XHS command adapter unavailable") from exc
+        assert process.stdin is not None and process.stdout is not None
+        selector = selectors.DefaultSelector()
+        output = bytearray()
+        failed = False
+        try:
+            try:
+                process.stdin.write(request_body)
+                process.stdin.close()
+            except (BrokenPipeError, OSError):
+                failed = True
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while not failed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    failed = True
+                    break
+                events = selector.select(min(remaining, 0.25))
+                if not events:
+                    if process.poll() is None:
+                        continue
+                    # Wait for pipe EOF so final buffered bytes are retained.
+                    continue
+                chunk = os.read(process.stdout.fileno(), 65_536)
+                if not chunk:
+                    break
+                output.extend(chunk)
+                if len(output) > max_output:
+                    failed = True
+                    break
+            if failed:
+                self._kill_process_group(process)
+                raise LinkPreviewError("XHS command adapter unavailable")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._kill_process_group(process)
+                raise LinkPreviewError("XHS command adapter unavailable")
+            try:
+                returncode = process.wait(timeout=max(0.05, remaining))
+            except subprocess.TimeoutExpired:
+                self._kill_process_group(process)
+                raise LinkPreviewError("XHS command adapter unavailable") from None
+            if returncode != 0 or not output:
+                raise LinkPreviewError("XHS command adapter unavailable")
+            return bytes(output)
+        finally:
+            selector.close()
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
+            if process.poll() is None:
+                self._kill_process_group(process)
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+
+    @staticmethod
     def _is_xhs(url: str) -> bool:
         try:
             host = (urlsplit(url).hostname or "").lower().rstrip(".")
         except ValueError:
             return False
-        return host in XHS_HOSTS or host.endswith(".xiaohongshu.com")
+        return (
+            host in XHS_HOSTS
+            or host.endswith(".xiaohongshu.com")
+            or host.endswith(".xhslink.com")
+        )
 
     @staticmethod
     def _is_wechat(url: str) -> bool:
@@ -1702,6 +1845,11 @@ class LinkPreviewService:
         # The cookie/API-backed XHS adapter is preferred when explicitly
         # configured.  No cookie path is guessed and an unavailable adapter
         # falls through to safe plain HTTP extraction.
+        if self._is_xhs(url) and self.xhs_cli_command:
+            try:
+                return self._call_command_adapter(url, deadline)
+            except LinkPreviewError:
+                pass
         if self._is_xhs(url) and self.xhs_api_url:
             try:
                 return self._call_adapter(self.xhs_api_url, url, "xhs-api", deadline)
@@ -1840,6 +1988,13 @@ class LinkPreviewService:
             sections.extend(["", "正文：", safe_body_text[: self.max_text_chars]])
         if safe_comments:
             sections.extend(["", "评论：", safe_comments[: self.max_text_chars]])
+            if not page.comments_complete:
+                sections.append("评论抓取范围：仅抓取首批，可能有更多评论或楼中楼。")
+        elif is_xhs and page.comments_fetched:
+            if page.comments_complete:
+                sections.extend(["", "评论抓取状态：已抓取，当前暂无评论。"])
+            else:
+                sections.extend(["", "评论抓取状态：已抓取首批但返回为空，可能仍有更多评论。"])
         elif is_xhs:
             sections.extend(["", "评论抓取状态：未抓取；不得据此声称评论或帖子内容完整。"])
         content = "\n".join(sections).strip() + "\n"
@@ -1879,7 +2034,17 @@ class LinkPreviewService:
             "image_cache_urls": [],
             "image_paths": [],
             "provider": page.provider,
-            "comments_status": "included" if page.comments else ("not_fetched" if is_xhs else "not_applicable"),
+            "comments_status": (
+                "included" if page.comments and page.comments_complete
+                else "included_partial" if page.comments
+                else "fetched_empty"
+                if is_xhs and page.comments_fetched and page.comments_complete
+                else "fetched_empty_partial"
+                if is_xhs and page.comments_fetched
+                else "not_fetched"
+                if is_xhs
+                else "not_applicable"
+            ),
         }
         lease_until = int(time.time() + self.lease_seconds)
 
@@ -2074,6 +2239,12 @@ class LinkPreviewService:
                     lines.append(f"- 内容图片：{image_path}")
             if item.get("comments_status") == "not_fetched":
                 lines.append("- 抓取范围：评论未抓取，不得声称帖子或评论内容完整。")
+            elif item.get("comments_status") == "included_partial":
+                lines.append("- 抓取范围：仅抓取首批评论，可能有更多评论或楼中楼。")
+            elif item.get("comments_status") == "fetched_empty":
+                lines.append("- 抓取范围：评论已抓取，当前返回为空。")
+            elif item.get("comments_status") == "fetched_empty_partial":
+                lines.append("- 抓取范围：已抓取首批但返回为空，仍可能有更多评论。")
         lines.append("请先读取这些文件，再结合用户原话作答；若文件内容不足或抓取不完整，请明确说明。")
         return LinkPreviewBundle(tuple(previews), "\n".join(lines))
 

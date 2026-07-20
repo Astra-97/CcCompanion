@@ -1982,6 +1982,7 @@ class ServerState:
             lease_seconds=link_lease_seconds,
             max_cache_entries=link_cache_entries,
             max_cache_bytes=link_cache_bytes,
+            xhs_cli_command=link_cfg.get("xhs_cli_command"),
             xhs_api_url=str(link_cfg.get("xhs_api_url") or ""),
             xhs_api_token=os.environ.get(xhs_token_env, "") if xhs_token_env else "",
             windows_api_url=str(link_cfg.get("windows_api_url") or ""),
@@ -5836,6 +5837,12 @@ class PushHandler(BaseHTTPRequestHandler):
                         added = True
             if item.get("comments_status") == "not_fetched":
                 lines.append("- 抓取范围：评论未抓取，不得声称帖子或评论内容完整。")
+            elif item.get("comments_status") == "included_partial":
+                lines.append("- 抓取范围：仅抓取首批评论，可能有更多评论或楼中楼。")
+            elif item.get("comments_status") == "fetched_empty":
+                lines.append("- 抓取范围：评论已抓取，当前返回为空。")
+            elif item.get("comments_status") == "fetched_empty_partial":
+                lines.append("- 抓取范围：已抓取首批但返回为空，仍可能有更多评论。")
         if not added:
             return ""
         lines.append("请先读取这些文件，再结合用户原话作答；若文件内容不足或抓取不完整，请明确说明。")
