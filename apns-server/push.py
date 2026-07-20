@@ -95,6 +95,7 @@ from tts import TTS
 from settings import Settings
 from usage import UsageReader
 from link_preview import LinkPreviewBundle, LinkPreviewService, merge_preview_metadata
+from xhs_login import XhsLoginError, XhsLoginManager
 import todos as todos_mod
 from studyroom import StudyroomDB
 from ai_chat import AIChatManager
@@ -1729,6 +1730,20 @@ class ServerState:
         self.public_server_url: str = (
             public_server_url or "https://companion-vps2.xiaonancaleb.xyz"
         ).rstrip("/")
+
+        xhs_login_cfg = config.get("xhs_login", {})
+        raw_import_command = xhs_login_cfg.get("import_command")
+        import_command = raw_import_command if isinstance(raw_import_command, list) else None
+        allowed_contacts = {
+            str(item).strip().lower()
+            for item in (xhs_login_cfg.get("allowed_contacts", ["kairos"]) or [])
+            if str(item).strip()
+        }
+        self.xhs_login = XhsLoginManager(
+            import_command=import_command,
+            ttl_seconds=int(xhs_login_cfg.get("ttl_seconds", 300)),
+            allowed_contacts=allowed_contacts,
+        )
 
         if self.apns_enabled:
             self.jwt = APNsJWT(
@@ -3703,6 +3718,20 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_appearance_assets_upload()
             return
 
+        xhs_body_limits = {
+            "/xhs-login/start": 4 * 1024,
+            "/xhs-login/import": 32 * 1024,
+        }
+        if self.path in xhs_body_limits:
+            try:
+                xhs_length = int(self.headers.get("Content-Length", "0"))
+            except (TypeError, ValueError):
+                xhs_length = 0
+            if xhs_length <= 0 or xhs_length > xhs_body_limits[self.path]:
+                self.close_connection = True
+                self._send_json(413, {"ok": False, "error": "request_too_large"})
+                return
+
         if self.path == "/ai-chat/persona":
             try:
                 persona_length = int(self.headers.get("Content-Length", "0"))
@@ -3791,6 +3820,12 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_chat_send(body)
         elif self.path == "/chat/card_action":
             self._handle_chat_card_action(body)
+        elif self.path == "/xhs-login/start":
+            self._handle_xhs_login_start(body)
+            return
+        elif self.path == "/xhs-login/import":
+            self._handle_xhs_login_import(body)
+            return
         elif self.path == "/chat/stop":
             # Stopping the live Claude TUI is remote control.  The handler also
             # requires exact turn/session fencing before it emits any key.
@@ -3976,6 +4011,38 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     # ---------- handlers ----------
+
+    def _handle_xhs_login_start(self, body: dict[str, Any]):
+        if self._source_for_request() != "android-app":
+            self._send_json(403, {"ok": False, "error": "android client required"})
+            return
+        try:
+            result = self.state.xhs_login.start(
+                contact_id=body.get("contact_id"),
+                device_id=body.get("device_id"),
+                origin=body.get("origin"),
+            )
+        except XhsLoginError as exc:
+            self._send_json(exc.status, {"ok": False, "error": exc.code})
+            return
+        self._send_json(200, result)
+
+    def _handle_xhs_login_import(self, body: dict[str, Any]):
+        if self._source_for_request() != "android-app":
+            self._send_json(403, {"ok": False, "error": "android client required"})
+            return
+        try:
+            result = self.state.xhs_login.import_cookies(
+                nonce=body.get("nonce"),
+                contact_id=body.get("contact_id"),
+                device_id=body.get("device_id"),
+                origin=body.get("origin"),
+                cookie_header=body.get("cookies"),
+            )
+        except XhsLoginError as exc:
+            self._send_json(exc.status, {"ok": False, "error": exc.code})
+            return
+        self._send_json(200, result)
 
     def _handle_register(self, body: dict[str, Any]):
         token = body.get("token")

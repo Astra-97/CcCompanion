@@ -174,3 +174,10 @@ ghp_token = ""
 
 # 返回给 Android 的外网 VPS 地址。真实部署可改成当前 HTTPS 域名。
 server_url = "https://companion-vps2.xiaonancaleb.xyz"
+
+[xhs_login]
+# Android 专用 WebView 登录能力；nonce 最长十分钟且只可使用一次。
+ttl_seconds = 300
+allowed_contacts = ["kairos"]
+# 固定 argv，cookie JSON 只经 subprocess stdin 传入，不得改成 shell 字符串。
+import_command = ["ssh", "memory-sg", "/home/ubuntu/xhs-login-bridge/import_cookies.py"]
