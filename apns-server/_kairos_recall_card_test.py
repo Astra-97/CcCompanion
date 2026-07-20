@@ -5,11 +5,12 @@ import tempfile
 import threading
 import types
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from chat_history import ChatHistory
-from push import PushHandler, ServerState
+from push import KairosRecallIndex, PushHandler, ServerState
 
 
 class FakeRecall:
@@ -18,8 +19,8 @@ class FakeRecall:
         self.error = error
         self.queries = []
 
-    def recall_result(self, query):
-        self.queries.append(query)
+    def recall_result(self, query, *, exclude_memory_keys=()):
+        self.queries.append((query, tuple(exclude_memory_keys)))
         if self.error:
             raise self.error
         return self.result
@@ -41,6 +42,7 @@ class KairosRecallCardTest(unittest.TestCase):
             kairos_semantic_memory_recall_init_attempted=True,
             kairos_semantic_memory_recall_lock=threading.Lock(),
             kairos_recall_card_lock=threading.Lock(),
+            kairos_recall_index=KairosRecallIndex(Path(self.tmp.name) / "recall-index.json"),
         )
         handler = object.__new__(PushHandler)
         handler.state = state
@@ -54,6 +56,7 @@ class KairosRecallCardTest(unittest.TestCase):
             items=(
                 {"date": "2026-07-19", "title": "午饭", "snippet": "Astra 喜欢番茄"},
             ),
+            memory_keys=("v1:" + "a" * 64,),
         )
 
     def test_hit_appends_one_card_between_user_and_reply(self):
@@ -67,12 +70,14 @@ class KairosRecallCardTest(unittest.TestCase):
             result,
             user_ts=user["ts"],
             source="memory-recall:kairos",
+            session_id="session-a",
         ))
         self.assertFalse(handler._append_kairos_recall_card(
             self.chat,
             result,
             user_ts=user["ts"],
             source="memory-recall:kairos",
+            session_id="session-a",
         ))
         self.chat.append(role="assistant", text="吃番茄吧", source="codex:kairos")
 
@@ -86,6 +91,84 @@ class KairosRecallCardTest(unittest.TestCase):
         self.assertEqual(card["metadata"]["items"], [
             {"date": "2026-07-19", "title": "午饭", "snippet": "Astra 喜欢番茄"},
         ])
+        self.assertEqual(card["metadata"]["recall_session_id"], "session-a")
+        self.assertEqual(card["metadata"]["recall_memory_keys"], ["v1:" + "a" * 64])
+
+    def test_seen_keys_are_persistent_session_scoped_and_do_not_scan_chat_history(self):
+        recall = FakeRecall(self.result())
+        handler = self.handler(recall)
+        group_chat = ChatHistory(Path(self.tmp.name) / "group.jsonl")
+        group_user = group_chat.append(role="user", text="群聊第一轮", source="cc-app:apples")
+        self.assertTrue(handler._append_kairos_recall_card(
+            group_chat,
+            self.result(),
+            user_ts=group_user["ts"],
+            source="memory-recall:group:kairos",
+            group=True,
+            session_id="session-a",
+        ))
+        # Rendering the UI card alone must not mark a memory seen before Codex
+        # confirms that turn/start accepted the prompt.
+        self.assertEqual(handler._kairos_seen_memory_keys("session-a"), ())
+        self.assertTrue(handler._commit_kairos_recall(self.result(), "session-a"))
+
+        # Simulate a service restart: a fresh handler/index recovers from the
+        # bounded ledger and does not need any chat JSONL scan.
+        restarted = self.handler(recall)
+        restarted.state.contact_chats = {
+            "kairos": types.SimpleNamespace(read_since=lambda **_kwargs: self.fail("history scanned")),
+            "apples": types.SimpleNamespace(read_since=lambda **_kwargs: self.fail("history scanned")),
+        }
+
+        self.assertIsNotNone(restarted._kairos_semantic_recall("私聊第二轮", session_id="session-a"))
+        self.assertEqual(recall.queries[-1], ("私聊第二轮", ("v1:" + "a" * 64,)))
+        self.assertIsNotNone(restarted._kairos_semantic_recall("同会话第三轮", session_id="session-a"))
+        self.assertEqual(recall.queries[-1], ("同会话第三轮", ("v1:" + "a" * 64,)))
+
+        self.assertIsNotNone(restarted._kairos_semantic_recall("另一个会话", session_id="session-b"))
+        self.assertEqual(recall.queries[-1], ("另一个会话", ()))
+
+        self.assertIsNotNone(restarted._kairos_semantic_recall("无会话边界"))
+        self.assertEqual(recall.queries[-1], ("无会话边界", ()))
+
+    def test_new_session_first_recall_binds_only_after_real_thread_is_accepted(self):
+        recall = FakeRecall(self.result())
+        handler = self.handler(recall)
+        user = self.chat.append(role="user", text="新会话首轮", source="cc-app:kairos")
+
+        first = handler._kairos_semantic_recall("新会话首轮", session_id=None)
+        self.assertIsNotNone(first)
+        self.assertFalse(handler._append_kairos_recall_card(
+            self.chat,
+            first,
+            user_ts=user["ts"],
+            source="memory-recall:kairos",
+            session_id=None,
+        ))
+        self.assertEqual(handler._kairos_seen_memory_keys("thread-new"), ())
+
+        # Mirrors run_turn's order: thread preparation resolves a real ID, the
+        # UI card binds to it, then accepted turn/start commits the index.
+        self.assertTrue(handler._append_kairos_recall_card(
+            self.chat,
+            first,
+            user_ts=user["ts"],
+            source="memory-recall:kairos",
+            session_id="thread-new",
+        ))
+        self.assertEqual(handler._kairos_seen_memory_keys("thread-new"), ())
+        self.assertTrue(handler._commit_kairos_recall(first, "thread-new"))
+
+        second = handler._kairos_semantic_recall("新会话第二轮", session_id="thread-new")
+        self.assertIsNotNone(second)
+        self.assertEqual(recall.queries[-1], ("新会话第二轮", ("v1:" + "a" * 64,)))
+
+    def test_index_persist_failure_does_not_mutate_seen_state(self):
+        index = KairosRecallIndex(Path(self.tmp.name) / "failing-index.json")
+        key = "v1:" + "b" * 64
+        with mock.patch.object(index, "_persist_locked", return_value=False):
+            self.assertFalse(index.add("session-fail", (key,)))
+        self.assertEqual(index.keys("session-fail"), ())
 
     def test_empty_or_exception_is_fail_open_and_appends_nothing(self):
         empty = types.SimpleNamespace(context="", items=())
@@ -104,6 +187,7 @@ class KairosRecallCardTest(unittest.TestCase):
             user_ts=user["ts"],
             source="memory-recall:group:kairos",
             group=True,
+            session_id="session-group",
         ))
         card = self.chat.read_since(since_ts=user["ts"], limit=20, include_hidden=True)[0]
         self.assertEqual(card["sender_id"], "kairos")
@@ -174,6 +258,7 @@ class KairosRecallCardTest(unittest.TestCase):
                 self.result(),
                 user_ts=user["ts"],
                 source="memory-recall:kairos",
+                session_id="session-concurrent",
             )
             with outcomes_lock:
                 outcomes.append(outcome)
@@ -201,6 +286,7 @@ class KairosRecallCardTest(unittest.TestCase):
             self.result(),
             user_ts=user["ts"],
             source="memory-recall:kairos",
+            session_id="session-recovery",
         )
         pending = Path(self.tmp.name) / "pending.json"
         pending.write_text(json.dumps({

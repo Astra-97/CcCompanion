@@ -24,6 +24,7 @@ except ImportError:  # pragma: no cover - production is Linux.
 UpdateCallback = Callable[[str], None]
 ActivityCallback = Callable[[str], None]
 ThreadCallback = Callable[[str], None]
+TurnAcceptedCallback = Callable[[str], None]
 MarkerProvider = Callable[[str], tuple[str, int, int] | None]
 
 OBSERVER_PHASE_LABELS = {
@@ -416,6 +417,7 @@ class CodexAppBridge:
         on_update: UpdateCallback | None = None,
         on_activity: ActivityCallback | None = None,
         on_thread: ThreadCallback | None = None,
+        on_turn_accepted: TurnAcceptedCallback | None = None,
         marker_provider: MarkerProvider | None = None,
         max_runtime_sec: float = 0,
     ) -> CodexTurnResult:
@@ -531,6 +533,11 @@ class CodexAppBridge:
 
             if not active.turn_id:
                 return self._uncertain_result(active, "unable to identify accepted turn")
+            if on_turn_accepted is not None:
+                try:
+                    on_turn_accepted(resolved_thread_id)
+                except Exception:
+                    self.log.exception("Codex turn-accepted callback failed")
             with active.condition:
                 cancelled_while_starting = active.interrupt_requested or (
                     cancel_event is not None and cancel_event.is_set()

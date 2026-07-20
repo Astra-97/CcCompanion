@@ -114,6 +114,120 @@ CLIENT_LOG_PATH = HERE / "client_logs.jsonl"
 CLIENT_LOG_MAX_FIELD = 20_000
 
 
+class KairosRecallIndex:
+    """Small persistent per-session index for memories already injected."""
+
+    KEY_RE = re.compile(r"v1:[0-9a-f]{64}")
+    MAX_SESSIONS = 64
+    MAX_KEYS_PER_SESSION = 3000
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path).expanduser()
+        self._lock = threading.Lock()
+        self._sessions = self._load()
+
+    @classmethod
+    def _valid_keys(cls, values: Any) -> set[str]:
+        if not isinstance(values, (list, tuple, set, frozenset)):
+            return set()
+        return {
+            str(value) for value in values
+            if cls.KEY_RE.fullmatch(str(value or ""))
+        }
+
+    def _load(self) -> dict[str, dict[str, Any]]:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            raw_sessions = payload.get("sessions") if isinstance(payload, dict) else None
+            if not isinstance(raw_sessions, dict):
+                return {}
+            loaded: dict[str, dict[str, Any]] = {}
+            for raw_session_id, entry in raw_sessions.items():
+                session_id = str(raw_session_id or "").strip()
+                if not session_id or len(session_id) > 256 or not isinstance(entry, dict):
+                    continue
+                keys = sorted(self._valid_keys(entry.get("keys")))[: self.MAX_KEYS_PER_SESSION]
+                if keys:
+                    loaded[session_id] = {
+                        "keys": keys,
+                        "updated_at": float(entry.get("updated_at") or 0.0),
+                    }
+            newest = sorted(
+                loaded.items(),
+                key=lambda pair: float(pair[1].get("updated_at") or 0.0),
+                reverse=True,
+            )[: self.MAX_SESSIONS]
+            return dict(newest)
+        except Exception:
+            return {}
+
+    def keys(self, session_id: str | None) -> tuple[str, ...]:
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return ()
+        with self._lock:
+            entry = self._sessions.get(session_id) or {}
+            return tuple(entry.get("keys") or ())
+
+    def add(self, session_id: str | None, values: Any) -> bool:
+        session_id = str(session_id or "").strip()
+        new_keys = self._valid_keys(values)
+        if not session_id or len(session_id) > 256 or not new_keys:
+            return False
+        with self._lock:
+            existing = self._sessions.get(session_id) or {}
+            merged = set(existing.get("keys") or ())
+            before = len(merged)
+            merged.update(new_keys)
+            if len(merged) == before:
+                return True
+            candidate = {
+                sid: {"keys": list(entry.get("keys") or ()), "updated_at": entry.get("updated_at", 0.0)}
+                for sid, entry in self._sessions.items()
+            }
+            candidate[session_id] = {
+                "keys": sorted(merged)[: self.MAX_KEYS_PER_SESSION],
+                "updated_at": time.time(),
+            }
+            if len(candidate) > self.MAX_SESSIONS:
+                oldest = min(
+                    candidate,
+                    key=lambda sid: float(candidate[sid].get("updated_at") or 0.0),
+                )
+                candidate.pop(oldest, None)
+            if not self._persist_locked(candidate):
+                return False
+            self._sessions = candidate
+            return True
+
+    def _persist_locked(self, sessions: dict[str, dict[str, Any]]) -> bool:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            data = json.dumps(
+                {"version": 1, "sessions": sessions},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ) + "\n"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+            os.replace(tmp, self.path)
+            return True
+        except Exception:
+            return False
+
+
 @dataclass(frozen=True)
 class TmuxInjectionResult:
     """Outcome of one direct tmux prompt injection.
@@ -1827,6 +1941,9 @@ class ServerState:
         self.kairos_semantic_memory_recall_init_attempted = False
         self.kairos_semantic_memory_recall_lock = threading.Lock()
         self.kairos_recall_card_lock = threading.Lock()
+        self.kairos_recall_index = KairosRecallIndex(
+            Path(self.token_store_path).expanduser().parent / "kairos_recall_index.json"
+        )
         self.codex_kairos_backend: str = str(
             server_cfg.get("codex_kairos_backend", "app-server") or "app-server"
         ).strip().lower()
@@ -7854,7 +7971,17 @@ class PushHandler(BaseHTTPRequestHandler):
                         self.state.kairos_active_task = None
                         self.state.kairos_active_task_cancel = None
 
-    def _kairos_semantic_recall(self, query: str) -> Any:
+    def _kairos_seen_memory_keys(self, session_id: str | None) -> tuple[str, ...]:
+        """Collect memories already injected into one active Codex session."""
+        try:
+            index = getattr(self.state, "kairos_recall_index", None)
+            if index is None:
+                return ()
+            return tuple(index.keys(session_id))
+        except Exception:
+            return ()
+
+    def _kairos_semantic_recall(self, query: str, *, session_id: str | None = None) -> Any:
         """Return one shared structured recall, or ``None`` on every failure."""
         if not self.state.kairos_semantic_memory_recall_enabled or not str(query or "").strip():
             return None
@@ -7878,7 +8005,10 @@ class PushHandler(BaseHTTPRequestHandler):
                     self.state.kairos_semantic_memory_recall = client
             if client is None:
                 return None
-            result = client.recall_result(str(query))
+            result = client.recall_result(
+                str(query),
+                exclude_memory_keys=self._kairos_seen_memory_keys(session_id),
+            )
             context = str(getattr(result, "context", "") or "").strip()
             items = getattr(result, "items", ())
             if not context or not isinstance(items, (list, tuple)) or not items:
@@ -7886,6 +8016,16 @@ class PushHandler(BaseHTTPRequestHandler):
             return result
         except Exception:
             return None
+
+    def _commit_kairos_recall(self, result: Any, session_id: str | None) -> bool:
+        """Mark recall keys seen only after Codex accepts the prompt turn."""
+        try:
+            index = getattr(self.state, "kairos_recall_index", None)
+            if index is None:
+                return False
+            return bool(index.add(session_id, getattr(result, "memory_keys", ())))
+        except Exception:
+            return False
 
     @staticmethod
     def _kairos_recall_card_exists(chat: ChatHistory, user_ts: str) -> bool:
@@ -7916,6 +8056,7 @@ class PushHandler(BaseHTTPRequestHandler):
         user_ts: str,
         source: str,
         group: bool = False,
+        session_id: str | None = None,
     ) -> bool:
         """Append one compact App card after a hit; never affect the main turn."""
         try:
@@ -7926,6 +8067,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     user_ts=user_ts,
                     source=source,
                     group=group,
+                    session_id=session_id,
                 )
         except Exception:
             return False
@@ -7938,8 +8080,12 @@ class PushHandler(BaseHTTPRequestHandler):
         user_ts: str,
         source: str,
         group: bool = False,
+        session_id: str | None = None,
     ) -> bool:
         try:
+            session_id = str(session_id or "").strip()
+            if not session_id:
+                return False
             if self._kairos_recall_card_exists(chat, user_ts):
                 return False
             raw_items = getattr(result, "items", ())
@@ -7956,6 +8102,10 @@ class PushHandler(BaseHTTPRequestHandler):
                     items.append(item)
             if not items:
                 return False
+            memory_keys = [
+                str(key) for key in getattr(result, "memory_keys", ())[:100]
+                if re.fullmatch(r"v1:[0-9a-f]{64}", str(key))
+            ]
             # Chat polling is ``ts > since``.  Make the card's millisecond key
             # strictly newer than its user turn even when a fake/local recall
             # returns in the same clock tick.
@@ -7980,6 +8130,8 @@ class PushHandler(BaseHTTPRequestHandler):
                     "recall_card": True,
                     "items": items,
                     "kairos_user_ts": user_ts,
+                    "recall_session_id": session_id,
+                    "recall_memory_keys": memory_keys,
                 },
                 **kwargs,
             )
@@ -8172,14 +8324,37 @@ class PushHandler(BaseHTTPRequestHandler):
                 if run_id:
                     CODEX_RUNS.set_observer_phase(run_id, "starting")
                 prompt = self._kairos_prompt_for_task(task)
-                recall_result = self._kairos_semantic_recall(text)
-                if recall_result is not None:
-                    self._append_kairos_recall_card(
+                recall_result = self._kairos_semantic_recall(text, session_id=session_id)
+                recall_card_appended = False
+                recall_committed = False
+
+                def _append_recall_for_session(target_session_id: str | None) -> None:
+                    nonlocal recall_card_appended
+                    target_session_id = str(target_session_id or "").strip()
+                    if recall_result is None or recall_card_appended or not target_session_id:
+                        return
+                    recall_card_appended = self._append_kairos_recall_card(
                         chat,
                         recall_result,
                         user_ts=user_ts,
                         source="memory-recall:kairos",
+                        session_id=target_session_id,
                     )
+
+                def _commit_recall_for_session(target_session_id: str | None) -> None:
+                    nonlocal recall_committed
+                    target_session_id = str(target_session_id or "").strip()
+                    if recall_result is None or recall_committed or not target_session_id:
+                        return
+                    # Index persistence is independent of UI-card success.
+                    _append_recall_for_session(target_session_id)
+                    recall_committed = self._commit_kairos_recall(
+                        recall_result,
+                        target_session_id,
+                    )
+
+                if recall_result is not None:
+                    _append_recall_for_session(session_id)
                     recall_context = str(getattr(recall_result, "context", "") or "").strip()
                     if recall_context:
                         prompt = f"{recall_context}\n\n{prompt}"
@@ -8219,6 +8394,10 @@ class PushHandler(BaseHTTPRequestHandler):
                     if not self._save_codex_target(new_thread_id, cwd, "cc-app:kairos:app-server"):
                         raise CodexAppBridgeError("failed to persist app-server thread pointer")
                     session_id = new_thread_id
+                    _append_recall_for_session(new_thread_id)
+
+                def _on_turn_accepted(accepted_thread_id: str) -> None:
+                    _commit_recall_for_session(accepted_thread_id)
 
                 def _on_activity(activity_text: str) -> None:
                     nonlocal activity_count
@@ -8325,6 +8504,7 @@ class PushHandler(BaseHTTPRequestHandler):
                                 on_update=_on_update,
                                 on_activity=_on_activity,
                                 on_thread=_on_thread,
+                                on_turn_accepted=_on_turn_accepted,
                                 marker_provider=self._codex_rollout_marker,
                                 # Interactive Kairos turns can legitimately run while
                                 # agents, builds, or reviews are still making progress.
@@ -8454,6 +8634,9 @@ class PushHandler(BaseHTTPRequestHandler):
                     return
                 if thread_id:
                     self._save_codex_target(thread_id, cwd, "cc-app:kairos")
+                    _append_recall_for_session(thread_id)
+                    if return_code == 0:
+                        _commit_recall_for_session(thread_id)
                 if return_code != 0 and stderr_text:
                     logger.warning("kairos codex return_code=%s stderr=%s", return_code, stderr_text[-800:])
                 answer = (answer or "").strip() or _current_draft_text() or "Kairos 没有返回可展示内容。"
@@ -8587,16 +8770,39 @@ class PushHandler(BaseHTTPRequestHandler):
                     )
                     if link_context:
                         prompt = f"{prompt}\n\n{link_context}"
+                    recall_result = None
+                    recall_card_appended = False
+                    recall_committed = False
+
+                    def _append_group_recall_for_session(target_session_id: str | None) -> None:
+                        nonlocal recall_card_appended
+                        target_session_id = str(target_session_id or "").strip()
+                        if recall_result is None or recall_card_appended or not target_session_id:
+                            return
+                        recall_card_appended = self._append_kairos_recall_card(
+                            chat,
+                            recall_result,
+                            user_ts=user_ts,
+                            source="memory-recall:group:kairos",
+                            group=True,
+                            session_id=target_session_id,
+                        )
+
+                    def _commit_group_recall_for_session(target_session_id: str | None) -> None:
+                        nonlocal recall_committed
+                        target_session_id = str(target_session_id or "").strip()
+                        if recall_result is None or recall_committed or not target_session_id:
+                            return
+                        _append_group_recall_for_session(target_session_id)
+                        recall_committed = self._commit_kairos_recall(
+                            recall_result,
+                            target_session_id,
+                        )
+
                     if semantic_recall_allowed:
-                        recall_result = self._kairos_semantic_recall(text)
+                        recall_result = self._kairos_semantic_recall(text, session_id=session_id)
                         if recall_result is not None:
-                            self._append_kairos_recall_card(
-                                chat,
-                                recall_result,
-                                user_ts=user_ts,
-                                source="memory-recall:group:kairos",
-                                group=True,
-                            )
+                            _append_group_recall_for_session(session_id)
                             recall_context = str(getattr(recall_result, "context", "") or "").strip()
                             if recall_context:
                                 prompt = f"{recall_context}\n\n{prompt}"
@@ -8650,6 +8856,9 @@ class PushHandler(BaseHTTPRequestHandler):
                         return
                     if thread_id:
                         self._save_codex_target(thread_id, cwd, "cc-app:apples:kairos")
+                        _append_group_recall_for_session(thread_id)
+                        if return_code == 0:
+                            _commit_group_recall_for_session(thread_id)
                     if return_code != 0 and stderr_text:
                         logger.warning("group kairos codex return_code=%s stderr=%s", return_code, stderr_text[-800:])
                     answer = (answer or "").strip() or "Kairos 没有返回可展示内容。"

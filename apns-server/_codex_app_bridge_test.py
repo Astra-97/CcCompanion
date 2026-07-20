@@ -8,7 +8,7 @@ import time
 import unittest
 from unittest import mock
 
-from codex_app_bridge import CodexActiveTurnError, CodexAppBridge
+from codex_app_bridge import CodexActiveTurnError, CodexAppBridge, CodexAppBridgeError
 
 
 FAKE_APP_SERVER = r'''
@@ -284,6 +284,35 @@ class CodexAppBridgeTest(unittest.TestCase):
             for entry in thread_entries
         ))
 
+    def test_turn_accepted_callback_runs_once_after_real_turn_id_exists(self):
+        accepted = []
+        result = self.bridge.run_turn(
+            thread_id=None,
+            cwd=self.root,
+            prompt="normal",
+            model="gpt-test",
+            effort="high",
+            on_turn_accepted=accepted.append,
+        )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(accepted, ["thread-test"])
+
+    def test_turn_accepted_callback_does_not_run_on_pre_start_failure(self):
+        accepted = []
+        error = CodexAppBridgeError("prepare failed", fallback_safe=True)
+        with mock.patch.object(self.bridge, "_prepare_thread", side_effect=error):
+            with self.assertRaises(CodexAppBridgeError) as raised:
+                self.bridge.run_turn(
+                    thread_id=None,
+                    cwd=self.root,
+                    prompt="normal",
+                    model="gpt-test",
+                    effort="high",
+                    on_turn_accepted=accepted.append,
+                )
+        self.assertTrue(raised.exception.fallback_safe)
+        self.assertEqual(accepted, [])
+
     def test_current_turn_compaction_is_returned(self):
         result = self.bridge.run_turn(
             thread_id=None,
@@ -493,6 +522,7 @@ class CodexAppBridgeTest(unittest.TestCase):
     def test_cancelled_before_start_does_not_create_turn(self):
         cancel_event = threading.Event()
         cancel_event.set()
+        accepted = []
         result = self.bridge.run_turn(
             thread_id=None,
             cwd=self.root,
@@ -500,9 +530,11 @@ class CodexAppBridgeTest(unittest.TestCase):
             model="gpt-test",
             effort="high",
             cancel_event=cancel_event,
+            on_turn_accepted=accepted.append,
         )
         self.assertEqual(result.status, "interrupted")
         self.assertNotIn("turn/start", self.methods())
+        self.assertEqual(accepted, [])
 
     def test_cancel_during_turn_start_interrupts_as_soon_as_id_arrives(self):
         cancel_event = threading.Event()
