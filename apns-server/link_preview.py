@@ -35,11 +35,13 @@ URL_RE = re.compile(
 )
 TRAILING_URL_PUNCTUATION = ".,;:!?)]}\u3002\uff0c\uff1b\uff1a\uff01\uff1f\uff09\u3011\u300b\u201d\u2019"
 XHS_HOSTS = {"xiaohongshu.com", "www.xiaohongshu.com", "xhslink.com", "www.xhslink.com"}
+WECHAT_HOSTS = {"mp.weixin.qq.com"}
 MAX_TITLE = 300
 MAX_DESCRIPTION = 800
 MAX_PAGE_IMAGES = 6
 GENERIC_CACHE_SCHEMA_VERSION = 3
 XHS_CACHE_SCHEMA_VERSION = 4
+WECHAT_CACHE_SCHEMA_VERSION = 1
 DNS_WORKERS = 4
 DNS_QUEUE_SIZE = 8
 
@@ -470,6 +472,7 @@ class SafeHTTPFetcher:
         headers: dict[str, str] | None = None,
         max_bytes: int | None = None,
         allow_redirects: bool = True,
+        truncate_at_limit: bool = False,
     ) -> HTTPPayload:
         current = str(url)
         method = method.upper()
@@ -523,7 +526,7 @@ class SafeHTTPFetcher:
                         extra_headers.pop("Content-Type", None)
                     continue
                 declared = response_headers.get("content-length")
-                if declared:
+                if declared and not truncate_at_limit:
                     try:
                         if int(declared) > limit:
                             raise ResponseTooLargeError("declared response too large")
@@ -534,19 +537,26 @@ class SafeHTTPFetcher:
                     raise LinkPreviewError("compressed responses are not accepted")
                 chunks: list[bytes] = []
                 total = 0
+                truncated = False
                 while True:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise LinkPreviewError("total timeout exceeded")
                     if conn.sock is not None:
                         conn.sock.settimeout(min(self.read_timeout, remaining))
-                    chunk = response.read(min(65_536, limit - total + 1))
+                    if truncate_at_limit and total >= limit:
+                        truncated = True
+                        break
+                    read_limit = limit - total if truncate_at_limit else limit - total + 1
+                    chunk = response.read(min(65_536, read_limit))
                     if not chunk:
                         break
                     total += len(chunk)
                     if total > limit:
                         raise ResponseTooLargeError("streamed response too large")
                     chunks.append(chunk)
+                if truncated:
+                    response_headers["x-cc-preview-truncated"] = "1"
                 return HTTPPayload(current, response.status, response_headers, b"".join(chunks))
             except (LinkPreviewError, UnsafeAddressError, ResponseTooLargeError):
                 raise
@@ -558,6 +568,17 @@ class SafeHTTPFetcher:
 
 
 class _HTMLTextExtractor(HTMLParser):
+    _VOID_TAGS = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr",
+    }
+    _BLOCK_TAGS = {
+        "address", "article", "aside", "blockquote", "dd", "div", "dl", "dt",
+        "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3",
+        "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p",
+        "pre", "section", "table", "td", "th", "tr", "ul",
+    }
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.meta: dict[str, str] = {}
@@ -570,10 +591,41 @@ class _HTMLTextExtractor(HTMLParser):
         self._script_type = ""
         self._script_parts: list[str] = []
         self._script_chars = 0
+        # WeChat pages carry a large amount of shell/recommendation text.  The
+        # publisher and article body have stable DOM ids, so capture those
+        # bounded subtrees separately from generic visible text.
+        self.wechat_name_parts: list[str] = []
+        self.wechat_body_tokens: list[tuple[str, str, bool]] = []
+        self.wechat_content_seen = False
+        self._wechat_capture = ""
+        self._wechat_stack: list[tuple[str, bool, bool]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
         values = {str(k).lower(): str(v or "") for k, v in attrs}
+        element_id = values.get("id", "").strip().lower()
+        if not self._wechat_capture and element_id in {"js_name", "js_content"}:
+            self._wechat_capture = element_id
+            self._wechat_stack = [(tag, False, False)]
+            if element_id == "js_content":
+                self.wechat_content_seen = True
+        elif self._wechat_capture and tag not in self._VOID_TAGS:
+            _parent_tag, parent_related, parent_ignored = self._wechat_stack[-1]
+            if (
+                self._wechat_capture == "js_content"
+                and tag in self._BLOCK_TAGS
+                and not parent_ignored
+            ):
+                self.wechat_body_tokens.append(("break", "", parent_related))
+            class_names = set(values.get("class", "").split())
+            related = parent_related or "mp_article_text_link" in class_names
+            style = re.sub(r"\s+", "", values.get("style", "")).lower()
+            ignored = parent_ignored or "hidden" in values or "display:none" in style
+            self._wechat_stack.append((tag, related, ignored))
+        elif self._wechat_capture == "js_content" and tag == "br" and self._wechat_stack:
+            _parent_tag, parent_related, parent_ignored = self._wechat_stack[-1]
+            if not parent_ignored:
+                self.wechat_body_tokens.append(("break", "", parent_related))
         if tag in {"script", "style", "noscript", "svg", "template"}:
             self._hidden_depth += 1
         if tag == "script":
@@ -603,6 +655,20 @@ class _HTMLTextExtractor(HTMLParser):
             self._hidden_depth -= 1
         if tag == "title":
             self._in_title = False
+        if self._wechat_capture and self._wechat_stack:
+            _current_tag, current_related, current_ignored = self._wechat_stack[-1]
+            if (
+                self._wechat_capture == "js_content"
+                and tag in self._BLOCK_TAGS
+                and not current_ignored
+            ):
+                self.wechat_body_tokens.append(("break", "", current_related))
+            for index in range(len(self._wechat_stack) - 1, -1, -1):
+                if self._wechat_stack[index][0] == tag:
+                    del self._wechat_stack[index:]
+                    break
+            if not self._wechat_stack:
+                self._wechat_capture = ""
 
     def handle_data(self, data: str) -> None:
         if self._in_script:
@@ -618,6 +684,14 @@ class _HTMLTextExtractor(HTMLParser):
             self.title_parts.append(value)
         if not self._hidden_depth:
             self.text_parts.append(value)
+            if self._wechat_capture == "js_name":
+                self.wechat_name_parts.append(value)
+            elif self._wechat_capture == "js_content" and self._wechat_stack:
+                _tag, related, ignored = self._wechat_stack[-1]
+                if not ignored:
+                    body_value = re.sub(r"\s+", " ", data)
+                    if body_value.strip():
+                        self.wechat_body_tokens.append(("text", body_value, related))
 
 
 def _safe_image_url(value: Any, base_url: str, *, xhs_only: bool = False) -> str:
@@ -930,6 +1004,67 @@ def _is_xhs_logo_url(url: str) -> bool:
     )
 
 
+_WECHAT_TRAILING_SECTION_LABELS = {
+    "互动一下",
+    "相关阅读",
+    "推荐阅读",
+    "往期推荐",
+}
+
+
+def _clean_wechat_body_tokens(tokens: list[tuple[str, str, bool]]) -> str:
+    """Build paragraphs from js_content, preserving inline runs and <br>."""
+    paragraphs: list[tuple[str, bool]] = []
+    text_parts: list[str] = []
+    related_flags: list[bool] = []
+
+    def flush() -> None:
+        value = unescape("".join(text_parts)).strip()
+        value = re.sub(r"[ \t\f\v]+", " ", value)
+        if value and (not paragraphs or paragraphs[-1][0] != value):
+            paragraphs.append((value, bool(related_flags) and all(related_flags)))
+        text_parts.clear()
+        related_flags.clear()
+
+    for kind, raw, related in tokens:
+        if kind == "break":
+            flush()
+            continue
+        text_parts.append(str(raw or ""))
+        related_flags.append(bool(related))
+    flush()
+
+    # Remove a related-article tail only when the publisher explicitly starts
+    # it with one of the known section labels.  A terminal inline article link
+    # without such a label remains legitimate body text.
+    for index in range(len(paragraphs) - 1, -1, -1):
+        if paragraphs[index][0] not in _WECHAT_TRAILING_SECTION_LABELS:
+            continue
+        trailing = paragraphs[index + 1 :]
+        if trailing and all(related for _value, related in trailing):
+            paragraphs = paragraphs[:index]
+        break
+    return "\n".join(value for value, _related in paragraphs)
+
+
+def _is_wechat_challenge_payload(
+    payload: HTTPPayload,
+    visible_parts: list[str] | None = None,
+) -> bool:
+    try:
+        path = urlsplit(payload.url).path.rstrip("/")
+    except ValueError:
+        path = ""
+    if path == "/mp/wappoc_appmsgcaptcha":
+        return True
+    compact = re.sub(r"\s+", "", unescape(" ".join(visible_parts or ())))
+    return (
+        "当前环境异常" in compact
+        and "完成验证后即可继续访问" in compact
+        and "去验证" in compact
+    )
+
+
 def _decode_html(payload: HTTPPayload) -> str:
     content_type = payload.headers.get("content-type", "")
     charset_match = re.search(r"charset\s*=\s*['\"]?([^;'\"\s]+)", content_type, re.I)
@@ -949,12 +1084,24 @@ def extract_html_page(requested_url: str, payload: HTTPPayload, *, max_text_char
         raise LinkPreviewError("upstream returned non-success status")
     if "html" not in content_type and not payload.body.lstrip().startswith((b"<!DOCTYPE", b"<html", b"<HTML")):
         raise LinkPreviewError("response is not HTML")
+    is_wechat = LinkPreviewService._is_wechat(requested_url) or LinkPreviewService._is_wechat(payload.url)
+    if is_wechat and _is_wechat_challenge_payload(payload):
+        raise LinkPreviewError("WeChat verification challenge")
     parser = _HTMLTextExtractor()
     try:
         parser.feed(_decode_html(payload))
     except Exception as exc:
         raise LinkPreviewError("HTML parsing failed") from exc
     meta = parser.meta
+    trusted_wechat_article = bool(
+        str(meta.get("og:title") or "").strip() and parser.wechat_content_seen
+    )
+    if (
+        is_wechat
+        and not trusted_wechat_article
+        and _is_wechat_challenge_payload(payload, parser.text_parts)
+    ):
+        raise LinkPreviewError("WeChat verification challenge")
     title = meta.get("og:title") or meta.get("twitter:title") or " ".join(parser.title_parts)
     description = meta.get("og:description") or meta.get("description") or meta.get("twitter:description") or ""
     site_name = meta.get("og:site_name") or ""
@@ -982,6 +1129,13 @@ def extract_html_page(requested_url: str, payload: HTTPPayload, *, max_text_char
         # state payload.  With no exact desc, retain content via a deliberately
         # narrow whole-line boilerplate filter.
         body_text = _xhs_body_text(body_text, authoritative_desc=note_description)
+    elif is_wechat:
+        body_text = _clean_wechat_body_tokens(parser.wechat_body_tokens)
+        site_name = " ".join(parser.wechat_name_parts) or meta.get("author") or site_name
+        if not body_text:
+            raise LinkPreviewError("WeChat article body was not available")
+        if not description:
+            description = re.sub(r"\s+", " ", body_text).strip()[:MAX_DESCRIPTION]
     body_text = _redact_url_echoes(
         re.sub(r"(?:\n\s*){3,}", "\n\n", unescape(body_text)).strip(),
         *source_urls,
@@ -1380,6 +1534,8 @@ class LinkPreviewService:
             # not serve a pre-upgrade sidecar until TTL.
             if self._is_xhs(url) and meta.get("schema_version") != XHS_CACHE_SCHEMA_VERSION:
                 return None
+            if self._is_wechat(url) and meta.get("schema_version") != WECHAT_CACHE_SCHEMA_VERSION:
+                return None
             if not self._cached_image_paths_are_valid(meta):
                 return None
             # Renew before exposing the path.  The atomic sidecar replacement is
@@ -1486,7 +1642,63 @@ class LinkPreviewService:
             return False
         return host in XHS_HOSTS or host.endswith(".xiaohongshu.com")
 
+    @staticmethod
+    def _is_wechat(url: str) -> bool:
+        try:
+            host = (urlsplit(url).hostname or "").lower().rstrip(".")
+        except ValueError:
+            return False
+        return host in WECHAT_HOSTS
+
+    def _fetch_wechat_page(self, url: str, deadline: float) -> ExtractedPage:
+        # The ordinary bot-like UA is redirected to a verification wall, while
+        # the public article is served to normal phone browsers.  Try two
+        # realistic, cookie-free mobile variants within the same hard deadline.
+        header_variants = (
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 "
+                    "Mobile/15E148 Safari/604.1"
+                ),
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5",
+                "Referer": "https://mp.weixin.qq.com/",
+            },
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 "
+                    "MicroMessenger/8.0.56 NetType/WIFI Language/zh_CN"
+                ),
+                "Accept-Language": "zh-CN,zh;q=0.9",
+                "Referer": "https://mp.weixin.qq.com/",
+            },
+        )
+        last_error: LinkPreviewError | None = None
+        for headers in header_variants:
+            if time.monotonic() >= deadline:
+                break
+            try:
+                payload = self.fetcher.request(
+                    url,
+                    deadline=deadline,
+                    headers=headers,
+                    max_bytes=self.max_download_bytes,
+                    truncate_at_limit=True,
+                )
+                if not self._is_wechat(payload.url):
+                    raise LinkPreviewError("WeChat article redirected off origin")
+                return extract_html_page(url, payload, max_text_chars=self.max_text_chars)
+            except LinkPreviewError as exc:
+                last_error = exc
+        raise last_error or LinkPreviewError("WeChat article fetch failed")
+
     def _fetch_page(self, url: str, deadline: float) -> ExtractedPage:
+        if self._is_wechat(url):
+            # Never send a verification wall through the generic renderer or
+            # persist it as article content.  A failed mobile fetch simply
+            # degrades to no preview.
+            return self._fetch_wechat_page(url, deadline)
         # The cookie/API-backed XHS adapter is preferred when explicitly
         # configured.  No cookie path is guessed and an unavailable adapter
         # falls through to safe plain HTTP extraction.
@@ -1599,6 +1811,7 @@ class LinkPreviewService:
         text_path, meta_path = self._paths(url)
         key = self._url_key(url)
         is_xhs = self._is_xhs(url) or self._is_xhs(page.final_url)
+        is_wechat = self._is_wechat(url) or self._is_wechat(page.final_url)
         remote_image_urls = list(page.image_urls or ((page.image_url,) if page.image_url else ()))[:MAX_PAGE_IMAGES]
         source_urls = (url, page.final_url, *remote_image_urls)
         safe_requested_url = _redact_url_echoes(_metadata_url(url), *source_urls)
@@ -1647,7 +1860,13 @@ class LinkPreviewService:
             pass
         safe_host = _redact_url_echoes(host, *source_urls)
         meta_base: dict[str, Any] = {
-            "schema_version": XHS_CACHE_SCHEMA_VERSION if is_xhs else GENERIC_CACHE_SCHEMA_VERSION,
+            "schema_version": (
+                XHS_CACHE_SCHEMA_VERSION
+                if is_xhs
+                else WECHAT_CACHE_SCHEMA_VERSION
+                if is_wechat
+                else GENERIC_CACHE_SCHEMA_VERSION
+            ),
             "url": safe_requested_url,
             "final_url": safe_final_url,
             "title": _metadata_text(safe_title, MAX_TITLE),

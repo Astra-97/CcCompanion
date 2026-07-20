@@ -252,6 +252,127 @@ class LinkPreviewTests(unittest.TestCase):
         self.assertIn("Hello", page.body_text)
         self.assertNotIn("secret", page.body_text)
 
+    def test_wechat_extracts_trusted_article_fields_and_scoped_clean_body(self):
+        html = """<html><head>
+        <meta property="og:title" content="工信部：AI 产品成为新热点">
+        <meta property="og:description" content="人工智能终端不断丰富">
+        <meta property="og:image" content="https://mmbiz.qpic.cn/cover.jpg">
+        <meta property="og:site_name" content="微信公众平台">
+        </head><body>
+        <a id="js_name">财闻</a>
+        <div id="js_content" style="visibility:hidden">
+          <p>第一段正文</p><p>第二段正文</p>
+          <section><span>互动一下</span></section>
+          <a class="normal_text_link mp_article_text_link" href="/s/other">推荐文章一</a>
+          <a class="mp_article_text_link" href="/s/another">推荐文章二</a>
+          <p style="display: none">隐藏弹窗文案</p>
+        </div>
+        <div>阅读原文 点赞 在看 页面壳</div></body></html>""".encode()
+        payload = link_preview.HTTPPayload(
+            "https://mp.weixin.qq.com/s/article", 200,
+            {"content-type": "text/html; charset=UTF-8"}, html,
+        )
+        page = link_preview.extract_html_page(
+            "https://mp.weixin.qq.com/s/article", payload, max_text_chars=1000
+        )
+        self.assertEqual(page.title, "工信部：AI 产品成为新热点")
+        self.assertEqual(page.description, "人工智能终端不断丰富")
+        self.assertEqual(page.site_name, "财闻")
+        self.assertEqual(page.image_url, "https://mmbiz.qpic.cn/cover.jpg")
+        self.assertEqual(page.body_text, "第一段正文\n第二段正文")
+        self.assertNotIn("页面壳", page.body_text)
+        self.assertNotIn("推荐文章", page.body_text)
+        self.assertNotIn("隐藏弹窗", page.body_text)
+
+    def test_wechat_derives_description_from_article_body_when_meta_is_empty(self):
+        html = b"""<html><head><meta property='og:title' content='Title'></head>
+        <body><span id='js_name'>Publisher</span><div id='js_content'>First paragraph<br>Second</div>"""
+        payload = link_preview.HTTPPayload(
+            "https://mp.weixin.qq.com/s/partial", 200,
+            {"content-type": "text/html", "x-cc-preview-truncated": "1"}, html,
+        )
+        page = link_preview.extract_html_page(
+            "https://mp.weixin.qq.com/s/partial", payload, max_text_chars=1000
+        )
+        self.assertEqual(page.description, "First paragraph Second")
+        self.assertEqual(page.body_text, "First paragraph\nSecond")
+
+    def test_wechat_inline_nodes_stay_in_one_paragraph_and_br_breaks_line(self):
+        html = """<html><head><meta property='og:title' content='Inline'></head><body>
+        <span id='js_name'>Publisher</span><div id='js_content'>
+        <p>这是一句<strong>强调文字</strong>的正常正文</p>
+        <p>第一行<br>第二行</p></div></body></html>""".encode()
+        payload = link_preview.HTTPPayload(
+            "https://mp.weixin.qq.com/s/inline", 200,
+            {"content-type": "text/html"}, html,
+        )
+        page = link_preview.extract_html_page(
+            "https://mp.weixin.qq.com/s/inline", payload, max_text_chars=1000
+        )
+        self.assertEqual(
+            page.body_text,
+            "这是一句强调文字的正常正文\n第一行\n第二行",
+        )
+
+    def test_wechat_terminal_inline_article_link_without_section_label_is_preserved(self):
+        html = """<html><head><meta property='og:title' content='Linked'></head><body>
+        <div id='js_content'><p>请参阅<a class='mp_article_text_link'>官方文件</a>获取详情</p>
+        </div></body></html>""".encode()
+        payload = link_preview.HTTPPayload(
+            "https://mp.weixin.qq.com/s/linked", 200,
+            {"content-type": "text/html"}, html,
+        )
+        page = link_preview.extract_html_page(
+            "https://mp.weixin.qq.com/s/linked", payload, max_text_chars=1000
+        )
+        self.assertEqual(page.body_text, "请参阅官方文件获取详情")
+
+    def test_wechat_challenge_url_and_visible_challenge_are_rejected(self):
+        challenge = """<html><body><main>环境异常 当前环境异常，完成验证后即可继续访问。
+        <button>去验证</button></main></body></html>""".encode()
+        payloads = (
+            link_preview.HTTPPayload(
+                "https://mp.weixin.qq.com/mp/wappoc_appmsgcaptcha?poc_token=secret",
+                200, {"content-type": "text/html"}, b"<html><body>anything</body></html>",
+            ),
+            link_preview.HTTPPayload(
+                "https://mp.weixin.qq.com/s/article", 200,
+                {"content-type": "text/html"}, challenge,
+            ),
+        )
+        for payload in payloads:
+            with self.subTest(url=payload.url), self.assertRaises(link_preview.LinkPreviewError):
+                link_preview.extract_html_page(
+                    "https://mp.weixin.qq.com/s/article", payload, max_text_chars=1000
+                )
+
+    def test_wechat_real_article_may_quote_challenge_wording(self):
+        html = """<html><head><meta property='og:title' content='验证码研究'></head>
+        <body><a id='js_name'>安全研究所</a><div id='js_content'><p>页面提示：</p>
+        <blockquote>当前环境异常，完成验证后即可继续访问。去验证</blockquote>
+        <p>以上是本文引用的原文。</p></div></body></html>""".encode()
+        payload = link_preview.HTTPPayload(
+            "https://mp.weixin.qq.com/s/research", 200,
+            {"content-type": "text/html"}, html,
+        )
+        page = link_preview.extract_html_page(
+            "https://mp.weixin.qq.com/s/research", payload, max_text_chars=1000
+        )
+        self.assertIn("当前环境异常", page.body_text)
+        self.assertIn("去验证", page.body_text)
+
+    def test_explicit_truncation_keeps_hard_response_budget(self):
+        fetcher = link_preview.SafeHTTPFetcher(max_download_bytes=1024)
+        response = FakeResponse(200, {"Content-Length": "3000"}, b"x" * 3000)
+        connection = FakeConnection(response)
+        fetcher._connect = lambda *args: connection
+        payload = fetcher.request(
+            "https://public.example", deadline=time.monotonic() + 1,
+            truncate_at_limit=True,
+        )
+        self.assertEqual(len(payload.body), 1024)
+        self.assertEqual(payload.headers["x-cc-preview-truncated"], "1")
+
     def test_xhs_prefers_article_jsonld_images_over_generic_logo(self):
         article = {
             "@context": "https://schema.org",
@@ -604,6 +725,84 @@ class LinkPreviewTests(unittest.TestCase):
             self.assertNotIn("stale", persisted)
             self.assertEqual(preview["description"], "fresh summary")
             self.assertEqual(preview["schema_version"], link_preview.XHS_CACHE_SCHEMA_VERSION)
+
+    def test_wechat_mobile_retry_never_returns_challenge_as_article(self):
+        url = "https://mp.weixin.qq.com/s/article"
+        challenge = link_preview.HTTPPayload(
+            "https://mp.weixin.qq.com/mp/wappoc_appmsgcaptcha",
+            200, {"content-type": "text/html"}, b"<html>challenge</html>",
+        )
+        article = link_preview.HTTPPayload(
+            url, 200, {"content-type": "text/html", "content-length": "3000000"},
+            b"""<html><head><meta property='og:title' content='Fresh article'></head>
+            <body><a id='js_name'>Fresh publisher</a>
+            <div id='js_content'>Fresh body</div>""",
+        )
+        fetcher = QueueFetcher([challenge, article])
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(td, fetcher=fetcher)
+            page = service._fetch_page(url, time.monotonic() + 1)
+        self.assertEqual(page.title, "Fresh article")
+        self.assertEqual(page.site_name, "Fresh publisher")
+        self.assertEqual(len(fetcher.calls), 2)
+        for _called_url, kwargs in fetcher.calls:
+            self.assertTrue(kwargs["truncate_at_limit"])
+            self.assertIn("Mobile", kwargs["headers"]["User-Agent"])
+            self.assertEqual(kwargs["headers"]["Referer"], "https://mp.weixin.qq.com/")
+
+    def test_wechat_all_challenges_fail_open_without_cache_artifacts(self):
+        url = "https://mp.weixin.qq.com/s/article"
+        challenge = link_preview.HTTPPayload(
+            "https://mp.weixin.qq.com/mp/wappoc_appmsgcaptcha",
+            200, {"content-type": "text/html"}, b"<html>challenge</html>",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(
+                td, fetcher=QueueFetcher([challenge, challenge]), cleanup_grace_seconds=1
+            )
+            bundle = service.enrich(url)
+            self.assertEqual(bundle.previews, ())
+            self.assertEqual(list(Path(td).iterdir()), [])
+
+    def test_wechat_article_redirect_off_origin_is_not_trusted(self):
+        url = "https://mp.weixin.qq.com/s/article"
+        off_origin = link_preview.HTTPPayload(
+            "https://evil.example/article", 200, {"content-type": "text/html"},
+            b"<html><div id='js_content'>forged article</div></html>",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(
+                td, fetcher=QueueFetcher([off_origin, off_origin])
+            )
+            self.assertEqual(service.enrich(url).previews, ())
+
+    def test_pre_upgrade_wechat_challenge_cache_is_not_reused(self):
+        url = "https://mp.weixin.qq.com/s/article"
+        html = b"""<html><head><meta property='og:title' content='Fresh'></head>
+        <body><a id='js_name'>Publisher</a><div id='js_content'>Real body</div>"""
+        article = link_preview.HTTPPayload(
+            url, 200, {"content-type": "text/html"}, html,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(td, fetcher=QueueFetcher([article]))
+            text_path, meta_path = service._paths(url)
+            key = service._url_key(url)
+            text_path.write_text("环境异常 去验证")
+            meta_path.write_text(json.dumps({
+                "schema_version": link_preview.GENERIC_CACHE_SCHEMA_VERSION,
+                "cache_key": key,
+                "lease_until": time.time() + 1000,
+                "title": "环境异常",
+                "image_cache_url": "",
+                "image_cache_urls": [],
+                "image_paths": [],
+            }))
+            preview = service.enrich(url).previews[0]
+            persisted = Path(preview["content_path"]).read_text()
+            self.assertEqual(preview["schema_version"], link_preview.WECHAT_CACHE_SCHEMA_VERSION)
+            self.assertEqual(preview["title"], "Fresh")
+            self.assertIn("Real body", persisted)
+            self.assertNotIn("环境异常", persisted)
 
     def test_multi_image_lease_protects_every_cached_image(self):
         with tempfile.TemporaryDirectory() as td:
