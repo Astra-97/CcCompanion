@@ -1919,6 +1919,116 @@ class LinkPreviewTests(unittest.TestCase):
         self.assertEqual(bundle.previews[0]["comments_status"], "included")
         self.assertNotIn("xhslink", " ".join(command))
 
+    def test_xhs_cli_retries_once_with_http_resolved_tokenized_url(self):
+        short_url = "https://xhslink.com/o/abc"
+        final_url = (
+            "https://www.xiaohongshu.com/explore/1234567890abcdef"
+            "?xsec_token=opaque&xsec_source=pc_share"
+        )
+        http_payload = link_preview.HTTPPayload(
+            final_url,
+            200,
+            {"content-type": "text/html; charset=utf-8"},
+            b"<html><head><meta property='og:title' content='HTTP note'></head>"
+            b"<body>HTTP body</body></html>",
+        )
+        adapter_page = link_preview.ExtractedPage(
+            requested_url=final_url,
+            final_url=final_url,
+            title="adapter note",
+            description="",
+            site_name="xhs-cli",
+            image_url="",
+            body_text="adapter body",
+            comments="author: comment",
+            comments_fetched=True,
+            comments_complete=True,
+            provider="xhs-cli",
+        )
+        calls = []
+
+        def adapter(url, deadline):
+            calls.append(url)
+            if url == short_url:
+                raise link_preview.LinkPreviewError("short link rejected")
+            return adapter_page
+
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(
+                td,
+                xhs_cli_command=["unused"],
+                windows_api_url="https://windows.example/preview",
+                fetcher=QueueFetcher([http_payload]),
+            )
+            service._call_command_adapter = adapter
+            bundle = service.enrich(short_url)
+
+        self.assertEqual(calls, [short_url, final_url])
+        self.assertEqual(bundle.previews[0]["provider"], "xhs-cli")
+        self.assertEqual(bundle.previews[0]["comments_status"], "included")
+
+    def test_xhs_cli_second_failure_keeps_http_preview_without_repeating(self):
+        short_url = "https://xhslink.com/o/abc"
+        final_url = (
+            "https://www.xiaohongshu.com/explore/1234567890abcdef"
+            "?xsec_token=opaque"
+        )
+        http_payload = link_preview.HTTPPayload(
+            final_url,
+            200,
+            {"content-type": "text/html; charset=utf-8"},
+            b"<html><head><meta property='og:title' content='HTTP note'></head>"
+            b"<body>HTTP body</body></html>",
+        )
+        calls = []
+
+        def rejected(url, deadline):
+            calls.append(url)
+            raise link_preview.LinkPreviewError("adapter rejected")
+
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(
+                td, xhs_cli_command=["unused"], fetcher=QueueFetcher([http_payload])
+            )
+            service._call_command_adapter = rejected
+            bundle = service.enrich(short_url)
+
+        self.assertEqual(calls, [short_url, final_url])
+        self.assertEqual(bundle.previews[0]["provider"], "http")
+        self.assertEqual(bundle.previews[0]["comments_status"], "not_fetched")
+
+    def test_xhs_cli_does_not_retry_same_untokenized_or_untrusted_final_url(self):
+        cases = (
+            "https://xhslink.com/o/abc",
+            "https://www.xiaohongshu.com/explore/1234567890abcdef",
+            "https://evil.example/explore/1234567890abcdef?xsec_token=opaque",
+        )
+        for final_url in cases:
+            with self.subTest(final_url=final_url):
+                short_url = "https://xhslink.com/o/abc"
+                http_payload = link_preview.HTTPPayload(
+                    final_url,
+                    200,
+                    {"content-type": "text/html; charset=utf-8"},
+                    b"<html><head><title>HTTP note</title></head><body>HTTP body</body></html>",
+                )
+                calls = []
+
+                def rejected(url, deadline):
+                    calls.append(url)
+                    raise link_preview.LinkPreviewError("adapter rejected")
+
+                with tempfile.TemporaryDirectory() as td:
+                    service = link_preview.LinkPreviewService(
+                        td, xhs_cli_command=["unused"], fetcher=QueueFetcher([http_payload])
+                    )
+                    service._call_command_adapter = rejected
+                    bundle = service.enrich(short_url)
+
+                self.assertEqual(calls, [short_url])
+                self.assertEqual(bundle.previews[0]["provider"], "http")
+                self.assertEqual(bundle.previews[0]["comments_status"], "not_fetched")
+
     def test_xhs_cli_url_rejects_userinfo_bad_port_and_host_suffix(self):
         rejected = (
             "https://user@xhslink.com/o/a",
@@ -2030,13 +2140,13 @@ class LinkPreviewTests(unittest.TestCase):
             text_path, meta_path = service._paths(url)
             text_path.write_text("old")
             meta_path.write_text(json.dumps({
-                "schema_version": 4,
+                "schema_version": 5,
                 "cache_key": service._url_key(url),
                 "lease_until": int(time.time() + 60),
                 "image_paths": [],
             }))
             self.assertIsNone(service._load_cache(url, time.monotonic() + 1))
-        self.assertEqual(link_preview.XHS_CACHE_SCHEMA_VERSION, 5)
+        self.assertEqual(link_preview.XHS_CACHE_SCHEMA_VERSION, 6)
 
 
 if __name__ == "__main__":

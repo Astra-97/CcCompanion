@@ -29,7 +29,16 @@ import tempfile
 import threading
 import time
 from typing import Any, Callable
-from urllib.parse import quote, quote_plus, unquote, unquote_plus, urljoin, urlsplit, urlunsplit
+from urllib.parse import (
+    parse_qs,
+    quote,
+    quote_plus,
+    unquote,
+    unquote_plus,
+    urljoin,
+    urlsplit,
+    urlunsplit,
+)
 
 
 URL_RE = re.compile(
@@ -43,7 +52,7 @@ MAX_TITLE = 300
 MAX_DESCRIPTION = 800
 MAX_PAGE_IMAGES = 6
 GENERIC_CACHE_SCHEMA_VERSION = 3
-XHS_CACHE_SCHEMA_VERSION = 5
+XHS_CACHE_SCHEMA_VERSION = 6
 WECHAT_CACHE_SCHEMA_VERSION = 1
 DNS_WORKERS = 4
 DNS_QUEUE_SIZE = 8
@@ -1692,6 +1701,28 @@ class LinkPreviewService:
         )
         return self._adapter_page(url, payload, "xhs-cli", self.max_text_chars)
 
+    def _retry_xhs_command_adapter(
+        self,
+        requested_url: str,
+        page: ExtractedPage,
+        deadline: float,
+    ) -> ExtractedPage:
+        """Retry the XHS CLI once when HTTP resolved a short link to a usable note URL."""
+        if not self.xhs_cli_command or time.monotonic() >= deadline:
+            return page
+        try:
+            requested_adapter_url = self._xhs_cli_url(requested_url)
+            final_adapter_url = self._xhs_cli_url(page.final_url)
+            token = parse_qs(urlsplit(final_adapter_url).query).get("xsec_token", [""])[0]
+        except (LinkPreviewError, ValueError):
+            return page
+        if not token or final_adapter_url == requested_adapter_url:
+            return page
+        try:
+            return self._call_command_adapter(final_adapter_url, deadline)
+        except LinkPreviewError:
+            return page
+
     @staticmethod
     def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
         try:
@@ -1862,6 +1893,15 @@ class LinkPreviewService:
             if self.windows_api_url and time.monotonic() < deadline:
                 return self._call_adapter(self.windows_api_url, url, "windows-render", deadline)
             raise
+        if self._is_xhs(url):
+            # The Singapore adapter may be unable to resolve a short link even
+            # though the main fetcher follows it successfully.  Give the
+            # adapter exactly one second chance with the canonical tokenized
+            # note URL.  This is deliberately non-recursive: a second failure
+            # keeps the ordinary HTTP preview and its not_fetched status.
+            page = self._retry_xhs_command_adapter(url, page, deadline)
+            if page.provider == "xhs-cli":
+                return page
         if self.windows_api_url and len(page.body_text) < 200:
             try:
                 return self._call_adapter(self.windows_api_url, url, "windows-render", deadline)
