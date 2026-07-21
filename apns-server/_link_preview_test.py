@@ -1604,7 +1604,12 @@ class LinkPreviewTests(unittest.TestCase):
             content_path.write_text("body")
             image_path.write_bytes(b"image")
             bundle = link_preview.LinkPreviewBundle(
-                ({"title": "T", "content_path": str(content_path)},), "SAFE LINK CONTEXT"
+                ({
+                    "title": "T",
+                    "content_path": str(content_path),
+                    "comments_status": "included_partial",
+                },),
+                "SAFE LINK CONTEXT",
             )
             meta = link_preview.merge_preview_metadata({"via": "card"}, bundle)
             self.assertEqual(meta["via"], "card")
@@ -1617,6 +1622,8 @@ class LinkPreviewTests(unittest.TestCase):
             rebuilt = handler._link_context_from_record({"metadata": meta})
             self.assertIn(str(content_path), rebuilt)
             self.assertIn("不可信", rebuilt)
+            self.assertIn("必须先读取该全文文件", rebuilt)
+            self.assertIn("内容图片只是帖子配图", rebuilt)
             rebuilt_images = handler._link_context_from_record({
                 "metadata": {
                     "link_previews": [{
@@ -1917,6 +1924,8 @@ class LinkPreviewTests(unittest.TestCase):
             bundle = service.enrich("http://xhslink.com/o/abc?xsec_token=opaque#fragment")
         self.assertEqual(bundle.previews[0]["provider"], "xhs-cli")
         self.assertEqual(bundle.previews[0]["comments_status"], "included")
+        self.assertIn("必须先读取该全文文件", bundle.prompt_context)
+        self.assertIn("内容图片只是帖子配图", bundle.prompt_context)
         self.assertNotIn("xhslink", " ".join(command))
 
     def test_xhs_cli_retries_once_with_http_resolved_tokenized_url(self):
@@ -2119,6 +2128,8 @@ class LinkPreviewTests(unittest.TestCase):
         self.assertEqual(bundle.previews[0]["comments_status"], "included_partial")
         self.assertIn("仅抓取首批", content)
         self.assertIn("可能有更多评论或楼中楼", bundle.prompt_context)
+        self.assertIn("必须先读取该全文文件", bundle.prompt_context)
+        self.assertIn("内容图片只是帖子配图", bundle.prompt_context)
 
         false_string = link_preview.HTTPPayload(
             "xhs-cli://adapter", 200, {"content-type": "application/json"},

@@ -5966,7 +5966,16 @@ class PushHandler(BaseHTTPRequestHandler):
             elif item.get("comments_status") == "login_required":
                 lines.append("- 抓取范围：小红书登录已失效，评论未抓取；请明确提醒用户重新登录。")
             elif item.get("comments_status") == "included_partial":
-                lines.append("- 抓取范围：仅抓取首批评论，可能有更多评论或楼中楼。")
+                lines.append(
+                    "- 评论已抓取并保存在上面的全文 .txt 文件中；必须先读取该全文文件后再回答。"
+                    "内容图片只是帖子配图，不能根据图片中没有评论而声称评论未抓取。"
+                    "抓取范围仅为首批，可能有更多评论或楼中楼。"
+                )
+            elif item.get("comments_status") == "included":
+                lines.append(
+                    "- 评论已抓取并保存在上面的全文 .txt 文件中；必须先读取该全文文件后再回答。"
+                    "内容图片只是帖子配图，不能根据图片中没有评论而声称评论未抓取。"
+                )
             elif item.get("comments_status") == "fetched_empty":
                 lines.append("- 抓取范围：评论已抓取，当前返回为空。")
             elif item.get("comments_status") == "fetched_empty_partial":
