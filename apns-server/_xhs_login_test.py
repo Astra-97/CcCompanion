@@ -124,6 +124,19 @@ class XhsLoginManagerTests(unittest.TestCase):
         self.assertIn('"/xhs-login/start": 4 * 1024', post)
         self.assertIn('"/xhs-login/import": 32 * 1024', post)
 
+    def test_successful_cookie_import_invalidates_stale_comment_failures(self):
+        source = Path("push.py").read_text(encoding="utf-8")
+        start_handler = source[
+            source.index("    def _handle_xhs_login_start"):
+            source.index("    def _handle_xhs_login_import")
+        ]
+        import_handler = source[
+            source.index("    def _handle_xhs_login_import"):
+            source.index("    def _handle_register")
+        ]
+        self.assertNotIn("invalidate_xhs_comment_failures", start_handler)
+        self.assertIn("invalidate_xhs_comment_failures", import_handler)
+
 
 if __name__ == "__main__":
     unittest.main()

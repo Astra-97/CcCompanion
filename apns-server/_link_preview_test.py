@@ -2133,6 +2133,242 @@ class LinkPreviewTests(unittest.TestCase):
         self.assertFalse(page.comments_fetched)
         self.assertFalse(page.comments_complete)
 
+        auth_payload = link_preview.HTTPPayload(
+            "xhs-cli://adapter", 200, {"content-type": "application/json"},
+            json.dumps({
+                "title": "note", "body_text": "body", "comments": [],
+                "comments_fetched": False, "comments_complete": False,
+                "comments_auth_required": True,
+            }).encode(),
+        )
+        auth_page = link_preview.LinkPreviewService._adapter_page(
+            "https://xhslink.com/o/a", auth_payload, "xhs-cli", 1000
+        )
+        self.assertTrue(auth_page.comments_auth_required)
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(td)
+            service._fetch_page = lambda url, deadline: auth_page
+            bundle = service.enrich("https://xhslink.com/o/a")
+            content = Path(bundle.previews[0]["content_path"]).read_text()
+        self.assertEqual(bundle.previews[0]["comments_status"], "login_required")
+        self.assertIn("登录已失效", content)
+        self.assertIn("提醒用户重新登录", bundle.prompt_context)
+
+        auth_string = link_preview.HTTPPayload(
+            "xhs-cli://adapter", 200, {"content-type": "application/json"},
+            json.dumps({
+                "title": "note", "body_text": "body", "comments": [],
+                "comments_auth_required": "true",
+            }).encode(),
+        )
+        strict_page = link_preview.LinkPreviewService._adapter_page(
+            "https://xhslink.com/o/a", auth_string, "xhs-cli", 1000
+        )
+        self.assertFalse(strict_page.comments_auth_required)
+
+    def test_successful_login_invalidates_only_xhs_comment_failures(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(td, cache_ttl_seconds=60)
+            xhs_auth_url = "https://xhslink.com/o/auth"
+            xhs_other_url = "https://xhslink.com/o/other"
+            generic_url = "https://example.com/article"
+            xhs_included_url = "https://xhslink.com/o/included"
+            pages = {
+                xhs_auth_url: link_preview.ExtractedPage(
+                    requested_url=xhs_auth_url, final_url=xhs_auth_url, title="auth",
+                    description="", site_name="小红书", image_url="", body_text="body",
+                    comments_auth_required=True, provider="xhs-cli",
+                ),
+                xhs_other_url: link_preview.ExtractedPage(
+                    requested_url=xhs_other_url, final_url=xhs_other_url, title="other",
+                    description="", site_name="小红书", image_url="", body_text="body",
+                ),
+                generic_url: link_preview.ExtractedPage(
+                    requested_url=generic_url, final_url=generic_url, title="generic",
+                    description="", site_name="Example", image_url="", body_text="body",
+                ),
+                xhs_included_url: link_preview.ExtractedPage(
+                    requested_url=xhs_included_url, final_url=xhs_included_url,
+                    title="included", description="", site_name="小红书", image_url="",
+                    body_text="body", comments="甲：评论", comments_fetched=True,
+                    comments_complete=True, provider="xhs-cli",
+                ),
+            }
+            service._fetch_page = lambda url, deadline: pages[url]
+            for url in pages:
+                service.enrich(url)
+
+            self.assertEqual(service.invalidate_xhs_comment_failures(), 2)
+            # Keep leased paths intact for already-queued turns, but force the
+            # next lookup through a fresh fetch by invalidating the schema.
+            self.assertTrue(service._paths(xhs_auth_url)[0].exists())
+            self.assertTrue(service._paths(xhs_auth_url)[1].exists())
+            self.assertIsNone(service._load_cache(xhs_auth_url, time.monotonic() + 1))
+            self.assertIsNone(service._load_cache(xhs_other_url, time.monotonic() + 1))
+            self.assertTrue(service._paths(generic_url)[1].exists())
+            self.assertIsNotNone(service._load_cache(generic_url, time.monotonic() + 1))
+            self.assertIsNotNone(service._load_cache(xhs_included_url, time.monotonic() + 1))
+
+    def test_login_boundary_makes_inflight_xhs_comment_failures_uncacheable(self):
+        for failure_status in ("login_required", "not_fetched"):
+            with self.subTest(failure_status=failure_status), tempfile.TemporaryDirectory() as td:
+                url = f"https://xhslink.com/o/race-{failure_status}"
+                image_url = "https://sns-webpic-qc.xhscdn.com/race.jpg"
+                fetch_started = threading.Event()
+                release_fetch = threading.Event()
+                calls = []
+                service = link_preview.LinkPreviewService(td, total_timeout=5)
+                image_key = service._image_url_key(image_url, xhs_only=True)
+                image_path = Path(td) / f"link_image_{image_key}.jpg"
+
+                failure_page = link_preview.ExtractedPage(
+                    requested_url=url,
+                    final_url=url,
+                    title="old failure",
+                    description="",
+                    site_name="小红书",
+                    image_url=image_url,
+                    body_text="body needed by the in-flight turn",
+                    comments_auth_required=failure_status == "login_required",
+                    provider="xhs-cli" if failure_status == "login_required" else "http",
+                )
+                fresh_page = link_preview.ExtractedPage(
+                    requested_url=url,
+                    final_url=url,
+                    title="fresh success",
+                    description="",
+                    site_name="小红书",
+                    image_url=image_url,
+                    body_text="fresh body",
+                    comments="甲：新评论",
+                    comments_fetched=True,
+                    comments_complete=True,
+                    provider="xhs-cli",
+                )
+
+                def fetch(_url, _deadline):
+                    calls.append(_url)
+                    if len(calls) == 1:
+                        fetch_started.set()
+                        self.assertTrue(release_fetch.wait(timeout=2))
+                        return failure_page
+                    return fresh_page
+
+                service._fetch_page = fetch
+                service._download_image_candidate = (
+                    lambda _url, _deadline, **_kwargs: (image_path, b"image")
+                )
+                results = []
+                worker = threading.Thread(target=lambda: results.append(service.enrich(url)))
+                worker.start()
+                self.assertTrue(fetch_started.wait(timeout=2))
+
+                # The old implementation skipped this active key and allowed
+                # its later failure commit to remain cacheable.
+                self.assertEqual(service.invalidate_xhs_comment_failures(), 0)
+                release_fetch.set()
+                worker.join(timeout=2)
+                self.assertFalse(worker.is_alive())
+
+                old_preview = results[0].previews[0]
+                self.assertEqual(old_preview["comments_status"], failure_status)
+                self.assertTrue(Path(old_preview["content_path"]).is_file())
+                self.assertTrue(image_path.is_file())
+                self.assertIsNone(service._load_cache(url, time.monotonic() + 1))
+
+                fresh = service.enrich(url).previews[0]
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(fresh["comments_status"], "included")
+                self.assertTrue(image_path.is_file())
+
+    def test_login_boundary_invalidates_failure_while_active_reader_uses_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            url = "https://xhslink.com/o/active-cached-failure"
+            cache_read = threading.Event()
+            release_reader = threading.Event()
+            service = link_preview.LinkPreviewService(td, total_timeout=5)
+            failure_page = link_preview.ExtractedPage(
+                requested_url=url,
+                final_url=url,
+                title="cached failure",
+                description="",
+                site_name="小红书",
+                image_url="",
+                body_text="leased body",
+                comments_auth_required=True,
+                provider="xhs-cli",
+            )
+            service._fetch_page = lambda _url, _deadline: failure_page
+            initial = service.enrich(url).previews[0]
+            self.assertEqual(initial["comments_status"], "login_required")
+
+            original_load = service._load_cache
+
+            def controlled_load(_url, deadline):
+                cached = original_load(_url, deadline)
+                cache_read.set()
+                self.assertTrue(release_reader.wait(timeout=2))
+                return cached
+
+            service._load_cache = controlled_load
+            results = []
+            worker = threading.Thread(target=lambda: results.append(service.enrich(url)))
+            worker.start()
+            self.assertTrue(cache_read.wait(timeout=2))
+
+            # The reader already owns a safe in-memory snapshot and leased
+            # path. Invalidating the sidecar commit marker does not delete or
+            # mutate either, even though this cache key is active.
+            self.assertEqual(service.invalidate_xhs_comment_failures(), 1)
+            release_reader.set()
+            worker.join(timeout=2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(results[0].previews[0]["comments_status"], "login_required")
+            self.assertTrue(Path(results[0].previews[0]["content_path"]).is_file())
+
+            service._load_cache = original_load
+            self.assertIsNone(service._load_cache(url, time.monotonic() + 1))
+
+    def test_login_boundary_preserves_inflight_xhs_comment_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            url = "https://xhslink.com/o/race-success"
+            fetch_started = threading.Event()
+            release_fetch = threading.Event()
+            service = link_preview.LinkPreviewService(td, total_timeout=5)
+            page = link_preview.ExtractedPage(
+                requested_url=url,
+                final_url=url,
+                title="included",
+                description="",
+                site_name="小红书",
+                image_url="",
+                body_text="body",
+                comments="甲：评论",
+                comments_fetched=True,
+                comments_complete=True,
+                provider="xhs-cli",
+            )
+
+            def fetch(_url, _deadline):
+                fetch_started.set()
+                self.assertTrue(release_fetch.wait(timeout=2))
+                return page
+
+            service._fetch_page = fetch
+            results = []
+            worker = threading.Thread(target=lambda: results.append(service.enrich(url)))
+            worker.start()
+            self.assertTrue(fetch_started.wait(timeout=2))
+            self.assertEqual(service.invalidate_xhs_comment_failures(), 0)
+            release_fetch.set()
+            worker.join(timeout=2)
+            self.assertFalse(worker.is_alive())
+
+            self.assertEqual(results[0].previews[0]["comments_status"], "included")
+            cached = service._load_cache(url, time.monotonic() + 1)
+            self.assertIsNotNone(cached)
+            self.assertEqual(cached["comments_status"], "included")
+
     def test_xhs_cache_schema_upgrade_invalidates_previous_sidecar(self):
         with tempfile.TemporaryDirectory() as td:
             service = link_preview.LinkPreviewService(td, cache_ttl_seconds=60)
@@ -2140,13 +2376,13 @@ class LinkPreviewTests(unittest.TestCase):
             text_path, meta_path = service._paths(url)
             text_path.write_text("old")
             meta_path.write_text(json.dumps({
-                "schema_version": 5,
+                "schema_version": 6,
                 "cache_key": service._url_key(url),
                 "lease_until": int(time.time() + 60),
                 "image_paths": [],
             }))
             self.assertIsNone(service._load_cache(url, time.monotonic() + 1))
-        self.assertEqual(link_preview.XHS_CACHE_SCHEMA_VERSION, 6)
+        self.assertEqual(link_preview.XHS_CACHE_SCHEMA_VERSION, 7)
 
 
 if __name__ == "__main__":

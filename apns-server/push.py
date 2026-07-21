@@ -4160,6 +4160,15 @@ class PushHandler(BaseHTTPRequestHandler):
         except XhsLoginError as exc:
             self._send_json(exc.status, {"ok": False, "error": exc.code})
             return
+        # A successful cookie import changes the result of comment fetching.
+        # Do not keep serving cached auth failures (or failures that predated
+        # this distinction) for the normal cache TTL.
+        try:
+            self.state.link_preview.invalidate_xhs_comment_failures()
+        except Exception:
+            # Cookie import itself already succeeded; a local cache maintenance
+            # failure must not turn that success into a misleading login error.
+            logger.exception("failed to invalidate stale XHS comment previews")
         self._send_json(200, result)
 
     def _handle_register(self, body: dict[str, Any]):
@@ -5954,6 +5963,8 @@ class PushHandler(BaseHTTPRequestHandler):
                         added = True
             if item.get("comments_status") == "not_fetched":
                 lines.append("- 抓取范围：评论未抓取，不得声称帖子或评论内容完整。")
+            elif item.get("comments_status") == "login_required":
+                lines.append("- 抓取范围：小红书登录已失效，评论未抓取；请明确提醒用户重新登录。")
             elif item.get("comments_status") == "included_partial":
                 lines.append("- 抓取范围：仅抓取首批评论，可能有更多评论或楼中楼。")
             elif item.get("comments_status") == "fetched_empty":

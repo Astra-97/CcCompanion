@@ -52,7 +52,7 @@ MAX_TITLE = 300
 MAX_DESCRIPTION = 800
 MAX_PAGE_IMAGES = 6
 GENERIC_CACHE_SCHEMA_VERSION = 3
-XHS_CACHE_SCHEMA_VERSION = 6
+XHS_CACHE_SCHEMA_VERSION = 7
 WECHAT_CACHE_SCHEMA_VERSION = 1
 DNS_WORKERS = 4
 DNS_QUEUE_SIZE = 8
@@ -91,6 +91,7 @@ class ExtractedPage:
     comments: str = ""
     comments_fetched: bool = False
     comments_complete: bool = False
+    comments_auth_required: bool = False
     provider: str = "http"
 
 
@@ -1248,6 +1249,8 @@ class LinkPreviewService:
         self._locks_guard = threading.Lock()
         self._locks: dict[str, _LockEntry] = {}
         self._cache_budget_lock = threading.Lock()
+        self._xhs_login_generation_lock = threading.Lock()
+        self._xhs_login_generation = 0
 
     @staticmethod
     def _url_key(url: str) -> str:
@@ -1449,6 +1452,50 @@ class LinkPreviewService:
         with self._cache_budget_lock:
             self._cleanup_cache_locked(time.time(), protected_keys=protected_keys)
 
+    def _xhs_login_generation_snapshot(self) -> int:
+        with self._xhs_login_generation_lock:
+            return self._xhs_login_generation
+
+    def invalidate_xhs_comment_failures(self) -> int:
+        """Make stale XHS comment failures miss cache after cookie import.
+
+        The page files stay in place for any already-queued AI turn that holds
+        their leased paths. A schema miss makes the next link use fresh cookies
+        and atomically replace the same group; cached images are untouched. The
+        generation is advanced before scanning so a failure fetch already in
+        flight cannot become a cache hit when it commits after this boundary.
+        """
+        invalidated = 0
+        # Never hold this lock while acquiring the budget lock. Persistence
+        # checks the generation while holding the budget lock, so releasing it
+        # here keeps the lock graph acyclic. Either persistence commits first
+        # and the scan invalidates it, or it observes this newer generation.
+        with self._xhs_login_generation_lock:
+            self._xhs_login_generation += 1
+        with self._cache_budget_lock:
+            pages, _images = self._grouped_artifacts_locked()
+            for key, parts in pages.items():
+                if "meta" not in parts:
+                    continue
+                meta = self._read_sidecar(parts["meta"][2], key)
+                if not meta or meta.get("comments_status") not in {"login_required", "not_fetched"}:
+                    continue
+                is_xhs = (
+                    str(meta.get("provider") or "") in {"xhs-api", "xhs-cli"}
+                    or self._is_xhs(str(meta.get("url") or ""))
+                    or self._is_xhs(str(meta.get("final_url") or ""))
+                )
+                if not is_xhs:
+                    continue
+                stale = dict(meta)
+                stale["schema_version"] = 0
+                self._atomic_write(
+                    parts["meta"][2],
+                    json.dumps(stale, ensure_ascii=False).encode("utf-8"),
+                )
+                invalidated += 1
+        return invalidated
+
     def _acquire_budget_lock(self, deadline: float) -> None:
         remaining = deadline - time.monotonic()
         if remaining <= 0 or not self._cache_budget_lock.acquire(timeout=remaining):
@@ -1645,6 +1692,9 @@ class LinkPreviewService:
             comments_fetched=data.get("comments_fetched") is True or bool(comments),
             comments_complete=(data.get("comments_complete") is True)
             and (data.get("comments_fetched") is True or bool(comments)),
+            comments_auth_required=(data.get("comments_auth_required") is True)
+            and not bool(comments)
+            and data.get("comments_fetched") is not True,
             provider=provider,
         )
 
@@ -1995,7 +2045,14 @@ class LinkPreviewService:
             if acquired:
                 self._cache_budget_lock.release()
 
-    def _persist_page(self, url: str, page: ExtractedPage, deadline: float) -> dict[str, Any]:
+    def _persist_page(
+        self,
+        url: str,
+        page: ExtractedPage,
+        deadline: float,
+        *,
+        xhs_login_generation: int | None = None,
+    ) -> dict[str, Any]:
         text_path, meta_path = self._paths(url)
         key = self._url_key(url)
         is_xhs = self._is_xhs(url) or self._is_xhs(page.final_url)
@@ -2030,6 +2087,11 @@ class LinkPreviewService:
             sections.extend(["", "评论：", safe_comments[: self.max_text_chars]])
             if not page.comments_complete:
                 sections.append("评论抓取范围：仅抓取首批，可能有更多评论或楼中楼。")
+        elif is_xhs and page.comments_auth_required:
+            sections.extend([
+                "",
+                "评论抓取状态：小红书登录已失效，需要重新登录后才能抓取评论。",
+            ])
         elif is_xhs and page.comments_fetched:
             if page.comments_complete:
                 sections.extend(["", "评论抓取状态：已抓取，当前暂无评论。"])
@@ -2077,6 +2139,8 @@ class LinkPreviewService:
             "comments_status": (
                 "included" if page.comments and page.comments_complete
                 else "included_partial" if page.comments
+                else "login_required"
+                if is_xhs and page.comments_auth_required
                 else "fetched_empty"
                 if is_xhs and page.comments_fetched and page.comments_complete
                 else "fetched_empty_partial"
@@ -2108,6 +2172,18 @@ class LinkPreviewService:
         try:
             self._acquire_budget_lock(deadline)
             acquired = True
+            if (
+                is_xhs
+                and meta_base["comments_status"] in {"login_required", "not_fetched"}
+                and xhs_login_generation is not None
+                and xhs_login_generation != self._xhs_login_generation_snapshot()
+            ):
+                # Preserve the page body and image lease for this in-flight
+                # turn, but make its pre-login comment failure uncacheable.
+                # A later lookup will refetch with the newly imported cookies.
+                meta_base["schema_version"] = 0
+                no_image_meta, no_image_bytes = sidecar([])
+                selected_meta, selected_meta_bytes = no_image_meta, no_image_bytes
             revalidated_candidates: list[tuple[Path, bytes | None]] = []
             for image_path, image_data in image_candidates:
                 # Revalidate the lock-free candidate.  A regular file now at
@@ -2227,8 +2303,18 @@ class LinkPreviewService:
             cached = self._load_cache(url, deadline)
             if cached is not None:
                 return cached
+            xhs_login_generation = (
+                self._xhs_login_generation_snapshot() if self._is_xhs(url) else None
+            )
             page = self._fetch_page(url, deadline)
-            return self._persist_page(url, page, deadline)
+            if xhs_login_generation is None:
+                return self._persist_page(url, page, deadline)
+            return self._persist_page(
+                url,
+                page,
+                deadline,
+                xhs_login_generation=xhs_login_generation,
+            )
         finally:
             self._release_key_lock(key, lock_entry)
 
@@ -2279,6 +2365,8 @@ class LinkPreviewService:
                     lines.append(f"- 内容图片：{image_path}")
             if item.get("comments_status") == "not_fetched":
                 lines.append("- 抓取范围：评论未抓取，不得声称帖子或评论内容完整。")
+            elif item.get("comments_status") == "login_required":
+                lines.append("- 抓取范围：小红书登录已失效，评论未抓取；请明确提醒用户重新登录。")
             elif item.get("comments_status") == "included_partial":
                 lines.append("- 抓取范围：仅抓取首批评论，可能有更多评论或楼中楼。")
             elif item.get("comments_status") == "fetched_empty":
