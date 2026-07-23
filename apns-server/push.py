@@ -34,6 +34,7 @@ import argparse
 from collections import OrderedDict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
+import gzip as _gzip_mod
 import hmac
 import hashlib
 import ipaddress
@@ -276,6 +277,9 @@ KAIROS_TERMINAL_OWNER_OPTION = "@ccc_kairos_terminal_owner"
 KAIROS_TERMINAL_OWNER_VALUE = "cccompanion:qiaokairos:v1"
 KAIROS_TERMINAL_READY_OPTION = "@ccc_kairos_terminal_ready"
 KAIROS_TERMINAL_READY_VALUE = "cccompanion:qiaokairos:ready:v1"
+KAIROS_TERMINAL_COMPAT_LOCK_WAIT_TEXT = (
+    "旧版 standalone 客户端占用兼容锁；等待它退出后自动连接…"
+)
 
 
 def _trim_terminal_capture(content: str) -> str:
@@ -1953,6 +1957,12 @@ class ServerState:
         self.codex_app_server_fallback_to_exec: bool = bool(
             server_cfg.get("codex_app_server_fallback_to_exec", False)
         )
+        self.codex_app_server_socket: str | None = (
+            str(server_cfg.get("codex_app_server_socket") or "").strip() or None
+        )
+        self.codex_app_server_daemon_autostart: bool = bool(
+            server_cfg.get("codex_app_server_daemon_autostart", True)
+        )
         self.codex_auto_forge_enabled: bool = bool(
             server_cfg.get("codex_auto_forge_enabled", True)
         )
@@ -1988,6 +1998,8 @@ class ServerState:
             codex_bin=self.codex_bin,
             codex_home=self.codex_home,
             logger=logger,
+            daemon_socket_path=self.codex_app_server_socket,
+            daemon_autostart=self.codex_app_server_daemon_autostart,
             model_auto_compact_token_limit=(
                 self.codex_app_server_model_auto_compact_token_limit
             ),
@@ -3256,8 +3268,14 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, status: int, body: dict[str, Any]):
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        accept_enc = self.headers.get("Accept-Encoding", "")
+        use_gzip = "gzip" in accept_enc and len(data) > 512
+        if use_gzip:
+            data = _gzip_mod.compress(data, compresslevel=1)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        if use_gzip:
+            self.send_header("Content-Encoding", "gzip")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -3338,6 +3356,9 @@ class PushHandler(BaseHTTPRequestHandler):
                     "top_memory": [],
                     "health": {"ok": False},
                 })
+            return
+        if self.path.startswith("/chat/list-preview"):
+            self._handle_chat_list_preview()
             return
         if self.path.startswith("/chat/history"):
             self._handle_chat_history()
@@ -6015,15 +6036,15 @@ class PushHandler(BaseHTTPRequestHandler):
         before = qs.get("before", qs.get("before_ts", [None]))[0]  # 向上翻页 拉 before_ts 之前的旧消息
         around_ts = qs.get("around_ts", [None])[0]  # 2026-05-07 用户 push 跳原文 围绕 ts 前后取
         try:
-            limit = int(qs.get("limit", ["10000"])[0])
+            limit = int(qs.get("limit", ["500"])[0])
         except Exception:
-            limit = 10000
+            limit = 500
         try:
             n_around = int(qs.get("n", ["25"])[0])
         except Exception:
             n_around = 25
         # iOS 本地 SwiftData 首次同步需要全量；UI 自己只渲染最近窗口。
-        limit = min(max(limit, 1), 10000)
+        limit = min(max(limit, 1), 10000)  # cap stays at 10000 for explicit requests
         n_around = min(max(n_around, 1), 200)
         chat = self._chat_for_contact(contact_id)
         if around_ts:
@@ -6033,6 +6054,31 @@ class PushHandler(BaseHTTPRequestHandler):
         # task records 走 /chat/poll 不混入持久 history (prevents stale task injection causing scroll-jump)
         records = chat_records
         self._send_json(200, {"ok": True, "contact_id": contact_id, "records": records, "count": len(records)})
+
+    def _handle_chat_list_preview(self):
+        """Batch endpoint: return last N messages for all contacts in one response."""
+        qs = self._query_params()
+        try:
+            limit = int(qs.get("limit", ["20"])[0])
+        except Exception:
+            limit = 20
+        limit = min(max(limit, 1), 50)
+        result: dict[str, Any] = {}
+        for cid, chat in self.state.contact_chats.items():
+            recs = chat.tail(limit)
+            if recs:
+                result[cid] = {"records": recs, "count": len(recs)}
+        ai_chat = getattr(self.state, "ai_chat_history", None)
+        if ai_chat:
+            try:
+                from ai_chat import AIChatHistory
+                if isinstance(ai_chat, AIChatHistory):
+                    ai_recs = ai_chat.read_since(limit=limit)
+                    if ai_recs:
+                        result["ai-custom"] = {"records": ai_recs, "count": len(ai_recs)}
+            except Exception:
+                pass
+        self._send_json(200, {"ok": True, "contacts": result})
 
     def _handle_chat_draft(self):
         contact_id = self._contact_id_from_query()
@@ -11819,10 +11865,10 @@ class PushHandler(BaseHTTPRequestHandler):
                 _same_pane, terminal_state = self.state.kairos_terminal.terminal_state(
                     expected_pane=capture_pane,
                 )
+                safe_snapshot: dict[str, Any] | None = None
                 if terminal_state == "waiting":
                     observer_provider = getattr(self.state, "codex_app_bridge", None)
                     observer_snapshot = getattr(observer_provider, "observer_snapshot", None)
-                    safe_snapshot: dict[str, Any] | None = None
                     if callable(observer_snapshot):
                         candidate = observer_snapshot()
                         if isinstance(candidate, dict) and candidate.get("busy") is True:
@@ -11837,6 +11883,12 @@ class PushHandler(BaseHTTPRequestHandler):
                             safe_snapshot = candidate
                     if safe_snapshot is not None:
                         content = _format_kairos_observer(safe_snapshot)
+                    elif KAIROS_TERMINAL_COMPAT_LOCK_WAIT_TEXT not in content:
+                        # A missing ready marker also covers the short interval
+                        # between creating the pane and qiaokairos publishing
+                        # readiness.  That is connection startup, not an active
+                        # reply, so let Android show its CONNECTING state.
+                        terminal_state = "starting"
             if is_kairos and not content.strip():
                 # Closing the create/capture race matters to the Android UI:
                 # an owned pane can exist a few milliseconds before Python or
@@ -11846,7 +11898,11 @@ class PushHandler(BaseHTTPRequestHandler):
                 content = (
                     "Kairos 正在回复；终端当前只读，回复结束后自动恢复输入。\n"
                     if terminal_state == "waiting"
-                    else "Kairos 终端已连接，正在等待终端输出…\n"
+                    else (
+                        "正在连接 Kairos 当前 session…\n"
+                        if terminal_state == "starting"
+                        else "Kairos 终端已连接，正在等待终端输出…\n"
+                    )
                 )
             self._send_json(200, {
                 "ok": True,

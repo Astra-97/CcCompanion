@@ -99,6 +99,53 @@ class ChatHistory:
         self.path = Path(path).expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._cache: list[dict[str, Any]] | None = None
+        self._CACHE_SIZE = 1000
+
+    def _read_tail_from_file(self, n: int) -> list[dict[str, Any]]:
+        """Read last n records by seeking from end of file. O(n) not O(file)."""
+        if not self.path.exists():
+            return []
+        size = self.path.stat().st_size
+        if size == 0:
+            return []
+        lines: list[bytes] = []
+        with self.path.open("rb") as f:
+            chunk_size = min(max(4096, size // 20), 65536)
+            pos = size
+            tail = b""
+            while pos > 0 and len(lines) < n:
+                read_n = min(chunk_size, pos)
+                pos -= read_n
+                f.seek(pos)
+                block = f.read(read_n) + tail
+                parts = block.split(b"\n")
+                tail = parts[0]
+                for raw in reversed(parts[1:]):
+                    raw = raw.strip()
+                    if raw:
+                        lines.append(raw)
+                        if len(lines) >= n:
+                            break
+            if len(lines) < n and tail.strip():
+                lines.append(tail.strip())
+        lines.reverse()
+        records: list[dict[str, Any]] = []
+        for raw in lines:
+            try:
+                records.append(json.loads(raw))
+            except Exception:
+                continue
+        return records
+
+    def _ensure_cache(self):
+        """Lazy-load tail cache. Caller must hold self._lock."""
+        if self._cache is None:
+            self._cache = self._read_tail_from_file(self._CACHE_SIZE)
+
+    def _invalidate_cache(self):
+        """Mark cache stale after file mutation. Caller must hold self._lock."""
+        self._cache = None
 
     def append(
         self,
@@ -156,6 +203,10 @@ class ChatHistory:
         with self._lock:
             with self.path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            if self._cache is not None:
+                self._cache.append(rec)
+                if len(self._cache) > self._CACHE_SIZE:
+                    self._cache = self._cache[-self._CACHE_SIZE:]
         return rec
 
     def _clean_location(self, loc: dict[str, Any]) -> dict[str, Any] | None:
@@ -219,6 +270,7 @@ class ChatHistory:
                     tmp = self.path.with_suffix(self.path.suffix + ".tmp")
                     tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
                     tmp.replace(self.path)
+                    self._invalidate_cache()
                 else:
                     logger.warning("update_audio skip: ts not found")
                 return ok
@@ -253,6 +305,7 @@ class ChatHistory:
                 tmp = self.path.with_suffix(self.path.suffix + ".tmp")
                 tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
                 tmp.replace(self.path)
+                self._invalidate_cache()
                 return True
         except Exception as e:
             logger.warning("merge_thinking fail: %s", e)
@@ -278,6 +331,28 @@ class ChatHistory:
     def read_since(self, since_ts: str | None = None, before_ts: str | None = None, limit: int = 10000, include_hidden: bool = False) -> list[dict[str, Any]]:
         """since_ts 之后 + before_ts 之前 (二者皆 optional).
         include_hidden=False (默认) 过滤掉 hidden_in_ui=True 的 record (重新发言覆盖那条)."""
+        # Fast path: tail query (no filters) — use cache
+        if since_ts is None and before_ts is None:
+            with self._lock:
+                self._ensure_cache()
+                snapshot = list(self._cache)
+            if not include_hidden:
+                snapshot = [r for r in snapshot if not r.get("hidden_in_ui")]
+            return snapshot[-limit:]
+
+        # Fast path: polling (since_ts only) — check cache first
+        if since_ts is not None and before_ts is None:
+            with self._lock:
+                self._ensure_cache()
+                cache = self._cache
+                cache_oldest_ts = cache[0].get("ts", "") if cache else ""
+                if since_ts >= cache_oldest_ts or not cache:
+                    snapshot = [r for r in cache if r.get("ts", "") > since_ts]
+                    if not include_hidden:
+                        snapshot = [r for r in snapshot if not r.get("hidden_in_ui")]
+                    return snapshot[-limit:]
+
+        # Slow path: before_ts pagination or since_ts older than cache
         if not self.path.exists():
             return []
         out: list[dict[str, Any]] = []
@@ -304,7 +379,10 @@ class ChatHistory:
         return out[-limit:]
 
     def tail(self, n: int = 50) -> list[dict[str, Any]]:
-        return self.read_since(since_ts=None, limit=n)
+        with self._lock:
+            self._ensure_cache()
+            snapshot = list(self._cache)
+        return snapshot[-n:]
 
     def read_around(self, ts: str, n: int = 25) -> list[dict[str, Any]]:
         """围绕指定 ts 取前 n + 后 n 条 (含目标本身). 2026-05-07 用户 push 跳原文用."""
@@ -425,6 +503,7 @@ class ChatHistory:
             if ok:
                 with self.path.open("w", encoding="utf-8") as f:
                     f.writelines(kept)
+                self._invalidate_cache()
         return ok
 
     def add_reaction(self, ts: str, emoji: str) -> bool:
@@ -462,6 +541,7 @@ class ChatHistory:
             if toggled:
                 with self.path.open("w", encoding="utf-8") as f:
                     f.writelines(kept)
+                self._invalidate_cache()
         return toggled
 
     def mark_regenerated(self, old_ts: str, new_ts: str | None = None) -> bool:
@@ -496,6 +576,7 @@ class ChatHistory:
             if marked:
                 with self.path.open("w", encoding="utf-8") as f:
                     f.writelines(new_lines)
+                self._invalidate_cache()
         return marked
 
     def delete(self, ts: str) -> bool:
@@ -523,4 +604,5 @@ class ChatHistory:
             if deleted:
                 with self.path.open("w", encoding="utf-8") as f:
                     f.writelines(kept)
+                self._invalidate_cache()
         return deleted
