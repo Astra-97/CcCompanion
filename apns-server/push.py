@@ -1756,6 +1756,8 @@ def _inject_to_tmux_session(state: "ServerState", session: str, text: str) -> tu
 # rejected — no free-form model string ever reaches the tmux injection.
 TOOLBOT_MODEL_ALLOWLIST: frozenset = frozenset({
     "claude-fable-5",
+    "claude-opus-5",
+    "claude-sonnet-5",
     "claude-opus-4-6",
     "claude-opus-4-6[1m]",
     "claude-opus-4-7",
@@ -1773,6 +1775,8 @@ TOOLBOT_MODEL_ALIASES: dict[str, str] = {
     "opus4.7": "claude-opus-4-7",
     "opus4.7-1m": "claude-opus-4-7[1m]",
     "opus4.8": "claude-opus-4-8",
+    "opus5": "claude-opus-5",
+    "sonnet5": "claude-sonnet-5",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
 }
