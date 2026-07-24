@@ -1757,6 +1757,7 @@ def _inject_to_tmux_session(state: "ServerState", session: str, text: str) -> tu
 TOOLBOT_MODEL_ALLOWLIST: frozenset = frozenset({
     "claude-fable-5",
     "claude-opus-5",
+    "claude-opus-5[1m]",
     "claude-sonnet-5",
     "claude-opus-4-6",
     "claude-opus-4-6[1m]",
@@ -1776,6 +1777,7 @@ TOOLBOT_MODEL_ALIASES: dict[str, str] = {
     "opus4.7-1m": "claude-opus-4-7[1m]",
     "opus4.8": "claude-opus-4-8",
     "opus5": "claude-opus-5",
+    "opus5-1m": "claude-opus-5[1m]",
     "sonnet5": "claude-sonnet-5",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
@@ -1796,6 +1798,7 @@ _models_menu_lock = threading.Lock()
 _STATIC_MODEL_MENU: list[dict[str, str]] = [
     {"alias": "fable", "label": "Fable 5", "id": "claude-fable-5"},
     {"alias": "opus5", "label": "Opus 5", "id": "claude-opus-5"},
+    {"alias": "opus5-1m", "label": "Opus 5 1M", "id": "claude-opus-5[1m]"},
     {"alias": "opus4.8", "label": "Opus 4.8", "id": "claude-opus-4-8"},
     {"alias": "sonnet5", "label": "Sonnet 5", "id": "claude-sonnet-5"},
     {"alias": "opus", "label": "Opus 4.6", "id": "claude-opus-4-6"},
