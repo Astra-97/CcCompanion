@@ -73,3 +73,4 @@ apns-server/tests/
 
 # --- Doc archive (历史 spec / results / migration drafts) ---
 _archived/
+apns-server/models_cache.json

@@ -1781,6 +1781,128 @@ TOOLBOT_MODEL_ALIASES: dict[str, str] = {
     "haiku": "claude-haiku-4-5-20251001",
 }
 
+# ---------------------------------------------------------------------------
+# 动态模型清单（GET /models, 2026-07-24）
+# 数据源：Anthropic GET /v1/models（Claude Code OAuth token），缓存 TTL 24h；
+# 拉取失败用缓存（哪怕过期），缓存也没有则回退内置静态清单。
+# 目的：opus6 上线后 app 模型菜单/服务端 allowlist 自动认识，不用改代码发版。
+# ---------------------------------------------------------------------------
+_MODELS_CACHE_PATH = Path(__file__).resolve().parent / "models_cache.json"
+_MODELS_CACHE_TTL_SECONDS = 24 * 3600
+_CLAUDE_CREDENTIALS_PATH = Path("/root/.claude/.credentials.json")
+_models_menu_lock = threading.Lock()
+
+# 内置静态回退清单（与安卓端离线回退清单保持一致）。
+_STATIC_MODEL_MENU: list[dict[str, str]] = [
+    {"alias": "fable", "label": "Fable 5", "id": "claude-fable-5"},
+    {"alias": "opus5", "label": "Opus 5", "id": "claude-opus-5"},
+    {"alias": "opus4.8", "label": "Opus 4.8", "id": "claude-opus-4-8"},
+    {"alias": "sonnet5", "label": "Sonnet 5", "id": "claude-sonnet-5"},
+    {"alias": "opus", "label": "Opus 4.6", "id": "claude-opus-4-6"},
+    {"alias": "opus-1m", "label": "Opus 4.6 1M", "id": "claude-opus-4-6[1m]"},
+    {"alias": "opus4.7", "label": "Opus 4.7", "id": "claude-opus-4-7"},
+    {"alias": "opus4.7-1m", "label": "Opus 4.7 1M", "id": "claude-opus-4-7[1m]"},
+    {"alias": "sonnet", "label": "Sonnet 4.6", "id": "claude-sonnet-4-6"},
+    {"alias": "haiku", "label": "Haiku 4.5", "id": "claude-haiku-4-5-20251001"},
+]
+
+
+def _derive_model_menu_entry(model_id: str) -> dict[str, str]:
+    """从模型 id 推导菜单项：claude-opus-5 → alias "opus5" / label "Opus 5"；
+    claude-haiku-4-5-20251001 → "haiku4.5" / "Haiku 4.5"。
+    与现有 TOOLBOT_MODEL_ALIASES 冲突（同名别名指向不同 id）时现有优先，
+    该动态项改用完整 id 作为 alias（id 本身也在放行集合里）。"""
+    base = model_id[len("claude-"):] if model_id.startswith("claude-") else model_id
+    base = re.sub(r"-\d{8}$", "", base)  # 去日期后缀
+    tokens = [t for t in base.split("-") if t]
+    name_parts = [t for t in tokens if not t.isdigit()]
+    ver_parts = [t for t in tokens if t.isdigit()]
+    family = "-".join(name_parts) or base
+    version = ".".join(ver_parts)
+    alias = (family.replace("-", "") + version).lower()
+    label = " ".join(w.capitalize() for w in family.split("-")) + (f" {version}" if version else "")
+    if TOOLBOT_MODEL_ALIASES.get(alias, model_id) != model_id:
+        alias = model_id  # 别名撞车，向后兼容：现有映射优先
+    return {"alias": alias, "label": label, "id": model_id}
+
+
+def _fetch_anthropic_model_ids() -> list[str] | None:
+    """调 Anthropic /v1/models 拿模型 id 列表；失败返回 None。token 绝不进日志/返回体。"""
+    try:
+        creds = json.loads(_CLAUDE_CREDENTIALS_PATH.read_text())
+        token = str(((creds.get("claudeAiOauth") or {}).get("accessToken")) or "").strip()
+        if not token:
+            logger.warning("models fetch skipped: no oauth accessToken")
+            return None
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/models?limit=100",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": "oauth-2025-04-20",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        ids = [str(m.get("id") or "").strip() for m in payload.get("data", [])]
+        ids = [m for m in ids if m]
+        return ids or None
+    except Exception as e:
+        # 只记异常类型，不记详情（防止意外把敏感 header 带进日志）
+        logger.warning("models fetch failed: %s", type(e).__name__)
+        return None
+
+
+def _build_model_menu(ids: list[str]) -> list[dict[str, str]]:
+    """API id 列表 → 菜单。派生项按 API 顺序在前；静态清单里 API 没覆盖的条目
+    （如 [1m] 长上下文变体）保留追加在后，防止 opus-1m 这类常用项消失。"""
+    menu: list[dict[str, str]] = []
+    seen_aliases: set[str] = set()
+    seen_ids: set[str] = set()
+    for mid in ids:
+        entry = _derive_model_menu_entry(mid)
+        if entry["alias"] in seen_aliases or mid in seen_ids:
+            continue
+        menu.append(entry)
+        seen_aliases.add(entry["alias"])
+        seen_ids.add(mid)
+    for entry in _STATIC_MODEL_MENU:
+        if entry["id"] not in seen_ids and entry["alias"] not in seen_aliases:
+            menu.append(entry)
+            seen_aliases.add(entry["alias"])
+            seen_ids.add(entry["id"])
+    return menu
+
+
+def get_dynamic_model_menu(force_refresh: bool = False) -> tuple[list[dict[str, str]], str]:
+    """返回 (菜单, 来源)。来源 ∈ {"live", "cache", "cache-stale", "static"}。"""
+    now = time.time()
+    with _models_menu_lock:
+        cached: dict | None = None
+        try:
+            if _MODELS_CACHE_PATH.exists():
+                cached = json.loads(_MODELS_CACHE_PATH.read_text())
+        except Exception:
+            cached = None
+        cached_menu = (cached or {}).get("menu") or None
+        cached_at = float((cached or {}).get("fetched_at") or 0)
+        if cached_menu and not force_refresh and now - cached_at < _MODELS_CACHE_TTL_SECONDS:
+            return cached_menu, "cache"
+        ids = _fetch_anthropic_model_ids()
+        if ids:
+            menu = _build_model_menu(ids)
+            try:
+                _MODELS_CACHE_PATH.write_text(
+                    json.dumps({"fetched_at": now, "menu": menu}, ensure_ascii=False, indent=1)
+                )
+            except Exception as e:
+                logger.warning("models cache write failed: %s", type(e).__name__)
+            return menu, "live"
+        if cached_menu:
+            return cached_menu, "cache-stale"
+        return list(_STATIC_MODEL_MENU), "static"
+
 
 class ServerState:
     def __init__(self, config: dict[str, Any], sandbox_override: bool | None = None):
@@ -3366,6 +3488,13 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/task/list":
             self._send_json(200, self.state.tasks.snapshot())
+            return
+        if self.path == "/models" or self.path.startswith("/models?"):
+            # 动态模型清单：app 模型菜单用。鉴权走 do_GET 顶层 _require_auth。
+            qs = self._query_params()
+            force = (qs.get("refresh", ["0"])[0] or "").lower() in {"1", "true"}
+            menu, _source = get_dynamic_model_menu(force_refresh=force)
+            self._send_json(200, menu)
             return
         if self.path == "/usage/active":
             self._handle_usage_active()
@@ -13004,6 +13133,17 @@ class PushHandler(BaseHTTPRequestHandler):
             return TOOLBOT_MODEL_ALIASES[normalized]
         if normalized in TOOLBOT_MODEL_ALLOWLIST:
             return normalized
+        # 动态清单（/v1/models 24h 缓存）：静态集合 ∪ 动态 id+alias 都放行，
+        # opus6 这类新模型上线后服务端自动认，不用改代码。
+        try:
+            menu, _source = get_dynamic_model_menu()
+            for entry in menu:
+                if normalized in (str(entry.get("alias") or "").lower(), str(entry.get("id") or "").lower()):
+                    model_id = str(entry.get("id") or "").strip()
+                    if model_id:
+                        return model_id
+        except Exception as e:
+            logger.warning("dynamic model resolve failed: %s", type(e).__name__)
         return None
 
     def _handle_clear_unread(self):
