@@ -97,6 +97,13 @@ from settings import Settings
 from usage import UsageReader
 from link_preview import LinkPreviewBundle, LinkPreviewService, merge_preview_metadata
 from xhs_login import XhsLoginError, XhsLoginManager
+from kimi_acp import (
+    KimiACPAuthRequired,
+    KimiACPBusy,
+    KimiACPCancelled,
+    KimiACPClient,
+    KimiACPError,
+)
 import todos as todos_mod
 from studyroom import StudyroomDB
 from ai_chat import AIChatManager
@@ -1915,6 +1922,7 @@ class ServerState:
         self.contact_chats: dict[str, ChatHistory] = {
             "xiaoke": self.chat,
             "kairos": ChatHistory(contact_history_dir / "chat_history_kairos.jsonl"),
+            "kimi": ChatHistory(contact_history_dir / "chat_history_kimi.jsonl"),
             "hajiki": ChatHistory(contact_history_dir / "chat_history_hajiki.jsonl"),
             "apples": ChatHistory(contact_history_dir / "chat_history_apples.jsonl"),
             # 小克·工具版 (toolbot) — 只读派活存档窗口。scheduler 往这里写派活记录，
@@ -2029,6 +2037,7 @@ class ServerState:
         self.contact_typing_states: dict[str, dict[str, Any]] = {
             "xiaoke": self.typing_state,
             "kairos": {"is_typing": False, "since": None},
+            "kimi": {"is_typing": False, "since": None},
             "hajiki": {"is_typing": False, "since": None},
             "apples": {"is_typing": False, "since": None},
             "toolbot": {"is_typing": False, "since": None},
@@ -2046,6 +2055,17 @@ class ServerState:
         self.chat_draft_lock = threading.Lock()
         self.chat_drafts: dict[str, dict[str, Any]] = {}
         self.chat_reply_states: dict[str, dict[str, Any]] = {}
+        self.kimi_turn_lock = threading.RLock()
+        self.kimi_active_turn: dict[str, Any] = {}
+        self.kimi_prepare_token = ""
+        self.kimi_acp = KimiACPClient(
+            command=server_cfg.get("kimi_bin", "/root/.kimi-code/bin/kimi"),
+            cwd=server_cfg.get("kimi_cwd", "/root/Windows-Codex-TG"),
+            state_path=contact_history_dir / "kimi_acp_session.json",
+            logger=logger,
+            request_timeout=float(server_cfg.get("kimi_acp_request_timeout_seconds", 30)),
+            prompt_timeout=float(server_cfg.get("kimi_acp_prompt_timeout_seconds", 900)),
+        )
         self.kairos_queue_lock = threading.Lock()
         self.kairos_queue_path = contact_history_dir / "kairos_queue.json"
         self.kairos_queue: deque[dict[str, Any]] = self._load_kairos_queue()
@@ -2508,6 +2528,22 @@ def _attachment_cache_control(filename: str) -> str:
     if name.startswith("link_") or name.startswith(".link_"):
         return "private, no-store"
     return "public, max-age=86400"
+
+
+def _should_generate_chat_append_tts(
+    contact_id: str,
+    role: str,
+    text: str,
+    attachment_url: str | None,
+    enabled: bool,
+) -> bool:
+    return (
+        contact_id != "kimi"
+        and role == "assistant"
+        and bool(text)
+        and not attachment_url
+        and enabled
+    )
 
 
 class PushHandler(BaseHTTPRequestHandler):
@@ -6632,6 +6668,9 @@ class PushHandler(BaseHTTPRequestHandler):
         if contact_id == "kairos":
             self._handle_kairos_chat_send(body, contact_id)
             return
+        if contact_id == "kimi":
+            self._handle_kimi_chat_send(body, contact_id)
+            return
         if contact_id == "apples":
             self._handle_apples_chat_send(body, contact_id)
             return
@@ -6827,6 +6866,238 @@ class PushHandler(BaseHTTPRequestHandler):
             },
         })
 
+    def _handle_kimi_chat_send(self, body: dict[str, Any], contact_id: str) -> None:
+        """Queue one text turn into Kimi's isolated ACP session."""
+        text = str(body.get("text") or "").strip()
+        quoted_ts = body.get("quoted_ts") or None
+        if not text:
+            self._send_json(400, {"ok": False, "error": "text required"})
+            return
+        with self.state.kimi_turn_lock:
+            if self.state.kimi_active_turn or self.state.kimi_prepare_token:
+                self._send_json(409, {
+                    "ok": False,
+                    "error": "kimi_turn_active",
+                    "reason": "Stop the current Kimi reply before sending another message",
+                })
+                return
+            prepare_token = secrets.token_hex(16)
+            self.state.kimi_prepare_token = prepare_token
+
+        try:
+            session_id = self.state.kimi_acp.prepare_session()
+        except KimiACPAuthRequired:
+            with self.state.kimi_turn_lock:
+                if self.state.kimi_prepare_token == prepare_token:
+                    self.state.kimi_prepare_token = ""
+            self.state.kimi_acp.close()
+            self._send_json(503, {
+                "ok": False,
+                "error": "kimi_auth_required",
+                "reason": "Kimi 还没有完成登录，请先在 VPS 终端完成登录。",
+            })
+            return
+        except (KimiACPBusy, KimiACPError) as exc:
+            with self.state.kimi_turn_lock:
+                if self.state.kimi_prepare_token == prepare_token:
+                    self.state.kimi_prepare_token = ""
+            logger.warning("Kimi ACP prepare failed: %s", type(exc).__name__)
+            self.state.kimi_acp.close()
+            self._send_json(503, {
+                "ok": False,
+                "error": "kimi_unavailable",
+                "reason": "Kimi 暂时无法建立安全会话，请稍后重试。",
+            })
+            return
+        except Exception:
+            with self.state.kimi_turn_lock:
+                if self.state.kimi_prepare_token == prepare_token:
+                    self.state.kimi_prepare_token = ""
+            logger.exception("Kimi ACP prepare crashed")
+            self.state.kimi_acp.close()
+            self._send_json(503, {
+                "ok": False,
+                "error": "kimi_unavailable",
+                "reason": "Kimi 暂时无法建立安全会话，请稍后重试。",
+            })
+            return
+
+        with self.state.kimi_turn_lock:
+            if (
+                self.state.kimi_prepare_token != prepare_token
+                or self.state.kimi_active_turn
+            ):
+                if self.state.kimi_prepare_token == prepare_token:
+                    self.state.kimi_prepare_token = ""
+                self.state.kimi_acp.close()
+                self._send_json(409, {
+                    "ok": False,
+                    "error": "kimi_turn_active",
+                    "reason": "Kimi 会话准备状态已变化，本次消息未发送。",
+                })
+                return
+            chat = self._chat_for_contact(contact_id)
+            try:
+                rec = chat.append(
+                    role="user",
+                    text=text,
+                    source=self._source_for_request("kimi"),
+                    quoted_ts=quoted_ts,
+                )
+            except Exception:
+                logger.exception("Kimi history append failed")
+                self.state.kimi_prepare_token = ""
+                self.state.kimi_acp.close()
+                self._send_json(500, {
+                    "ok": False,
+                    "error": "kimi_history_unavailable",
+                    "reason": "Kimi 消息暂时无法安全保存，请稍后重试。",
+                })
+                return
+            cancel_event = threading.Event()
+            self.state.kimi_active_turn = {
+                "user_ts": str(rec.get("ts") or ""),
+                "cancel_event": cancel_event,
+                "session_id": session_id,
+            }
+            self.state.kimi_prepare_token = ""
+            self._set_typing_for_contact(contact_id, {
+                "is_typing": True,
+                "since": rec["ts"],
+                "transport": "kimi-acp",
+            })
+            self._set_chat_generating(
+                contact_id,
+                user_ts=rec["ts"],
+                queued_at=rec["ts"],
+                source="cc-app:kimi",
+            )
+
+        def worker() -> None:
+            chunks: list[str] = []
+            last_published = 0.0
+            terminalized = False
+
+            def append_assistant_safely(message: str, source: str) -> str:
+                try:
+                    final = chat.append(
+                        role="assistant",
+                        text=message,
+                        source=source,
+                        metadata={"kimi_user_ts": str(rec.get("ts") or "")},
+                    )
+                    return str(final.get("ts") or "")
+                except Exception:
+                    logger.exception("Kimi assistant history append failed")
+                    return ""
+
+            def set_completed(message: str, source: str) -> None:
+                nonlocal terminalized
+                final_ts = append_assistant_safely(message, source)
+                self._set_chat_completed(
+                    contact_id,
+                    user_ts=rec["ts"],
+                    final_ts=final_ts,
+                    source=source,
+                    session_id=session_id,
+                )
+                terminalized = True
+
+            def on_update(delta: str) -> None:
+                nonlocal last_published
+                chunks.append(delta)
+                now = time.monotonic()
+                if now - last_published >= 0.08:
+                    self._set_chat_draft(
+                        contact_id,
+                        "".join(chunks),
+                        source="cc-app:kimi",
+                        user_ts=rec["ts"],
+                        queued_at=rec["ts"],
+                    )
+                    last_published = now
+
+            try:
+                self.state.kimi_acp.prompt_existing(
+                    text,
+                    session_id=session_id,
+                    turn_id=str(rec.get("ts") or ""),
+                    on_update=on_update,
+                    cancel_event=cancel_event,
+                )
+                answer = "".join(chunks).strip()
+                if not answer:
+                    answer = "Kimi 没有返回可展示内容。"
+                set_completed(answer, "kimi-acp")
+            except KimiACPCancelled:
+                partial = "".join(chunks).strip()
+                final_ts = ""
+                if partial:
+                    final_ts = append_assistant_safely(
+                        partial + "\n\n*[已停止生成]*",
+                        "kimi-acp:interrupted",
+                    )
+                self._set_chat_interrupted(
+                    contact_id,
+                    user_ts=rec["ts"],
+                    final_ts=final_ts,
+                    source="kimi-acp",
+                    session_id=session_id,
+                )
+                terminalized = True
+            except KimiACPAuthRequired:
+                set_completed(
+                    "Kimi 还没有完成登录。请先在 VPS 终端运行 `kimi login`，登录后再发一次。",
+                    "kimi-acp:auth-required",
+                )
+            except (KimiACPBusy, KimiACPError) as exc:
+                logger.warning("Kimi ACP turn failed: %s", type(exc).__name__)
+                set_completed(
+                    "Kimi 这次没有成功回复。请稍后重试；原消息已经保留。",
+                    "kimi-acp:error",
+                )
+            except Exception:
+                logger.exception("Kimi ACP worker failed")
+                set_completed(
+                    "Kimi 接入进程异常退出。请稍后重试；原消息已经保留。",
+                    "kimi-acp:error",
+                )
+            finally:
+                if not terminalized:
+                    # History persistence is allowed to fail, but lifecycle
+                    # state must never remain "generating" indefinitely.
+                    try:
+                        self._set_chat_completed(
+                            contact_id,
+                            user_ts=rec["ts"],
+                            final_ts="",
+                            source="kimi-acp:error",
+                            session_id=session_id,
+                        )
+                    except Exception:
+                        logger.exception("Kimi terminal reply state cleanup failed")
+                        self._clear_chat_draft(contact_id)
+                self.state.kimi_acp.close()
+                with self.state.kimi_turn_lock:
+                    current = dict(self.state.kimi_active_turn)
+                    if str(current.get("user_ts") or "") == str(rec.get("ts") or ""):
+                        self.state.kimi_active_turn = {}
+                self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
+
+        threading.Thread(target=worker, name="kimi-acp-chat-turn", daemon=True).start()
+        self._send_json(200, {
+            "ok": True,
+            "contact_id": contact_id,
+            "record": rec,
+            "queued": True,
+            "turn": {
+                "contact_id": contact_id,
+                "user_ts": rec["ts"],
+                "session_id": session_id,
+                "transport": "kimi-acp",
+            },
+        })
+
     def _handle_chat_card_action(self, body: dict[str, Any]) -> None:
         """POST /chat/card_action — 互动卡片 (WebView HTML) 按钮结果回传。
 
@@ -6839,8 +7110,15 @@ class PushHandler(BaseHTTPRequestHandler):
         _handle_chat_send (同一入库 + turn_token 登记 + tmux/channel 注入 +
         busy 排队管线), 仅在 record.metadata 里追加 {"via": "card", "card": ...}
         标记来源。响应格式同 /chat/send (200 带 record+turn / busy 时 queued /
-        400/409/502 同语义)。
+        400/409/502 同语义)。Kimi 是严格文字入口，不接受历史卡片动作。
         """
+        if self._contact_id_from_body(body) == "kimi":
+            self._send_json(415, {
+                "ok": False,
+                "error": "kimi_text_only",
+                "reason": "Kimi 当前只支持直接发送文字消息。",
+            })
+            return
         text = str(body.get("text") or "").strip()
         if not text:
             self._send_json(400, {"error": "text required"})
@@ -6869,6 +7147,9 @@ class PushHandler(BaseHTTPRequestHandler):
         contact_id = str(body.get("contact_id") or "").strip()
         user_ts = str(body.get("user_ts") or "").strip()
         session = str(body.get("session") or "").strip()
+        if contact_id == "kimi":
+            self._handle_kimi_chat_stop(user_ts)
+            return
         if contact_id != "xiaoke":
             self._send_json(400, {"ok": False, "error": "Stop only supports the XiaoKe private chat"})
             return
@@ -7043,6 +7324,53 @@ class PushHandler(BaseHTTPRequestHandler):
             "user_ts": user_ts,
             "session": session,
             "message": "已停止小克生成。",
+        })
+
+    def _handle_kimi_chat_stop(self, user_ts: str) -> None:
+        if not user_ts:
+            self._send_json(400, {
+                "ok": False,
+                "error": "missing_turn_identity",
+                "reason": "缺少本轮 Kimi 消息标识，未发送停止指令。",
+            })
+            return
+        with self.state.kimi_turn_lock:
+            active = dict(self.state.kimi_active_turn)
+            active_ts = str(active.get("user_ts") or "")
+            if not active:
+                self._send_json(200, {
+                    "ok": True,
+                    "stopped": False,
+                    "already_finished": True,
+                    "message": "这轮 Kimi 生成已经结束。",
+                })
+                return
+            if not active_ts or user_ts != active_ts:
+                self._send_json(409, {
+                    "ok": False,
+                    "error": "stale_turn",
+                    "reason": "当前 Kimi 轮次与停止目标不一致，未发送停止指令。",
+                })
+                return
+            session_id = str(active.get("session_id") or "")
+            if not session_id:
+                self._send_json(409, {
+                    "ok": False,
+                    "error": "invalid_turn_identity",
+                    "reason": "当前 Kimi 轮次缺少会话标识，未发送停止指令。",
+                })
+                return
+            cancel_event = active.get("cancel_event")
+            if isinstance(cancel_event, threading.Event):
+                cancel_event.set()
+        # The prompt worker owns the one exact ACP cancel notification. HTTP
+        # only signals its turn event so repeated Stop requests cannot emit
+        # duplicate protocol cancels.
+        self._send_json(200, {
+            "ok": True,
+            "stopped": True,
+            "user_ts": active_ts,
+            "message": "已停止 Kimi 生成。",
         })
 
     def _load_codex_target(self) -> tuple[str | None, Path]:
@@ -9923,6 +10251,60 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(401, {"error": "auth required"})
             return
         contact_id = self._contact_id_from_body(body)
+        if contact_id == "kimi":
+            allowed_fields = {
+                "contact_id",
+                "contactId",
+                "text",
+                "role",
+                "source",
+                "client_msg_id",
+            }
+            role_in = str(body.get("role") or "assistant")
+            text_in = body.get("text")
+            has_non_plain_fields = any(
+                key not in allowed_fields and value is not None
+                for key, value in body.items()
+            )
+            if (
+                role_in not in {"user", "assistant"}
+                or not isinstance(text_in, str)
+                or not text_in.strip()
+                or has_non_plain_fields
+            ):
+                self._send_json(415, {
+                    "ok": False,
+                    "error": "kimi_text_only",
+                    "reason": "Kimi 的 append 入口只接受纯文字 user/assistant 消息。",
+                })
+                return
+        metadata_in = body.get("metadata")
+        has_card_metadata = isinstance(metadata_in, dict) and (
+            bool(metadata_in.get("card_title"))
+            or bool(metadata_in.get("card"))
+            or metadata_in.get("via") == "card"
+            or "card" in str(metadata_in.get("type") or "").lower()
+            or any(
+                "card" in str(key).lower() and bool(value)
+                for key, value in metadata_in.items()
+            )
+        )
+        has_attachment = any(
+            body.get(field)
+            for field in (
+                "attachment_path",
+                "attachment_url",
+                "attachment_type",
+                "attachment_filename",
+            )
+        )
+        if contact_id == "kimi" and (has_attachment or has_card_metadata):
+            self._send_json(415, {
+                "ok": False,
+                "error": "kimi_text_only",
+                "reason": "Kimi 当前不接受附件或互动卡片。",
+            })
+            return
         text = body.get("text", "").strip()
         role = body.get("role", "assistant")
         source = body.get("source", self._source_for_request())
@@ -10134,7 +10516,13 @@ class PushHandler(BaseHTTPRequestHandler):
             self._notify_chain_todo(f"[用户 落子: {text}]")
 
         # assistant text reply 后台异步生成 TTS mp3 — 不阻塞 hook (仅 settings.tts_enabled)
-        if role == "assistant" and text and not attachment_url and self.state.settings.get("tts_enabled"):
+        if _should_generate_chat_append_tts(
+            contact_id,
+            role,
+            text,
+            attachment_url,
+            bool(self.state.settings.get("tts_enabled")),
+        ):
             ts = rec["ts"]
             chat_for_tts = chat
             attachments_dir = self.state.attachments_dir
@@ -10252,6 +10640,13 @@ class PushHandler(BaseHTTPRequestHandler):
 
         qs = parse_qs(urlparse(self.path).query)
         contact_id = self._clean_contact_id(qs.get("contact_id", qs.get("contactId", ["xiaoke"]))[0])
+        if contact_id == "kimi":
+            self.close_connection = True
+            self._send_json(415, {
+                "ok": False,
+                "error": "Kimi ACP contact currently supports text messages only",
+            })
+            return
         filename = (qs.get("filename", [None])[0]
                     or self.headers.get("X-Filename")
                     or "upload.bin")
@@ -10545,6 +10940,13 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"ok": False, "error": "text required"})
             return
         contact_id = self._contact_id_from_body(body)
+        if contact_id == "kimi":
+            self._send_json(415, {
+                "ok": False,
+                "error": "kimi_text_only",
+                "reason": "Kimi 当前不接受语音消息。",
+            })
+            return
 
         ok, payload = self._run_stackchan_voice_helper(
             ["tts", "--text", text, "--output-dir", str(self.state.attachments_dir)],
