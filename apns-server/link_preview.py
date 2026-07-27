@@ -46,7 +46,14 @@ URL_RE = re.compile(
     re.IGNORECASE,
 )
 TRAILING_URL_PUNCTUATION = ".,;:!?)]}\u3002\uff0c\uff1b\uff1a\uff01\uff1f\uff09\u3011\u300b\u201d\u2019"
-XHS_HOSTS = {"xiaohongshu.com", "www.xiaohongshu.com", "xhslink.com", "www.xhslink.com"}
+XHS_HOSTS = {
+    "xiaohongshu.com",
+    "www.xiaohongshu.com",
+    "xhslink.com",
+    "www.xhslink.com",
+    "xhslink.cn",
+    "www.xhslink.cn",
+}
 WECHAT_HOSTS = {"mp.weixin.qq.com"}
 MAX_TITLE = 300
 MAX_DESCRIPTION = 800
@@ -1725,7 +1732,9 @@ class LinkPreviewService:
         host = (parts.hostname or "").lower().rstrip(".")
         if parts.username is not None or parts.password is not None:
             raise LinkPreviewError("invalid XHS adapter URL")
-        if parts.scheme.lower() == "http" and host in {"xhslink.com", "www.xhslink.com"}:
+        if parts.scheme.lower() == "http" and host in {
+            "xhslink.com", "www.xhslink.com", "xhslink.cn", "www.xhslink.cn",
+        }:
             if port not in (None, 80):
                 raise LinkPreviewError("invalid XHS adapter URL")
             netloc = host
@@ -1864,6 +1873,7 @@ class LinkPreviewService:
             host in XHS_HOSTS
             or host.endswith(".xiaohongshu.com")
             or host.endswith(".xhslink.com")
+            or host.endswith(".xhslink.cn")
         )
 
     @staticmethod

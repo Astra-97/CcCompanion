@@ -1928,6 +1928,29 @@ class LinkPreviewTests(unittest.TestCase):
         self.assertIn("内容图片只是帖子配图", bundle.prompt_context)
         self.assertNotIn("xhslink", " ".join(command))
 
+    def test_xhs_cli_adapter_accepts_cn_short_url_and_upgrades_http(self):
+        adapter = {
+            "title": "note",
+            "body_text": "body",
+            "comments": ["作者：评论"],
+            "comments_fetched": True,
+            "comments_complete": True,
+        }
+        script = (
+            "import json,sys; "
+            "request=json.load(sys.stdin); "
+            "assert request['url'] == 'https://xhslink.cn/o/abc'; "
+            f"print({json.dumps(json.dumps(adapter, ensure_ascii=False))})"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(
+                td, xhs_cli_command=[sys.executable, "-c", script]
+            )
+            bundle = service.enrich("http://xhslink.cn/o/abc#fragment")
+        self.assertEqual(bundle.previews[0]["provider"], "xhs-cli")
+        self.assertEqual(bundle.previews[0]["comments_status"], "included")
+        self.assertTrue(service._is_xhs("https://xhslink.cn/o/abc"))
+
     def test_xhs_cli_retries_once_with_http_resolved_tokenized_url(self):
         short_url = "https://xhslink.com/o/abc"
         final_url = (
@@ -2042,6 +2065,8 @@ class LinkPreviewTests(unittest.TestCase):
         rejected = (
             "https://user@xhslink.com/o/a",
             "https://xhslink.com:444/o/a",
+            "https://xhslink.cn.evil.example/o/a",
+            "http://xhslink.cn:81/o/a",
             "https://xiaohongshu.com.evil.example/o/a",
             "http://www.xiaohongshu.com/o/a",
         )
