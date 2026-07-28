@@ -139,6 +139,15 @@ ASR_HALLUCINATION_BLACKLIST = frozenset(
 # Substring markers: any transcript containing these is a subtitle-credit hallucination.
 ASR_HALLUCINATION_SUBSTRINGS = ("字幕由", "amara.org")
 
+# --- Protocol capability negotiation ------------------------------------
+# The client lists what it understands in its `start` frame; we only send frame
+# types it asked for. That is the whole point: an APK built before a frame type
+# existed must keep seeing exactly the stream it was written against, so the
+# protocol can grow without a forced app update.
+SERVER_CAPABILITIES = ("thinking_frames", "app_ping", "error_severity")
+# How often to remind a thinking_frames client that the LLM is still chewing.
+THINKING_TICK_SEC = float(_env_int("CC_VOICE_THINKING_TICK_SEC", 5))
+
 ASR_TIMEOUT_SEC = 90
 TTS_TIMEOUT_SEC = 90
 LIVE_REPLY_TIMEOUT_SEC = 180
@@ -640,6 +649,65 @@ async def send_json(ws: ServerConnection, payload: dict[str, Any]) -> None:
         raise
 
 
+async def send_error(ws: ServerConnection, msg: str, *, fatal: bool = False) -> None:
+    """Send an error frame tagged with whether the *call* is over.
+
+    Historically every error frame looked identical, so the Android client tore
+    the whole call down when a single utterance failed ASR. ``fatal`` separates
+    "this turn didn't work, say it again" from "this session can never work".
+    Old clients ignore the extra key.
+    """
+    await send_json(ws, {"type": "error", "msg": msg, "fatal": fatal})
+
+
+@contextlib.asynccontextmanager
+async def thinking_ticker(
+    ws: ServerConnection,
+    capabilities: frozenset,
+    interrupt_event: asyncio.Event,
+):
+    """Emit periodic ``{"type": "thinking"}`` frames while the LLM is working.
+
+    A Claude Code turn regularly takes tens of seconds. With no traffic in that
+    window the phone cannot tell "still thinking" from "socket quietly died",
+    and the user cannot tell it from "he hung up".
+
+    Only sent to clients that advertised ``thinking_frames`` in their hello, so
+    an old APK sees byte-for-byte the stream it has always seen.
+    """
+    if "thinking_frames" not in capabilities:
+        yield
+        return
+
+    t0 = time.monotonic()
+
+    async def _tick() -> None:
+        try:
+            while True:
+                if interrupt_event.is_set():
+                    return
+                await send_json(
+                    ws,
+                    {
+                        "type": "thinking",
+                        "elapsed_ms": int((time.monotonic() - t0) * 1000),
+                    },
+                )
+                await asyncio.sleep(THINKING_TICK_SEC)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return
+
+    task = asyncio.create_task(_tick(), name="ws-thinking")
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(BaseException):
+            await task
+
+
 async def stream_tts_audio(
     ws: ServerConnection,
     pcm: bytes,
@@ -772,6 +840,7 @@ async def handle_utterance(
     interrupt_event: asyncio.Event,
     contact_id: str,
     speech_ms: int = 0,
+    capabilities: frozenset = frozenset(),
 ) -> None:
     """ASR -> LLM -> TTS for a single utterance. Caller has already cleared
     interrupt_event."""
@@ -790,9 +859,8 @@ async def handle_utterance(
         if interrupt_event.is_set():
             return
         if not ok:
-            await send_json(
-                ws, {"type": "error", "msg": f"asr failed: {payload.get('error') or 'unknown'}"}
-            )
+            # Per-turn failure, not a dead call: say it again.
+            await send_error(ws, f"asr failed: {payload.get('error') or 'unknown'}")
             return
         transcript = str(payload.get("transcript") or "").strip()
         # Anti ASR hallucination (second line of defense): a single-character
@@ -828,38 +896,44 @@ async def handle_utterance(
         # --- LLM -------------------------------------------------------
         if interrupt_event.is_set():
             return
+        # The LLM leg is the long one (a Claude Code turn is routinely 30-60s).
+        # Keep a `thinking` drip going for clients that asked for it so neither
+        # the phone nor the human has to guess whether the call is still alive.
         if contact_id == "ai-custom":
             try:
                 mgr = get_ai_manager()
             except Exception as e:
-                await send_json(ws, {"type": "error", "msg": f"ai_chat init failed: {e}"})
+                await send_error(ws, f"ai_chat init failed: {e}", fatal=True)
                 return
 
             loop = asyncio.get_running_loop()
             try:
-                result = await loop.run_in_executor(None, mgr.send_message, transcript)
+                async with thinking_ticker(ws, capabilities, interrupt_event):
+                    result = await loop.run_in_executor(None, mgr.send_message, transcript)
             except Exception as e:
-                await send_json(ws, {"type": "error", "msg": f"llm failed: {e}"})
+                await send_error(ws, f"llm failed: {e}")
                 return
             if interrupt_event.is_set():
                 return
             if not isinstance(result, dict) or not result.get("ok"):
                 err = (result or {}).get("error") if isinstance(result, dict) else "llm error"
-                await send_json(ws, {"type": "error", "msg": f"llm: {err}"})
+                await send_error(ws, f"llm: {err}")
                 return
             reply_text = str(result.get("reply") or "").strip()
         elif contact_id in {"xiaoke", "kairos"}:
             try:
-                reply_text = await send_live_contact_and_wait_reply(contact_id, transcript)
+                async with thinking_ticker(ws, capabilities, interrupt_event):
+                    reply_text = await send_live_contact_and_wait_reply(
+                        contact_id, transcript
+                    )
             except Exception as e:
-                await send_json(ws, {"type": "error", "msg": f"live chat: {e}"})
+                await send_error(ws, f"live chat: {e}")
                 return
             if interrupt_event.is_set():
                 return
         else:
-            await send_json(
-                ws,
-                {"type": "error", "msg": f"voice call contact not supported: {contact_id}"},
+            await send_error(
+                ws, f"voice call contact not supported: {contact_id}", fatal=True
             )
             return
         await send_json(ws, {"type": "reply_text", "text": reply_text})
@@ -886,7 +960,7 @@ async def handle_utterance(
         elif interrupt_event.is_set():
             await send_json(ws, {"type": "tts_interrupted"})
         elif info.get("error"):
-            await send_json(ws, {"type": "error", "msg": f"tts: {info['error']}"})
+            await send_error(ws, f"tts: {info['error']}")
         else:
             # Started but ws closed mid-stream — nothing to report.
             pass
@@ -911,6 +985,11 @@ class Session:
         self.started = False
         self.close_reason: str = "unknown"
         self.opened_at = time.monotonic()
+        # Negotiated in the `start` frame; empty means "old client, send it
+        # nothing it wasn't built for".
+        self.capabilities: frozenset = frozenset()
+        self.client_name: str = ""
+        self.client_version: str = ""
 
     async def recv_loop(self) -> None:
         try:
@@ -955,27 +1034,54 @@ class Session:
             if mtype == "start":
                 sr = int(msg.get("sampleRate") or SAMPLE_RATE)
                 if sr != SAMPLE_RATE:
-                    await send_json(
-                        self.ws,
-                        {"type": "error", "msg": f"only {SAMPLE_RATE}Hz supported (got {sr})"},
+                    await send_error(
+                        self.ws, f"only {SAMPLE_RATE}Hz supported (got {sr})", fatal=True
                     )
                     self.end_event.set()
                     return
                 cid = str(msg.get("contact_id") or "xiaoke").strip().lower()
                 self.contact_id = cid or "xiaoke"
+                raw_caps = msg.get("capabilities")
+                if isinstance(raw_caps, list):
+                    self.capabilities = frozenset(
+                        str(c) for c in raw_caps if isinstance(c, (str, int))
+                    )
+                self.client_name = str(msg.get("client") or "")[:32]
+                self.client_version = str(msg.get("client_version") or "")[:32]
                 self.started = True
                 logger.info(
-                    "ws session start contact=%s sample_rate=%d peer=%s",
+                    "ws session start contact=%s sample_rate=%d client=%s/%s caps=%s "
+                    "resumed=%s peer=%s",
                     self.contact_id,
                     sr,
+                    self.client_name or "?",
+                    self.client_version or "?",
+                    sorted(self.capabilities) or "-",
+                    bool(msg.get("resumed")),
                     self.ws.remote_address,
                 )
-                await send_json(self.ws, {"type": "ready"})
+                await send_json(
+                    self.ws,
+                    {"type": "ready", "capabilities": list(SERVER_CAPABILITIES)},
+                )
+            elif mtype == "ping":
+                # Application-level heartbeat. The protocol-level ping/pong is
+                # handled inside websockets, but that only proves the *socket*
+                # is alive; this proves the event loop is still servicing this
+                # session, and it gives the phone inbound traffic to measure
+                # its own half-open-link watchdog against.
+                await send_json(
+                    self.ws, {"type": "pong", "t": msg.get("t")}
+                )
             elif mtype == "interrupt":
                 self.interrupt_event.set()
             elif mtype == "end":
                 self.end_event.set()
                 return
+            else:
+                # Forward compatibility in the other direction: a newer client
+                # may send frames this build predates. Never close over one.
+                logger.debug("ignoring unknown client frame type=%r", mtype)
 
     async def pipeline_loop(self) -> None:
         """Pulls audio frames, runs VAD, dispatches utterances to handle_utterance."""
@@ -1012,7 +1118,12 @@ class Session:
             # arriving mid-stream cleanly aborts the send loop.
             self.current_task = asyncio.create_task(
                 handle_utterance(
-                    self.ws, pcm, self.interrupt_event, self.contact_id, speech_ms
+                    self.ws,
+                    pcm,
+                    self.interrupt_event,
+                    self.contact_id,
+                    speech_ms,
+                    self.capabilities,
                 )
             )
             try:
