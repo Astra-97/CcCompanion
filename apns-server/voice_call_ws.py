@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import audioop
+import collections
 import contextlib
 import io
 import json
@@ -64,12 +65,51 @@ FRAME_BYTES = int(SAMPLE_RATE * 2 * FRAME_MS / 1000)  # int16 mono 20ms = 640 by
 MAX_TTS_CHUNK_MS = 100
 MAX_TTS_CHUNK_BYTES = int(SAMPLE_RATE * 2 * MAX_TTS_CHUNK_MS / 1000)
 
-VAD_RMS_SPEAK = 500          # >= this -> definitely speaking
-VAD_RMS_SILENCE = 300        # < this -> silence candidate
-VAD_SILENCE_END_MS = 700     # 700ms of silence after speech => utterance end
-MAX_UTTERANCE_MS = 30_000    # safety cap
-VAD_MIN_SPEECH_MS = 400      # utterances with less active speech are dropped (anti ASR hallucination)
-ASR_SINGLE_CHAR_MIN_MS = 900 # single-char transcript needs at least this much active speech
+def _env_int(name: str, default: int) -> int:
+    """Read an int tuning knob from the environment.
+
+    Every VAD / keepalive constant below is env-tunable so the call feel can be
+    dialled in from the systemd unit without editing (and redeploying) code.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger_boot = logging.getLogger("voice_call_ws")
+        logger_boot.warning("bad int for %s=%r, using default %d", name, raw, default)
+        return default
+
+
+VAD_RMS_SPEAK = _env_int("CC_VOICE_VAD_RMS_SPEAK", 500)      # >= this -> definitely speaking
+VAD_RMS_SILENCE = _env_int("CC_VOICE_VAD_RMS_SILENCE", 300)  # < this -> silence candidate
+# Silence after speech that ends an utterance. Was 700ms, which cut people off
+# mid-sentence every time they paused to think or took a breath. The reference
+# implementation we benchmarked against settled on 1800ms for exactly this
+# reason; 1200ms is our compromise between "doesn't interrupt me" and "answers
+# quickly".
+VAD_SILENCE_END_MS = _env_int("CC_VOICE_VAD_SILENCE_END_MS", 1200)
+MAX_UTTERANCE_MS = _env_int("CC_VOICE_MAX_UTTERANCE_MS", 30_000)  # safety cap
+VAD_MIN_SPEECH_MS = _env_int("CC_VOICE_VAD_MIN_SPEECH_MS", 400)   # anti ASR hallucination
+ASR_SINGLE_CHAR_MIN_MS = _env_int("CC_VOICE_ASR_SINGLE_CHAR_MIN_MS", 900)
+# Pre-roll: how much audio *before* the VAD fires we keep and prepend to the
+# utterance. Without this the quiet onset of the first syllable is thrown away
+# (frames below VAD_RMS_SPEAK were simply dropped), which makes the ASR mishear
+# or drop the start of every sentence.
+VAD_PREROLL_MS = _env_int("CC_VOICE_VAD_PREROLL_MS", 300)
+VAD_PREROLL_FRAMES = max(0, VAD_PREROLL_MS // FRAME_MS)
+
+# WebSocket keepalive. The previous 10s/10s pair was the single biggest cause of
+# dropped calls: an Android client that is busy with AudioTrack, briefly dozing,
+# or on a flaky mobile link routinely needs more than 10s to turn a ping around,
+# and websockets then kills the session with 1011 "keepalive ping timeout".
+WS_PING_INTERVAL = _env_int("CC_VOICE_WS_PING_INTERVAL", 20)
+WS_PING_TIMEOUT = _env_int("CC_VOICE_WS_PING_TIMEOUT", 60)
+WS_CLOSE_TIMEOUT = _env_int("CC_VOICE_WS_CLOSE_TIMEOUT", 10)
+# Hard ceiling on a single ws.send(); a stalled client must not wedge the whole
+# session forever on a full TCP send buffer.
+WS_SEND_TIMEOUT_SEC = float(_env_int("CC_VOICE_WS_SEND_TIMEOUT_SEC", 30))
 
 # Anti ASR hallucination (third line of defense): classic Whisper-style
 # hallucination phrases emitted on silence/noise. Matched against the
@@ -102,7 +142,10 @@ ASR_HALLUCINATION_SUBSTRINGS = ("字幕由", "amara.org")
 ASR_TIMEOUT_SEC = 90
 TTS_TIMEOUT_SEC = 90
 LIVE_REPLY_TIMEOUT_SEC = 180
-LIVE_REPLY_POLL_INTERVAL_SEC = 1.0
+# Halved from 1.0s: this poll is a loopback HTTP call, and the old interval added
+# up to a full second of dead air to *every* turn after the reply had already
+# landed.
+LIVE_REPLY_POLL_INTERVAL_SEC = 0.5
 PUSH_HTTP_BASE = "http://127.0.0.1:8291"
 
 logger = logging.getLogger("voice_call_ws")
@@ -518,6 +561,11 @@ class Utterance:
 
     def __init__(self) -> None:
         self.buf = bytearray()
+        # Rolling window of pre-speech frames, prepended to the utterance when
+        # the VAD finally fires so we don't clip the first syllable.
+        self.preroll: collections.deque[bytes] = collections.deque(
+            maxlen=VAD_PREROLL_FRAMES or 1
+        )
         self.is_speaking = False
         self.has_spoken = False
         self.silence_ms = 0
@@ -527,9 +575,24 @@ class Utterance:
     def feed(self, frame: bytes) -> bool:
         """Returns True when the utterance has just ended (caller should flush)."""
         rms = frame_rms(frame)
-        self.total_ms += FRAME_MS
+        # NOTE: total_ms deliberately counts *buffered* audio only, i.e. it does
+        # not start ticking until speech has actually begun. It used to be
+        # incremented on every frame including room silence, so after ~30s of
+        # quiet in a call total_ms had already passed MAX_UTTERANCE_MS; the very
+        # first frame of the next thing you said set has_spoken and instantly
+        # tripped the safety cap, yielding a 20ms "utterance" that the
+        # min-speech gate then discarded. The call went deaf and you had to
+        # repeat yourself. See the regression test in _voice_vad_test.py.
+        if self.has_spoken:
+            self.total_ms += FRAME_MS
 
         if rms >= VAD_RMS_SPEAK:
+            if not self.is_speaking:
+                # Onset — flush the pre-roll so the attack of the word survives.
+                for prev in self.preroll:
+                    self.buf.extend(prev)
+                self.total_ms += len(self.preroll) * FRAME_MS
+                self.preroll.clear()
             self.is_speaking = True
             self.has_spoken = True
             self.silence_ms = 0
@@ -546,6 +609,10 @@ class Utterance:
             self.silence_ms = 0
             self.speech_ms += FRAME_MS
             self.buf.extend(frame)
+        else:
+            # Not speaking yet — keep the frame as pre-roll context only.
+            if VAD_PREROLL_FRAMES:
+                self.preroll.append(frame)
 
         if self.has_spoken and self.total_ms >= MAX_UTTERANCE_MS:
             return True
@@ -553,6 +620,7 @@ class Utterance:
 
     def reset(self) -> None:
         self.buf.clear()
+        self.preroll.clear()
         self.is_speaking = False
         self.has_spoken = False
         self.silence_ms = 0
@@ -660,9 +728,19 @@ async def stream_tts_from_helper(
                     break
                 part = pcm_chunk[offset : offset + MAX_TTS_CHUNK_BYTES]
                 try:
-                    await ws.send(part)
+                    # Guard the send: on a stalled client the TCP send buffer
+                    # fills and a bare `await ws.send()` would hang this session
+                    # forever with no diagnostic.
+                    await asyncio.wait_for(ws.send(part), timeout=WS_SEND_TIMEOUT_SEC)
                 except ConnectionClosed:
                     error = "ws closed"
+                    sent_all = False
+                    break
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "tts send stalled >%.0fs, abandoning stream", WS_SEND_TIMEOUT_SEC
+                    )
+                    error = "ws send timeout"
                     sent_all = False
                     break
                 if info["first_chunk_ms"] is None:
@@ -831,8 +909,24 @@ class Session:
         self.end_event = asyncio.Event()
         self.current_task: Optional[asyncio.Task] = None
         self.started = False
+        self.close_reason: str = "unknown"
+        self.opened_at = time.monotonic()
 
     async def recv_loop(self) -> None:
+        try:
+            await self._recv_loop_inner()
+        except ConnectionClosed as e:
+            # Swallow here and record the reason. Previously this propagated out
+            # of the task and, because asyncio.wait(FIRST_COMPLETED) never
+            # retrieved it, showed up as a bare "Task exception was never
+            # retrieved" traceback with no session context.
+            rcvd = getattr(self.ws, "close_code", None)
+            self.close_reason = (
+                f"{type(e).__name__} code={rcvd} reason={getattr(self.ws, 'close_reason', '')!r}"
+            )
+            self.end_event.set()
+
+    async def _recv_loop_inner(self) -> None:
         async for message in self.ws:
             if isinstance(message, (bytes, bytearray)):
                 if not self.started:
@@ -941,6 +1035,20 @@ class Session:
             {recv, pipe, end_waiter}, return_when=asyncio.FIRST_COMPLETED
         )
 
+        # Retrieve exceptions from whatever finished so asyncio never reports
+        # "Task exception was never retrieved", and so we know why we're closing.
+        for t in done:
+            exc = t.exception() if not t.cancelled() else None
+            if exc is not None and self.close_reason == "unknown":
+                self.close_reason = f"{t.get_name()}: {type(exc).__name__}: {exc}"
+        if self.close_reason == "unknown":
+            if end_waiter in done:
+                self.close_reason = "client sent end"
+            elif recv in done:
+                self.close_reason = "client closed stream"
+            elif pipe in done:
+                self.close_reason = "pipeline finished"
+
         # Tear down.
         self.end_event.set()
         if self.current_task is not None:
@@ -1002,11 +1110,21 @@ async def ws_handler(ws: ServerConnection) -> None:
     sess = Session(ws)
     try:
         await sess.run()
-    except ConnectionClosed:
-        pass
-    except Exception:
+    except ConnectionClosed as e:
+        sess.close_reason = f"{type(e).__name__}: {e}"
+    except Exception as e:
         logger.exception("session crashed")
-    logger.info("ws session ended peer=%s", ws.remote_address)
+        sess.close_reason = f"crash: {type(e).__name__}: {e}"
+    # Log *why* the call ended and how long it lasted. Without this a dropped
+    # call was indistinguishable from a normal hangup in the journal.
+    logger.info(
+        "ws session ended peer=%s duration=%.1fs started=%s close_code=%s why=%s",
+        ws.remote_address,
+        time.monotonic() - sess.opened_at,
+        sess.started,
+        getattr(ws, "close_code", None),
+        sess.close_reason,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1023,16 +1141,38 @@ async def amain() -> None:
         # Still serve, but every connection will be rejected.
     logger.info("auth source: %s", AUTH_SOURCE)
     logger.info("listening on ws://%s:%d%s", WS_HOST, WS_PORT, WS_PATH)
+    logger.info(
+        "keepalive: ping_interval=%ss ping_timeout=%ss close_timeout=%ss send_timeout=%ss",
+        WS_PING_INTERVAL,
+        WS_PING_TIMEOUT,
+        WS_CLOSE_TIMEOUT,
+        WS_SEND_TIMEOUT_SEC,
+    )
+    logger.info(
+        "vad: speak_rms=%d silence_rms=%d silence_end=%dms preroll=%dms "
+        "min_speech=%dms max_utterance=%dms",
+        VAD_RMS_SPEAK,
+        VAD_RMS_SILENCE,
+        VAD_SILENCE_END_MS,
+        VAD_PREROLL_MS,
+        VAD_MIN_SPEECH_MS,
+        MAX_UTTERANCE_MS,
+    )
 
     async with serve(
         ws_handler,
         WS_HOST,
         WS_PORT,
         max_size=2 * 1024 * 1024,
-        # Tighter keepalive: detect dead mobile connections fast so we don't
-        # hold half-open sessions when the phone backgrounded or lost wifi.
-        ping_interval=10,
-        ping_timeout=10,
+        # Keepalive tuned for phones, not datacentres. A handset that is busy
+        # with AudioTrack, briefly dozing, or on a weak mobile link regularly
+        # takes well over 10s to turn a ping around; the old 10s/10s pair killed
+        # those calls outright with 1011 "keepalive ping timeout". We still ping
+        # often enough to keep NAT/proxy state warm, but we wait a full minute
+        # before declaring the phone dead.
+        ping_interval=WS_PING_INTERVAL,
+        ping_timeout=WS_PING_TIMEOUT,
+        close_timeout=WS_CLOSE_TIMEOUT,
     ):
         await asyncio.Future()
 
