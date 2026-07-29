@@ -318,6 +318,12 @@ def _read_live_contact_records(contact_id: str, since_ts: str) -> list[dict[str,
     return [item for item in records if isinstance(item, dict)]
 
 
+# Assistant records whose source is a real conversational reply. Anything else
+# (memory-recall cards, leaving-check / schedule-remind pushes, ...) shares
+# role=assistant in chat history but must never be spoken as the call reply.
+LIVE_REPLY_SOURCES = {"cc-companion-channel", "ccc-stop-hook", "claude-code"}
+
+
 async def send_live_contact_and_wait_reply(contact_id: str, text: str) -> str:
     """Send a transcript to a live CC Companion contact and wait for its next
     assistant message. Used by voice calls for xiaoke/kairos-style contacts.
@@ -333,6 +339,9 @@ async def send_live_contact_and_wait_reply(contact_id: str, text: str) -> str:
         )
         for rec in records:
             if rec.get("role") != "assistant":
+                continue
+            source = str(rec.get("source") or "")
+            if source and source not in LIVE_REPLY_SOURCES:
                 continue
             reply_text = str(rec.get("text") or "").strip()
             if reply_text:
