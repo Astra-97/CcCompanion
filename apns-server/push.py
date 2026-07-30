@@ -98,6 +98,7 @@ from usage import UsageReader
 from link_preview import LinkPreviewBundle, LinkPreviewService, merge_preview_metadata
 from xhs_login import XhsLoginError, XhsLoginManager
 from kimi_acp import (
+    DEFAULT_KIMI_CWD,
     KimiACPAuthRequired,
     KimiACPBusy,
     KimiACPCancelled,
@@ -2189,7 +2190,7 @@ class ServerState:
         self.kimi_prepare_token = ""
         self.kimi_acp = KimiACPClient(
             command=server_cfg.get("kimi_bin", "/root/.kimi-code/bin/kimi"),
-            cwd=server_cfg.get("kimi_cwd", "/root/Windows-Codex-TG"),
+            cwd=server_cfg.get("kimi_cwd", DEFAULT_KIMI_CWD),
             state_path=contact_history_dir / "kimi_acp_session.json",
             logger=logger,
             request_timeout=float(server_cfg.get("kimi_acp_request_timeout_seconds", 30)),

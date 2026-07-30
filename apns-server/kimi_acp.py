@@ -18,6 +18,7 @@ import time
 from typing import Any, Callable
 
 KIMI_APP_MODEL = "kimi-code/kimi-for-coding-highspeed"
+DEFAULT_KIMI_CWD = "/root/Karami-Workspace"
 
 
 class KimiACPError(RuntimeError):
@@ -63,7 +64,7 @@ class KimiACPClient:
         self,
         *,
         command: str | Path = "/root/.kimi-code/bin/kimi",
-        cwd: str | Path = "/root/Windows-Codex-TG",
+        cwd: str | Path = DEFAULT_KIMI_CWD,
         state_path: str | Path,
         logger: logging.Logger | None = None,
         request_timeout: float = 30.0,
@@ -103,7 +104,19 @@ class KimiACPClient:
     def _load_session_id(self) -> str:
         try:
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
-            return str(payload.get("session_id") or "").strip() if isinstance(payload, dict) else ""
+            if not isinstance(payload, dict):
+                return ""
+            if payload.get("version") != 2:
+                return ""
+            session_id = str(payload.get("session_id") or "").strip()
+            saved_cwd = str(payload.get("cwd") or "").strip()
+            if not session_id or not saved_cwd:
+                return ""
+            try:
+                canonical_saved_cwd = str(Path(saved_cwd).expanduser().resolve())
+            except (OSError, RuntimeError):
+                return ""
+            return session_id if canonical_saved_cwd == str(self.cwd) else ""
         except (FileNotFoundError, OSError, ValueError):
             return ""
 
@@ -114,7 +127,14 @@ class KimiACPClient:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_name(f".{self.state_path.name}.tmp.{os.getpid()}")
         tmp.write_text(
-            json.dumps({"version": 1, "session_id": session_id}, separators=(",", ":")),
+            json.dumps(
+                {
+                    "version": 2,
+                    "session_id": session_id,
+                    "cwd": str(self.cwd),
+                },
+                separators=(",", ":"),
+            ),
             encoding="utf-8",
         )
         os.chmod(tmp, 0o600)

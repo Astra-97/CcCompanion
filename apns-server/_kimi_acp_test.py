@@ -6,6 +6,7 @@ import threading
 import unittest
 
 from kimi_acp import (
+    DEFAULT_KIMI_CWD,
     KIMI_APP_MODEL,
     KimiACPAuthRequired,
     KimiACPClient,
@@ -41,13 +42,97 @@ class KimiACPProtocolTest(unittest.TestCase):
             ),
         )
 
-    def test_session_state_is_private_and_round_trips(self):
+    def test_default_workspace_is_isolated_from_kairos(self):
+        client = KimiACPClient(state_path="/tmp/unused-kimi-test-state")
+        self.assertEqual(Path(DEFAULT_KIMI_CWD).resolve(), client.cwd)
+        self.assertNotEqual(Path("/root/Windows-Codex-TG").resolve(), client.cwd)
+
+    def test_session_state_is_private_cwd_bound_and_round_trips(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "session.json"
-            client = KimiACPClient(state_path=path)
+            cwd = Path(tmp) / "workspace"
+            cwd.mkdir()
+            client = KimiACPClient(state_path=path, cwd=cwd)
             client._save_session_id("kimi-session-1")
             self.assertEqual("kimi-session-1", client._load_session_id())
             self.assertEqual(0o600, path.stat().st_mode & 0o777)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(2, payload["version"])
+            self.assertEqual(str(cwd.resolve()), payload["cwd"])
+
+    def test_legacy_or_other_workspace_session_is_not_resumed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            current = base / "current"
+            other = base / "other"
+            current.mkdir()
+            other.mkdir()
+            path = base / "session.json"
+            client = KimiACPClient(state_path=path, cwd=current)
+
+            path.write_text(
+                json.dumps({"version": 1, "session_id": "legacy"}),
+                encoding="utf-8",
+            )
+            self.assertEqual("", client._load_session_id())
+
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "session_id": "other-session",
+                        "cwd": str(other),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual("", client._load_session_id())
+
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 3,
+                        "session_id": "future-session",
+                        "cwd": str(current),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual("", client._load_session_id())
+
+    def test_workspace_mismatch_starts_new_session_instead_of_loading_old(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            current = base / "current"
+            old = base / "old"
+            current.mkdir()
+            old.mkdir()
+            state_path = base / "session.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "session_id": "old-session",
+                        "cwd": str(old),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            client = KimiACPClient(state_path=state_path, cwd=current)
+            calls = []
+
+            def request(method, params, **_kwargs):
+                calls.append((method, params))
+                if method == "session/new":
+                    return {"sessionId": "new-session", "configOptions": []}
+                raise AssertionError(method)
+
+            client._request = request
+            session_id, _options = client._new_or_load_session()
+
+            self.assertEqual("new-session", session_id)
+            self.assertEqual(["session/new"], [method for method, _params in calls])
+            self.assertEqual(str(current.resolve()), calls[0][1]["cwd"])
 
     def test_cancel_notification_has_no_request_id(self):
         client = KimiACPClient(state_path="/tmp/unused-kimi-test-state")
