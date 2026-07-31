@@ -667,7 +667,9 @@ class _HTMLTextExtractor(HTMLParser):
         if tag == "script":
             script = "".join(self._script_parts)
             if script and (
-                self._script_type == "application/ld+json" or "__INITIAL_STATE__" in script
+                self._script_type == "application/ld+json"
+                or "__INITIAL_STATE__" in script
+                or "window.cgiDataNew" in script
             ):
                 self.structured_scripts.append((self._script_type, script))
             self._script_type = ""
@@ -1069,6 +1071,226 @@ def _clean_wechat_body_tokens(tokens: list[tuple[str, str, bool]]) -> str:
     return "\n".join(value for value, _related in paragraphs)
 
 
+_WECHAT_CGI_STRING_FIELDS = frozenset({
+    "title",
+    "nick_name",
+    "content_noencode",
+    "cdn_url",
+})
+
+
+def _decode_js_single_quoted(source: str, start: int) -> tuple[str, int] | None:
+    """Decode one bounded JS single-quoted string without executing script."""
+    if start >= len(source) or source[start] != "'":
+        return None
+    out: list[str] = []
+    index = start + 1
+    simple_escapes = {
+        "'": "'",
+        '"': '"',
+        "\\": "\\",
+        "b": "\b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "v": "\v",
+        "0": "\0",
+    }
+    while index < len(source):
+        char = source[index]
+        if char == "'":
+            value = "".join(out)
+            # Combine valid UTF-16 surrogate-pair escapes while replacing
+            # unpaired surrogates with U+FFFD so downstream UTF-8 is safe.
+            normalized: list[str] = []
+            cursor = 0
+            while cursor < len(value):
+                codepoint = ord(value[cursor])
+                if 0xD800 <= codepoint <= 0xDBFF and cursor + 1 < len(value):
+                    low = ord(value[cursor + 1])
+                    if 0xDC00 <= low <= 0xDFFF:
+                        normalized.append(chr(0x10000 + ((codepoint - 0xD800) << 10) + low - 0xDC00))
+                        cursor += 2
+                        continue
+                normalized.append("\ufffd" if 0xD800 <= codepoint <= 0xDFFF else value[cursor])
+                cursor += 1
+            return "".join(normalized), index + 1
+        if char in "\r\n":
+            return None
+        if char != "\\":
+            out.append(char)
+            index += 1
+        else:
+            index += 1
+            if index >= len(source):
+                return None
+            escaped = source[index]
+            if escaped in simple_escapes:
+                out.append(simple_escapes[escaped])
+                index += 1
+            elif escaped in "\r\n":
+                if escaped == "\r" and index + 1 < len(source) and source[index + 1] == "\n":
+                    index += 1
+                index += 1
+            elif escaped == "x":
+                digits = source[index + 1 : index + 3]
+                if len(digits) != 2 or not re.fullmatch(r"[0-9A-Fa-f]{2}", digits):
+                    return None
+                out.append(chr(int(digits, 16)))
+                index += 3
+            elif escaped == "u":
+                if index + 1 < len(source) and source[index + 1] == "{":
+                    close = source.find("}", index + 2, index + 9)
+                    digits = source[index + 2 : close] if close >= 0 else ""
+                    if not digits or not re.fullmatch(r"[0-9A-Fa-f]{1,6}", digits):
+                        return None
+                    codepoint = int(digits, 16)
+                    if codepoint > 0x10FFFF:
+                        return None
+                    out.append(chr(codepoint))
+                    index = close + 1
+                else:
+                    digits = source[index + 1 : index + 5]
+                    if len(digits) != 4 or not re.fullmatch(r"[0-9A-Fa-f]{4}", digits):
+                        return None
+                    out.append(chr(int(digits, 16)))
+                    index += 5
+            else:
+                # JavaScript treats an unknown non-octal escape as the escaped
+                # character itself.  It remains data; nothing is evaluated.
+                out.append(escaped)
+                index += 1
+        if len(out) > 1_000_000:
+            return None
+    return None
+
+
+def _skip_js_space_and_comments(source: str, index: int) -> int | None:
+    while index < len(source):
+        if source[index].isspace():
+            index += 1
+        elif source.startswith("//", index):
+            newline = source.find("\n", index + 2)
+            index = len(source) if newline < 0 else newline + 1
+        elif source.startswith("/*", index):
+            close = source.find("*/", index + 2)
+            if close < 0:
+                return None
+            index = close + 2
+        else:
+            break
+    return index
+
+
+def _skip_js_value(source: str, start: int) -> tuple[int, str] | None:
+    """Skip a data-literal value to its top-level comma or closing brace."""
+    stack: list[str] = []
+    pairs = {")": "(", "]": "[", "}": "{"}
+    index = start
+    while index < len(source):
+        if source[index] == "`":
+            # Template literals may contain interpolation with arbitrary
+            # expressions.  This data-only parser does not guess through them.
+            return None
+        if source[index] in {"'", '"'}:
+            if source[index] == "'":
+                parsed = _decode_js_single_quoted(source, index)
+                if parsed is None:
+                    return None
+                _value, index = parsed
+                continue
+            # Double-quoted values are irrelevant to the selected fields, but
+            # still need lexical skipping so braces inside them stay inert.
+            index += 1
+            while index < len(source):
+                if source[index] in "\r\n":
+                    return None
+                if source[index] == "\\":
+                    index += 2
+                elif source[index] == '"':
+                    index += 1
+                    break
+                else:
+                    index += 1
+            else:
+                return None
+            continue
+        if source.startswith("//", index) or source.startswith("/*", index):
+            skipped = _skip_js_space_and_comments(source, index)
+            if skipped is None:
+                return None
+            index = skipped
+            continue
+        if source[index] == "/":
+            # Outside comments, slash may begin a regular-expression literal
+            # whose braces/commas are data rather than structure.  Fail closed
+            # instead of misbalancing the surrounding object.
+            return None
+        char = source[index]
+        if char in "([{":
+            if len(stack) >= 256:
+                return None
+            stack.append(char)
+        elif char in ")]}":
+            if not stack:
+                if char == "}":
+                    return index, "end"
+                return None
+            if stack[-1] != pairs[char]:
+                return None
+            stack.pop()
+        elif char == "," and not stack:
+            return index + 1, "comma"
+        index += 1
+    return None
+
+
+def _wechat_cgi_string_fields(parser: _HTMLTextExtractor) -> dict[str, str]:
+    """Extract selected top-level cgiDataNew fields from a complete object."""
+    assignment = re.compile(r"(?:^|[;\n])\s*window\s*\.\s*cgiDataNew\s*=\s*\{")
+    identifier = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
+    for _script_type, script in parser.structured_scripts:
+        match = assignment.search(script)
+        if not match:
+            continue
+        fields: dict[str, str] = {}
+        index = match.end()
+        while index < len(script):
+            index = _skip_js_space_and_comments(script, index)
+            if index is None or index >= len(script):
+                break
+            if script[index] == "}":
+                return fields
+            key_match = identifier.match(script, index)
+            if not key_match:
+                break
+            key = key_match.group(0)
+            index = _skip_js_space_and_comments(script, key_match.end())
+            if index is None or index >= len(script) or script[index] != ":":
+                break
+            index = _skip_js_space_and_comments(script, index + 1)
+            if index is None or index >= len(script):
+                break
+            if key in _WECHAT_CGI_STRING_FIELDS:
+                decoded = _decode_js_single_quoted(script, index)
+                if decoded is not None:
+                    value_end = _skip_js_space_and_comments(script, decoded[1])
+                    if (
+                        value_end is not None
+                        and value_end < len(script)
+                        and script[value_end] in {",", "}"}
+                    ):
+                        fields.setdefault(key, decoded[0])
+            skipped_value = _skip_js_value(script, index)
+            if skipped_value is None:
+                break
+            index, delimiter = skipped_value
+            if delimiter == "end":
+                return fields
+    return {}
+
+
 def _is_wechat_challenge_payload(
     payload: HTTPPayload,
     visible_parts: list[str] | None = None,
@@ -1124,6 +1346,19 @@ def extract_html_page(requested_url: str, payload: HTTPPayload, *, max_text_char
         and _is_wechat_challenge_payload(payload, parser.text_parts)
     ):
         raise LinkPreviewError("WeChat verification challenge")
+    wechat_cgi = _wechat_cgi_string_fields(parser) if is_wechat else {}
+    normalized_og_title = re.sub(
+        r"\s+", " ", unescape(str(meta.get("og:title") or ""))
+    ).strip()
+    normalized_cgi_title = re.sub(
+        r"\s+", " ", unescape(str(wechat_cgi.get("title") or ""))
+    ).strip()
+    trusted_wechat_cgi = bool(
+        normalized_og_title
+        and normalized_cgi_title == normalized_og_title
+        and str(wechat_cgi.get("nick_name") or "").strip()
+        and str(wechat_cgi.get("content_noencode") or "").strip()
+    )
     title = meta.get("og:title") or meta.get("twitter:title") or " ".join(parser.title_parts)
     description = meta.get("og:description") or meta.get("description") or meta.get("twitter:description") or ""
     site_name = meta.get("og:site_name") or ""
@@ -1142,6 +1377,9 @@ def extract_html_page(requested_url: str, payload: HTTPPayload, *, max_text_char
             image_urls = (generic_image,)
     else:
         image_urls = (generic_image,) if generic_image else ()
+        if trusted_wechat_cgi and not image_urls:
+            cgi_image = _safe_image_url(wechat_cgi.get("cdn_url") or "", payload.url)
+            image_urls = (cgi_image,) if cgi_image else ()
     image_url = image_urls[0] if image_urls else ""
     source_urls = (requested_url, payload.url)
     body_text = "\n".join(parser.text_parts)
@@ -1154,6 +1392,11 @@ def extract_html_page(requested_url: str, payload: HTTPPayload, *, max_text_char
     elif is_wechat:
         body_text = _clean_wechat_body_tokens(parser.wechat_body_tokens)
         site_name = " ".join(parser.wechat_name_parts) or meta.get("author") or site_name
+        if not body_text and trusted_wechat_cgi:
+            body_text = str(wechat_cgi.get("content_noencode") or "")
+            title = str(wechat_cgi.get("title") or "") or title
+            site_name = str(wechat_cgi.get("nick_name") or "") or site_name
+            description = re.sub(r"\s+", " ", body_text).strip()[:MAX_DESCRIPTION]
         if not body_text:
             raise LinkPreviewError("WeChat article body was not available")
         if not description:

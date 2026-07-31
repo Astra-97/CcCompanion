@@ -328,6 +328,158 @@ class LinkPreviewTests(unittest.TestCase):
         )
         self.assertEqual(page.body_text, "请参阅官方文件获取详情")
 
+    def test_wechat_share_content_page_uses_safe_cgi_data_fallback(self):
+        html = r"""<html><head>
+        <meta property='og:title' content='分享页标题'>
+        </head><body><div id='js_base_container'></div>
+        <script>
+        window.cgiDataNew = {
+          nick_name: '暖暖公众号',
+          title: '分享页\u6807题',
+          content_noencode: '第一行\x0a第二行：it\'s \u4e2d文 \u{1F31F}',
+          cdn_url: 'https://mmbiz.qpic.cn/cover.jpg',
+          nested: {cdn_url: 'https://evil.example/nested.jpg'}
+        };
+        </script></body></html>""".encode()
+        payload = link_preview.HTTPPayload(
+            "https://mp.weixin.qq.com/s/new", 200,
+            {"content-type": "text/html; charset=UTF-8"}, html,
+        )
+        page = link_preview.extract_html_page(
+            "https://mp.weixin.qq.com/s/new", payload, max_text_chars=1000
+        )
+        self.assertEqual(page.title, "分享页标题")
+        self.assertEqual(page.site_name, "暖暖公众号")
+        self.assertEqual(page.body_text, "第一行\n第二行：it's 中文 🌟")
+        self.assertEqual(page.image_url, "https://mmbiz.qpic.cn/cover.jpg")
+        self.assertNotIn("evil.example", " ".join(page.image_urls))
+
+    def test_wechat_share_content_page_does_not_evaluate_field_expression(self):
+        html = b"""<html><head><meta property='og:title' content='Title'></head><body>
+        <div id='js_base_container'></div><script>
+        window.cgiDataNew = {
+          title: 'Title',
+          nick_name: 'Publisher',
+          content_noencode: (function(){ return 'forged body'; })(),
+          cdn_url: 'https://mmbiz.qpic.cn/cover.jpg'
+        };</script></body></html>"""
+        payload = link_preview.HTTPPayload(
+            "https://mp.weixin.qq.com/s/expression", 200,
+            {"content-type": "text/html"}, html,
+        )
+        with self.assertRaises(link_preview.LinkPreviewError):
+            link_preview.extract_html_page(
+                "https://mp.weixin.qq.com/s/expression", payload, max_text_chars=1000
+            )
+
+    def test_wechat_share_content_page_rejects_string_plus_runtime_expression(self):
+        html = b"""<html><head><meta property='og:title' content='Title'></head><body>
+        <script>window.cgiDataNew = {
+          title: 'Title',
+          content_noencode: 'trusted prefix' + runtimeExpression,
+          cdn_url: 'https://mmbiz.qpic.cn/cover.jpg'
+        };</script></body></html>"""
+        payload = link_preview.HTTPPayload(
+            "https://mp.weixin.qq.com/s/concatenated", 200,
+            {"content-type": "text/html"}, html,
+        )
+        with self.assertRaises(link_preview.LinkPreviewError):
+            link_preview.extract_html_page(
+                "https://mp.weixin.qq.com/s/concatenated", payload, max_text_chars=1000
+            )
+
+    def test_wechat_share_content_page_fails_closed_on_regex_or_template_unknown_field(self):
+        values = ("/}/", "`unsafe ${runtimeExpression}`")
+        for value in values:
+            html = f"""<html><head><meta property='og:title' content='Title'></head><body>
+            <script>window.cgiDataNew = {{
+              unknown: {value},
+              title: 'Title',
+              content_noencode: 'must not be accepted'
+            }};</script></body></html>""".encode()
+            payload = link_preview.HTTPPayload(
+                "https://mp.weixin.qq.com/s/ambiguous", 200,
+                {"content-type": "text/html"}, html,
+            )
+            with self.subTest(value=value), self.assertRaises(link_preview.LinkPreviewError):
+                link_preview.extract_html_page(
+                    "https://mp.weixin.qq.com/s/ambiguous", payload, max_text_chars=1000
+                )
+
+    def test_wechat_share_content_page_rejects_excessive_nesting(self):
+        nested = "[" * 257 + "0" + "]" * 257
+        html = f"""<html><head><meta property='og:title' content='Title'></head>
+        <script>window.cgiDataNew = {{
+          unknown: {nested}, title: 'Title', nick_name: 'Publisher',
+          content_noencode: 'must not be accepted'
+        }};</script></html>""".encode()
+        payload = link_preview.HTTPPayload(
+            "https://mp.weixin.qq.com/s/deep", 200,
+            {"content-type": "text/html"}, html,
+        )
+        with self.assertRaises(link_preview.LinkPreviewError):
+            link_preview.extract_html_page(
+                "https://mp.weixin.qq.com/s/deep", payload, max_text_chars=1000
+            )
+
+    def test_wechat_share_content_page_rejects_truncated_cgi_object(self):
+        html = b"""<html><head><meta property='og:title' content='Title'></head><body>
+        <script>window.cgiDataNew = {
+          title: 'Title', nick_name: 'Publisher', content_noencode: 'partial body'
+        """
+        payload = link_preview.HTTPPayload(
+            "https://mp.weixin.qq.com/s/truncated", 200,
+            {"content-type": "text/html", "x-cc-preview-truncated": "1"}, html,
+        )
+        with self.assertRaises(link_preview.LinkPreviewError):
+            link_preview.extract_html_page(
+                "https://mp.weixin.qq.com/s/truncated", payload, max_text_chars=1000
+            )
+
+    def test_wechat_share_content_page_requires_meta_title_and_body(self):
+        cases = (
+            b"""<html><script>window.cgiDataNew = {
+              title: 'Script title', nick_name: 'Publisher', content_noencode: 'body'
+            };</script></html>""",
+            b"""<html><head><meta property='og:title' content='Meta title'></head>
+            <script>window.cgiDataNew = {
+              title: 'Meta title', nick_name: 'Publisher', content_noencode: ''
+            };</script></html>""",
+            b"""<html><head><meta property='og:title' content='Meta title'></head>
+            <script>window.cgiDataNew = {
+              title: 'Different title', nick_name: 'Publisher', content_noencode: 'body'
+            };</script></html>""",
+            b"""<html><head><meta property='og:title' content='Meta title'></head>
+            <script>window.cgiDataNew = {
+              title: 'Meta title', nick_name: '', content_noencode: 'body'
+            };</script></html>""",
+        )
+        for html in cases:
+            payload = link_preview.HTTPPayload(
+                "https://mp.weixin.qq.com/s/missing", 200,
+                {"content-type": "text/html"}, html,
+            )
+            with self.subTest(html=html), self.assertRaises(link_preview.LinkPreviewError):
+                link_preview.extract_html_page(
+                    "https://mp.weixin.qq.com/s/missing", payload, max_text_chars=1000
+                )
+
+    def test_wechat_complete_cgi_before_truncated_shell_still_succeeds(self):
+        html = b"""<html><head><meta property='og:title' content='Title'></head><body>
+        <script>window.cgiDataNew = {
+          title: 'Title', nick_name: 'Publisher', content_noencode: 'complete body',
+          cdn_url: 'https://mmbiz.qpic.cn/cover.jpg'
+        };</script><div class='later-shell'>this trailing shell is cut"""
+        payload = link_preview.HTTPPayload(
+            "https://mp.weixin.qq.com/s/truncated-shell", 200,
+            {"content-type": "text/html", "x-cc-preview-truncated": "1"}, html,
+        )
+        page = link_preview.extract_html_page(
+            "https://mp.weixin.qq.com/s/truncated-shell", payload, max_text_chars=1000
+        )
+        self.assertEqual(page.body_text, "complete body")
+        self.assertEqual(page.site_name, "Publisher")
+
     def test_wechat_challenge_url_and_visible_challenge_are_rejected(self):
         challenge = """<html><body><main>环境异常 当前环境异常，完成验证后即可继续访问。
         <button>去验证</button></main></body></html>""".encode()
