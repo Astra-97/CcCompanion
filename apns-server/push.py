@@ -3749,6 +3749,14 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/attachments/"):
             self._handle_attachment_get()
             return
+        # 通话罐头音（服务端可配置，换音频/调音量不用重编 APK）。
+        # 精确匹配：ambience-config 必须排在 ambience 之前判断。
+        if self.path == "/voice-call/ambience-config":
+            self._handle_voice_ambience_config()
+            return
+        if self.path == "/voice-call/ambience" or self.path.startswith("/voice-call/ambience?"):
+            self._handle_voice_ambience_audio()
+            return
         # 2026-05-07 settings v2 endpoints
         if self.path == "/session/info":
             self._handle_session_info()
@@ -11178,6 +11186,98 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.debug("attachment client disconnected path=%s err=%s", target.name, e)
         except Exception:
             logger.exception("attachment stream fail path=%s", target)
+
+    # ------------------------------------------------------------------
+    # 通话罐头音 (voice-ambience) — 服务端可配置, 换音频/调音量不用重编 APK
+    # ------------------------------------------------------------------
+
+    _VOICE_AMBIENCE_DIR = HERE / "voice-ambience"
+
+    def _voice_ambience_sha(self) -> str | None:
+        """当前 ambience.wav 的 sha256 前 16 位; 文件不存在返回 None."""
+        wav = self._VOICE_AMBIENCE_DIR / "ambience.wav"
+        if not wav.exists() or not wav.is_file():
+            return None
+        try:
+            h = hashlib.sha256()
+            with wav.open("rb") as f:
+                while True:
+                    chunk = f.read(64 * 1024)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            return h.hexdigest()[:16]
+        except Exception:
+            logger.exception("voice-ambience sha fail")
+            return None
+
+    def _handle_voice_ambience_config(self):
+        """GET /voice-call/ambience-config — 现读 config.json + 当前音频 sha256.
+
+        每次请求现读文件 (文件小), 保证扔新文件立即生效, 不缓存.
+        """
+        cfg_path = self._VOICE_AMBIENCE_DIR / "config.json"
+        cfg: dict[str, Any] = {}
+        try:
+            if cfg_path.exists():
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            logger.exception("voice-ambience config read fail")
+            cfg = {}
+        sha = self._voice_ambience_sha()
+        body = {
+            "ok": True,
+            "gain": cfg.get("gain", 0.6),
+            "delay_ms": cfg.get("delay_ms", 2000),
+            "on_ms": cfg.get("on_ms", 3000),
+            "off_ms": cfg.get("off_ms", 2000),
+            "sha256": sha or "",
+            "audio_url": "/voice-call/ambience",
+        }
+        self._send_json(200, body)
+
+    def _handle_voice_ambience_audio(self):
+        """GET /voice-call/ambience — 返回 ambience.wav 字节流 (audio/wav).
+
+        带 ETag(=sha256 前16位), 支持 If-None-Match 返回 304.
+        """
+        wav = self._VOICE_AMBIENCE_DIR / "ambience.wav"
+        if not wav.exists() or not wav.is_file():
+            self._send_json(404, {"error": "not found"})
+            return
+        sha = self._voice_ambience_sha() or ""
+        etag = f'"{sha}"' if sha else None
+        inm = self.headers.get("If-None-Match", "")
+        if etag and inm and (inm == etag or inm.strip('"') == sha):
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            return
+        try:
+            length = wav.stat().st_size
+        except Exception:
+            self._send_json(500, {"error": "read fail"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(length))
+        if etag:
+            self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        try:
+            with wav.open("rb") as f:
+                while True:
+                    chunk = f.read(64 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError) as e:
+            logger.debug("voice-ambience client disconnected err=%s", e)
+        except Exception:
+            logger.exception("voice-ambience stream fail")
 
     # ------------------------------------------------------------------
     # Health Records API
