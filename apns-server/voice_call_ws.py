@@ -41,6 +41,15 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 from websockets.asyncio.server import ServerConnection, serve
 
+from voice_protocol import (
+    VOICE_INTERNAL_HEADER,
+    VOICE_INTERNAL_TOKEN_PATH,
+    VOICE_REPLY_SOURCE,
+    VOICE_REPLY_TOKEN_FIELD,
+    generate_voice_reply_token,
+    load_or_create_voice_internal_token,
+)
+
 # ---------------------------------------------------------------------------
 # Paths / constants
 # ---------------------------------------------------------------------------
@@ -229,6 +238,7 @@ AUTH_TOKEN, AUTH_SOURCE = _load_auth_token()
 # ---------------------------------------------------------------------------
 
 _ai_mgr: Any = None
+_background_tasks: set[asyncio.Task[Any]] = set()
 
 
 def get_ai_manager() -> Any:
@@ -248,12 +258,17 @@ def _request_json(
     method: str = "GET",
     payload: Optional[dict[str, Any]] = None,
     timeout: float = 15,
+    internal_voice: bool = False,
 ) -> dict[str, Any]:
     data = None
     headers = {"X-Auth-Token": AUTH_TOKEN}
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
+    if internal_voice:
+        headers[VOICE_INTERNAL_HEADER] = load_or_create_voice_internal_token(
+            VOICE_INTERNAL_TOKEN_PATH
+        )
     req = urllib.request.Request(
         f"{PUSH_HTTP_BASE}{path}",
         data=data,
@@ -285,16 +300,24 @@ def _request_json(
         return {"ok": False, "error": str(e)}
 
 
-def _send_live_contact_message(contact_id: str, text: str) -> str:
+def _send_live_contact_message(
+    contact_id: str,
+    text: str,
+    voice_reply_token: str = "",
+) -> str:
+    payload: dict[str, Any] = {
+        "text": text,
+        "contact_id": contact_id,
+    }
+    internal_voice = contact_id == "xiaoke" and bool(voice_reply_token)
+    if internal_voice:
+        payload[VOICE_REPLY_TOKEN_FIELD] = voice_reply_token
     body = _request_json(
         "/chat/send",
         method="POST",
-        payload={
-            "text": text,
-            "contact_id": contact_id,
-            "source": "android-app:voice-call",
-        },
+        payload=payload,
         timeout=20,
+        internal_voice=internal_voice,
     )
     if not body.get("ok"):
         raise RuntimeError(str(body.get("error") or "chat send failed"))
@@ -306,11 +329,13 @@ def _send_live_contact_message(contact_id: str, text: str) -> str:
 
 
 def _read_live_contact_records(contact_id: str, since_ts: str) -> list[dict[str, Any]]:
-    query = urllib.parse.urlencode({
+    params = {
         "contact_id": contact_id,
-        "since": since_ts,
         "limit": 50,
-    })
+    }
+    if since_ts:
+        params["since"] = since_ts
+    query = urllib.parse.urlencode(params)
     body = _request_json(f"/chat/history?{query}", timeout=10)
     records = body.get("records")
     if not isinstance(records, list):
@@ -318,36 +343,201 @@ def _read_live_contact_records(contact_id: str, since_ts: str) -> list[dict[str,
     return [item for item in records if isinstance(item, dict)]
 
 
-# Assistant records whose source is a real conversational reply. Anything else
-# (memory-recall cards, leaving-check / schedule-remind pushes, ...) shares
-# role=assistant in chat history but must never be spoken as the call reply.
-LIVE_REPLY_SOURCES = {"cc-companion-channel", "ccc-stop-hook", "claude-code"}
+LEGACY_LIVE_REPLY_SOURCES = {
+    "cc-companion-channel",
+    "ccc-stop-hook",
+    "claude-code",
+    "codex:kairos",
+}
 
 
-async def send_live_contact_and_wait_reply(contact_id: str, text: str) -> str:
-    """Send a transcript to a live CC Companion contact and wait for its next
-    assistant message. Used by voice calls for xiaoke/kairos-style contacts.
-    """
-    loop = asyncio.get_running_loop()
-    user_ts = await loop.run_in_executor(
-        None, _send_live_contact_message, contact_id, text
+def _cancel_live_voice_reply(voice_reply_token: str) -> None:
+    _request_json(
+        "/voice-call/cancel",
+        method="POST",
+        payload={VOICE_REPLY_TOKEN_FIELD: voice_reply_token},
+        timeout=5,
+        internal_voice=True,
     )
-    deadline = time.monotonic() + LIVE_REPLY_TIMEOUT_SEC
-    while time.monotonic() < deadline:
-        records = await loop.run_in_executor(
-            None, _read_live_contact_records, contact_id, user_ts
+
+
+def _track_background_task(task: asyncio.Task[Any]) -> None:
+    _background_tasks.add(task)
+
+    def _finished(done: asyncio.Task[Any]) -> None:
+        _background_tasks.discard(done)
+        try:
+            done.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("background voice-call cleanup failed: %s", exc)
+
+    task.add_done_callback(_finished)
+
+
+def _schedule_voice_cancel(voice_reply_token: str) -> None:
+    if not voice_reply_token:
+        return
+    _track_background_task(asyncio.create_task(
+        asyncio.to_thread(_cancel_live_voice_reply, voice_reply_token)
+    ))
+
+
+async def _cancel_after_send(
+    send_future: asyncio.Future[str],
+    voice_reply_token: str,
+) -> None:
+    try:
+        await asyncio.shield(send_future)
+    except BaseException:
+        # A transport exception does not prove that the server failed before
+        # registering the turn.  Always issue the idempotent exact-token
+        # cleanup after the blocking send has settled.
+        pass
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _cancel_live_voice_reply, voice_reply_token)
+
+
+async def _await_future_or_interrupt(
+    future: asyncio.Future[Any],
+    interrupt_event: asyncio.Event | None,
+) -> tuple[bool, Any]:
+    """Return ``(interrupted, result)`` without canceling blocking executor IO."""
+
+    if interrupt_event is None:
+        return False, await asyncio.shield(future)
+    if interrupt_event.is_set():
+        return True, None
+    interrupt_wait = asyncio.create_task(interrupt_event.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            {future, interrupt_wait},
+            return_when=asyncio.FIRST_COMPLETED,
         )
-        for rec in records:
-            if rec.get("role") != "assistant":
-                continue
-            source = str(rec.get("source") or "")
-            if source and source not in LIVE_REPLY_SOURCES:
-                continue
-            reply_text = str(rec.get("text") or "").strip()
-            if reply_text:
-                return reply_text
-        await asyncio.sleep(LIVE_REPLY_POLL_INTERVAL_SEC)
-    raise TimeoutError(f"timed out waiting for {contact_id} reply")
+        if interrupt_wait in done and interrupt_event.is_set():
+            return True, None
+        return False, future.result()
+    finally:
+        if not interrupt_wait.done():
+            interrupt_wait.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await interrupt_wait
+
+
+async def send_live_contact_and_wait_reply(
+    contact_id: str,
+    text: str,
+    interrupt_event: asyncio.Event | None = None,
+) -> str:
+    """Send a transcript to a live CC Companion contact and wait for its next
+    token-bound formal channel reply.
+
+    Assistant records from the terminal stop hook, Claude transcript scraping,
+    and older voice turns are deliberately ignored even if they arrive first.
+    """
+    if interrupt_event is not None and interrupt_event.is_set():
+        return ""
+    loop = asyncio.get_running_loop()
+    voice_reply_token = generate_voice_reply_token() if contact_id == "xiaoke" else ""
+    send_future: asyncio.Future[str] | None = None
+    reply_received = False
+    cancel_scheduled = False
+
+    def schedule_exact_cancel(*, after_send: bool = False) -> None:
+        """Schedule at most one server-side cancel for this generated token."""
+
+        nonlocal cancel_scheduled
+        if not voice_reply_token or cancel_scheduled or reply_received:
+            return
+        cancel_scheduled = True
+        if after_send and send_future is not None:
+            _track_background_task(
+                asyncio.create_task(_cancel_after_send(send_future, voice_reply_token))
+            )
+        else:
+            _schedule_voice_cancel(voice_reply_token)
+
+    try:
+        send_future = loop.run_in_executor(
+            None, _send_live_contact_message, contact_id, text, voice_reply_token
+        )
+        interrupted, user_ts = await _await_future_or_interrupt(
+            send_future,
+            interrupt_event,
+        )
+        if interrupted:
+            schedule_exact_cancel(after_send=not send_future.done())
+            return ""
+        user_ts = str(user_ts or "")
+        deadline = time.monotonic() + LIVE_REPLY_TIMEOUT_SEC
+        while time.monotonic() < deadline:
+            if interrupt_event is not None and interrupt_event.is_set():
+                schedule_exact_cancel()
+                return ""
+            # XiaoKe is fenced by the exact private token, so do not rely on the
+            # millisecond timestamp cursor: a formal reply can share user_ts.
+            since_ts = "" if contact_id == "xiaoke" else user_ts
+            read_future = loop.run_in_executor(
+                None, _read_live_contact_records, contact_id, since_ts
+            )
+            interrupted, records = await _await_future_or_interrupt(
+                read_future,
+                interrupt_event,
+            )
+            if interrupted:
+                schedule_exact_cancel()
+                return ""
+            for rec in records:
+                if rec.get("role") != "assistant":
+                    continue
+                source = str(rec.get("source") or "")
+                if contact_id == "xiaoke":
+                    if source != VOICE_REPLY_SOURCE:
+                        continue
+                    metadata = rec.get("metadata")
+                    if not isinstance(metadata, dict):
+                        continue
+                    if metadata.get(VOICE_REPLY_TOKEN_FIELD) != voice_reply_token:
+                        continue
+                else:
+                    # Kairos still uses the established App conversation path;
+                    # there is no XiaoKe terminal protocol marker in that backend.
+                    if source and source not in LEGACY_LIVE_REPLY_SOURCES:
+                        continue
+                reply_text = str(rec.get("text") or "").strip()
+                if reply_text:
+                    reply_received = True
+                    return reply_text
+            if interrupt_event is None:
+                await asyncio.sleep(LIVE_REPLY_POLL_INTERVAL_SEC)
+            else:
+                try:
+                    await asyncio.wait_for(
+                        interrupt_event.wait(),
+                        timeout=LIVE_REPLY_POLL_INTERVAL_SEC,
+                    )
+                    schedule_exact_cancel()
+                    return ""
+                except asyncio.TimeoutError:
+                    pass
+        schedule_exact_cancel()
+        raise TimeoutError(f"timed out waiting for {contact_id} reply")
+    except BaseException:
+        # Session.run() cancels the current call task when the websocket ends.
+        # The server may already have accepted the prompt, so cancellation and
+        # every unexpected failure must clear that exact pending turn.  If the
+        # send is still blocking, wait for it only in a retained background
+        # task so websocket teardown remains immediate.
+        schedule_exact_cancel(
+            after_send=send_future is not None and not send_future.done()
+        )
+        raise
+    finally:
+        if not reply_received:
+            schedule_exact_cancel(
+                after_send=send_future is not None and not send_future.done()
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -933,7 +1123,7 @@ async def handle_utterance(
             try:
                 async with thinking_ticker(ws, capabilities, interrupt_event):
                     reply_text = await send_live_contact_and_wait_reply(
-                        contact_id, transcript
+                        contact_id, transcript, interrupt_event
                     )
             except Exception as e:
                 await send_error(ws, f"live chat: {e}")

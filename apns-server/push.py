@@ -96,6 +96,20 @@ from tts import TTS
 from settings import Settings
 from usage import UsageReader
 from link_preview import LinkPreviewBundle, LinkPreviewService, merge_preview_metadata
+from voice_protocol import (
+    VOICE_CALL_SOURCE,
+    VOICE_INTERNAL_HEADER,
+    VOICE_INTERNAL_TOKEN_PATH,
+    VOICE_REPLY_SOURCE,
+    VOICE_REPLY_TOKEN_FIELD,
+    PendingVoiceReplies,
+    VoiceReplyNotPending,
+    build_voice_reply_instruction,
+    load_or_create_voice_internal_token,
+    normalize_voice_reply_token,
+    parse_voice_reply,
+    sanitize_voice_metadata,
+)
 from xhs_login import XhsLoginError, XhsLoginManager
 from kimi_acp import (
     DEFAULT_KIMI_CWD,
@@ -1941,6 +1955,12 @@ class ServerState:
         if not raw_secret:
             raw_secret = _load_or_create_secret()
         self.shared_secret: str | None = raw_secret or None
+        # Separate process-local-service credential: unlike shared_secret this
+        # is never distributed to an App client.  It gates voice turn tokens.
+        self.voice_internal_token = load_or_create_voice_internal_token(
+            VOICE_INTERNAL_TOKEN_PATH
+        )
+        self.pending_voice_replies = PendingVoiceReplies()
         # P0-1: strict_auth defaults to True (secure-by-default for CcCompanion community release)
         self.strict_auth: bool = bool(server_cfg.get("strict_auth", True))
         self.allow_public_bind: bool = bool(server_cfg.get("allow_public_bind", False))
@@ -2701,6 +2721,18 @@ class PushHandler(BaseHTTPRequestHandler):
             return True
         token = self.headers.get("X-Auth-Token", "") or self.headers.get("X-Auth", "")
         return token == self.state.shared_secret
+
+    def _voice_internal_auth_matches(self) -> bool:
+        try:
+            supplied = self.headers.get(VOICE_INTERNAL_HEADER, "") or ""
+        except Exception:
+            supplied = ""
+        expected = str(getattr(self.state, "voice_internal_token", "") or "")
+        return bool(
+            supplied
+            and expected
+            and hmac.compare_digest(str(supplied), expected)
+        )
 
     def _require_auth(self) -> bool:
         if self._auth_matches():
@@ -4138,6 +4170,8 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_task_append_ephemeral(body)
         elif self.path == "/chat/send":
             self._handle_chat_send(body)
+        elif self.path == "/voice-call/cancel":
+            self._handle_voice_call_cancel(body)
         elif self.path == "/chat/card_action":
             self._handle_chat_card_action(body)
         elif self.path == "/xhs-login/start":
@@ -6809,6 +6843,12 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _handle_chat_send(self, body: dict[str, Any]):
         """iPhone 发消息进来 → 写 user 条 + 调 bus_send.py 注入主 session"""
+        body = dict(body)
+        clean_user_metadata = sanitize_voice_metadata(body.get("metadata"))
+        if clean_user_metadata is None:
+            body.pop("metadata", None)
+        else:
+            body["metadata"] = clean_user_metadata
         contact_id = self._contact_id_from_body(body)
         if contact_id == "kairos":
             self._handle_kairos_chat_send(body, contact_id)
@@ -6826,7 +6866,23 @@ class PushHandler(BaseHTTPRequestHandler):
         text = body.get("text", "").strip()
         quoted_ts = body.get("quoted_ts") or None
         location = body.get("location") or None
-        source = str(body.get("source") or self._source_for_request()).strip()
+        is_card_action = (
+            isinstance(body.get("metadata"), dict)
+            and body["metadata"].get("via") == "card"
+        )
+        source = self._source_for_request("card" if is_card_action else "")
+        voice_reply_token = ""
+        if self._voice_internal_auth_matches():
+            voice_reply_token = normalize_voice_reply_token(
+                body.get(VOICE_REPLY_TOKEN_FIELD)
+            )
+            if voice_reply_token:
+                source = VOICE_CALL_SOURCE
+        voice_reply_instruction = (
+            build_voice_reply_instruction(voice_reply_token)
+            if voice_reply_token
+            else ""
+        )
         # 2026-07-18 互动卡片: /chat/card_action 复用本管线并靠 metadata 标
         # {"via": "card", ...}; 普通 App 发消息不带 metadata, 行为不变。
         metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else None
@@ -6858,6 +6914,15 @@ class PushHandler(BaseHTTPRequestHandler):
                     "reserved_at": time.time(),
                 }
         if busy_error:
+            if voice_reply_token:
+                # A live call turn must have one exact direct-terminal prompt;
+                # queuing it behind another turn cannot safely bind a reply.
+                self._send_json(409, {
+                    "ok": False,
+                    "error": busy_error,
+                    "reason": busy_reason,
+                })
+                return
             # 忙时不再直接 409：改走 channel transport 排队投递（转发 /
             # 生成中发消息都会排队，channel 不可用时内部保持旧 409）。
             self._queue_xiaoke_busy_chat_send(
@@ -6870,7 +6935,9 @@ class PushHandler(BaseHTTPRequestHandler):
                 busy_error=busy_error,
                 busy_reason=busy_reason,
                 metadata=metadata,
-                injection_text=f"{text}\n\n{link_context}" if link_context else text,
+                injection_text="\n\n".join(
+                    part for part in (text, link_context, voice_reply_instruction) if part
+                ),
             )
             return
         # 写 user 历史
@@ -6889,6 +6956,11 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.exception("xiaoke history append failed")
             self._send_json(500, {"ok": False, "error": f"history append failed: {exc}"})
             return
+        if voice_reply_token:
+            self.state.pending_voice_replies.register(
+                voice_reply_token,
+                user_ts=str(rec.get("ts") or ""),
+            )
         # ``active_session`` is the deprecated chain/session pointer and may be
         # a Claude conversation UUID.  XiaoKe's terminal identity is the
         # configured tmux session name.
@@ -6917,6 +6989,8 @@ class PushHandler(BaseHTTPRequestHandler):
                     injected = f"{injected}\n{text}"
         if link_context:
             injected = f"{injected}\n\n{link_context}"
+        if voice_reply_instruction:
+            injected = f"{injected}\n\n{voice_reply_instruction}"
         # App-originated XiaoKe text turns deliberately bypass the development
         # channel even when it is enabled.  POST /messages acknowledges only
         # that a notification was queued; it does not provide a synchronous
@@ -6985,6 +7059,8 @@ class PushHandler(BaseHTTPRequestHandler):
                     # positively confirmed.  Only those phases may expose idle.
                     self._clear_xiaoke_typing_if_match(str(rec.get("ts") or ""), target_session)
         if not ok:
+            if voice_reply_token and not injection_result.injection_uncertain:
+                self.state.pending_voice_replies.cancel(voice_reply_token)
             # 注入失败 (target session 不存在 / tmux 没装 / bus_send crash 等). 用 502 surface
             # 给客户端 不再 silent 200 — 否则 ccc app 显示发送成功但 chain 根本收不到.
             self._send_json(502, {
@@ -9999,6 +10075,16 @@ class PushHandler(BaseHTTPRequestHandler):
         if not isinstance(text, str):
             self._send_json(400, {"error": "text must be a string"})
             return
+        stream_contact_id = self._clean_contact_id(body.get("contact_id"))
+        if (
+            stream_contact_id == "xiaoke"
+            and self.state.pending_voice_replies.should_suppress_stream(stream_id, text)
+        ):
+            # Voice replies are one-shot only.  Never expose a private marker
+            # through the ordinary chat stream, including a late `done` frame
+            # after the pending token has already been claimed.
+            self._send_json(200, {"ok": True, "suppressed": True})
+            return
         ts = str(body.get("ts") or "")
         if not ts:
             tz = timezone(timedelta(hours=8))
@@ -10006,7 +10092,7 @@ class PushHandler(BaseHTTPRequestHandler):
         rec: dict[str, Any] = {
             "event": event,
             "stream_id": stream_id,
-            "contact_id": self._clean_contact_id(body.get("contact_id")),
+            "contact_id": stream_contact_id,
             "text": text,
             "ts": ts,
         }
@@ -10017,6 +10103,41 @@ class PushHandler(BaseHTTPRequestHandler):
             rec["persisted"] = bool(body.get("persisted", True))
         self.state.chat_stream_bus.publish(rec)
         self._send_json(200, {"ok": True})
+
+    def _handle_voice_call_cancel(self, body: dict[str, Any]) -> None:
+        """Cancel one exact internal XiaoKe voice turn and release its TUI."""
+
+        if not self._voice_internal_auth_matches():
+            self._send_json(403, {"ok": False, "error": "voice_cancel_forbidden"})
+            return
+        token = normalize_voice_reply_token(body.get(VOICE_REPLY_TOKEN_FIELD))
+        if not token:
+            self._send_json(400, {"ok": False, "error": "invalid_voice_cancel"})
+            return
+        details = self.state.pending_voice_replies.cancel_details(token)
+        if details is None:
+            self._send_json(200, {"ok": True, "canceled": False})
+            return
+
+        user_ts = str(details.get("user_ts") or "")
+        with self.state.xiaoke_stop_lock:
+            active = dict(self.state.typing_state or {})
+        if (
+            user_ts
+            and active.get("is_typing")
+            and str(active.get("since") or "") == user_ts
+            and str(active.get("transport") or "") == "tmux"
+            and str(active.get("session") or "")
+        ):
+            # Reuse the exact-turn stop fence.  This internal endpoint is
+            # stronger than App remote-control auth and never guesses a turn.
+            self._handle_chat_stop({
+                "contact_id": "xiaoke",
+                "user_ts": user_ts,
+                "session": str(active.get("session") or ""),
+            })
+            return
+        self._send_json(200, {"ok": True, "canceled": True, "stopped": False})
 
     def _handle_chat_stream(self):
         """GET /chat/stream?contact_id=xiaoke — SSE 实时推流式回复 chunk.
@@ -10395,6 +10516,12 @@ class PushHandler(BaseHTTPRequestHandler):
         if not self._check_auth():
             self._send_json(401, {"error": "auth required"})
             return
+        body = dict(body)
+        clean_append_metadata = sanitize_voice_metadata(body.get("metadata"))
+        if clean_append_metadata is None:
+            body.pop("metadata", None)
+        else:
+            body["metadata"] = clean_append_metadata
         contact_id = self._contact_id_from_body(body)
         if contact_id == "kimi":
             allowed_fields = {
@@ -10450,11 +10577,52 @@ class PushHandler(BaseHTTPRequestHandler):
                 "reason": "Kimi 当前不接受附件或互动卡片。",
             })
             return
-        text = body.get("text", "").strip()
+        raw_text = body.get("text", "")
+        text = raw_text.strip()
         role = body.get("role", "assistant")
         source = body.get("source", self._source_for_request())
         if not isinstance(source, str) or not source:
             source = self._source_for_request()
+        formal_voice_token = ""
+        if role == "assistant" and contact_id == "xiaoke":
+            # Marker-bearing replies are private protocol messages.  They may
+            # only come from the formal channel and atomically claim the one
+            # current server-side pending token; reject all stale/unknown/
+            # misplaced forms without echoing their marker into a response.
+            marker_text, marker_token = parse_voice_reply(raw_text)
+            if marker_token:
+                if not self._voice_internal_auth_matches():
+                    self._send_json(403, {
+                        "ok": False,
+                        "error": "voice_reply_forbidden",
+                    })
+                    return
+                if (
+                    source != VOICE_REPLY_SOURCE
+                    or not self.state.pending_voice_replies.is_pending(marker_token)
+                ):
+                    self._send_json(409, {
+                        "ok": False,
+                        "error": "voice_reply_not_pending",
+                    })
+                    return
+                text = marker_text
+                formal_voice_token = marker_token
+                marker_metadata = dict(body.get("metadata") or {})
+                marker_metadata[VOICE_REPLY_TOKEN_FIELD] = marker_token
+                body["metadata"] = marker_metadata
+            elif "[[CCC_VOICE_REPLY:" in raw_text:
+                self._send_json(409, {
+                    "ok": False,
+                    "error": "voice_reply_not_pending",
+                })
+                return
+        elif isinstance(raw_text, str) and "[[CCC_VOICE_REPLY:" in raw_text:
+            self._send_json(409, {
+                "ok": False,
+                "error": "voice_reply_not_pending",
+            })
+            return
         if role == "assistant":
             has_group_marker = "[[CCC_GROUP_REPLY:apples:" in text
             if has_group_marker:
@@ -10562,7 +10730,7 @@ class PushHandler(BaseHTTPRequestHandler):
         _req_t0 = time.time()
         client_msg_id = body.get("client_msg_id") or None
         dedupe_cache_key = None
-        if role != "move":
+        if role != "move" and not formal_voice_token:
             cache = getattr(type(self), "_chat_append_dedupe_cache", None)
             if cache is None:
                 cache = {}
@@ -10633,7 +10801,7 @@ class PushHandler(BaseHTTPRequestHandler):
             else:
                 metadata = {k: v for k, v in metadata.items() if k != "card_title"} or None
 
-        rec = chat.append(
+        append_record = lambda: chat.append(
             role=role,
             text=text,
             source=source,
@@ -10647,6 +10815,20 @@ class PushHandler(BaseHTTPRequestHandler):
             sender_name=sender_name,
             mentions=mentions,
         )
+        if formal_voice_token:
+            try:
+                rec = self.state.pending_voice_replies.claim_and_run(
+                    formal_voice_token,
+                    append_record,
+                )
+            except VoiceReplyNotPending:
+                self._send_json(409, {
+                    "ok": False,
+                    "error": "voice_reply_not_pending",
+                })
+                return
+        else:
+            rec = append_record()
 
         # move 成功 append 后缓存 client_msg_id (LRU 100)
         if role == "move" and client_msg_id:
