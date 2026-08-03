@@ -119,6 +119,7 @@ from kimi_acp import (
     KimiACPClient,
     KimiACPError,
 )
+from kimi_web_client import KimiWebClient, KimiWebError
 import todos as todos_mod
 from studyroom import StudyroomDB
 from ai_chat import AIChatManager
@@ -2216,6 +2217,16 @@ class ServerState:
             request_timeout=float(server_cfg.get("kimi_acp_request_timeout_seconds", 30)),
             prompt_timeout=float(server_cfg.get("kimi_acp_prompt_timeout_seconds", 900)),
         )
+        self.kimi_web = KimiWebClient(
+            command=server_cfg.get("kimi_bin", "/root/.kimi-code/bin/kimi"),
+            port=int(server_cfg.get("kimi_web_port", 58627)),
+            host=str(server_cfg.get("kimi_web_host", "127.0.0.1")),
+            logger=logger,
+            start_timeout=float(server_cfg.get("kimi_web_start_timeout_seconds", 30)),
+        )
+        self.kimi_auto_forge_context_threshold = float(
+            server_cfg.get("kimi_auto_forge_context_threshold", 0.75)
+        )
         self.kairos_queue_lock = threading.Lock()
         self.kairos_queue_path = contact_history_dir / "kairos_queue.json"
         self.kairos_queue: deque[dict[str, Any]] = self._load_kairos_queue()
@@ -2597,6 +2608,12 @@ class ServerState:
             self.kairos_terminal.release()
         except KairosTerminalUnavailable:
             logger.exception("Kairos terminal did not confirm release during shutdown")
+        try:
+            self.kimi_web.close()
+        except Exception:
+            # Kimi is optional. Its child cleanup must never prevent the
+            # shared Codex bridge or APNs client from being released.
+            logger.exception("Kimi web client cleanup failed during shutdown")
         self.codex_app_bridge.close()
         if self.client:
             self.client.close()
@@ -3712,6 +3729,9 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/codex/sessions":
             self._handle_codex_sessions()
+            return
+        if self.path == "/kimi/status":
+            self._handle_kimi_status()
             return
         if self.path == "/settings":
             self._send_json(200, {"ok": True, "settings": self.state.settings.snapshot()})
@@ -7107,6 +7127,10 @@ class PushHandler(BaseHTTPRequestHandler):
 
         try:
             session_id = self.state.kimi_acp.prepare_session()
+            try:
+                session_id, _forged = self._maybe_forge_kimi_session(session_id)
+            except Exception as exc:
+                logger.warning("Kimi auto-forge failed, continuing with existing session: %s", exc)
         except KimiACPAuthRequired:
             with self.state.kimi_turn_lock:
                 if self.state.kimi_prepare_token == prepare_token:
@@ -7318,6 +7342,59 @@ class PushHandler(BaseHTTPRequestHandler):
                 "transport": "kimi-acp",
             },
         })
+
+    def _kimi_context_usage(self, session_id: str) -> float:
+        """Return current Kimi context usage ratio, or 0.0 if unavailable."""
+        try:
+            self.state.kimi_web.start()
+            status = self.state.kimi_web.get_session_status(session_id)
+        except KimiWebError as exc:
+            logger.warning("Kimi web context query failed: %s", exc)
+            return 0.0
+        usage = status.get("context_usage")
+        if isinstance(usage, (int, float)) and usage >= 0:
+            return float(usage)
+        tokens = status.get("context_tokens")
+        limit = status.get("max_context_tokens")
+        if isinstance(tokens, (int, float)) and isinstance(limit, (int, float)) and limit > 0:
+            return float(tokens) / float(limit)
+        return 0.0
+
+    def _kimi_quota_snapshot(self) -> dict[str, Any]:
+        """Return the managed-account quota snapshot, or an empty dict on error."""
+        try:
+            self.state.kimi_web.start()
+            return self.state.kimi_web.get_quota()
+        except KimiWebError as exc:
+            logger.warning("Kimi web quota query failed: %s", exc)
+            return {}
+
+    def _maybe_forge_kimi_session(
+        self,
+        session_id: str,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[str, bool]:
+        """Auto-forge if context usage is above the configured threshold.
+
+        Returns ``(session_id, forged)``.
+        """
+        threshold = self.state.kimi_auto_forge_context_threshold
+        if threshold <= 0 or threshold >= 1:
+            return session_id, False
+        usage = self._kimi_context_usage(session_id)
+        if usage < threshold:
+            return session_id, False
+        logger.info(
+            "Kimi context usage %.2f%% exceeds threshold %.2f%%; forging new session",
+            usage * 100,
+            threshold * 100,
+        )
+        new_session_id, _summary = self.state.kimi_acp.forge_new_session(
+            cancel_event=cancel_event,
+        )
+        logger.info("Kimi forged new session %s", new_session_id)
+        return new_session_id, True
 
     def _handle_chat_card_action(self, body: dict[str, Any]) -> None:
         """POST /chat/card_action — 互动卡片 (WebView HTML) 按钮结果回传。
@@ -8070,6 +8147,49 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception as e:
             logger.exception("codex/sessions failed")
             self._send_json(500, {"ok": False, "error": str(e)})
+
+    def _handle_kimi_status(self):
+        """GET /kimi/status — return quota and current session context usage."""
+        try:
+            self.state.kimi_web.start()
+        except KimiWebError as exc:
+            logger.warning("Kimi web start failed in status handler: %s", exc)
+            self._send_json(503, {"ok": False, "error": "kimi_web_unavailable"})
+            return
+
+        session_id = ""
+        try:
+            session_id = self.state.kimi_acp.load_session_id()
+        except Exception:
+            pass
+
+        quota = self._kimi_quota_snapshot()
+        context_usage = 0.0
+        context_tokens = 0
+        max_context_tokens = 0
+        if session_id:
+            try:
+                status = self.state.kimi_web.get_session_status(session_id)
+                context_usage = status.get("context_usage") or 0.0
+                context_tokens = status.get("context_tokens") or 0
+                max_context_tokens = status.get("max_context_tokens") or 0
+                if not context_usage and max_context_tokens:
+                    context_usage = float(context_tokens) / float(max_context_tokens)
+            except KimiWebError as exc:
+                logger.warning("Kimi status context query failed: %s", exc)
+
+        active_turn = dict(self.state.kimi_active_turn)
+        self._send_json(200, {
+            "ok": True,
+            "session_id": session_id,
+            "context_usage": round(context_usage, 6),
+            "context_tokens": context_tokens,
+            "max_context_tokens": max_context_tokens,
+            "context_usage_percent": round(context_usage * 100, 2),
+            "quota": quota,
+            "busy": bool(active_turn),
+            "auto_forge_threshold": self.state.kimi_auto_forge_context_threshold,
+        })
 
     def _cancel_kairos_pending_task(
         self,

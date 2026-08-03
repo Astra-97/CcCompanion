@@ -101,7 +101,7 @@ class KimiACPClient:
     def busy(self) -> bool:
         return self._turn_lock.locked()
 
-    def _load_session_id(self) -> str:
+    def load_session_id(self) -> str:
         try:
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
@@ -345,7 +345,7 @@ class KimiACPClient:
                 self._pending.pop(request_id, None)
 
     def _new_or_load_session(self) -> tuple[str, list[dict[str, Any]]]:
-        previous = self._load_session_id()
+        previous = self.load_session_id()
         if previous and previous == self._loaded_session_id and self._process_alive():
             return previous, []
         common = {"cwd": str(self.cwd), "mcpServers": []}
@@ -525,6 +525,96 @@ class KimiACPClient:
                 self._active_turn_id = ""
                 self._active_update = None
             self._turn_lock.release()
+
+    def _prompt_and_collect_text(
+        self,
+        text: str,
+        *,
+        session_id: str,
+        turn_id: str,
+        cancel_event: threading.Event | None = None,
+    ) -> str:
+        """Send a prompt and return the complete assistant text.
+
+        The ACP wire protocol delivers assistant text through
+        ``session/update`` chunks; this helper drains them into a single
+        string.
+        """
+        chunks: list[str] = []
+
+        def on_update(delta: str) -> None:
+            chunks.append(delta)
+
+        self.prompt_existing(
+            text,
+            session_id=session_id,
+            turn_id=turn_id,
+            on_update=on_update,
+            cancel_event=cancel_event,
+        )
+        return "".join(chunks)
+
+    def forge_new_session(
+        self,
+        *,
+        summarize_prompt: str | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[str, str]:
+        """Summarize the current session and start a fresh one seeded with it.
+
+        Returns ``(new_session_id, summary_text)``.
+        """
+        with self._prepare_lock:
+            # 1. Ensure the existing session is loaded.
+            old_session_id = self.load_session_id()
+            if not old_session_id:
+                raise KimiACPError("No existing Kimi session to forge from")
+            self.prepare_session()
+            old_session_id = self._loaded_session_id
+            if not old_session_id:
+                raise KimiACPError("Kimi session not loaded")
+
+            # 2. Ask Kimi to summarize the conversation so far.
+            prompt = summarize_prompt or (
+                "请用一段话总结我们当前会话的所有关键上下文：任务目标、已完成的工作、"
+                "未完成的决策、重要的文件路径或代码位置。要足够详细，让我能在新会话中"
+                "无缝继续。用中文。"
+            )
+            turn_id = f"forge-summarize-{int(time.time() * 1000)}"
+            summary = self._prompt_and_collect_text(
+                prompt,
+                session_id=old_session_id,
+                turn_id=turn_id,
+                cancel_event=cancel_event,
+            )
+            if not summary.strip():
+                raise KimiACPError("Kimi forge summary was empty")
+
+            # 3. Create a brand-new session.
+            common = {"cwd": str(self.cwd), "mcpServers": []}
+            result = self._request("session/new", common, timeout=self.request_timeout)
+            new_session_id = str(result.get("sessionId") or "").strip()
+            if not new_session_id:
+                raise KimiACPError("Kimi ACP did not return a new session id")
+            self._save_session_id(new_session_id)
+            # Force prepare_session() to load the new session next time.
+            self._loaded_session_id = ""
+            self._highspeed_model_session_id = ""
+
+            # 4. Load the new session and seed it with the summary.
+            self.prepare_session()
+            seed_turn_id = f"forge-seed-{int(time.time() * 1000)}"
+            seed_prompt = (
+                "【上下文继承】这是我们之前会话的总结，请牢记它，"
+                "后续所有请求都在此基础上继续：\n\n" + summary
+            )
+            self._prompt_and_collect_text(
+                seed_prompt,
+                session_id=new_session_id,
+                turn_id=seed_turn_id,
+                cancel_event=cancel_event,
+            )
+            return new_session_id, summary
 
     def cancel(self, turn_id: str, session_id: str) -> bool:
         expected_turn = str(turn_id or "").strip()
