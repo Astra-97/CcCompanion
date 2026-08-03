@@ -91,6 +91,14 @@ from codex_app_bridge import (
     OBSERVER_PHASES,
     prompt_lock_is_busy,
 )
+from codex_preferences import (
+    CodexModelCapability,
+    CodexPreferenceError,
+    CodexPreferencePersistenceError,
+    CodexPreferenceStore,
+    parse_codex_model_catalog,
+    validate_codex_selection,
+)
 from timeline import Timeline
 from tts import TTS
 from settings import Settings
@@ -1798,6 +1806,7 @@ TOOLBOT_MODEL_ALIASES: dict[str, str] = {
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
 }
+TOOLBOT_EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 
 # ---------------------------------------------------------------------------
 # 动态模型清单（GET /models, 2026-07-24）
@@ -2090,8 +2099,16 @@ class ServerState:
         self.codex_shared_session_name: str = str(server_cfg.get("codex_shared_session_name", "kairos") or "kairos")
         self.codex_bin: str = server_cfg.get("codex_bin", "/usr/bin/codex")
         self.codex_home: str = server_cfg.get("codex_home", "/root/.codex")
-        self.codex_model: str = server_cfg.get("codex_model", "gpt-5.5")
-        self.codex_reasoning_effort: str = server_cfg.get("codex_reasoning_effort", "high")
+        self.codex_preferences = CodexPreferenceStore(
+            contact_history_dir / "codex_preferences.json",
+            default_model=str(server_cfg.get("codex_model", "gpt-5.5")),
+            default_effort=str(server_cfg.get("codex_reasoning_effort", "high")),
+        )
+        self.codex_model, self.codex_reasoning_effort = self.codex_preferences.snapshot()
+        self.codex_model_catalog_lock = threading.Lock()
+        self.codex_model_catalog: tuple[CodexModelCapability, ...] = ()
+        self.codex_model_catalog_at = 0.0
+        self.codex_model_catalog_ttl_sec = 30.0
         self.kairos_semantic_memory_recall_enabled: bool = bool(
             server_cfg.get("kairos_semantic_memory_recall_enabled", True)
         )
@@ -3727,8 +3744,14 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path == "/codex/status":
             self._handle_codex_status()
             return
+        if self.path == "/codex/preferences" or self.path.startswith("/codex/preferences?"):
+            self._handle_codex_preferences_get()
+            return
         if self.path == "/codex/sessions":
             self._handle_codex_sessions()
+            return
+        if self.path == "/toolbot/capabilities":
+            self._send_json(200, {"ok": True, "effort_levels": list(TOOLBOT_EFFORT_LEVELS)})
             return
         if self.path == "/kimi/status":
             self._handle_kimi_status()
@@ -4143,6 +4166,9 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         elif self.path == "/toolbot/command":
             self._handle_toolbot_command(body)
+            return
+        elif self.path == "/codex/preferences":
+            self._handle_codex_preferences_post(body)
             return
         elif self.path == "/codex/abort":
             self._handle_codex_abort(body)
@@ -7844,9 +7870,21 @@ class PushHandler(BaseHTTPRequestHandler):
             })
         return matches
 
+    def _codex_preference_snapshot(self) -> tuple[str, str]:
+        store = getattr(self.state, "codex_preferences", None)
+        if store is not None:
+            return store.snapshot()
+        # Compatibility for narrowly mocked tests and emergency rollback
+        # state created before the private store existed.
+        return (
+            str(getattr(self.state, "codex_model", "")),
+            str(getattr(self.state, "codex_reasoning_effort", "")),
+        )
+
     def _codex_busy_snapshot(self) -> dict[str, Any]:
         session_id, cwd = self._load_codex_target()
         cwd = self._codex_allowed_cwd(cwd)
+        selected_model, selected_effort = self._codex_preference_snapshot()
         run = CODEX_RUNS.latest()
         bridge = self.state.codex_app_bridge.snapshot()
         scan_session_id = session_id
@@ -7863,8 +7901,8 @@ class PushHandler(BaseHTTPRequestHandler):
             "ok": True,
             "active_session_id": session_id,
             "active_cwd": str(cwd),
-            "model": self.state.codex_model,
-            "reasoning_effort": self.state.codex_reasoning_effort,
+            "model": selected_model,
+            "reasoning_effort": selected_effort,
             "busy": busy,
             "busy_pid": processes[0]["pid"] if processes else (bridge.get("pid") if bridge_busy else None),
             "busy_session_id": bridge.get("thread_id") if bridge_busy else scan_session_id,
@@ -8008,6 +8046,7 @@ class PushHandler(BaseHTTPRequestHandler):
         return list(lines)
 
     def _codex_runtime_detail(self, session_id: str | None, cwd: Path) -> dict[str, Any]:
+        selected_model, _selected_effort = self._codex_preference_snapshot()
         account_label = self._mask_status_email(os.environ.get("CODEX_STATUS_ACCOUNT_LABEL", "main") or "main")
         quota_lines = self._codex_quota_lines_cached()
         quota = self._parse_quota_lines(quota_lines)
@@ -8033,7 +8072,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 percent_text = f"{float(percent_value):.0f}%"
         except (TypeError, ValueError):
             percent_text = ""
-        summary_parts = [self.state.codex_model]
+        summary_parts = [selected_model]
         if percent_text:
             summary_parts.append(percent_text)
         if quota.get("plan"):
@@ -8058,14 +8097,14 @@ class PushHandler(BaseHTTPRequestHandler):
             "context": context,
             "summary": {
                 "default": " · ".join(part for part in summary_parts if str(part).strip()),
-                "model": self.state.codex_model,
+                "model": selected_model,
                 "context_percent": percent_text,
                 "plan": quota.get("plan") or "",
             },
             "runtime_lines": [
                 "运行状态:",
                 f"account: {account_label}",
-                f"model: {self.state.codex_model}",
+                f"model: {selected_model}",
                 f"cwd: {cwd}",
                 "权限: bypass=2",
                 *quota_lines,
@@ -8125,6 +8164,147 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _handle_codex_status(self):
         self._send_json(200, self._codex_busy_snapshot())
+
+    def _codex_catalog(
+        self,
+        *,
+        force_refresh: bool,
+        allow_stale: bool,
+    ) -> tuple[tuple[CodexModelCapability, ...], bool, str | None]:
+        """Load the official app-server catalog with a short in-memory cache."""
+
+        state = self.state
+        with state.codex_model_catalog_lock:
+            age = time.monotonic() - state.codex_model_catalog_at
+            if (
+                not force_refresh
+                and state.codex_model_catalog
+                and age < state.codex_model_catalog_ttl_sec
+            ):
+                return state.codex_model_catalog, True, None
+            try:
+                _session_id, cwd = self._load_codex_target()
+                raw = state.codex_app_bridge.list_models(
+                    cwd=self._codex_allowed_cwd(cwd),
+                    timeout=12.0,
+                )
+                catalog = parse_codex_model_catalog(raw)
+            except (CodexAppBridgeError, CodexPreferenceError, OSError) as exc:
+                logger.warning("Codex model catalog unavailable: %s", type(exc).__name__)
+                if allow_stale and state.codex_model_catalog:
+                    return (
+                        state.codex_model_catalog,
+                        True,
+                        "codex_model_catalog_refresh_failed",
+                    )
+                raise CodexPreferenceError("Codex model catalog is unavailable") from exc
+            state.codex_model_catalog = catalog
+            state.codex_model_catalog_at = time.monotonic()
+            return catalog, False, None
+
+    def _codex_preferences_payload(
+        self,
+        catalog: tuple[CodexModelCapability, ...],
+        *,
+        cached: bool,
+        catalog_error: str | None = None,
+    ) -> dict[str, Any]:
+        model, effort = self.state.codex_preferences.snapshot()
+        payload: dict[str, Any] = {
+            "ok": True,
+            "models": [item.as_dict() for item in catalog],
+            "selection": {"model": model, "reasoning_effort": effort},
+            "busy": bool(self._codex_busy_snapshot().get("busy")),
+            "applies_from": "next_turn",
+            "catalog_cached": cached,
+        }
+        if catalog_error:
+            payload["catalog_error"] = catalog_error
+        return payload
+
+    def _handle_codex_preferences_get(self) -> None:
+        force = (self._query_params().get("refresh", ["0"])[0] or "").lower() in {
+            "1", "true",
+        }
+        try:
+            catalog, cached, catalog_error = self._codex_catalog(
+                force_refresh=force,
+                allow_stale=True,
+            )
+        except CodexPreferenceError:
+            model, effort = self.state.codex_preferences.snapshot()
+            self._send_json(503, {
+                "ok": False,
+                "error": "codex_model_catalog_unavailable",
+                "message": "无法从 Codex app-server 读取模型列表，请稍后重试。",
+                "models": [],
+                "selection": {"model": model, "reasoning_effort": effort},
+                "busy": bool(self._codex_busy_snapshot().get("busy")),
+                "applies_from": "next_turn",
+                "catalog_cached": False,
+            })
+            return
+        self._send_json(200, self._codex_preferences_payload(
+            catalog,
+            cached=cached,
+            catalog_error=catalog_error,
+        ))
+
+    def _handle_codex_preferences_post(self, body: dict[str, Any]) -> None:
+        try:
+            catalog, _cached, _catalog_error = self._codex_catalog(
+                force_refresh=True,
+                allow_stale=False,
+            )
+        except CodexPreferenceError:
+            self._send_json(503, {
+                "ok": False,
+                "error": "codex_model_catalog_unavailable",
+                "message": "无法验证模型选择；Codex app-server 模型列表暂不可用。",
+            })
+            return
+        requested_model = str(body.get("model") or "").strip()
+        requested_effort = str(body.get("reasoning_effort") or "").strip().lower()
+        selected = next((item for item in catalog if item.id == requested_model), None)
+        if selected is None:
+            self._send_json(400, {
+                "ok": False,
+                "error": "invalid_model",
+                "message": "model 必须来自当前 Codex app-server 模型列表。",
+            })
+            return
+        if requested_effort not in selected.supported_reasoning_efforts:
+            self._send_json(400, {
+                "ok": False,
+                "error": "unsupported_reasoning_effort",
+                "message": "reasoning_effort 不受所选模型支持。",
+                "supported_reasoning_efforts": list(selected.supported_reasoning_efforts),
+            })
+            return
+        try:
+            model, effort = validate_codex_selection(
+                requested_model,
+                requested_effort,
+                catalog,
+            )
+            self.state.codex_preferences.save_validated(model, effort)
+        except CodexPreferenceError as exc:
+            self._send_json(400, {"ok": False, "error": "invalid_selection", "message": str(exc)})
+            return
+        except CodexPreferencePersistenceError:
+            logger.exception("persist Codex preferences failed")
+            self._send_json(500, {
+                "ok": False,
+                "error": "codex_preferences_persistence_failed",
+                "message": "模型设置未保存，当前选择保持不变。",
+            })
+            return
+        # Compatibility mirrors for status/legacy-exec readers. New turn
+        # admission snapshots the store, so an in-flight turn cannot change.
+        current_model, current_effort = self.state.codex_preferences.snapshot()
+        self.state.codex_model = current_model
+        self.state.codex_reasoning_effort = current_effort
+        self._send_json(200, self._codex_preferences_payload(catalog, cached=False))
 
     def _handle_codex_sessions(self):
         session_id, _ = self._load_codex_target()
@@ -8359,6 +8539,13 @@ class PushHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True, "active_session_id": session_id, "active_cwd": str(cwd)})
 
     def _handle_codex_forge(self, body: dict[str, Any]):
+        if "model" in body:
+            self._send_json(400, {
+                "ok": False,
+                "error": "deprecated_model_override",
+                "message": "forge 不再接受单次 model 覆盖；请先通过 Codex 模型设置选择模型与 effort。",
+            })
+            return
         old_session_id, cwd = self._load_codex_target()
         cwd = self._codex_allowed_cwd(cwd)
         if not old_session_id:
@@ -8368,7 +8555,7 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(409, {"ok": False, "error": "Kairos 正在生成中，请稍后再 forge。"})
             return
         history_limit = self._parse_codex_forge_limit(body.get("retain"))
-        model = str(body.get("model") or "").strip() or None
+        selection = self.state.codex_preferences.snapshot()
         run = CODEX_RUNS.start(source="cc-app:codex:forge", session_id=old_session_id, cwd=cwd)
         if run is None:
             self._send_json(409, {"ok": False, "error": "Kairos 正在生成中，请稍后再 forge。"})
@@ -8376,7 +8563,7 @@ class PushHandler(BaseHTTPRequestHandler):
         run_id, cancel_event = run
         worker = threading.Thread(
             target=self._run_codex_forge_worker,
-            args=(run_id, cancel_event, old_session_id, cwd, history_limit, model),
+            args=(run_id, cancel_event, old_session_id, cwd, history_limit, selection),
             daemon=True,
         )
         worker.start()
@@ -8501,6 +8688,8 @@ class PushHandler(BaseHTTPRequestHandler):
         if cancel_event.is_set():
             return _append_failure("已取消", "cancelled")
 
+        selected_model, selected_effort = self.state.codex_preferences.snapshot()
+
         try:
             sys.path.insert(0, "/root/Windows-Codex-TG")
             from codex_common import SessionStore
@@ -8519,8 +8708,8 @@ class PushHandler(BaseHTTPRequestHandler):
                 thread_id=None,
                 cwd=cwd,
                 prompt=prompt,
-                model=self.state.codex_model,
-                effort=self.state.codex_reasoning_effort,
+                model=selected_model,
+                effort=selected_effort,
                 cancel_event=cancel_event,
                 max_runtime_sec=900,
             )
@@ -8587,9 +8776,10 @@ class PushHandler(BaseHTTPRequestHandler):
         old_session_id: str,
         cwd: Path,
         history_limit: int,
-        model: str | None,
+        selection: tuple[str, str],
     ) -> None:
         try:
+            selected_model, selected_effort = selection
             sys.path.insert(0, "/root/Windows-Codex-TG")
             from codex_common import CodexRunner, SessionStore
 
@@ -8608,8 +8798,8 @@ class PushHandler(BaseHTTPRequestHandler):
             )
             env_overrides = {
                 "CODEX_HOME": self.state.codex_home,
-                "CODEX_MODEL": model or self.state.codex_model,
-                "CODEX_REASONING_EFFORT": self.state.codex_reasoning_effort,
+                "CODEX_MODEL": selected_model,
+                "CODEX_REASONING_EFFORT": selected_effort,
             }
             thread_id, answer, stderr_text, return_code = runner.run_prompt(
                 prompt=prompt,
@@ -9044,6 +9234,10 @@ class PushHandler(BaseHTTPRequestHandler):
                         break
                     cancel_event.wait(1.0)
 
+                # One immutable selection per admitted turn. A settings POST
+                # during generation is persisted for the next turn only.
+                selected_model, selected_effort = self._codex_preference_snapshot()
+
                 if cancel_event.is_set():
                     _append_interrupted_draft()
                     return
@@ -9105,8 +9299,8 @@ class PushHandler(BaseHTTPRequestHandler):
                 )
                 env_overrides = {
                     "CODEX_HOME": self.state.codex_home,
-                    "CODEX_MODEL": self.state.codex_model,
-                    "CODEX_REASONING_EFFORT": self.state.codex_reasoning_effort,
+                    "CODEX_MODEL": selected_model,
+                    "CODEX_REASONING_EFFORT": selected_effort,
                 }
 
                 def _on_update(live_text: str) -> None:
@@ -9232,8 +9426,8 @@ class PushHandler(BaseHTTPRequestHandler):
                                 thread_id=session_id,
                                 cwd=cwd,
                                 prompt=prompt,
-                                model=self.state.codex_model,
-                                effort=self.state.codex_reasoning_effort,
+                                model=selected_model,
+                                effort=selected_effort,
                                 image_paths=image_paths,
                                 cancel_event=cancel_event,
                                 on_update=_on_update,
@@ -9479,6 +9673,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         )
                         return
                     run_id, cancel_event = run
+                    selected_model, selected_effort = self._codex_preference_snapshot()
                     CODEX_RUNS.set_observer_phase(run_id, "starting")
                     if self._codex_session_busy(session_id):
                         chat.append(
@@ -9553,8 +9748,8 @@ class PushHandler(BaseHTTPRequestHandler):
                     )
                     env_overrides = {
                         "CODEX_HOME": self.state.codex_home,
-                        "CODEX_MODEL": self.state.codex_model,
-                        "CODEX_REASONING_EFFORT": self.state.codex_reasoning_effort,
+                        "CODEX_MODEL": selected_model,
+                        "CODEX_REASONING_EFFORT": selected_effort,
                     }
 
                     def _on_update(live_text: str) -> None:
@@ -13176,9 +13371,9 @@ class PushHandler(BaseHTTPRequestHandler):
         })
 
     # 严格白名单：命令名 -> 动作。绝不 eval / 拼接任意 shell。
-    # 仅这 8 个键可被 /toolbot/command 触发；未在表内一律 403。
+    # Only these fixed command names may be triggered; unknown names are 403.
     TOOLBOT_COMMANDS: frozenset = frozenset({
-        "forge", "statusbar", "vps", "model",
+        "forge", "statusbar", "vps", "model", "effort",
         "morning_on", "morning_off", "diary_on", "diary_off",
         "sessions", "session_rename", "session_switch",
         "session_new", "session_preview", "status_set",
@@ -13323,6 +13518,23 @@ class PushHandler(BaseHTTPRequestHandler):
             if not ok:
                 return False, f"注入失败：{err}"
             return True, f"已发送 `/model {model_id}` 到会话。"
+
+        if command == "effort":
+            effort = args.strip().lower()
+            if effort not in TOOLBOT_EFFORT_LEVELS:
+                return False, (
+                    f"未知 effort：{args or '(空)'}（允许："
+                    f"{', '.join(TOOLBOT_EFFORT_LEVELS)}）"
+                )
+            ok, err = self._inject_to_session(
+                session,
+                f"/effort {effort}",
+                source="toolbot",
+                sender="toolbot",
+            )
+            if not ok:
+                return False, f"注入失败：{err}"
+            return True, f"已发送 `/effort {effort}` 到会话。"
 
         if command == "forge":
             # Slide the context window. Runs the fixed forge wrapper. args is a

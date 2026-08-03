@@ -200,6 +200,9 @@ class KairosAutoForgeTest(unittest.TestCase):
             codex_home=str(self.root / "codex-home"),
             codex_model="gpt-test",
             codex_reasoning_effort="high",
+            codex_preferences=types.SimpleNamespace(
+                snapshot=lambda: ("gpt-preference", "xhigh")
+            ),
             codex_app_bridge=bridge,
             codex_bot_state_path=str(state_path),
             codex_shared_session_name="kairos",
@@ -240,6 +243,8 @@ class KairosAutoForgeTest(unittest.TestCase):
             new_session_id,
         )
         self.assertEqual(bridge.calls[0]["thread_id"], None)
+        self.assertEqual(bridge.calls[0]["model"], "gpt-preference")
+        self.assertEqual(bridge.calls[0]["effort"], "xhigh")
         self.assertNotIn("on_thread", bridge.calls[0])
         notice = chat.records[-1]["text"]
         self.assertIn("80.0%", notice)

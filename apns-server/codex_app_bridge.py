@@ -353,6 +353,56 @@ class CodexAppBridge:
                 "started_at": active.started_at,
             }
 
+    def list_models(
+        self,
+        *,
+        cwd: Path,
+        timeout: float = 12.0,
+    ) -> dict[str, Any]:
+        """Return the complete picker-visible app-server model catalog.
+
+        This uses the same authenticated local app-server connection as turns,
+        creates/resumes no thread, and never substitutes a hard-coded catalog.
+        """
+
+        cwd = Path(cwd).expanduser().resolve()
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        # The shared-daemon transport accepts an end-to-end recovery deadline;
+        # the legacy stdio bridge predates that keyword.  Keep the committed
+        # method valid on both implementations without giving daemon recovery
+        # an unbounded window beyond this request.
+        if hasattr(self, "daemon_recovery_timeout_sec"):
+            self._ensure_connected(cwd, recovery_deadline=deadline)
+        else:
+            self._ensure_connected(cwd)
+        data: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        cursor: str | None = None
+        for _page in range(20):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _TransportError("timed out waiting for model/list")
+            params: dict[str, Any] = {"limit": 100, "includeHidden": False}
+            if cursor:
+                params["cursor"] = cursor
+            result = self._rpc_request("model/list", params, timeout=remaining)
+            if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+                raise CodexAppBridgeError("model/list returned an invalid result")
+            for item in result["data"]:
+                if not isinstance(item, dict):
+                    continue
+                item_id = str(item.get("id") or item.get("model") or "").strip()
+                if item_id and item_id not in seen_ids:
+                    data.append(item)
+                    seen_ids.add(item_id)
+            next_cursor = result.get("nextCursor")
+            if next_cursor is None or next_cursor == "":
+                return {"data": data, "nextCursor": None}
+            if not isinstance(next_cursor, str) or next_cursor == cursor:
+                raise CodexAppBridgeError("model/list returned an invalid cursor")
+            cursor = next_cursor
+        raise CodexAppBridgeError("model/list exceeded the pagination limit")
+
     def observer_snapshot(self) -> dict[str, Any]:
         """Return a deliberately low-detail view suitable for the App terminal.
 
