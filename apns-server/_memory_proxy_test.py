@@ -144,6 +144,43 @@ class MemoryProxyTest(unittest.TestCase):
         _, captured = self.run_forward("/memory/list?limit=abc", [])
         self.assertNotIn("limit", captured["url"])
 
+    def test_paginated_list_params_are_forwarded_and_validated(self):
+        _, captured = self.run_forward(
+            "/memory/list?page=3&per_page=50&sort_order=asc", []
+        )
+        self.assertEqual(
+            captured["url"],
+            "https://memory.xiaonancaleb.xyz/api/memories?page=3&per_page=50&sort_order=asc",
+        )
+
+        _, captured = self.run_forward(
+            "/memory/list?page=oops&per_page=7&sort_order=sideways", []
+        )
+        self.assertNotIn("page=", captured["url"])
+        self.assertNotIn("per_page=", captured["url"])
+        self.assertNotIn("sort_order=", captured["url"])
+
+    def test_paginated_board_params_are_forwarded(self):
+        _, captured = self.run_forward(
+            "/memory/board?page=2&per_page=20&sort_order=desc", {}
+        )
+        self.assertEqual(
+            captured["url"],
+            "https://memory.xiaonancaleb.xyz/api/board?page=2&per_page=20&sort_order=desc",
+        )
+
+    def test_keyset_cursor_is_forwarded_but_malformed_or_oversized_values_are_not(self):
+        cursor = "eyJ2IjoxLCJpZCI6Im0tNTAifQ"
+        _, captured = self.run_forward(
+            f"/memory/list?per_page=50&sort_order=desc&cursor={cursor}", {}
+        )
+        self.assertIn(f"cursor={cursor}", captured["url"])
+
+        _, captured = self.run_forward("/memory/list?cursor=bad%2Fcursor", {})
+        self.assertNotIn("cursor=", captured["url"])
+        _, captured = self.run_forward("/memory/list?cursor=" + "a" * 1025, {})
+        self.assertNotIn("cursor=", captured["url"])
+
     def test_semantic_query_url_encoded(self):
         _, captured = self.run_forward(
             "/memory/semantic-search?query=%E5%A4%8F%E4%BB%A5%E6%98%BC&limit=5", []

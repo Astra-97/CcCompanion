@@ -11748,7 +11748,16 @@ class PushHandler(BaseHTTPRequestHandler):
         "/memory/semantic-search": "/api/semantic-search",
         "/memory/board": "/api/board",
     }
-    _MEMORY_ALLOWED_PARAMS = ("query", "category", "limit", "tag")
+    _MEMORY_ALLOWED_PARAMS = (
+        "query",
+        "category",
+        "limit",
+        "tag",
+        "page",
+        "per_page",
+        "sort_order",
+        "cursor",
+    )
     _memory_token_cache: str | None = None
 
     @classmethod
@@ -11788,12 +11797,33 @@ class PushHandler(BaseHTTPRequestHandler):
             values = qs.get(key)
             if not values:
                 continue
-            value = str(values[0])[:500]
+            raw_value = str(values[0])
+            value = raw_value[:500]
             if key == "limit":
                 try:
                     value = str(max(1, min(int(value), 200)))
                 except ValueError:
                     continue
+            elif key == "page":
+                try:
+                    value = str(max(1, min(int(value), 1_000_000)))
+                except ValueError:
+                    continue
+            elif key == "per_page":
+                try:
+                    requested_page_size = int(value)
+                except ValueError:
+                    continue
+                if requested_page_size not in (20, 50, 100):
+                    continue
+                value = str(requested_page_size)
+            elif key == "sort_order":
+                if value not in ("asc", "desc"):
+                    continue
+            elif key == "cursor":
+                if len(raw_value) > 1024 or not re.fullmatch(r"[A-Za-z0-9_-]+", raw_value):
+                    continue
+                value = raw_value
             params.append((key, value))
 
         url = self._MEMORY_UPSTREAM_BASE + upstream_path
