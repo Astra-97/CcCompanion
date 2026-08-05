@@ -1,0 +1,3 @@
+06dad3494d404a2580eeb1798b08fd2b.html
+gomoku_live.json
+gomoku_live.js

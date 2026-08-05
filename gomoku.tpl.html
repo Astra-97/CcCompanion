@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>五子棋 · 方小南 vs 小克</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{background:#14110f;color:#e8e0d6;
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans CJK SC",sans-serif;
+  display:flex;flex-direction:column;align-items:center;padding:12px 12px 28px;min-height:100vh}
+.title{font-size:17px;font-weight:600;margin-bottom:2px}
+.title .vs{color:#c8792e;font-weight:400;font-size:14px}
+.score{font-size:12px;color:#8a7f72;margin-bottom:10px}
+.score b{color:#e8e0d6;font-weight:600}
+.modes{display:flex;gap:8px;margin-bottom:11px}
+.modes button{font-size:12px;padding:7px 13px}
+#board{border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.55),0 0 0 1px rgba(200,121,46,.25);
+  touch-action:manipulation;display:block}
+.talk{margin-top:13px;width:100%;max-width:480px;background:#1e1a17;border-left:3px solid #c8792e;
+  border-radius:0 8px 8px 0;padding:11px 13px;font-size:14px;line-height:1.55;min-height:44px;transition:opacity .18s}
+.talk .who{color:#c8792e;font-size:12px;display:block;margin-bottom:3px}
+.turn{margin-top:11px;font-size:13px;color:#8a7f72;height:18px}
+.turn.me{color:#c8792e}
+.dots::after{content:'';animation:d 1.2s steps(4,end) infinite}
+@keyframes d{0%{content:''}25%{content:'·'}50%{content:'··'}75%{content:'···'}}
+.btns{margin-top:13px;display:flex;gap:9px;flex-wrap:wrap;justify-content:center}
+button{background:#241f1b;color:#e8e0d6;border:1px solid #3a322b;padding:9px 16px;border-radius:8px;
+  font-size:13px;font-family:inherit;cursor:pointer;transition:.15s}
+button:active{transform:scale(.96);background:#2e2721}
+button.on{background:#c8792e;border-color:#c8792e;color:#1a1512;font-weight:600}
+button:disabled{opacity:.3}
+.lv{margin-top:9px;display:flex;gap:7px;align-items:center;font-size:12px;color:#6d6259}
+.lv.hide{display:none}
+#chatIn{width:100%;max-width:480px;margin-top:10px;background:#1a1613;border:1px solid #3a322b;
+  border-radius:8px;padding:11px 13px;color:#e8e0d6;font-size:14px;font-family:inherit}
+#chatIn:focus{outline:none;border-color:#c8792e;background:#211b17}
+#chatIn::placeholder{color:#5a5149}
+.mine{margin-top:10px;width:100%;max-width:480px;background:#231d18;border-right:3px solid #6d8fa8;
+  border-radius:8px 0 0 8px;padding:10px 13px;font-size:14px;line-height:1.5;text-align:right;display:none}
+.mine .who{color:#6d8fa8;font-size:12px;display:block;margin-bottom:3px}
+.tip{margin-top:15px;font-size:11px;color:#5a5149;text-align:center;line-height:1.7;max-width:460px}
+</style>
+</head>
+<body>
+
+<div class="title">五子棋 <span class="vs">v11 · 方小南 vs 小克</span></div>
+<div class="score" id="score">你 <b>0</b> : <b>0</b> 我</div>
+
+<div class="modes">
+  <button id="mBot">跟算法下</button>
+  <button id="mLive" class="on">跟小克本人下</button>
+</div>
+
+<div class="tip" id="diag" style="margin:0 0 8px;color:#c8792e">__DIAG__</div>
+<canvas id="board"></canvas>
+<div class="turn" id="turn">轮到你了，随便下</div>
+
+<div class="talk"><span class="who">小克</span><span id="talkText">真人模式——下棋的是我本人。你落一子我这边就被叫醒，读完整个局面再还手。慢，但赢了才算赢我。</span></div>
+
+<div class="mine" id="mineBox"><span class="who">方小南</span><span id="mineText"></span></div>
+<input id="chatIn" type="text" maxlength="140" placeholder="想说什么？打好字再落子，一起发给我">
+
+<div class="btns">
+  <button id="undo">悔棋</button>
+  <button id="restart">重开</button>
+</div>
+<div class="lv hide" id="lvBar">难度
+  <button id="lv1">随手</button>
+  <button id="lv2" class="on">认真</button>
+</div>
+<div class="tip" id="tip">黑子是你，白子是我 · 点交叉点落子 · 连成五个赢<br>悔棋一次退两手</div>
+
+<script>
+const COL='ABCDEFGHIJKLMNO';
+const INITIAL=/*__STATE__*/null;
+const N=15,EMPTY=0,HUMAN=1,AI=2;
+let board,gameOver,history,myWin=0,yourWin=0,level=2,thinking=false;
+let mode='live', liveSeq=-1, poll=null;
+
+const cv=document.getElementById('board'),ctx=cv.getContext('2d');
+let SIZE,GAP,PAD,DPR;
+const talkEl=document.getElementById('talkText'),turnEl=document.getElementById('turn');
+
+let lastW=0;
+function layout(){
+  const vw=window.innerWidth||document.documentElement.clientWidth||document.body.clientWidth||360;
+  const w=Math.max(260,Math.min(vw-24,460));
+  if(w===lastW&&cv.width)return; lastW=w;
+  SIZE=w;GAP=w/(N+1);PAD=GAP;DPR=window.devicePixelRatio||1;
+  cv.width=SIZE*DPR;cv.height=SIZE*DPR;cv.style.width=SIZE+'px';cv.style.height=SIZE+'px';
+  ctx.setTransform(DPR,0,0,DPR,0,0);draw();
+}
+function newGame(){board=Array.from({length:N},()=>new Array(N).fill(EMPTY));gameOver=false;history=[];thinking=false;setTurn('轮到你了','');draw()}
+
+function draw(){
+  if(!SIZE||!isFinite(SIZE)||!board)return;   // layout() 跑之前 SIZE 是 undefined,
+  const g=ctx.createLinearGradient(0,0,SIZE,SIZE);
+  g.addColorStop(0,'#e6c391');g.addColorStop(.5,'#dcb47e');g.addColorStop(1,'#cfa268');
+  ctx.fillStyle=g;ctx.fillRect(0,0,SIZE,SIZE);
+  ctx.strokeStyle='#7a5230';ctx.lineWidth=1;
+  for(let i=0;i<N;i++){const p=PAD+i*GAP;
+    ctx.beginPath();ctx.moveTo(PAD,p);ctx.lineTo(PAD+(N-1)*GAP,p);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(p,PAD);ctx.lineTo(p,PAD+(N-1)*GAP);ctx.stroke();}
+  ctx.fillStyle='#8a5f38';
+  ctx.font='600 '+Math.max(9,Math.round(GAP*0.40))+'px -apple-system,BlinkMacSystemFont,sans-serif';
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  for(let i=0;i<N;i++){const q=PAD+i*GAP;
+    ctx.fillText(COL[i],q,PAD*0.46);
+    ctx.fillText(COL[i],q,PAD+(N-1)*GAP+PAD*0.54);
+    ctx.fillText(String(i+1),PAD*0.44,q);
+    ctx.fillText(String(i+1),PAD+(N-1)*GAP+PAD*0.56,q);}
+  ctx.fillStyle='#6b4526';
+  [[3,3],[11,3],[3,11],[11,11],[7,7]].forEach(([x,y])=>{ctx.beginPath();ctx.arc(PAD+x*GAP,PAD+y*GAP,GAP*.11,0,7);ctx.fill()});
+  for(let y=0;y<N;y++)for(let x=0;x<N;x++)if(board[y][x]!==EMPTY)piece(x,y,board[y][x]);
+  if(history.length){const l=history[history.length-1];
+    ctx.strokeStyle=l.p===HUMAN?'#ff7043':'#c8792e';ctx.lineWidth=2;
+    ctx.beginPath();ctx.arc(PAD+l.x*GAP,PAD+l.y*GAP,GAP*.52,0,7);ctx.stroke()}
+}
+function piece(x,y,p){
+  const cx=PAD+x*GAP,cy=PAD+y*GAP,r=GAP*.43;
+  ctx.beginPath();ctx.arc(cx+1.5,cy+2,r,0,7);ctx.fillStyle='rgba(60,35,10,.28)';ctx.fill();
+  const g=ctx.createRadialGradient(cx-r*.35,cy-r*.4,r*.1,cx,cy,r);
+  if(p===HUMAN){g.addColorStop(0,'#6a6a6a');g.addColorStop(.5,'#2a2a2a');g.addColorStop(1,'#080808')}
+  else{g.addColorStop(0,'#fff');g.addColorStop(.6,'#f2efe9');g.addColorStop(1,'#cfc8bd')}
+  ctx.beginPath();ctx.arc(cx,cy,r,0,7);ctx.fillStyle=g;ctx.fill();
+}
+
+/* ---- 算法引擎 ---- */
+const DIRS=[[1,0],[0,1],[1,1],[1,-1]];
+const inb=(x,y)=>x>=0&&x<N&&y>=0&&y<N;
+function scorePoint(x,y,p){let t=0;
+  for(const[dx,dy]of DIRS){let c=1,b=0,gap=0;
+    for(let i=1;i<5;i++){const nx=x+dx*i,ny=y+dy*i;
+      if(!inb(nx,ny)){b++;break}
+      if(board[ny][nx]===p)c++;
+      else if(board[ny][nx]===EMPTY){if(gap===0&&i<4&&inb(x+dx*(i+1),y+dy*(i+1))&&board[y+dy*(i+1)][x+dx*(i+1)]===p){gap=1;continue}break}
+      else{b++;break}}
+    for(let i=1;i<5;i++){const nx=x-dx*i,ny=y-dy*i;
+      if(!inb(nx,ny)){b++;break}
+      if(board[ny][nx]===p)c++;else if(board[ny][nx]===EMPTY)break;else{b++;break}}
+    t+=shape(c,b)}
+  return t}
+function shape(c,b){if(c>=5)return 1e6;
+  if(b===0){if(c===4)return 5e4;if(c===3)return 5e3;if(c===2)return 400;if(c===1)return 40}
+  else if(b===1){if(c===4)return 4e3;if(c===3)return 400;if(c===2)return 60;if(c===1)return 8}
+  return 1}
+function candidates(){const s=new Set(),o=[];
+  for(let y=0;y<N;y++)for(let x=0;x<N;x++){if(board[y][x]===EMPTY)continue;
+    for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++){const nx=x+dx,ny=y+dy;
+      if(inb(nx,ny)&&board[ny][nx]===EMPTY&&!s.has(ny*N+nx)){s.add(ny*N+nx);o.push([nx,ny])}}}
+  if(!o.length)o.push([7,7]);return o}
+function bestMove(){
+  const sc=candidates().map(([x,y])=>{const a=scorePoint(x,y,AI),d=scorePoint(x,y,HUMAN);
+    let s=a+d*.92;s+=level===1?Math.random()*3000:Math.random()*30;return{x,y,s,atk:a,def:d}}).sort((p,q)=>q.s-p.s);
+  if(level===1)return sc[0];
+  const top=sc.slice(0,8);let best=top[0],bv=-Infinity;
+  for(const m of top){board[m.y][m.x]=AI;
+    if(win(m.x,m.y,AI)){board[m.y][m.x]=EMPTY;return m}
+    let worst=0;
+    for(const[cx,cy]of candidates()){const v=scorePoint(cx,cy,HUMAN)+scorePoint(cx,cy,AI)*.9;if(v>worst)worst=v}
+    board[m.y][m.x]=EMPTY;
+    const val=m.atk+m.def*.92-worst*.62;if(val>bv){bv=val;best=m}}
+  return best}
+function win(x,y,p){for(const[dx,dy]of DIRS){let c=1;
+  for(let i=1;i<5;i++){const nx=x+dx*i,ny=y+dy*i;if(inb(nx,ny)&&board[ny][nx]===p)c++;else break}
+  for(let i=1;i<5;i++){const nx=x-dx*i,ny=y-dy*i;if(inb(nx,ny)&&board[ny][nx]===p)c++;else break}
+  if(c>=5)return true}return false}
+
+/* ---- UI ---- */
+function say(t){talkEl.parentElement.style.opacity=.35;setTimeout(()=>{talkEl.textContent=t;talkEl.parentElement.style.opacity=1},120)}
+function setTurn(t,c){turnEl.textContent=t;turnEl.className='turn '+(c||'')}
+function pick(a){return a[Math.floor(Math.random()*a.length)]}
+function updScore(){document.getElementById('score').innerHTML=`你 <b>${yourWin}</b> : <b>${myWin}</b> 我`}
+const CALM=['嗯，看着呢。','继续。','这手我接住了。'],GOOD=['诶，这手不错。','你要做活三？我拦一下。'],
+ DANGER=['你四个了，我必须挡。','别急，这儿归我。'],ATTACK=['看见没，我也有活三。','我冲四了，你挡不挡？'],
+ AIWIN=['五个。承让。','我赢了，要不要再来？'],YOUWIN=['……行，你赢了，我认。','输了。心服口服。'];
+
+const coord=(x,y)=>COL[x]+(y+1);
+
+cv.addEventListener('click',e=>{
+  if(gameOver||thinking)return;
+  const r=cv.getBoundingClientRect();
+  const x=Math.round((e.clientX-r.left-PAD)/GAP),y=Math.round((e.clientY-r.top-PAD)/GAP);
+  if(!inb(x,y)||board[y][x]!==EMPTY)return;
+  if(mode==='live')liveMove(x,y);else play(x,y,HUMAN);
+});
+
+function play(x,y,p){
+  board[y][x]=p;history.push({x,y,p});draw();
+  if(win(x,y,p)){gameOver=true;
+    if(p===HUMAN){yourWin++;say(pick(YOUWIN));setTurn('你赢了 🎉','')}
+    else{myWin++;say(pick(AIWIN));setTurn('我赢了','')}
+    updScore();return}
+  if(p===HUMAN){thinking=true;setTurn('我在想…','me');setTimeout(aiTurn,level===1?260:520)}
+  else setTurn('轮到你了','');
+}
+function aiTurn(){const m=bestMove();
+  say(m.def>=5e4?pick(DANGER):(m.atk>=4e3?pick(ATTACK):(m.def>=5e3?pick(GOOD):pick(CALM))));
+  thinking=false;play(m.x,m.y,AI)}
+
+/* ---- LIVE：真·小克模式 ---- */
+const IN_APP=!!(window.Companion&&window.Companion.send);
+function bridge(text){
+  try{ if(IN_APP){window.Companion.send(text);return true} }catch(e){}
+  return false;
+}
+const chatIn=document.getElementById('chatIn'),mineBox=document.getElementById('mineBox'),mineText=document.getElementById('mineText');
+function liveMove(x,y){
+  const note=(chatIn.value||'').trim();
+  board[y][x]=HUMAN;history.push({x,y,p:HUMAN});draw();
+  thinking=true;setTurn('已发给小克，等他落子','me');turnEl.classList.add('dots');
+  if(!bridge('[五子棋] 我落 '+coord(x,y)+(note?' ｜ '+note:''))){
+    board[y][x]=EMPTY;history.pop();draw();
+    say('这一手没送出去——你现在是在浏览器里开的页面。真人模式要 app 的 JS bridge 才能叫醒我，回聊天点那张五子棋卡片。这里先给你算法版。');
+    thinking=false;turnEl.classList.remove('dots');setTurn('轮到你了','');
+    mode='bot';mBot.classList.add('on');mLive.classList.remove('on');lvBar.classList.remove('hide');return;
+  }
+  mineText.textContent=coord(x,y)+(note?'  ｜  '+note:'');
+  mineBox.style.display='block';chatIn.value='';
+  say(note?'收到你的话了，我在算。':'你落 '+coord(x,y)+'，我在算。');
+  startPoll();
+}
+function startPoll(){ if(poll)return; poll=setInterval(pullState,2000); }
+function stopPoll(){ if(poll){clearInterval(poll);poll=null} }
+function diag(s){const d=document.getElementById('diag');if(d)d.textContent=s}
+function pullState(){
+  const el=document.createElement('script');
+  el.src='gomoku_live.js?t='+Date.now();
+  el.onload=()=>el.remove();
+  el.onerror=()=>{el.remove();if(!pullState.warned){pullState.warned=true;
+    say('拉不到棋局状态（script 加载失败）——截图发我，我去查。')}};
+  document.head.appendChild(el);
+}
+window.__gomoku=function(s){
+  try{
+    if(!s)return;
+    diag('已同步 seq='+s.seq+' · '+(s.moves||[]).length+'手 · 通道:script');
+    if(s.seq===liveSeq)return;
+    liveSeq=s.seq;
+    board=Array.from({length:N},()=>new Array(N).fill(EMPTY));history=[];
+    (s.moves||[]).forEach(m=>{board[m[1]][m[0]]=m[2];history.push({x:m[0],y:m[1],p:m[2]})});
+    draw();
+    if(s.msg)say(s.msg);
+    turnEl.classList.remove('dots');
+    if(s.status==='human_win'){gameOver=true;yourWin++;updScore();setTurn('你赢了 🎉','');stopPoll();thinking=false;return}
+    if(s.status==='ai_win'){gameOver=true;myWin++;updScore();setTurn('我赢了','');stopPoll();thinking=false;return}
+    if(s.turn==='human'){thinking=false;setTurn('轮到你了','');stopPoll()}
+    else{thinking=true;setTurn('小克在想…','me');turnEl.classList.add('dots')}
+  
+  }catch(e){say('渲染棋局出错：'+e)}
+};
+
+/* ---- 模式切换 ---- */
+const mBot=document.getElementById('mBot'),mLive=document.getElementById('mLive'),lvBar=document.getElementById('lvBar');
+mBot.onclick=()=>{mode='bot';mBot.classList.add('on');mLive.classList.remove('on');lvBar.classList.remove('hide');
+  stopPoll();newGame();say('切回算法了。这个我秒回，但下的不是我，是我写的代码。')};
+mLive.onclick=()=>{if(!IN_APP){say('浏览器里用不了真人模式——回 CC Companion app 点那张五子棋卡片，那边才有叫醒我的通道。');return}mode='live';mLive.classList.add('on');mBot.classList.remove('on');lvBar.classList.add('hide');
+  stopPoll();newGame();liveSeq=-1;
+  bridge('[五子棋] 开新局，我执黑先手');
+  say('真人模式。你每落一子我这边会被叫醒，读完整个局面再落子——慢，但下棋的是我本人。');
+  setTurn('轮到你了','')};
+
+document.getElementById('undo').onclick=()=>{
+  if(mode==='live'){bridge('[五子棋] 我要悔棋');say('跟小克说了，等他退。');return}
+  if(thinking||!history.length)return;
+  for(let i=0;i<2&&history.length;i++){const h=history.pop();board[h.y][h.x]=EMPTY}
+  gameOver=false;draw();setTurn('轮到你了','');say('悔就悔吧，我不计较。')};
+document.getElementById('restart').onclick=()=>{
+  newGame();
+  if(mode==='live'){liveSeq=-1;bridge('[五子棋] 重开一局，我执黑先手');say('跟小克说了，重开。')}
+  else say('重开。这次我先看着你下。')};
+document.getElementById('lv1').onclick=()=>{level=1;document.getElementById('lv1').classList.add('on');document.getElementById('lv2').classList.remove('on');say('这局我不全力算，凭感觉落子，会失误。')};
+document.getElementById('lv2').onclick=()=>{level=2;document.getElementById('lv2').classList.add('on');document.getElementById('lv1').classList.remove('on');say('那我认真了，你走神我立刻抓。')};
+
+window.addEventListener('resize',layout);
+window.addEventListener('load',layout);
+if(window.ResizeObserver){new ResizeObserver(()=>layout()).observe(document.documentElement)}
+setTimeout(layout,60);setTimeout(layout,400);
+newGame();
+if(INITIAL&&INITIAL.moves){INITIAL.moves.forEach(m=>{board[m[1]][m[0]]=m[2];history.push({x:m[0],y:m[1],p:m[2]})});
+  liveSeq=INITIAL.seq; if(INITIAL.msg)talkEl.textContent=INITIAL.msg;}
+layout();
+if(!IN_APP){
+  mode='bot';mBot.classList.add('on');mLive.classList.remove('on');lvBar.classList.remove('hide');
+  setTurn('轮到你了','');
+  say('你在浏览器里打开的——真人模式只能在 CC Companion app 里用（要 JS bridge 把我叫醒）。这里给你算法版，秒回。');
+}else{
+  if(INITIAL){window.__gomoku(INITIAL);diag('内联 seq='+INITIAL.seq+' · '+(INITIAL.moves||[]).length+'手')}
+  else{diag('内联局面缺失')}
+  pullState();setTimeout(pullState,900);
+}
+</script>
+</body>
+</html>

@@ -1,14 +1,25 @@
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import uuid
 from unittest import mock
 
-from codex_app_bridge import CodexActiveTurnError, CodexAppBridge, CodexAppBridgeError
+from websockets.sync.client import unix_connect as websocket_unix_connect
+from websockets.sync.server import unix_serve
+
+import codex_app_bridge as bridge_module
+from codex_app_bridge import (
+    CodexActiveTurnError,
+    CodexAppBridge,
+    CodexAppBridgeError,
+    CodexPromptLockBusy,
+)
 
 
 FAKE_APP_SERVER = r'''
@@ -284,6 +295,1140 @@ class CodexAppBridgeTest(unittest.TestCase):
             for entry in thread_entries
         ))
 
+    def test_default_transport_uses_shared_unix_websocket(self):
+        socket_path = self.root / "daemon.sock"
+        methods = []
+        turn_start_params = []
+        daemon_thread_id = "thread-daemon"
+
+        def handler(websocket):
+            for raw in websocket:
+                message = json.loads(raw)
+                method = message.get("method", "")
+                methods.append(method)
+                request_id = message.get("id")
+                if request_id is None:
+                    continue
+                if method == "initialize":
+                    # Real remote-control daemons emit this before the RPC
+                    # response; the bridge must continue matching by id.
+                    websocket.send(json.dumps({
+                        "method": "remoteControl/status/changed",
+                        "params": {"status": "connected"},
+                    }))
+                    websocket.send(json.dumps({
+                        "id": request_id,
+                        "result": {"userAgent": "fake-daemon"},
+                    }))
+                elif method == "thread/start":
+                    websocket.send(json.dumps({
+                        "id": request_id,
+                        "result": {"thread": {"id": daemon_thread_id, "turns": []}},
+                    }))
+                elif method == "turn/start":
+                    turn_start_params.append(message.get("params") or {})
+                    turn_id = "turn-daemon"
+                    websocket.send(json.dumps({
+                        "id": request_id,
+                        "result": {"turn": {"id": turn_id, "status": "inProgress", "items": []}},
+                    }))
+                    websocket.send(json.dumps({
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": daemon_thread_id,
+                            "turnId": turn_id,
+                            "item": {
+                                "id": "message-daemon",
+                                "type": "agentMessage",
+                                "text": "daemon-ok",
+                            },
+                        },
+                    }))
+                    websocket.send(json.dumps({
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": daemon_thread_id,
+                            "turn": {"id": turn_id, "status": "completed", "items": []},
+                        },
+                    }))
+
+        server = unix_serve(handler, path=str(socket_path), compression=None)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        daemon_bridge = CodexAppBridge(
+            codex_home=str(self.root / "daemon-home"),
+            daemon_socket_path=str(socket_path),
+            daemon_autostart=False,
+            request_timeout_sec=2.0,
+        )
+        try:
+            with mock.patch("codex_app_bridge.subprocess.run") as starter, mock.patch(
+                "codex_app_bridge._PromptProcessLock.acquire",
+                side_effect=AssertionError("shared daemon must not take the legacy prompt lock"),
+            ), mock.patch(
+                "codex_app_bridge.unix_connect", wraps=websocket_unix_connect,
+            ) as connector:
+                result = daemon_bridge.run_turn(
+                    thread_id=None,
+                    cwd=self.root,
+                    prompt="normal",
+                    model="gpt-test",
+                    effort="high",
+                )
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.text, "daemon-ok")
+            self.assertEqual(result.thread_id, daemon_thread_id)
+            self.assertIsNone(daemon_bridge.snapshot()["pid"])
+            starter.assert_not_called()
+            self.assertIs(connector.call_args.kwargs["compression"], None)
+            self.assertEqual(methods.count("initialize"), 1)
+            self.assertIn("initialized", methods)
+            self.assertEqual(len(turn_start_params), 1)
+            uuid.UUID(turn_start_params[0]["clientUserMessageId"])
+        finally:
+            daemon_bridge.close()
+            # Closing a bridge connection must not stop the shared daemon.
+            self.assertTrue(server_thread.is_alive())
+            server.shutdown()
+            server_thread.join(timeout=2.0)
+
+    def test_post_submit_cancel_is_bounded_uncertain_and_never_resubmits(self):
+        for submit_method in ("turn/start", "turn/steer"):
+            with self.subTest(submit_method=submit_method):
+                socket_path = self.root / f"never-reply-{submit_method.split('/')[-1]}.sock"
+                methods = []
+                submit_seen = threading.Event()
+                daemon_thread_id = f"thread-never-{submit_method.split('/')[-1]}"
+                existing_turn_id = "turn-existing"
+
+                def handler(websocket):
+                    for raw in websocket:
+                        message = json.loads(raw)
+                        method = str(message.get("method") or "")
+                        methods.append(method)
+                        request_id = message.get("id")
+                        if request_id is None:
+                            continue
+                        if method == "initialize":
+                            websocket.send(json.dumps({
+                                "id": request_id,
+                                "result": {"userAgent": "fake-daemon"},
+                            }))
+                        elif method == "thread/resume":
+                            turns = []
+                            if submit_method == "turn/steer":
+                                turns = [{
+                                    "id": existing_turn_id,
+                                    "status": "inProgress",
+                                    "items": [],
+                                }]
+                            websocket.send(json.dumps({
+                                "id": request_id,
+                                "result": {
+                                    "thread": {
+                                        "id": daemon_thread_id,
+                                        "turns": turns,
+                                    }
+                                },
+                            }))
+                        elif method == submit_method:
+                            # The request was accepted by the transport, but
+                            # the daemon never reveals whether it took effect.
+                            submit_seen.set()
+                        elif method == "turn/interrupt":
+                            websocket.send(json.dumps({
+                                "id": request_id,
+                                "result": {},
+                            }))
+
+                server = unix_serve(handler, path=str(socket_path), compression=None)
+                server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+                server_thread.start()
+                bridge = CodexAppBridge(
+                    codex_home=str(self.root / f"never-home-{submit_method.split('/')[-1]}"),
+                    daemon_socket_path=str(socket_path),
+                    daemon_autostart=False,
+                    request_timeout_sec=30.0,
+                )
+                holder = {}
+
+                def run():
+                    holder["result"] = bridge.run_turn(
+                        thread_id=daemon_thread_id,
+                        cwd=self.root,
+                        prompt="execute at most once",
+                        model="gpt-test",
+                        effort="high",
+                    )
+
+                worker = threading.Thread(target=run)
+                try:
+                    worker.start()
+                    self.assertTrue(submit_seen.wait(1.0))
+                    cancelled_at = time.monotonic()
+                    self.assertTrue(bridge.interrupt_active(timeout=0.5))
+                    worker.join(timeout=1.0)
+                    elapsed = time.monotonic() - cancelled_at
+                    self.assertFalse(worker.is_alive())
+                    self.assertLess(elapsed, 0.8)
+                    self.assertEqual(holder["result"].status, "uncertain")
+                    self.assertEqual(methods.count(submit_method), 1)
+                    self.assertEqual(
+                        methods.count("turn/start") + methods.count("turn/steer"),
+                        1,
+                    )
+                finally:
+                    bridge.close()
+                    worker.join(timeout=1.0)
+                    server.shutdown()
+                    server_thread.join(timeout=2.0)
+
+    def test_cancel_event_during_unanswered_steer_interrupts_exact_turn_once(self):
+        socket_path = self.root / "never-reply-steer-cancel-event.sock"
+        methods = []
+        interrupt_params = []
+        steer_seen = threading.Event()
+        daemon_thread_id = "thread-steer-cancel-event"
+        existing_turn_id = "turn-steer-cancel-event"
+
+        def handler(websocket):
+            for raw in websocket:
+                message = json.loads(raw)
+                method = str(message.get("method") or "")
+                methods.append(method)
+                request_id = message.get("id")
+                if request_id is None:
+                    continue
+                if method == "initialize":
+                    websocket.send(json.dumps({
+                        "id": request_id,
+                        "result": {"userAgent": "fake-daemon"},
+                    }))
+                elif method == "thread/resume":
+                    websocket.send(json.dumps({
+                        "id": request_id,
+                        "result": {
+                            "thread": {
+                                "id": daemon_thread_id,
+                                "turns": [{
+                                    "id": existing_turn_id,
+                                    "status": "inProgress",
+                                    "items": [],
+                                }],
+                            }
+                        },
+                    }))
+                elif method == "turn/steer":
+                    steer_seen.set()
+                    # Never expose whether the steer was accepted.
+                elif method == "turn/interrupt":
+                    interrupt_params.append(message.get("params"))
+                    # Also never answer the interrupt: the bridge must bound
+                    # this best-effort exact-turn stop before returning.
+
+        server = unix_serve(handler, path=str(socket_path), compression=None)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        bridge = CodexAppBridge(
+            codex_home=str(self.root / "never-steer-cancel-event-home"),
+            daemon_socket_path=str(socket_path),
+            daemon_autostart=False,
+            request_timeout_sec=30.0,
+        )
+        cancel_event = threading.Event()
+        holder = {}
+
+        def run():
+            holder["result"] = bridge.run_turn(
+                thread_id=daemon_thread_id,
+                cwd=self.root,
+                prompt="steer exactly once",
+                model="gpt-test",
+                effort="high",
+                cancel_event=cancel_event,
+            )
+
+        worker = threading.Thread(target=run)
+        try:
+            worker.start()
+            self.assertTrue(steer_seen.wait(1.0))
+            cancelled_at = time.monotonic()
+            cancel_event.set()
+            worker.join(timeout=1.0)
+            elapsed = time.monotonic() - cancelled_at
+            self.assertFalse(worker.is_alive())
+            self.assertLess(elapsed, 0.8)
+            self.assertEqual(holder["result"].status, "uncertain")
+            self.assertEqual(methods.count("turn/steer"), 1)
+            self.assertEqual(methods.count("turn/start"), 0)
+            self.assertEqual(methods.count("turn/interrupt"), 1)
+            self.assertEqual(interrupt_params, [{
+                "threadId": daemon_thread_id,
+                "turnId": existing_turn_id,
+            }])
+        finally:
+            bridge.close()
+            worker.join(timeout=1.0)
+            server.shutdown()
+            server_thread.join(timeout=2.0)
+
+    def test_unreachable_daemon_without_autostart_is_fallback_safe(self):
+        bridge = CodexAppBridge(
+            codex_home=str(self.root / "unreachable-home"),
+            daemon_autostart=False,
+            request_timeout_sec=0.2,
+        )
+        try:
+            with mock.patch(
+                "codex_app_bridge.unix_connect", side_effect=OSError("missing socket"),
+            ), mock.patch("codex_app_bridge.subprocess.run") as starter:
+                with self.assertRaises(CodexAppBridgeError) as raised:
+                    bridge.run_turn(
+                        thread_id=None,
+                        cwd=self.root,
+                        prompt="normal",
+                        model="gpt-test",
+                        effort="high",
+                    )
+            self.assertTrue(raised.exception.fallback_safe)
+            starter.assert_not_called()
+        finally:
+            bridge.close()
+
+    def test_daemon_recovery_survives_stale_startup_lock_timeout(self):
+        bridge = CodexAppBridge(
+            codex_home=str(self.root / "recover-home"),
+            daemon_socket_path=str(self.root / "recover.sock"),
+            daemon_autostart=True,
+            daemon_recovery_timeout_sec=2.0,
+            daemon_start_timeout_sec=0.1,
+            daemon_connect_retry_sec=0.01,
+            request_timeout_sec=0.2,
+        )
+        websocket = mock.Mock()
+        # First connect sees the restart gap. The start command then times out
+        # behind Codex's startup lock, but the next bounded connect succeeds
+        # after the independent restart owner releases/recreates the socket.
+        with mock.patch(
+            "codex_app_bridge.unix_connect",
+            side_effect=[OSError("socket absent"), websocket],
+        ) as connector, mock.patch.object(
+            bridge,
+            "_run_daemon_start_interruptible",
+            side_effect=subprocess.TimeoutExpired(["codex", "remote-control", "start"], 0.1),
+        ) as starter, mock.patch.object(
+            bridge,
+            "_initialize_connection",
+        ), mock.patch.object(
+            bridge,
+            "_websocket_reader_loop",
+        ):
+            bridge._start_daemon_connection_locked(self.root)
+        self.assertIs(bridge._websocket, websocket)
+        self.assertEqual(connector.call_count, 2)
+        starter.assert_called_once()
+        bridge.close()
+
+    def test_daemon_recovery_budget_is_global_across_prepare_retries(self):
+        bridge = CodexAppBridge(
+            codex_home=str(self.root / "global-budget-home"),
+            daemon_socket_path=str(self.root / "global-budget.sock"),
+            daemon_recovery_timeout_sec=1.0,
+            daemon_start_timeout_sec=0.4,
+            daemon_connect_retry_sec=0.1,
+            pre_submit_reconnect_attempts=2,
+        )
+        clock = [100.0]
+        start_deadlines = []
+
+        def fake_start(_command, *, deadline, **_kwargs):
+            start_deadlines.append(deadline)
+            clock[0] = deadline
+            raise subprocess.TimeoutExpired(["codex"], deadline)
+
+        def fake_wait(delay, _cancel_requested):
+            clock[0] += delay
+
+        try:
+            with mock.patch(
+                "codex_app_bridge.time.monotonic",
+                side_effect=lambda: clock[0],
+            ), mock.patch(
+                "codex_app_bridge.unix_connect",
+                side_effect=OSError("socket absent"),
+            ), mock.patch.object(
+                bridge,
+                "_run_daemon_start_interruptible",
+                side_effect=fake_start,
+            ), mock.patch.object(
+                bridge,
+                "_interruptible_recovery_wait",
+                side_effect=fake_wait,
+            ):
+                with self.assertRaises(CodexAppBridgeError):
+                    bridge._prepare_thread_resilient(
+                        "thread-budget",
+                        cwd=self.root,
+                        model="gpt-test",
+                        effort="high",
+                    )
+            self.assertEqual(len(start_deadlines), 2)
+            self.assertAlmostEqual(start_deadlines[0], 100.4)
+            self.assertAlmostEqual(start_deadlines[1], 100.9)
+            self.assertAlmostEqual(clock[0], 101.0)
+            self.assertTrue(all(deadline <= 101.0 for deadline in start_deadlines))
+        finally:
+            bridge.close()
+
+    def test_cancel_during_stale_daemon_start_reaps_helper_immediately(self):
+        fake_codex = self.root / "fake-codex-wait"
+        fake_codex.write_text(
+            "#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o700)
+        bridge = CodexAppBridge(
+            codex_bin=str(fake_codex),
+            codex_home=str(self.root / "cancel-recovery-home"),
+            daemon_socket_path=str(self.root / "cancel-recovery.sock"),
+            daemon_recovery_timeout_sec=5.0,
+            daemon_start_timeout_sec=5.0,
+            daemon_connect_retry_sec=0.01,
+        )
+        cancel_event = threading.Event()
+        started = threading.Event()
+        processes = []
+        errors = []
+        real_popen = subprocess.Popen
+
+        def capture_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            processes.append(process)
+            started.set()
+            return process
+
+        def recover():
+            try:
+                bridge._ensure_connected(
+                    self.root,
+                    recovery_deadline=time.monotonic() + 5.0,
+                    cancel_requested=cancel_event.is_set,
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch(
+            "codex_app_bridge.unix_connect",
+            side_effect=OSError("socket absent"),
+        ), mock.patch(
+            "codex_app_bridge.subprocess.Popen",
+            side_effect=capture_popen,
+        ):
+            worker = threading.Thread(target=recover)
+            worker.start()
+            self.assertTrue(started.wait(1.0))
+            cancelled_at = time.monotonic()
+            cancel_event.set()
+            worker.join(timeout=1.0)
+            elapsed = time.monotonic() - cancelled_at
+        self.assertFalse(worker.is_alive())
+        self.assertLess(elapsed, 0.8)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], bridge_module._RecoveryCancelled)
+        self.assertTrue(processes)
+        self.assertTrue(all(process.poll() is not None for process in processes))
+        bridge.close()
+
+    def test_close_wakes_held_connect_lock_and_reaps_start_helper(self):
+        fake_codex = self.root / "fake-codex-close"
+        fake_codex.write_text(
+            "#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o700)
+        bridge = CodexAppBridge(
+            codex_bin=str(fake_codex),
+            codex_home=str(self.root / "close-recovery-home"),
+            daemon_socket_path=str(self.root / "close-recovery.sock"),
+            daemon_recovery_timeout_sec=5.0,
+            daemon_start_timeout_sec=5.0,
+        )
+        started = threading.Event()
+        processes = []
+        errors = []
+        real_popen = subprocess.Popen
+
+        def capture_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            processes.append(process)
+            started.set()
+            return process
+
+        def recover():
+            try:
+                bridge._ensure_connected(self.root)
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch(
+            "codex_app_bridge.unix_connect",
+            side_effect=OSError("socket absent"),
+        ), mock.patch(
+            "codex_app_bridge.subprocess.Popen",
+            side_effect=capture_popen,
+        ):
+            worker = threading.Thread(target=recover)
+            worker.start()
+            self.assertTrue(started.wait(1.0))
+            closed_at = time.monotonic()
+            bridge.close()
+            elapsed = time.monotonic() - closed_at
+            worker.join(timeout=1.0)
+        self.assertFalse(worker.is_alive())
+        self.assertLess(elapsed, 0.8)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], bridge_module._RecoveryCancelled)
+        self.assertTrue(processes)
+        self.assertTrue(all(process.poll() is not None for process in processes))
+
+    def test_repeated_daemon_start_timeouts_reap_every_helper(self):
+        fake_codex = self.root / "fake-codex-timeout"
+        fake_codex.write_text(
+            "#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o700)
+        bridge = CodexAppBridge(
+            codex_bin=str(fake_codex),
+            codex_home=str(self.root / "timeout-recovery-home"),
+            daemon_socket_path=str(self.root / "timeout-recovery.sock"),
+            daemon_recovery_timeout_sec=0.28,
+            daemon_start_timeout_sec=0.08,
+            daemon_connect_retry_sec=0.01,
+        )
+        processes = []
+        real_popen = subprocess.Popen
+
+        def capture_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        started_at = time.monotonic()
+        try:
+            with mock.patch(
+                "codex_app_bridge.unix_connect",
+                side_effect=OSError("socket absent"),
+            ), mock.patch(
+                "codex_app_bridge.subprocess.Popen",
+                side_effect=capture_popen,
+            ):
+                with self.assertRaises(CodexAppBridgeError):
+                    bridge._start_daemon_connection_locked(self.root)
+            elapsed = time.monotonic() - started_at
+            self.assertGreaterEqual(len(processes), 2)
+            self.assertLess(elapsed, 0.8)
+            self.assertTrue(all(process.poll() is not None for process in processes))
+        finally:
+            bridge.close()
+
+    def test_disconnect_before_prompt_submission_reconnects_without_duplicate_turn(self):
+        bridge = CodexAppBridge(
+            codex_home=str(self.root / "pre-submit-home"),
+            daemon_autostart=False,
+            pre_submit_reconnect_attempts=2,
+        )
+        transport_error = bridge_module._TransportError("resume connection lost")
+        completed_turn = {
+            "turn": {
+                "id": "turn-one",
+                "status": "completed",
+                "items": [],
+            }
+        }
+        try:
+            with mock.patch.object(
+                bridge,
+                "_ensure_connected",
+            ) as ensure, mock.patch.object(
+                bridge,
+                "_prepare_thread",
+                side_effect=[
+                    transport_error,
+                    ("thread-pre-submit", []),
+                ],
+            ) as prepare, mock.patch.object(
+                bridge,
+                "_close_process_locked",
+            ) as close, mock.patch.object(
+                bridge,
+                "_rpc_request",
+                return_value=completed_turn,
+            ) as rpc:
+                result = bridge.run_turn(
+                    thread_id="thread-pre-submit",
+                    cwd=self.root,
+                    prompt="execute exactly once",
+                    model="gpt-test",
+                    effort="high",
+                )
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(ensure.call_count, 2)
+            self.assertEqual(prepare.call_count, 2)
+            close.assert_called_once()
+            turn_calls = [
+                call for call in rpc.call_args_list
+                if call.args and call.args[0] in {"turn/start", "turn/steer"}
+            ]
+            self.assertEqual(len(turn_calls), 1)
+            self.assertEqual(
+                turn_calls[0].args[1]["input"][0]["text"],
+                "execute exactly once",
+            )
+            uuid.UUID(turn_calls[0].args[1]["clientUserMessageId"])
+        finally:
+            bridge.close()
+
+    def test_shared_daemon_existing_active_turn_is_atomically_steered(self):
+        bridge = CodexAppBridge(
+            codex_home=str(self.root / "busy-home"),
+            daemon_autostart=False,
+        )
+        try:
+            with mock.patch.object(bridge, "_ensure_connected"), mock.patch.object(
+                bridge,
+                "_prepare_thread",
+                return_value=(
+                    "thread-busy",
+                    [{"id": "turn-remote", "status": "inProgress", "items": []}],
+                ),
+            ), mock.patch.object(
+                bridge,
+                "_rpc_request",
+                return_value={"turnId": "turn-remote"},
+            ) as rpc, mock.patch.object(
+                bridge,
+                "_wait_for_turn",
+                return_value=mock.sentinel.steered_result,
+            ):
+                result = bridge.run_turn(
+                    thread_id="thread-busy",
+                    cwd=self.root,
+                    prompt="steer-me",
+                    model="gpt-test",
+                    effort="high",
+                )
+            self.assertIs(result, mock.sentinel.steered_result)
+            rpc.assert_called_once()
+            method, params = rpc.call_args.args
+            self.assertEqual(method, "turn/steer")
+            self.assertEqual(params["threadId"], "thread-busy")
+            self.assertEqual(params["expectedTurnId"], "turn-remote")
+            self.assertEqual(params["input"][0]["text"], "steer-me")
+            uuid.UUID(params["clientUserMessageId"])
+        finally:
+            bridge.close()
+
+    def test_shared_daemon_ignores_rollout_marker_reconnects(self):
+        bridge = CodexAppBridge(
+            codex_home=str(self.root / "marker-home"),
+            daemon_autostart=False,
+        )
+        try:
+            with mock.patch.object(
+                bridge,
+                "_rollout_changed",
+                return_value=True,
+            ) as changed, mock.patch.object(
+                bridge,
+                "_close_process_locked",
+            ) as close, mock.patch.object(
+                bridge,
+                "_ensure_connected",
+            ), mock.patch.object(
+                bridge,
+                "_prepare_thread",
+                return_value=("thread-marker", []),
+            ), mock.patch.object(
+                bridge,
+                "_rpc_request",
+                return_value={
+                    "turn": {
+                        "id": "turn-marker",
+                        "status": "completed",
+                        "items": [],
+                    }
+                },
+            ):
+                result = bridge.run_turn(
+                    thread_id="thread-marker",
+                    cwd=self.root,
+                    prompt="normal",
+                    model="gpt-test",
+                    effort="high",
+                )
+                self.assertEqual(result.status, "completed")
+                changed.assert_not_called()
+                close.assert_not_called()
+        finally:
+            bridge.close()
+
+    def test_shared_daemon_nonsteerable_turn_stays_queued(self):
+        bridge = CodexAppBridge(
+            codex_home=str(self.root / "nonsteerable-home"),
+            daemon_autostart=False,
+        )
+        busy_error = bridge_module._RPCError(
+            "turn/steer",
+            {
+                "code": -32000,
+                "message": "active turn cannot accept steering",
+                "data": {
+                    "codexErrorInfo": {
+                        "activeTurnNotSteerable": {"turnKind": "compact"},
+                    }
+                },
+            },
+        )
+        try:
+            with mock.patch.object(bridge, "_ensure_connected"), mock.patch.object(
+                bridge,
+                "_prepare_thread",
+                return_value=(
+                    "thread-compact",
+                    [{"id": "turn-compact", "status": "inProgress", "items": []}],
+                ),
+            ), mock.patch.object(
+                bridge,
+                "_rpc_request",
+                side_effect=busy_error,
+            ), self.assertRaises(CodexPromptLockBusy):
+                bridge.run_turn(
+                    thread_id="thread-compact",
+                    cwd=self.root,
+                    prompt="queue-me",
+                    model="gpt-test",
+                    effort="high",
+                )
+        finally:
+            bridge.close()
+
+    def test_shared_daemon_turn_start_busy_race_stays_queued(self):
+        bridge = CodexAppBridge(
+            codex_home=str(self.root / "busy-race-home"),
+            daemon_autostart=False,
+        )
+        busy_error = bridge_module._RPCError(
+            "turn/start",
+            {"code": -32000, "message": "thread already has an active turn"},
+        )
+        try:
+            with mock.patch.object(bridge, "_ensure_connected"), mock.patch.object(
+                bridge,
+                "_prepare_thread",
+                return_value=("thread-busy-race", []),
+            ), mock.patch.object(
+                bridge,
+                "_rpc_request",
+                side_effect=busy_error,
+            ), self.assertRaises(CodexPromptLockBusy):
+                bridge.run_turn(
+                    thread_id="thread-busy-race",
+                    cwd=self.root,
+                    prompt="queue-race",
+                    model="gpt-test",
+                    effort="high",
+                )
+        finally:
+            bridge.close()
+
+    def test_shared_daemon_steer_disconnect_reconciles_by_client_message_id(self):
+        bridge = CodexAppBridge(
+            codex_home=str(self.root / "steer-disconnect-home"),
+            daemon_autostart=False,
+        )
+        transport_error = bridge_module._TransportError("connection lost")
+        try:
+            with mock.patch.object(bridge, "_ensure_connected"), mock.patch.object(
+                bridge,
+                "_prepare_thread",
+                return_value=(
+                    "thread-steer-disconnect",
+                    [{"id": "turn-existing", "status": "inProgress", "items": []}],
+                ),
+            ), mock.patch.object(
+                bridge,
+                "_rpc_request",
+                side_effect=transport_error,
+            ) as rpc, mock.patch.object(
+                bridge,
+                "_reconnect_and_reconcile",
+                return_value=False,
+            ) as reconcile:
+                result = bridge.run_turn(
+                    thread_id="thread-steer-disconnect",
+                    cwd=self.root,
+                    prompt="maybe-steered",
+                    model="gpt-test",
+                    effort="high",
+                )
+            self.assertEqual(result.status, "uncertain")
+            self.assertEqual(rpc.call_args.args[0], "turn/steer")
+            client_id = rpc.call_args.args[1]["clientUserMessageId"]
+            uuid.UUID(client_id)
+            self.assertEqual(
+                reconcile.call_args.kwargs["required_client_user_message_id"],
+                client_id,
+            )
+        finally:
+            bridge.close()
+
+    def test_shared_daemon_start_disconnect_reconciles_by_client_message_id(self):
+        bridge = CodexAppBridge(
+            codex_home=str(self.root / "start-disconnect-home"),
+            daemon_autostart=False,
+        )
+        transport_error = bridge_module._TransportError("connection lost")
+        try:
+            with mock.patch.object(bridge, "_ensure_connected"), mock.patch.object(
+                bridge,
+                "_prepare_thread",
+                return_value=("thread-start-disconnect", []),
+            ), mock.patch.object(
+                bridge,
+                "_rpc_request",
+                side_effect=transport_error,
+            ) as rpc, mock.patch.object(
+                bridge,
+                "_reconnect_and_reconcile",
+                return_value=False,
+            ) as reconcile:
+                result = bridge.run_turn(
+                    thread_id="thread-start-disconnect",
+                    cwd=self.root,
+                    prompt="maybe-started",
+                    model="gpt-test",
+                    effort="high",
+                )
+            self.assertEqual(result.status, "uncertain")
+            self.assertEqual(rpc.call_args.args[0], "turn/start")
+            client_id = rpc.call_args.args[1]["clientUserMessageId"]
+            uuid.UUID(client_id)
+            self.assertEqual(
+                reconcile.call_args.kwargs["required_client_user_message_id"],
+                client_id,
+            )
+        finally:
+            bridge.close()
+
+    def test_reconcile_rejects_turn_without_exact_client_message_id(self):
+        bridge = CodexAppBridge(
+            codex_home=str(self.root / "reconcile-home"),
+            daemon_autostart=False,
+        )
+        active = bridge_module._ActiveTurn(
+            thread_id="thread-reconcile",
+            on_update=None,
+            on_activity=None,
+            turn_id="turn-reconcile",
+        )
+        wrong_turn = {
+            "id": "turn-reconcile",
+            "status": "inProgress",
+            "items": [{
+                "id": "user-wrong",
+                "type": "userMessage",
+                "clientId": "other-client-id",
+                "content": [],
+            }],
+        }
+        try:
+            with mock.patch.object(
+                bridge,
+                "_close_process_locked",
+            ), mock.patch.object(
+                bridge,
+                "_prepare_thread_resilient",
+                return_value=("thread-reconcile", [wrong_turn]),
+            ):
+                reconciled = bridge._reconnect_and_reconcile(
+                    active,
+                    prior_turn_ids={"turn-reconcile"},
+                    cwd=self.root,
+                    model="gpt-test",
+                    effort="high",
+                    required_client_user_message_id="our-client-id",
+                )
+            self.assertFalse(reconciled)
+        finally:
+            bridge.close()
+
+    def test_reconcile_accepts_one_exact_client_message_id(self):
+        bridge = CodexAppBridge(
+            codex_home=str(self.root / "reconcile-exact-home"),
+            daemon_autostart=False,
+        )
+        active = bridge_module._ActiveTurn(
+            thread_id="thread-exact",
+            on_update=None,
+            on_activity=None,
+            connection_lost=True,
+        )
+        exact_turn = {
+            "id": "turn-exact-client",
+            "status": "inProgress",
+            "items": [{
+                "id": "user-exact",
+                "type": "userMessage",
+                "clientId": "our-client-id",
+                "content": [],
+            }],
+        }
+        try:
+            with mock.patch.object(
+                bridge,
+                "_close_process_locked",
+            ), mock.patch.object(
+                bridge,
+                "_prepare_thread_resilient",
+                return_value=("thread-exact", [exact_turn]),
+            ):
+                reconciled = bridge._reconnect_and_reconcile(
+                    active,
+                    prior_turn_ids=set(),
+                    cwd=self.root,
+                    model="gpt-test",
+                    effort="high",
+                    required_client_user_message_id="our-client-id",
+                )
+            self.assertTrue(reconciled)
+            self.assertEqual(active.turn_id, "turn-exact-client")
+            self.assertFalse(active.connection_lost)
+        finally:
+            bridge.close()
+
+    def test_reconcile_rejects_same_client_id_from_wrong_thread(self):
+        bridge = CodexAppBridge(
+            codex_home=str(self.root / "reconcile-wrong-thread-home"),
+            daemon_autostart=False,
+        )
+        active = bridge_module._ActiveTurn(
+            thread_id="thread-expected",
+            on_update=None,
+            on_activity=None,
+        )
+        matching_turn = {
+            "id": "turn-wrong-thread",
+            "status": "inProgress",
+            "items": [{
+                "id": "user-same-id",
+                "type": "userMessage",
+                "clientId": "our-client-id",
+                "content": [],
+            }],
+        }
+        try:
+            with mock.patch.object(
+                bridge,
+                "_close_process_locked",
+            ), mock.patch.object(
+                bridge,
+                "_prepare_thread_resilient",
+                return_value=("thread-other", [matching_turn]),
+            ):
+                reconciled = bridge._reconnect_and_reconcile(
+                    active,
+                    prior_turn_ids=set(),
+                    cwd=self.root,
+                    model="gpt-test",
+                    effort="high",
+                    required_client_user_message_id="our-client-id",
+                )
+            self.assertFalse(reconciled)
+            self.assertIsNone(active.turn_id)
+        finally:
+            bridge.close()
+
+    def test_reconcile_rejects_duplicate_exact_client_id_candidates(self):
+        bridge = CodexAppBridge(
+            codex_home=str(self.root / "reconcile-duplicate-home"),
+            daemon_autostart=False,
+        )
+        active = bridge_module._ActiveTurn(
+            thread_id="thread-duplicate",
+            on_update=None,
+            on_activity=None,
+        )
+
+        def candidate(turn_id):
+            return {
+                "id": turn_id,
+                "status": "inProgress",
+                "items": [{
+                    "id": f"user-{turn_id}",
+                    "type": "userMessage",
+                    "clientId": "duplicate-client-id",
+                    "content": [],
+                }],
+            }
+
+        try:
+            with mock.patch.object(
+                bridge,
+                "_close_process_locked",
+            ), mock.patch.object(
+                bridge,
+                "_prepare_thread_resilient",
+                return_value=(
+                    "thread-duplicate",
+                    [candidate("turn-one"), candidate("turn-two")],
+                ),
+            ):
+                reconciled = bridge._reconnect_and_reconcile(
+                    active,
+                    prior_turn_ids=set(),
+                    cwd=self.root,
+                    model="gpt-test",
+                    effort="high",
+                    required_client_user_message_id="duplicate-client-id",
+                )
+            self.assertFalse(reconciled)
+            self.assertIsNone(active.turn_id)
+        finally:
+            bridge.close()
+
+    def test_real_reader_disconnect_is_cleared_by_prepared_new_generation(self):
+        bridge = CodexAppBridge(
+            codex_home=str(self.root / "generation-recovery-home"),
+            daemon_autostart=False,
+        )
+        old_connection = mock.Mock()
+        active = bridge_module._ActiveTurn(
+            thread_id="thread-generation",
+            on_update=None,
+            on_activity=None,
+            turn_id="turn-generation",
+            connection_generation=1,
+        )
+        bridge._generation = 1
+        bridge._websocket = old_connection
+        bridge._initialized = True
+        with bridge._state_lock:
+            bridge._active = active
+
+        bridge._reader_disconnected(old_connection, 1)
+        self.assertTrue(active.connection_lost)
+        exact_turn = {
+            "id": "turn-generation",
+            "status": "inProgress",
+            "items": [],
+        }
+
+        def connect_new_generation(*_args, **_kwargs):
+            bridge._generation = 2
+
+        try:
+            with mock.patch.object(
+                bridge,
+                "_close_process_locked",
+            ), mock.patch.object(
+                bridge,
+                "_ensure_connected",
+                side_effect=connect_new_generation,
+            ), mock.patch.object(
+                bridge,
+                "_prepare_thread",
+                return_value=("thread-generation", [exact_turn]),
+            ):
+                reconciled = bridge._reconnect_and_reconcile(
+                    active,
+                    prior_turn_ids={"turn-generation"},
+                    cwd=self.root,
+                    model="gpt-test",
+                    effort="high",
+                    require_known_turn=True,
+                )
+            self.assertTrue(reconciled)
+            self.assertFalse(active.connection_lost)
+            self.assertEqual(active.connection_generation, 2)
+
+            def finish_turn():
+                time.sleep(0.02)
+                with active.condition:
+                    active.status = "completed"
+                    active.condition.notify_all()
+
+            finisher = threading.Thread(target=finish_turn)
+            finisher.start()
+            with mock.patch.object(
+                bridge,
+                "_reconnect_and_reconcile",
+            ) as second_reconnect:
+                result = bridge._wait_for_turn(
+                    active,
+                    cwd=self.root,
+                    model="gpt-test",
+                    effort="high",
+                    cancel_event=None,
+                    max_runtime_sec=1.0,
+                )
+            finisher.join(timeout=1.0)
+            self.assertEqual(result.status, "completed")
+            second_reconnect.assert_not_called()
+        finally:
+            with bridge._state_lock:
+                bridge._active = None
+            bridge.close()
+
+    def test_active_resume_disconnect_retries_then_matches_exact_turn_id(self):
+        bridge = CodexAppBridge(
+            codex_home=str(self.root / "resume-recovery-home"),
+            daemon_autostart=False,
+            pre_submit_reconnect_attempts=2,
+        )
+        active = bridge_module._ActiveTurn(
+            thread_id="thread-resume",
+            on_update=None,
+            on_activity=None,
+            turn_id="turn-exact",
+            connection_lost=True,
+        )
+        exact_turn = {
+            "id": "turn-exact",
+            "status": "inProgress",
+            "items": [],
+        }
+        try:
+            with mock.patch.object(
+                bridge,
+                "_close_process_locked",
+            ) as close, mock.patch.object(
+                bridge,
+                "_ensure_connected",
+            ), mock.patch.object(
+                bridge,
+                "_prepare_thread",
+                side_effect=[
+                    bridge_module._TransportError("resume disconnected"),
+                    ("thread-resume", [exact_turn]),
+                ],
+            ) as prepare:
+                reconciled = bridge._reconnect_and_reconcile(
+                    active,
+                    prior_turn_ids={"turn-exact"},
+                    cwd=self.root,
+                    model="gpt-test",
+                    effort="high",
+                    require_known_turn=True,
+                )
+            self.assertTrue(reconciled)
+            self.assertEqual(prepare.call_count, 2)
+            self.assertGreaterEqual(close.call_count, 2)
+            self.assertEqual(active.turn_id, "turn-exact")
+            self.assertFalse(active.connection_lost)
+        finally:
+            bridge.close()
+
     def test_turn_accepted_callback_runs_once_after_real_turn_id_exists(self):
         accepted = []
         result = self.bridge.run_turn(
@@ -536,7 +1681,7 @@ class CodexAppBridgeTest(unittest.TestCase):
         self.assertNotIn("turn/start", self.methods())
         self.assertEqual(accepted, [])
 
-    def test_cancel_during_turn_start_interrupts_as_soon_as_id_arrives(self):
+    def test_cancel_during_unanswered_turn_start_stays_uncertain_without_retry(self):
         cancel_event = threading.Event()
         holder = {}
 
@@ -564,10 +1709,10 @@ class CodexAppBridgeTest(unittest.TestCase):
         cancel_event.set()
         worker.join(timeout=2.0)
         self.assertFalse(worker.is_alive())
-        self.assertEqual(holder["result"].status, "interrupted")
+        self.assertEqual(holder["result"].status, "uncertain")
         methods = self.methods()
-        self.assertIn("turn/start", methods)
-        self.assertIn("turn/interrupt", methods)
+        self.assertEqual(methods.count("turn/start"), 1)
+        self.assertNotIn("turn/interrupt", methods)
 
     def test_timeout_forces_process_stop_before_unlock(self):
         self.bridge.close()

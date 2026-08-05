@@ -68,12 +68,37 @@ allowed_ips = []
 # codex_home = "/root/.codex"
 # codex_model = "gpt-5.5"
 # codex_reasoning_effort = "high"
-# `app-server` keeps one Codex app-server child and resumes the same thread.
+# `app-server` connects to the official remote-control daemon over its private
+# Unix/WebSocket socket. Official Remote, qiaokairos, and this service then use
+# one app-server process and one thread. Input can steer a normal active turn;
+# non-steerable review/compact turns remain queued until Codex accepts it.
 # Set `legacy-exec` only as a temporary rollback switch.
 # codex_kairos_backend = "app-server"
+# Defaults to `$CODEX_HOME/app-server-control/app-server-control.sock`.
+# codex_app_server_socket = "/root/.codex/app-server-control/app-server-control.sock"
+# Start the official daemon with `codex remote-control start --json` when its
+# socket isn't reachable. Disable only when another supervisor owns startup.
+# codex_app_server_daemon_autostart = true
 # Fallback is disabled by default because a transport failure after turn/start
 # may have already performed tools. The bridge only marks pre-start failures as safe.
 # codex_app_server_fallback_to_exec = false
+# Kimi is an isolated text-only App contact using the installed CLI's ACP
+# stdio protocol. Its session id is stored privately beside chat histories.
+# kimi_bin = "/root/.kimi-code/bin/kimi"
+# Keep Kimi/卡拉米 in a workspace that does not inherit Kairos's AGENTS.md.
+# kimi_cwd = "/root/Karami-Workspace"
+# The App session pins ACP's per-session model to Kimi's coding high-speed
+# model; this does not change Kimi Code's global config.toml.
+# kimi_acp_request_timeout_seconds = 30
+# kimi_acp_prompt_timeout_seconds = 900
+# Kimi web server is used only for state queries (quota, context usage).
+# It is started automatically on the first request if it is not already running.
+# kimi_web_host = "127.0.0.1"
+# kimi_web_port = 58627
+# kimi_web_start_timeout_seconds = 30
+# Auto-forge: when Kimi's context usage reaches this threshold, summarize the
+# current session and start a fresh one to save quota. 0 disables forging.
+# kimi_auto_forge_context_threshold = 0.75
 # Kairos App turns auto-forge after the completed reply has been persisted.
 # The old session is claimed at most once across service restarts.
 # codex_auto_forge_enabled = true
@@ -180,6 +205,6 @@ server_url = "https://companion-vps2.xiaonancaleb.xyz"
 [xhs_login]
 # Android 专用 WebView 登录能力；nonce 最长十分钟且只可使用一次。
 ttl_seconds = 300
-allowed_contacts = ["kairos"]
+allowed_contacts = ["kairos", "xiaoke"]
 # 固定 argv，cookie JSON 只经 subprocess stdin 传入，不得改成 shell 字符串。
 import_command = ["ssh", "memory-sg", "/home/ubuntu/xhs-login-bridge/import_cookies.py"]

@@ -431,7 +431,10 @@ class HandlerRoutingTest(unittest.TestCase):
 
     @mock.patch("push.subprocess.run")
     def test_capture_reports_waiting_from_exact_pane_marker(self, run: mock.Mock) -> None:
-        run.return_value = completed(0, stdout="qiaokairos is waiting\n")
+        run.return_value = completed(
+            0,
+            stdout="旧版 standalone 客户端占用兼容锁；等待它退出后自动连接…\n",
+        )
         bridge = FakeBridge(ready=False)
         handler = self.handler(bridge)
 
@@ -440,7 +443,7 @@ class HandlerRoutingTest(unittest.TestCase):
         status, payload = handler.responses[-1]
         self.assertEqual(status, 200)
         self.assertEqual(payload["state"], "waiting")
-        self.assertEqual(payload["content"], "qiaokairos is waiting\n")
+        self.assertIn("等待它退出后自动连接", payload["content"])
         self.assertEqual(bridge.state_calls, [None, "%42"])
 
     @mock.patch("push.subprocess.run")
@@ -599,7 +602,7 @@ class HandlerRoutingTest(unittest.TestCase):
         self.assertEqual(bridge.release_calls, 0)
 
     @mock.patch("push.subprocess.run")
-    def test_blank_waiting_capture_returns_read_only_fallback(self, run: mock.Mock) -> None:
+    def test_blank_unready_capture_reports_connection_startup(self, run: mock.Mock) -> None:
         run.return_value = completed(0, stdout="\n")
         bridge = FakeBridge(ready=False)
         handler = self.handler(bridge)
@@ -608,9 +611,22 @@ class HandlerRoutingTest(unittest.TestCase):
 
         status, payload = handler.responses[-1]
         self.assertEqual(status, 200)
-        self.assertEqual(payload["state"], "waiting")
-        self.assertIn("只读", payload["content"])
+        self.assertEqual(payload["state"], "starting")
+        self.assertIn("正在连接 Kairos 当前 session", payload["content"])
         self.assertTrue(payload["content"].strip())
+
+    @mock.patch("push.subprocess.run")
+    def test_printed_startup_line_is_not_misreported_as_reply(self, run: mock.Mock) -> None:
+        run.return_value = completed(0, stdout="正在连接 Kairos 当前 session…\n")
+        bridge = FakeBridge(ready=False)
+        handler = self.handler(bridge)
+
+        handler._handle_tmux_capture()
+
+        status, payload = handler.responses[-1]
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["state"], "starting")
+        self.assertIn("正在连接 Kairos 当前 session", payload["content"])
 
     @mock.patch("push.subprocess.run")
     def test_unavailable_kairos_never_falls_through_to_xiaoke(self, run: mock.Mock) -> None:

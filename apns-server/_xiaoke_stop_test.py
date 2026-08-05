@@ -943,6 +943,35 @@ class XiaokeStopTest(unittest.TestCase):
         self.assertEqual(payload["session_id"], "cctg")
         self.assertEqual(payload["metadata"]["xiaoke_turn_token"], token)
 
+    def test_repository_stop_hook_turns_exact_xhs_marker_into_metadata(self) -> None:
+        token = "a" * 32
+        payload = self.run_repository_stop_hook([
+            self.user_record(f"[CCC_APP_TURN:{token}:cctg]\nlogin"),
+            self.assistant_record("请登录。\n[[CCC_XHS_LOGIN_CARD:v1]]"),
+        ], "请登录。\n[[CCC_XHS_LOGIN_CARD:v1]]")
+        self.assertEqual(payload["text"], "请登录。")
+        self.assertTrue(payload["metadata"]["xhs_login_card"])
+        self.assertNotIn("CCC_XHS_LOGIN_CARD", payload["text"])
+
+    def test_repository_stop_hook_marker_only_keeps_visible_card_label(self) -> None:
+        token = "a" * 32
+        payload = self.run_repository_stop_hook([
+            self.user_record(f"[CCC_APP_TURN:{token}:cctg]\nlogin"),
+            self.assistant_record("[[CCC_XHS_LOGIN_CARD:v1]]"),
+        ], "[[CCC_XHS_LOGIN_CARD:v1]]")
+        self.assertEqual(payload["text"], "小红书登录已失效，点下方卡片重新登录。")
+        self.assertTrue(payload["metadata"]["xhs_login_card"])
+
+    def test_repository_stop_hook_does_not_trigger_on_inline_xhs_marker(self) -> None:
+        token = "a" * 32
+        text = "示例：[[CCC_XHS_LOGIN_CARD:v1]]"
+        payload = self.run_repository_stop_hook([
+            self.user_record(f"[CCC_APP_TURN:{token}:cctg]\nexample"),
+            self.assistant_record(text),
+        ], text)
+        self.assertEqual(payload["text"], text)
+        self.assertNotIn("xhs_login_card", payload["metadata"])
+
     def test_delayed_old_hook_never_borrows_newer_turn_marker(self) -> None:
         old_token = "a" * 32
         new_token = "b" * 32

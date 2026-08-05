@@ -14,6 +14,9 @@ import subprocess
 import threading
 import time
 from typing import Any, Callable, Sequence
+import uuid
+
+from websockets.sync.client import unix_connect
 
 try:
     import fcntl
@@ -100,6 +103,10 @@ class _TransportError(CodexAppBridgeError):
     pass
 
 
+class _RecoveryCancelled(CodexAppBridgeError):
+    pass
+
+
 @dataclass(frozen=True)
 class CodexTokenUsageBreakdown:
     input_tokens: int
@@ -182,6 +189,7 @@ class _ActiveTurn:
     token_usage: CodexThreadTokenUsage | None = None
     context_compacted: bool = False
     connection_lost: bool = False
+    connection_generation: int | None = None
     interrupt_requested: bool = False
     interrupt_sent: bool = False
     agent_deltas: OrderedDict[str, str] = field(default_factory=OrderedDict)
@@ -285,7 +293,13 @@ def prompt_lock_is_busy(session_id: str | None, cwd: Path) -> bool:
 
 
 class CodexAppBridge:
-    """Own one long-lived ``codex app-server --listen stdio://`` child."""
+    """Keep one client connection to Codex's shared app-server daemon.
+
+    Production uses the official local Unix/WebSocket control socket so Remote,
+    the Codex TUI, and CcCompanion all submit through one app-server process.
+    ``command`` remains an explicit stdio transport override for tests and
+    emergency rollback.
+    """
 
     def __init__(
         self,
@@ -297,10 +311,25 @@ class CodexAppBridge:
         request_timeout_sec: float = 30.0,
         interrupt_grace_sec: float = 10.0,
         model_auto_compact_token_limit: int | None = None,
+        daemon_socket_path: str | None = None,
+        daemon_autostart: bool = True,
+        daemon_recovery_timeout_sec: float = 90.0,
+        daemon_start_timeout_sec: float = 20.0,
+        daemon_connect_retry_sec: float = 0.25,
+        pre_submit_reconnect_attempts: int = 2,
     ) -> None:
         self.codex_bin = codex_bin
         self.codex_home = str(Path(codex_home).expanduser())
         self.command = list(command) if command else None
+        self.daemon_socket_path = Path(
+            daemon_socket_path
+            or (Path(self.codex_home) / "app-server-control" / "app-server-control.sock")
+        ).expanduser()
+        self.daemon_autostart = bool(daemon_autostart)
+        self.daemon_recovery_timeout_sec = max(0.05, float(daemon_recovery_timeout_sec))
+        self.daemon_start_timeout_sec = max(0.05, float(daemon_start_timeout_sec))
+        self.daemon_connect_retry_sec = max(0.01, float(daemon_connect_retry_sec))
+        self.pre_submit_reconnect_attempts = max(0, int(pre_submit_reconnect_attempts))
         self.log = logger or logging.getLogger(__name__)
         self.request_timeout_sec = request_timeout_sec
         self.interrupt_grace_sec = max(0.1, float(interrupt_grace_sec))
@@ -318,6 +347,7 @@ class CodexAppBridge:
         self._pending: dict[int, _PendingRequest] = {}
         self._next_request_id = 1
         self._process: subprocess.Popen[str] | None = None
+        self._websocket: Any = None
         self._reader: threading.Thread | None = None
         self._generation = 0
         self._initialized = False
@@ -325,8 +355,11 @@ class CodexAppBridge:
         self._active: _ActiveTurn | None = None
         self._last_markers: dict[str, tuple[str, int, int] | None] = {}
         self._marker_baselines: set[str] = set()
+        self._closing = threading.Event()
 
     def close(self) -> None:
+        # Wake an in-flight daemon recovery before waiting for its connect lock.
+        self._closing.set()
         self.interrupt_active(timeout=1.0)
         with self._connect_lock:
             self._close_process_locked()
@@ -480,12 +513,20 @@ class CodexAppBridge:
         active: _ActiveTurn | None = None
         resolved_thread_id = initial_thread_id
         try:
-            initial_lock = _PromptProcessLock(initial_thread_id, cwd)
-            if not initial_lock.acquire():
-                raise CodexPromptLockBusy()
-            locks.append(initial_lock)
+            # The official daemon is the single writer for Remote, TUI, and
+            # CcCompanion.  The legacy flock is retained only for the explicit
+            # stdio transport, which can still coexist with older CodexRunner
+            # callers during rollback.
+            if self.command is not None:
+                initial_lock = _PromptProcessLock(initial_thread_id, cwd)
+                if not initial_lock.acquire():
+                    raise CodexPromptLockBusy()
+                locks.append(initial_lock)
 
-            if self._rollout_changed(initial_thread_id, marker_provider):
+            if self.command is not None and self._rollout_changed(
+                initial_thread_id,
+                marker_provider,
+            ):
                 self.log.info("Codex rollout changed outside app-server; reloading thread")
                 with self._connect_lock:
                     self._close_process_locked()
@@ -502,14 +543,24 @@ class CodexAppBridge:
             if cancel_event is not None and cancel_event.is_set():
                 return self._interrupted_before_start(active)
 
+            recovery_deadline = time.monotonic() + self.daemon_recovery_timeout_sec
+            cancel_requested = lambda: (
+                self._closing.is_set()
+                or active.interrupt_requested
+                or (cancel_event is not None and cancel_event.is_set())
+            )
             try:
-                self._ensure_connected(cwd)
-                resolved_thread_id, prior_turns = self._prepare_thread(
+                resolved_thread_id, prior_turns = self._prepare_thread_resilient(
                     initial_thread_id,
                     cwd=cwd,
                     model=model,
                     effort=effort,
+                    active=active,
+                    recovery_deadline=recovery_deadline,
+                    cancel_requested=cancel_requested,
                 )
+            except _RecoveryCancelled:
+                return self._interrupted_before_start(active)
             except CodexAppBridgeError as exc:
                 raise CodexAppBridgeError(
                     str(exc),
@@ -517,7 +568,7 @@ class CodexAppBridge:
                     thread_id=initial_thread_id,
                 ) from exc
 
-            if resolved_thread_id != initial_thread_id:
+            if self.command is not None and resolved_thread_id != initial_thread_id:
                 thread_lock = _PromptProcessLock(resolved_thread_id, cwd)
                 if not thread_lock.acquire():
                     raise CodexPromptLockBusy()
@@ -546,9 +597,15 @@ class CodexAppBridge:
                 "type": "localImage",
                 "path": str(Path(path).expanduser().resolve()),
             } for path in image_paths)
+            client_user_message_id = str(uuid.uuid4())
+            steer_turn = next(
+                (turn for turn in prior_turns if self._turn_is_in_progress(turn)),
+                None,
+            ) if self.command is None else None
             params = {
                 "threadId": resolved_thread_id,
                 "input": input_items,
+                "clientUserMessageId": client_user_message_id,
                 "cwd": str(cwd),
                 "model": model,
                 "effort": effort,
@@ -559,21 +616,79 @@ class CodexAppBridge:
                 active.phase = "starting"
             self._record_observer_event(active, "正在启动本轮处理", key="phase:starting")
             try:
-                start_result = self._rpc_request("turn/start", params)
+                if steer_turn is not None:
+                    expected_turn_id = str(steer_turn.get("id") or "").strip()
+                    if not expected_turn_id:
+                        raise CodexPromptLockBusy()
+                    # Use the protocol's active-turn precondition so input from
+                    # Android joins the exact turn observed by thread/resume;
+                    # it can never be steered into a different racing turn.
+                    active.turn_id = expected_turn_id
+                    steer_result = self._rpc_request("turn/steer", {
+                        "threadId": resolved_thread_id,
+                        "input": input_items,
+                        "expectedTurnId": expected_turn_id,
+                        "clientUserMessageId": client_user_message_id,
+                    }, cancel_requested=cancel_requested)
+                    returned_turn_id = str(
+                        steer_result.get("turnId") if isinstance(steer_result, dict) else ""
+                    ).strip()
+                    if returned_turn_id != expected_turn_id:
+                        return self._uncertain_result(
+                            active,
+                            "turn/steer returned an unexpected turn id",
+                        )
+                    start_result = {
+                        "turn": {
+                            "id": returned_turn_id,
+                            "status": str(steer_turn.get("status") or "inProgress"),
+                            "items": [],
+                        }
+                    }
+                else:
+                    # If another official client starts a normal turn after the
+                    # snapshot, turn/start applies Codex's canonical same-turn
+                    # steering behavior. Non-steerable turns are retried below.
+                    start_result = self._rpc_request(
+                        "turn/start",
+                        params,
+                        cancel_requested=cancel_requested,
+                    )
             except _RPCError as exc:
+                if self.command is None and self._rpc_error_is_active_turn(exc):
+                    # Review/compact turns reject steering. Keep the Android
+                    # message queued until the daemon accepts it safely.
+                    raise CodexPromptLockBusy() from exc
                 raise CodexAppBridgeError(
                     str(exc),
                     fallback_safe=True,
                     thread_id=resolved_thread_id,
                 ) from exc
-            except CodexAppBridgeError:
-                if not self._reconnect_and_reconcile(
-                    active,
-                    prior_turn_ids=prior_turn_ids,
-                    cwd=cwd,
-                    model=model,
-                    effort=effort,
-                ):
+            except CodexAppBridgeError as exc:
+                if isinstance(exc, _RecoveryCancelled) and active.turn_id:
+                    # turn/steer has an exact pre-existing turn id even when
+                    # its response never arrives. A plain cancel_event must
+                    # stop that known turn before the UI returns uncertain.
+                    # turn/start has no id here and is deliberately not
+                    # interrupted by guesswork.
+                    self.interrupt_active(timeout=min(0.5, self.request_timeout_sec))
+                try:
+                    reconciled = self._reconnect_and_reconcile(
+                        active,
+                        prior_turn_ids=prior_turn_ids,
+                        cwd=cwd,
+                        model=model,
+                        effort=effort,
+                        required_client_user_message_id=client_user_message_id,
+                        recovery_deadline=recovery_deadline,
+                        cancel_requested=cancel_requested,
+                    )
+                except _RecoveryCancelled:
+                    return self._uncertain_result(
+                        active,
+                        "turn/start acceptance is uncertain after cancellation",
+                    )
+                if not reconciled:
                     return self._uncertain_result(active, "turn/start acceptance is uncertain")
             else:
                 turn = start_result.get("turn") if isinstance(start_result, dict) else None
@@ -622,6 +737,69 @@ class CodexAppBridge:
             for process_lock in reversed(locks):
                 process_lock.release()
             self._turn_gate.release()
+
+    def _prepare_thread_resilient(
+        self,
+        thread_id: str | None,
+        *,
+        cwd: Path,
+        model: str,
+        effort: str,
+        active: _ActiveTurn | None = None,
+        recovery_deadline: float | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Reconnect only before any user input can have been submitted.
+
+        ``thread/resume`` is read/attach-like and retrying ``thread/start`` can
+        at worst leave an empty thread. Neither path executes the user prompt.
+        Once ``turn/start`` or ``turn/steer`` is written, run_turn switches to
+        exact clientUserMessageId reconciliation and never blindly resubmits.
+        """
+        deadline = (
+            recovery_deadline
+            if recovery_deadline is not None
+            else time.monotonic() + self.daemon_recovery_timeout_sec
+        )
+        attempts = 1 if self.command is not None else self.pre_submit_reconnect_attempts + 1
+        last_error: _TransportError | None = None
+        for attempt in range(attempts):
+            self._raise_if_recovery_cancelled(cancel_requested)
+            if time.monotonic() >= deadline:
+                raise _TransportError(
+                    "unable to recover shared Codex app-server daemon before timeout",
+                    fallback_safe=True,
+                ) from last_error
+            try:
+                self._ensure_connected(
+                    cwd,
+                    recovery_deadline=deadline,
+                    cancel_requested=cancel_requested,
+                )
+                prepared = self._prepare_thread(
+                    thread_id,
+                    cwd=cwd,
+                    model=model,
+                    effort=effort,
+                    timeout=max(0.01, deadline - time.monotonic()),
+                    cancel_requested=cancel_requested,
+                )
+                self._mark_active_connection_ready(active)
+                return prepared
+            except _TransportError as exc:
+                last_error = exc
+                if attempt + 1 >= attempts:
+                    raise
+                self.log.warning(
+                    "Codex app-server disconnected before prompt submission; "
+                    "reconnecting (%d/%d)",
+                    attempt + 1,
+                    attempts - 1,
+                )
+                with self._connect_lock:
+                    self._close_process_locked()
+        assert last_error is not None
+        raise last_error
 
     def _wait_for_turn(
         self,
@@ -683,14 +861,29 @@ class CodexAppBridge:
                     return self._uncertain_result(active, "app-server disconnected twice")
                 reconnected = True
                 prior = {active.turn_id} if active.turn_id else set()
-                if not self._reconnect_and_reconcile(
-                    active,
-                    prior_turn_ids=prior,
-                    cwd=cwd,
-                    model=model,
-                    effort=effort,
-                    require_known_turn=True,
-                ):
+                recovery_deadline = time.monotonic() + self.daemon_recovery_timeout_sec
+                recovery_cancel_requested = lambda: (
+                    self._closing.is_set()
+                    or active.interrupt_requested
+                    or (cancel_event is not None and cancel_event.is_set())
+                )
+                try:
+                    reconciled = self._reconnect_and_reconcile(
+                        active,
+                        prior_turn_ids=prior,
+                        cwd=cwd,
+                        model=model,
+                        effort=effort,
+                        require_known_turn=True,
+                        recovery_deadline=recovery_deadline,
+                        cancel_requested=recovery_cancel_requested,
+                    )
+                except _RecoveryCancelled:
+                    return self._uncertain_result(
+                        active,
+                        "active turn recovery cancelled",
+                    )
+                if not reconciled:
                     return self._uncertain_result(active, "active turn could not be reconciled")
 
     def _reconnect_and_reconcile(
@@ -702,6 +895,9 @@ class CodexAppBridge:
         model: str,
         effort: str,
         require_known_turn: bool = False,
+        required_client_user_message_id: str | None = None,
+        recovery_deadline: float | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> bool:
         thread_id = active.thread_id
         if not thread_id:
@@ -709,20 +905,39 @@ class CodexAppBridge:
         try:
             with self._connect_lock:
                 self._close_process_locked()
-            self._ensure_connected(cwd)
-            resumed_id, turns = self._prepare_thread(
+            resumed_id, turns = self._prepare_thread_resilient(
                 thread_id,
                 cwd=cwd,
                 model=model,
                 effort=effort,
+                active=active,
+                recovery_deadline=recovery_deadline,
+                cancel_requested=cancel_requested,
             )
+        except _RecoveryCancelled:
+            raise
         except CodexAppBridgeError:
             return False
         if resumed_id != thread_id:
             return False
 
         target: dict[str, Any] | None = None
-        if active.turn_id:
+        if required_client_user_message_id:
+            candidates = [
+                turn for turn in turns
+                if self._turn_contains_client_message(
+                    turn,
+                    required_client_user_message_id,
+                )
+            ]
+            if active.turn_id:
+                candidates = [
+                    turn for turn in candidates
+                    if str(turn.get("id") or "") == active.turn_id
+                ]
+            if len(candidates) == 1:
+                target = candidates[0]
+        elif active.turn_id:
             target = next((turn for turn in turns if turn.get("id") == active.turn_id), None)
         elif not require_known_turn:
             candidates = [turn for turn in turns if str(turn.get("id") or "") not in prior_turn_ids]
@@ -735,6 +950,30 @@ class CodexAppBridge:
         self._apply_turn_snapshot(active, target)
         return True
 
+    def _mark_active_connection_ready(self, active: _ActiveTurn | None) -> None:
+        if active is None:
+            return
+        with self._state_lock:
+            if self._active is not active:
+                return
+            generation = self._generation
+        with active.condition:
+            active.connection_generation = generation
+            active.connection_lost = False
+            active.condition.notify_all()
+
+    @staticmethod
+    def _turn_contains_client_message(
+        turn: dict[str, Any],
+        client_user_message_id: str,
+    ) -> bool:
+        return any(
+            isinstance(item, dict)
+            and item.get("type") == "userMessage"
+            and str(item.get("clientId") or "") == client_user_message_id
+            for item in (turn.get("items") or [])
+        )
+
     def _prepare_thread(
         self,
         thread_id: str | None,
@@ -742,6 +981,8 @@ class CodexAppBridge:
         cwd: Path,
         model: str,
         effort: str,
+        timeout: float | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
         thread_config: dict[str, Any] = {"model_reasoning_effort": effort}
         if self.model_auto_compact_token_limit is not None:
@@ -755,10 +996,20 @@ class CodexAppBridge:
         }
         if thread_id:
             params = {"threadId": thread_id, **common}
-            result = self._rpc_request("thread/resume", params)
+            result = self._rpc_request(
+                "thread/resume",
+                params,
+                timeout=timeout,
+                cancel_requested=cancel_requested,
+            )
         else:
             params = {**common, "ephemeral": False}
-            result = self._rpc_request("thread/start", params)
+            result = self._rpc_request(
+                "thread/start",
+                params,
+                timeout=timeout,
+                cancel_requested=cancel_requested,
+            )
         thread = result.get("thread") if isinstance(result, dict) else None
         resolved = str(thread.get("id") or "").strip() if isinstance(thread, dict) else ""
         if not resolved:
@@ -766,6 +1017,32 @@ class CodexAppBridge:
         turns = thread.get("turns") if isinstance(thread, dict) else []
         turn_list = [turn for turn in (turns or []) if isinstance(turn, dict)]
         return resolved, turn_list
+
+    @staticmethod
+    def _turn_is_in_progress(turn: dict[str, Any]) -> bool:
+        status = str(turn.get("status") or "").strip().lower().replace("_", "")
+        return status in {"inprogress", "running", "starting", "pending"}
+
+    @staticmethod
+    def _rpc_error_is_active_turn(error: _RPCError) -> bool:
+        try:
+            payload = json.dumps(error.error, ensure_ascii=False, sort_keys=True).lower()
+        except Exception:
+            payload = str(error.error).lower()
+        return any(marker in payload for marker in (
+            "active turn",
+            "active_turn",
+            "turn in progress",
+            "turn_in_progress",
+            "already running",
+            "thread is busy",
+            "thread_busy",
+            "activeturnnotsteerable",
+            "active_turn_not_steerable",
+            "expectedturnid",
+            "expected_turn_id",
+            "expected turn",
+        ))
 
     def _rollout_changed(
         self,
@@ -799,16 +1076,46 @@ class CodexAppBridge:
             return None
         return str(marker[0]), int(marker[1]), int(marker[2])
 
-    def _ensure_connected(self, cwd: Path) -> None:
+    def _ensure_connected(
+        self,
+        cwd: Path,
+        *,
+        recovery_deadline: float | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> None:
+        self._raise_if_recovery_cancelled(cancel_requested)
         with self._connect_lock:
+            self._raise_if_recovery_cancelled(cancel_requested)
             process = self._process
-            if self._initialized and process is not None and process.poll() is None:
+            if self._initialized and (
+                self._websocket is not None
+                or (process is not None and process.poll() is None)
+            ):
                 return
             self._close_process_locked()
-            self._start_process_locked(cwd)
+            self._start_process_locked(
+                cwd,
+                recovery_deadline=recovery_deadline,
+                cancel_requested=cancel_requested,
+            )
 
-    def _start_process_locked(self, cwd: Path) -> None:
-        command = self.command or [self.codex_bin, "app-server", "--listen", "stdio://"]
+    def _start_process_locked(
+        self,
+        cwd: Path,
+        *,
+        recovery_deadline: float | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> None:
+        if self.command is None:
+            self._start_daemon_connection_locked(
+                cwd,
+                recovery_deadline=recovery_deadline,
+                cancel_requested=cancel_requested,
+            )
+            return
+
+        self._raise_if_recovery_cancelled(cancel_requested)
+        command = self.command
         env = os.environ.copy()
         env["CODEX_HOME"] = self.codex_home
         try:
@@ -840,14 +1147,18 @@ class CodexAppBridge:
         self._reader = reader
         reader.start()
         try:
-            self._rpc_request("initialize", {
-                "clientInfo": {
-                    "name": "cc-companion-kairos",
-                    "title": "CcCompanion Kairos",
-                    "version": "1",
+            self._rpc_request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "cc-companion-kairos",
+                        "title": "CcCompanion Kairos",
+                        "version": "1",
+                    },
+                    "capabilities": {"experimentalApi": True},
                 },
-                "capabilities": {"experimentalApi": True},
-            })
+                cancel_requested=cancel_requested,
+            )
             self._rpc_notify("initialized", {})
         except Exception:
             self._close_process_locked()
@@ -855,43 +1166,281 @@ class CodexAppBridge:
         self._initialized = True
         self.log.info("Codex app-server bridge initialized pid=%s", process.pid)
 
-    def _close_process_locked(self) -> None:
-        process = self._process
-        reader = self._reader
-        self._process = None
-        self._reader = None
-        self._initialized = False
-        self._connection_error = None
-        if process is None:
-            return
-        process_group_id = process.pid
-        if process.poll() is None:
+    def _start_daemon_connection_locked(
+        self,
+        cwd: Path,
+        *,
+        recovery_deadline: float | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> None:
+        env = os.environ.copy()
+        env["CODEX_HOME"] = self.codex_home
+        deadline = (
+            recovery_deadline
+            if recovery_deadline is not None
+            else time.monotonic() + self.daemon_recovery_timeout_sec
+        )
+
+        def connect() -> Any:
+            # Codex's Unix listener currently doesn't negotiate
+            # permessage-deflate; websockets enables it by default.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("daemon recovery deadline expired")
+            return unix_connect(
+                path=str(self.daemon_socket_path),
+                uri="ws://localhost/",
+                compression=None,
+                # The listener is local. Keep the handshake slice short so a
+                # half-open socket cannot make cancel/close wait for seconds;
+                # the outer recovery loop can safely try again.
+                open_timeout=max(0.01, min(0.25, self.request_timeout_sec, remaining)),
+                close_timeout=1.0,
+            )
+
+        first_error: BaseException | None = None
+        last_error: BaseException | None = None
+        websocket: Any = None
+        while websocket is None:
+            self._raise_if_recovery_cancelled(cancel_requested)
+            if time.monotonic() >= deadline:
+                break
             try:
-                os.killpg(process_group_id, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                process.terminate()
+                websocket = connect()
+                break
+            except Exception as exc:
+                first_error = first_error or exc
+                last_error = exc
+            if not self.daemon_autostart:
+                raise _TransportError(
+                    "unable to connect to shared Codex app-server daemon",
+                    fallback_safe=True,
+                ) from first_error
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             try:
-                process.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                pass
+                # A concurrent `daemon restart` may hold Codex's startup lock
+                # while its old PID is settling. The command can time out even
+                # though the lock becomes usable moments later, so failure here
+                # is not terminal; reconnect and retry until the bounded
+                # recovery deadline.
+                self._run_daemon_start_interruptible(
+                    [self.codex_bin, "remote-control", "start", "--json"],
+                    cwd=str(cwd),
+                    env=env,
+                    deadline=min(deadline, time.monotonic() + self.daemon_start_timeout_sec),
+                    cancel_requested=cancel_requested,
+                )
+            except Exception as exc:
+                if isinstance(exc, _RecoveryCancelled):
+                    raise
+                last_error = exc
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                self._interruptible_recovery_wait(
+                    min(self.daemon_connect_retry_sec, remaining),
+                    cancel_requested,
+                )
+        if websocket is None:
+            raise _TransportError(
+                "unable to recover shared Codex app-server daemon before timeout",
+                fallback_safe=True,
+            ) from (last_error or first_error)
+
         try:
-            os.killpg(process_group_id, signal.SIGKILL)
+            self._raise_if_recovery_cancelled(cancel_requested)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _TransportError(
+                    "unable to recover shared Codex app-server daemon before timeout",
+                    fallback_safe=True,
+                )
+        except Exception:
+            try:
+                websocket.close()
+            except Exception:
+                pass
+            raise
+        self._generation += 1
+        generation = self._generation
+        self._websocket = websocket
+        self._connection_error = None
+        self._initialized = False
+        reader = threading.Thread(
+            target=self._websocket_reader_loop,
+            args=(websocket, generation),
+            name="codex-app-server-daemon-reader",
+            daemon=True,
+        )
+        self._reader = reader
+        reader.start()
+        try:
+            self._initialize_connection(
+                timeout=max(0.01, min(self.request_timeout_sec, remaining)),
+                cancel_requested=cancel_requested,
+            )
+        except Exception:
+            self._close_process_locked()
+            raise
+        self._initialized = True
+        self.log.info("Codex app-server bridge connected to shared daemon")
+
+    def _run_daemon_start_interruptible(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: str,
+        env: dict[str, str],
+        deadline: float,
+        cancel_requested: Callable[[], bool] | None,
+    ) -> None:
+        process = subprocess.Popen(
+            list(command),
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            while True:
+                self._raise_if_recovery_cancelled(cancel_requested)
+                return_code = process.poll()
+                if return_code is not None:
+                    if return_code != 0:
+                        raise subprocess.CalledProcessError(return_code, list(command))
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(list(command), self.daemon_start_timeout_sec)
+                self._interruptible_recovery_wait(min(0.05, remaining), cancel_requested)
+        except BaseException:
+            self._terminate_helper_process(process)
+            raise
+        finally:
+            if process.poll() is not None:
+                try:
+                    process.wait(timeout=0)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _terminate_helper_process(process: subprocess.Popen[Any]) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                return
+        try:
+            process.wait(timeout=0.2)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             if process.poll() is None:
                 process.kill()
-        if process.poll() is None:
-            process.wait(timeout=2.0)
+        try:
+            process.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def _interruptible_recovery_wait(
+        self,
+        delay: float,
+        cancel_requested: Callable[[], bool] | None,
+    ) -> None:
+        deadline = time.monotonic() + max(0.0, delay)
+        while True:
+            self._raise_if_recovery_cancelled(cancel_requested)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            self._closing.wait(timeout=min(0.05, remaining))
+
+    def _raise_if_recovery_cancelled(
+        self,
+        cancel_requested: Callable[[], bool] | None,
+    ) -> None:
+        if self._closing.is_set() or (
+            cancel_requested is not None and cancel_requested()
+        ):
+            raise _RecoveryCancelled("Codex daemon recovery cancelled", fallback_safe=True)
+
+    def _initialize_connection(
+        self,
+        *,
+        timeout: float | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> None:
+        self._rpc_request("initialize", {
+            "clientInfo": {
+                "name": "cc-companion-kairos",
+                "title": "CcCompanion Kairos",
+                "version": "1",
+            },
+            "capabilities": {"experimentalApi": True},
+        }, timeout=timeout, cancel_requested=cancel_requested)
+        self._rpc_notify("initialized", {})
+
+    def _close_process_locked(self) -> None:
+        process = self._process
+        websocket = self._websocket
+        reader = self._reader
+        self._process = None
+        self._websocket = None
+        self._reader = None
+        self._initialized = False
+        self._connection_error = None
+        if websocket is not None:
+            try:
+                websocket.close()
+            except Exception:
+                pass
+        if process is not None:
+            process_group_id = process.pid
+            if process.poll() is None:
+                try:
+                    os.killpg(process_group_id, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    process.terminate()
+                try:
+                    process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    pass
+            try:
+                os.killpg(process_group_id, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                if process.poll() is None:
+                    process.kill()
+            if process.poll() is None:
+                process.wait(timeout=2.0)
         if reader is not None and reader is not threading.current_thread():
             reader.join(timeout=0.5)
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is not None:
-                try:
-                    stream.close()
-                except Exception:
-                    pass
+        if process is not None:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
         self._fail_pending(_TransportError("app-server connection closed"))
 
-    def _rpc_request(self, method: str, params: dict[str, Any], *, timeout: float | None = None) -> Any:
+    def _rpc_request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout: float | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> Any:
         with self._pending_lock:
             request_id = self._next_request_id
             self._next_request_id += 1
@@ -903,10 +1452,21 @@ class CodexAppBridge:
             with self._pending_lock:
                 self._pending.pop(request_id, None)
             raise _TransportError(f"failed to send {method}") from exc
-        if not pending.event.wait(timeout if timeout is not None else self.request_timeout_sec):
-            with self._pending_lock:
-                self._pending.pop(request_id, None)
-            raise _TransportError(f"timed out waiting for {method}")
+        wait_timeout = timeout if timeout is not None else self.request_timeout_sec
+        deadline = time.monotonic() + max(0.0, wait_timeout)
+        while not pending.event.is_set():
+            try:
+                self._raise_if_recovery_cancelled(cancel_requested)
+            except _RecoveryCancelled:
+                with self._pending_lock:
+                    self._pending.pop(request_id, None)
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                with self._pending_lock:
+                    self._pending.pop(request_id, None)
+                raise _TransportError(f"timed out waiting for {method}")
+            pending.event.wait(min(0.05, remaining))
         if pending.transport_error is not None:
             raise _TransportError(f"connection lost while waiting for {method}") from pending.transport_error
         if pending.error is not None:
@@ -922,6 +1482,13 @@ class CodexAppBridge:
     def _write_json(self, message: dict[str, Any]) -> None:
         encoded = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
         with self._write_lock:
+            websocket = self._websocket
+            if websocket is not None:
+                try:
+                    websocket.send(encoded)
+                except Exception as exc:
+                    raise _TransportError("app-server daemon is not connected") from exc
+                return
             process = self._process
             if process is None or process.poll() is not None or process.stdin is None:
                 raise _TransportError("app-server is not connected")
@@ -945,19 +1512,52 @@ class CodexAppBridge:
         finally:
             self._reader_disconnected(process, generation)
 
-    def _reader_disconnected(self, process: subprocess.Popen[str], generation: int) -> None:
+    def _websocket_reader_loop(self, websocket: Any, generation: int) -> None:
+        try:
+            while True:
+                raw = websocket.recv()
+                if raw is None:
+                    break
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="replace")
+                if not isinstance(raw, str):
+                    self.log.warning("Codex app-server emitted a non-text WebSocket frame")
+                    continue
+                try:
+                    message = json.loads(raw)
+                except Exception:
+                    self.log.warning("Codex app-server emitted invalid JSON")
+                    continue
+                if isinstance(message, dict):
+                    self._dispatch_message(message)
+        except Exception:
+            pass
+        finally:
+            self._reader_disconnected(websocket, generation)
+
+    def _reader_disconnected(self, connection: Any, generation: int) -> None:
         with self._state_lock:
-            if self._process is not process or self._generation != generation:
+            if (
+                self._generation != generation
+                or (self._process is not connection and self._websocket is not connection)
+            ):
                 return
-            error = _TransportError("Codex app-server stdio disconnected")
+            error = _TransportError("Codex app-server connection disconnected")
             self._connection_error = error
             self._initialized = False
             active = self._active
         self._fail_pending(error)
         if active is not None:
             with active.condition:
-                active.connection_lost = True
-                active.condition.notify_all()
+                # A delayed reader from an older generation must not poison a
+                # thread that has already prepared successfully on a new
+                # connection.
+                if (
+                    active.connection_generation is None
+                    or active.connection_generation == generation
+                ):
+                    active.connection_lost = True
+                    active.condition.notify_all()
         self.log.warning("Codex app-server bridge disconnected")
 
     def _fail_pending(self, error: BaseException) -> None:

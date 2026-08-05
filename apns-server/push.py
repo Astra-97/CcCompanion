@@ -118,6 +118,17 @@ from voice_protocol import (
     parse_voice_reply,
     sanitize_voice_metadata,
 )
+from health_records import (
+    PERIOD_RECORD_TYPES,
+    format_health_context_prompt,
+    normalize_health_context,
+    period_record_fields,
+    period_record_matches_date,
+    legacy_period_fields,
+    safe_timestamp,
+    validate_period_payload,
+    HealthRecordValidationError,
+)
 from xhs_login import XhsLoginError, XhsLoginManager
 from kimi_acp import (
     DEFAULT_KIMI_CWD,
@@ -6896,6 +6907,24 @@ class PushHandler(BaseHTTPRequestHandler):
         else:
             body["metadata"] = clean_user_metadata
         contact_id = self._contact_id_from_body(body)
+        # Health context is a private structured hint for XiaoKe only.  Strip
+        # it before dispatching any other contact so it cannot cross into
+        # Kairos/Kimi/apples/ai-custom history.
+        metadata_in = body.get("metadata") if isinstance(body.get("metadata"), dict) else None
+        if metadata_in is not None:
+            metadata_clean = dict(metadata_in)
+            if contact_id == "xiaoke":
+                normalized_health = normalize_health_context(metadata_clean.get("health_context"))
+                if normalized_health is None:
+                    metadata_clean.pop("health_context", None)
+                else:
+                    metadata_clean["health_context"] = normalized_health
+            else:
+                metadata_clean.pop("health_context", None)
+            if metadata_clean:
+                body["metadata"] = metadata_clean
+            else:
+                body.pop("metadata", None)
         if contact_id == "kairos":
             self._handle_kairos_chat_send(body, contact_id)
             return
@@ -6938,6 +6967,9 @@ class PushHandler(BaseHTTPRequestHandler):
         link_bundle = self._enrich_user_links(text)
         metadata = merge_preview_metadata(metadata, link_bundle)
         link_context = link_bundle.prompt_context
+        health_context_prompt = format_health_context_prompt(
+            metadata.get("health_context") if isinstance(metadata, dict) else None
+        )
         turn_token = secrets.token_hex(16)
         # Check and reserve under one lock before history append.  Concurrent
         # App sends therefore have a single winner, and Stop's in-flight
@@ -6982,7 +7014,9 @@ class PushHandler(BaseHTTPRequestHandler):
                 busy_reason=busy_reason,
                 metadata=metadata,
                 injection_text="\n\n".join(
-                    part for part in (text, link_context, voice_reply_instruction) if part
+                    part
+                    for part in (text, link_context, health_context_prompt, voice_reply_instruction)
+                    if part
                 ),
             )
             return
@@ -7035,6 +7069,8 @@ class PushHandler(BaseHTTPRequestHandler):
                     injected = f"{injected}\n{text}"
         if link_context:
             injected = f"{injected}\n\n{link_context}"
+        if health_context_prompt:
+            injected = f"{injected}\n\n{health_context_prompt}"
         if voice_reply_instruction:
             injected = f"{injected}\n\n{voice_reply_instruction}"
         # App-originated XiaoKe text turns deliberately bypass the development
@@ -11805,17 +11841,106 @@ class PushHandler(BaseHTTPRequestHandler):
         tmp.replace(path)
 
     def _health_records_cleanup(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Remove records older than 30 days."""
+        """Remove short-lived glucose/food records, retaining cycle history."""
         cutoff_ms = (time.time() - 30 * 86400) * 1000
-        return [r for r in records if r.get("timestamp", 0) > cutoff_ms]
+        return [
+            r
+            for r in records
+            if str(r.get("type") or "").strip().lower() in PERIOD_RECORD_TYPES
+            or r.get("timestamp", 0) > cutoff_ms
+        ]
 
     def _handle_health_records_post(self, body: dict[str, Any]):
-        """POST /health-records - add a health record (glucose or food)."""
+        """POST /health-records - add a health record.
+
+        The same authenticated endpoint is the AI/service write contract for
+        structured period data.  AI callers should send ``source``, ``actor``
+        and a stable ``client_record_id`` so retries are idempotent; this is
+        intentionally not coupled to chat/session memory.
+        """
         import uuid as _uuid
 
         record_type = str(body.get("type", "")).strip().lower()
-        if record_type not in ("glucose", "food"):
-            self._send_json(400, {"error": "type must be 'glucose' or 'food'"})
+        if record_type not in ("glucose", "food", *PERIOD_RECORD_TYPES):
+            self._send_json(400, {"error": "type must be 'glucose', 'food', 'period', or 'period_cycle'"})
+            return
+
+        if record_type in PERIOD_RECORD_TYPES:
+            # ``period`` was the original Android contract: it carried only
+            # value=dayNumber.  Translate that one legacy shape; every new
+            # period/period_cycle write still has to name start_date.
+            default_timestamp = int(
+                time.time() * 1000
+            )
+            try:
+                has_explicit_start = any(
+                    key in body or isinstance(body.get("period_cycle"), dict) and key in body["period_cycle"]
+                    for key in ("start_date", "startDate")
+                )
+                if record_type == "period" and not has_explicit_start:
+                    timestamp = safe_timestamp(body.get("timestamp"), default_timestamp)
+                    period_fields = legacy_period_fields(body, timestamp_ms=timestamp)
+                else:
+                    period_fields = validate_period_payload(body)
+            except HealthRecordValidationError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+
+            start_timestamp = int(
+                datetime.strptime(period_fields["start_date"], "%Y-%m-%d")
+                .replace(tzinfo=timezone.utc)
+                .timestamp()
+                * 1000
+            )
+            record: dict[str, Any] = {
+                "id": _uuid.uuid4().hex,
+                "type": record_type,
+                "timestamp": safe_timestamp(body.get("timestamp"), start_timestamp),
+                "created_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                **period_fields,
+            }
+            # Defaults are explicit so an AI write is auditable without
+            # inferring identity from the chat/session that happened to call it.
+            record["source"] = period_fields.get("source", "android")
+            record["actor"] = period_fields.get("actor", "user")
+
+            client_record_id = record.get("client_record_id")
+            if client_record_id:
+                try:
+                    with self._HEALTH_RECORDS_LOCK:
+                        records = self._health_records_cleanup(self._health_records_load())
+                        for existing in records:
+                            if existing.get("client_record_id") != client_record_id:
+                                continue
+                            if (
+                                str(existing.get("type") or "").lower() in PERIOD_RECORD_TYPES
+                                and period_record_fields(existing) == period_record_fields(record)
+                            ):
+                                self._send_json(200, {
+                                    "ok": True,
+                                    "record": existing,
+                                    "deduplicated": True,
+                                })
+                                return
+                            self._send_json(409, {"error": "client_record_id already belongs to another record"})
+                            return
+                        records.append(record)
+                        self._health_records_save(records)
+                except Exception as e:
+                    logger.exception("health period record post fail")
+                    self._send_json(500, {"error": str(e)})
+                    return
+            else:
+                try:
+                    with self._HEALTH_RECORDS_LOCK:
+                        records = self._health_records_cleanup(self._health_records_load())
+                        records.append(record)
+                        self._health_records_save(records)
+                except Exception as e:
+                    logger.exception("health period record post fail")
+                    self._send_json(500, {"error": str(e)})
+                    return
+            self._send_json(200, {"ok": True, "record": record})
             return
 
         record: dict[str, Any] = {
@@ -11873,15 +11998,44 @@ class PushHandler(BaseHTTPRequestHandler):
         try:
             with self._HEALTH_RECORDS_LOCK:
                 records = self._health_records_load()
-            # Filter records for the target date
+            # Keep legacy glucose/food date semantics, while a cycle can be
+            # relevant by explicit date fields as well as its legacy timestamp.
             day_records = []
+            period_records = []
             for r in records:
+                record_type = str(r.get("type") or "").strip().lower()
+                if record_type in PERIOD_RECORD_TYPES:
+                    period_records.append(r)
+                    if period_record_matches_date(r, target_date):
+                        day_records.append(r)
+                    else:
+                        # Old period rows only had value/timestamp.  Keep them
+                        # readable without pretending value is a cycle field.
+                        try:
+                            ts_ms = r.get("timestamp", 0)
+                            if ts_ms and datetime.fromtimestamp(
+                                ts_ms / 1000, tz=timezone.utc
+                            ).date() == target_date:
+                                day_records.append(r)
+                        except (TypeError, ValueError, OverflowError, OSError):
+                            pass
+                    continue
                 ts_ms = r.get("timestamp", 0)
                 if ts_ms:
-                    record_date = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).date()
+                    try:
+                        record_date = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).date()
+                    except (TypeError, ValueError, OverflowError, OSError):
+                        continue
                     if record_date == target_date:
                         day_records.append(r)
-            self._send_json(200, {"ok": True, "date": str(target_date), "records": day_records})
+            self._send_json(200, {
+                "ok": True,
+                "date": str(target_date),
+                "records": day_records,
+                # Additive field for clients that need the latest cycle even
+                # when its start date is not the currently selected day.
+                "period_records": period_records,
+            })
         except Exception as e:
             logger.exception("health records get fail")
             self._send_json(500, {"error": str(e)})

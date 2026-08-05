@@ -20,6 +20,7 @@ from typing import Any, Callable
 XHS_LOGIN_URL = "https://www.xiaohongshu.com/login"
 XHS_LOGIN_ORIGIN = "cccompanion-android-webview-v1"
 DEFAULT_TTL_SECONDS = 300
+DEFAULT_ALLOWED_CONTACTS = frozenset({"kairos"})
 MAX_COOKIE_HEADER_BYTES = 24_000
 MAX_COOKIE_VALUE_CHARS = 8_192
 MAX_PENDING_SESSIONS = 16
@@ -113,7 +114,9 @@ class XhsLoginManager:
             raise ValueError("xhs import command must be a fixed non-empty argv list")
         self.import_command = tuple(command)
         self.ttl_seconds = max(60, min(int(ttl_seconds), 600))
-        self.allowed_contacts = allowed_contacts or {"kairos"}
+        self.allowed_contacts = set(
+            DEFAULT_ALLOWED_CONTACTS if allowed_contacts is None else allowed_contacts
+        )
         self._runner = runner
         self._clock = clock
         self._pending: dict[str, PendingLogin] = {}

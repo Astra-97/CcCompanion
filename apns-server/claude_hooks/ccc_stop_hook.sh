@@ -247,8 +247,27 @@ if [ -z "$LAST_ASSISTANT" ]; then
     log "empty assistant text — posting signal-only beacon (session=$TURN_SESSION)"
 fi
 
+# XiaoKe can request Android's bounded XHS login card with one exact standalone
+# marker line. Near-matches remain ordinary visible text. Strip the internal
+# control line before history/push; a marker-only reply gets a useful label so
+# /chat/append does not mistake it for a signal-only completion beacon.
+XHS_LOGIN_CARD=0
+XHS_CARD_RESULT=$(printf '%s' "$LAST_ASSISTANT" | python3 -c '
+import sys
+marker = "[[CCC_XHS_LOGIN_CARD:v1]]"
+lines = sys.stdin.read().replace("\r\n", "\n").splitlines()
+found = any(line.strip() == marker for line in lines)
+visible = "\n".join(line for line in lines if line.strip() != marker).strip()
+if found and not visible:
+    visible = "小红书登录已失效，点下方卡片重新登录。"
+print("1" if found else "0")
+sys.stdout.write(visible)
+' 2>/dev/null)
+XHS_LOGIN_CARD=$(echo "$XHS_CARD_RESULT" | sed -n '1p')
+LAST_ASSISTANT=$(echo "$XHS_CARD_RESULT" | sed -n '2,$p')
+
 # POST 到 /chat/append
-PAYLOAD=$(ASSISTANT_TEXT="$LAST_ASSISTANT" TURN_TOKEN="$TURN_TOKEN" TURN_SESSION="$TURN_SESSION" python3 -c '
+PAYLOAD=$(ASSISTANT_TEXT="$LAST_ASSISTANT" XHS_LOGIN_CARD="$XHS_LOGIN_CARD" TURN_TOKEN="$TURN_TOKEN" TURN_SESSION="$TURN_SESSION" python3 -c '
 import json, os, datetime
 ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 payload = {
@@ -268,6 +287,8 @@ if session:
         "xiaoke_turn_token": token,
         "xiaoke_session_id": session,
     }
+if os.environ.get("XHS_LOGIN_CARD") == "1":
+    payload.setdefault("metadata", {})["xhs_login_card"] = True
 print(json.dumps(payload))
 ')
 

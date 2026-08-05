@@ -110,10 +110,53 @@ class XhsLoginManagerTests(unittest.TestCase):
         self.assertEqual(payload["id_token"], "id")
         self.assertEqual(payload["x-rednote-datactry"], "us")
 
+    def test_default_remains_kairos_only(self):
+        self.assertTrue(self.start()["ok"])
+        with self.assertRaises(XhsLoginError) as rejected:
+            self.manager.start(
+                contact_id="xiaoke", device_id=DEVICE, origin=XHS_LOGIN_ORIGIN
+            )
+        self.assertEqual(rejected.exception.code, "contact_rejected")
+
+    def test_explicit_allowlist_enables_kairos_and_xiaoke(self):
+        manager = XhsLoginManager(
+            import_command=["ssh", "memory-sg", "/fixed/import_cookies.py"],
+            allowed_contacts={"kairos", "xiaoke"},
+            runner=self.runner,
+            clock=lambda: self.now,
+        )
+        for contact in ("kairos", "xiaoke"):
+            result = manager.start(
+                contact_id=contact, device_id=DEVICE, origin=XHS_LOGIN_ORIGIN
+            )
+            self.assertTrue(result["ok"])
+
     def test_only_allowed_contact_and_origin_can_start(self):
-        for contact, origin in (("xiaoke", XHS_LOGIN_ORIGIN), ("kairos", "web")):
+        for contact, origin in (("mallory", XHS_LOGIN_ORIGIN), ("kairos", "web")):
             with self.assertRaises(XhsLoginError):
                 self.manager.start(contact_id=contact, device_id=DEVICE, origin=origin)
+
+    def test_explicit_empty_allowlist_denies_all_contacts(self):
+        manager = XhsLoginManager(
+            import_command=["ssh", "memory-sg", "/fixed/import_cookies.py"],
+            allowed_contacts=set(),
+            runner=self.runner,
+            clock=lambda: self.now,
+        )
+        for contact in ("kairos", "xiaoke"):
+            with self.assertRaises(XhsLoginError) as rejected:
+                manager.start(
+                    contact_id=contact,
+                    device_id=DEVICE,
+                    origin=XHS_LOGIN_ORIGIN,
+                )
+            self.assertEqual(rejected.exception.code, "contact_rejected")
+
+    def test_nonce_remains_bound_to_contact(self):
+        nonce = self.start()["nonce"]
+        with self.assertRaises(XhsLoginError) as mismatch:
+            self.import_once(nonce, contact_id="xiaoke")
+        self.assertEqual(mismatch.exception.code, "binding_mismatch")
 
     def test_http_body_limits_run_before_json_read(self):
         source = Path("push.py").read_text(encoding="utf-8")
