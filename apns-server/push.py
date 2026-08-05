@@ -121,6 +121,7 @@ from voice_protocol import (
 from health_records import (
     PERIOD_RECORD_TYPES,
     format_health_context_prompt,
+    is_explicit_health_share,
     normalize_health_context,
     period_record_fields,
     period_record_matches_date,
@@ -6910,12 +6911,19 @@ class PushHandler(BaseHTTPRequestHandler):
         # Health context is a private structured hint for XiaoKe only.  Strip
         # it before dispatching any other contact so it cannot cross into
         # Kairos/Kimi/apples/ai-custom history.
+        # 2026-08-05: the Android client stamps ``health_context`` onto every
+        # message, which taxed each ordinary turn with the period block.  Keep
+        # it only when this message *is* the health app's "发送给小克" share;
+        # ``/health-records`` storage is untouched.
         metadata_in = body.get("metadata") if isinstance(body.get("metadata"), dict) else None
         if metadata_in is not None:
             metadata_clean = dict(metadata_in)
             if contact_id == "xiaoke":
                 normalized_health = normalize_health_context(metadata_clean.get("health_context"))
-                if normalized_health is None:
+                shared = is_explicit_health_share(body.get("text"), metadata_clean)
+                if normalized_health is None or not shared:
+                    if normalized_health is not None:
+                        logger.info("health_context dropped: message is not an explicit health share")
                     metadata_clean.pop("health_context", None)
                 else:
                     metadata_clean["health_context"] = normalized_health
@@ -6967,9 +6975,12 @@ class PushHandler(BaseHTTPRequestHandler):
         link_bundle = self._enrich_user_links(text)
         metadata = merge_preview_metadata(metadata, link_bundle)
         link_context = link_bundle.prompt_context
-        health_context_prompt = format_health_context_prompt(
-            metadata.get("health_context") if isinstance(metadata, dict) else None
-        )
+        # Second gate: only an explicit health-app share may spend prompt
+        # budget on the period block, even if some other path re-attached
+        # health_context to this body's metadata.
+        health_context_prompt = ""
+        if isinstance(metadata, dict) and is_explicit_health_share(text, metadata):
+            health_context_prompt = format_health_context_prompt(metadata.get("health_context"))
         turn_token = secrets.token_hex(16)
         # Check and reserve under one lock before history append.  Concurrent
         # App sends therefore have a single winner, and Stop's in-flight

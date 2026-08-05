@@ -8,6 +8,7 @@ from unittest.mock import patch
 from health_records import (
     HealthRecordValidationError,
     format_health_context_prompt,
+    is_explicit_health_share,
     legacy_period_fields,
     normalize_health_context,
     period_record_matches_date,
@@ -103,6 +104,35 @@ class HealthRecordsTests(unittest.TestCase):
 
     def test_empty_health_context_is_not_injected(self):
         self.assertEqual(format_health_context_prompt({}), "")
+
+    def test_ordinary_chat_message_is_not_a_health_share(self):
+        context = {"schema": "period_cycle.v1", "record": {"start_date": "2026-07-28"}}
+        self.assertFalse(
+            is_explicit_health_share("那排骨明天中午能吃吗。。", {"health_context": context})
+        )
+        self.assertFalse(is_explicit_health_share("健康的排骨", {"health_context": context}))
+        self.assertFalse(is_explicit_health_share("", None))
+
+    def test_health_app_share_is_detected(self):
+        self.assertTrue(
+            is_explicit_health_share("健康数据 2026-08-05\n\n运动\n步数: 2,624", {})
+        )
+        self.assertTrue(is_explicit_health_share("健康数据：今天", None))
+
+    def test_client_share_flag_is_honoured(self):
+        self.assertTrue(is_explicit_health_share("在吗", {"health_share": True}))
+        self.assertTrue(is_explicit_health_share("在吗", {"health_share": "true"}))
+        self.assertTrue(is_explicit_health_share("在吗", {"via": "health_share"}))
+        self.assertTrue(
+            is_explicit_health_share("在吗", {"health_context": {"share": True}})
+        )
+        self.assertTrue(
+            is_explicit_health_share(
+                "在吗", {"health_context": {"source": "health_app_share"}}
+            )
+        )
+        self.assertFalse(is_explicit_health_share("在吗", {"health_share": False}))
+        self.assertFalse(is_explicit_health_share("在吗", {"via": "card"}))
 
 
 if __name__ == "__main__":

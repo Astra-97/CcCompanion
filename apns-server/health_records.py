@@ -280,6 +280,73 @@ def normalize_health_context(value: Any) -> dict[str, Any] | None:
     return {"schema": "period_cycle.v1", "record": normalized}
 
 
+_HEALTH_SHARE_TEXT_RE = re.compile(r"\A\s*健康数据(?:\s|[:：]|\Z)")
+_HEALTH_SHARE_FLAG_KEYS = (
+    "health_share",
+    "healthShare",
+    "is_health_share",
+    "isHealthShare",
+    "share_health",
+    "shareHealth",
+)
+_HEALTH_SHARE_VIA_VALUES = frozenset({
+    "health",
+    "health_app",
+    "health_data",
+    "health_share",
+    "healthshare",
+})
+_HEALTH_SHARE_SOURCE_VALUES = frozenset({
+    "health_share",
+    "health_app_share",
+    "manual_share",
+    "user_share",
+    "share",
+})
+_TRUTHY = frozenset({"1", "true", "yes", "y", "on", "share", "health_share"})
+
+
+def _is_truthy_flag(value: Any) -> bool:
+    if value is True:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in _TRUTHY
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value == 1
+    return False
+
+
+def is_explicit_health_share(text: Any, metadata: Any) -> bool:
+    """Was this inbound message produced by an explicit "send to XiaoKe" share?
+
+    The Android client currently stamps ``health_context`` onto *every* chat
+    message, so carrying it into the prompt would tax each ordinary turn with
+    the period block.  Only a deliberate share from the health app may inject
+    it.  A client-supplied flag is preferred; the health-app text header is the
+    server-side fallback until the client sends one.
+    """
+
+    if isinstance(metadata, Mapping):
+        for key in _HEALTH_SHARE_FLAG_KEYS:
+            if _is_truthy_flag(metadata.get(key)):
+                return True
+        via = metadata.get("via")
+        if isinstance(via, str) and via.strip().lower() in _HEALTH_SHARE_VIA_VALUES:
+            return True
+        context = metadata.get("health_context")
+        if isinstance(context, Mapping):
+            for key in ("share", "shared", *_HEALTH_SHARE_FLAG_KEYS):
+                if _is_truthy_flag(context.get(key)):
+                    return True
+            ctx_source = _first(context, "source", "trigger", "origin")
+            if isinstance(ctx_source, str) and ctx_source.strip().lower() in _HEALTH_SHARE_SOURCE_VALUES:
+                return True
+
+    if isinstance(text, str) and _HEALTH_SHARE_TEXT_RE.match(text):
+        return True
+    return False
+
+
 def format_health_context_prompt(value: Any) -> str:
     """Build a bounded prompt fragment for XiaoKe, or an empty string."""
 
