@@ -10,6 +10,7 @@ import logging
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import threading
 import time
@@ -105,6 +106,20 @@ class _TransportError(CodexAppBridgeError):
 
 class _RecoveryCancelled(CodexAppBridgeError):
     pass
+
+
+@dataclass(frozen=True)
+class _DaemonProcessIdentity:
+    pid: int
+    pidfile_device: int
+    pidfile_inode: int
+    starttime: int
+    argv: tuple[bytes, ...]
+    executable_device: int
+    executable_inode: int
+    executable_uid: int
+    process_uid: int
+    cgroups: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -292,6 +307,105 @@ def prompt_lock_is_busy(session_id: str | None, cwd: Path) -> bool:
     return False
 
 
+class _DaemonRecoveryLock:
+    """A short-lived cross-process lock for shared-daemon recovery.
+
+    The app-server is intentionally shared by CcCompanion, Remote, and the
+    TUI.  A bridge-local mutex is therefore insufficient: two service
+    instances can otherwise both decide that an old pid is stale and issue
+    competing supervisor restarts.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._file: Any = None
+
+    def acquire(
+        self,
+        *,
+        deadline: float,
+        cancel_requested: Callable[[], bool] | None = None,
+        closing: threading.Event | None = None,
+    ) -> bool:
+        if fcntl is None:
+            return False
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(self.path, flags, 0o600)
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != 0
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                os.close(descriptor)
+                descriptor = None
+                return False
+            lock_file = os.fdopen(descriptor, "a+", encoding="utf-8")
+            descriptor = None
+        except (OSError, ValueError):
+            if descriptor is not None:
+                os.close(descriptor)
+            return False
+        try:
+            while True:
+                if (closing is not None and closing.is_set()) or (
+                    cancel_requested is not None and cancel_requested()
+                ):
+                    lock_file.close()
+                    raise _RecoveryCancelled("Codex daemon recovery cancelled", fallback_safe=True)
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self._file = lock_file
+                    return True
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        lock_file.close()
+                        return False
+                    if closing is not None:
+                        closing.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic())))
+                    else:
+                        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        except Exception:
+            if self._file is not lock_file:
+                lock_file.close()
+            raise
+
+    def release(self) -> None:
+        lock_file = self._file
+        self._file = None
+        if lock_file is None:
+            return
+        try:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
+
+
+@dataclass
+class _DaemonRecoveryBudget:
+    """One pre-submit recovery scope may restart the shared daemon once."""
+
+    restart_limit: int = 1
+    restart_count: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def claim_restart(self) -> bool:
+        with self._lock:
+            if self.restart_count >= self.restart_limit:
+                return False
+            self.restart_count += 1
+            return True
+
+
 class CodexAppBridge:
     """Keep one client connection to Codex's shared app-server daemon.
 
@@ -317,6 +431,8 @@ class CodexAppBridge:
         daemon_start_timeout_sec: float = 20.0,
         daemon_connect_retry_sec: float = 0.25,
         pre_submit_reconnect_attempts: int = 2,
+        daemon_supervisor_command: Sequence[str] | None = None,
+        daemon_recovery_lock_path: str | None = None,
     ) -> None:
         self.codex_bin = codex_bin
         self.codex_home = str(Path(codex_home).expanduser())
@@ -330,6 +446,23 @@ class CodexAppBridge:
         self.daemon_start_timeout_sec = max(0.05, float(daemon_start_timeout_sec))
         self.daemon_connect_retry_sec = max(0.01, float(daemon_connect_retry_sec))
         self.pre_submit_reconnect_attempts = max(0, int(pre_submit_reconnect_attempts))
+        # The daemon must be owned outside cc-companion.service's cgroup.
+        # ``systemctl`` starts the tracked fail-closed supervisor in deploy/.
+        # A custom command is only for explicit deployments/tests; it receives
+        # either ``start`` or ``restart`` as its final argument.
+        self.daemon_supervisor_unit = (
+            "codex-remote-control.service" if daemon_supervisor_command is None else None
+        )
+        # Must stay aligned with User=root and --service-uid=0 in the tracked
+        # supervisor unit.  Binary ownership is deliberately independent.
+        self.daemon_supervisor_uid = 0
+        self.daemon_supervisor_command = list(daemon_supervisor_command or (
+            "systemctl", "{action}", self.daemon_supervisor_unit,
+        ))
+        self.daemon_recovery_lock_path = Path(
+            daemon_recovery_lock_path
+            or (Path(self.codex_home) / "app-server-daemon" / "recovery.lock")
+        ).expanduser()
         self.log = logger or logging.getLogger(__name__)
         self.request_timeout_sec = request_timeout_sec
         self.interrupt_grace_sec = max(0.1, float(interrupt_grace_sec))
@@ -352,6 +485,7 @@ class CodexAppBridge:
         self._generation = 0
         self._initialized = False
         self._connection_error: BaseException | None = None
+        self._daemon_repair_requested = False
         self._active: _ActiveTurn | None = None
         self._last_markers: dict[str, tuple[str, int, int] | None] = {}
         self._marker_baselines: set[str] = set()
@@ -762,6 +896,7 @@ class CodexAppBridge:
             else time.monotonic() + self.daemon_recovery_timeout_sec
         )
         attempts = 1 if self.command is not None else self.pre_submit_reconnect_attempts + 1
+        recovery_budget = _DaemonRecoveryBudget()
         last_error: _TransportError | None = None
         for attempt in range(attempts):
             self._raise_if_recovery_cancelled(cancel_requested)
@@ -775,6 +910,7 @@ class CodexAppBridge:
                     cwd,
                     recovery_deadline=deadline,
                     cancel_requested=cancel_requested,
+                    recovery_budget=recovery_budget,
                 )
                 prepared = self._prepare_thread(
                     thread_id,
@@ -790,6 +926,12 @@ class CodexAppBridge:
                 last_error = exc
                 if attempt + 1 >= attempts:
                     raise
+                if self.command is None and self.daemon_autostart:
+                    # A socket can accept the WebSocket handshake and even
+                    # initialize before a dead daemon immediately closes it.
+                    # Ask the next pre-submit attempt to inspect the daemon
+                    # pid instead of treating that as an ordinary reconnect.
+                    self._daemon_repair_requested = True
                 self.log.warning(
                     "Codex app-server disconnected before prompt submission; "
                     "reconnecting (%d/%d)",
@@ -1082,6 +1224,7 @@ class CodexAppBridge:
         *,
         recovery_deadline: float | None = None,
         cancel_requested: Callable[[], bool] | None = None,
+        recovery_budget: _DaemonRecoveryBudget | None = None,
     ) -> None:
         self._raise_if_recovery_cancelled(cancel_requested)
         with self._connect_lock:
@@ -1097,6 +1240,7 @@ class CodexAppBridge:
                 cwd,
                 recovery_deadline=recovery_deadline,
                 cancel_requested=cancel_requested,
+                recovery_budget=recovery_budget,
             )
 
     def _start_process_locked(
@@ -1105,12 +1249,14 @@ class CodexAppBridge:
         *,
         recovery_deadline: float | None = None,
         cancel_requested: Callable[[], bool] | None = None,
+        recovery_budget: _DaemonRecoveryBudget | None = None,
     ) -> None:
         if self.command is None:
             self._start_daemon_connection_locked(
                 cwd,
                 recovery_deadline=recovery_deadline,
                 cancel_requested=cancel_requested,
+                recovery_budget=recovery_budget,
             )
             return
 
@@ -1166,12 +1312,312 @@ class CodexAppBridge:
         self._initialized = True
         self.log.info("Codex app-server bridge initialized pid=%s", process.pid)
 
+    def _daemon_pid_state(self) -> str:
+        """Return ``dead``, ``live``, or ``unknown`` without trusting a pid file.
+
+        Only ``dead`` authorizes a supervisor restart.  A malformed file,
+        inaccessible /proc entry, or permission failure is deliberately
+        ``unknown`` and therefore never stopped by this bridge.  A live PID
+        whose argv is not the remote-control app-server is a *proven stale*
+        pid record, rather than a healthy daemon: it is safe to restart the
+        independently-owned supervisor because the bridge never signals that
+        unrelated process itself.
+        """
+        identity = self._read_daemon_identity()
+        if identity is not None:
+            return "live" if self._daemon_identity_is_managed(identity) else "dead"
+        pid_path = Path(self.codex_home) / "app-server-daemon" / "app-server.pid"
+        try:
+            payload = json.loads(pid_path.read_text(encoding="utf-8"))
+            pid = int(payload.get("pid"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return "unknown"
+        if pid <= 1:
+            return "unknown"
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return "dead"
+        except PermissionError:
+            return "unknown"
+        except OSError:
+            return "unknown"
+        return "unknown"
+
+    def _read_daemon_pid(self) -> int | None:
+        try:
+            payload = json.loads(
+                (Path(self.codex_home) / "app-server-daemon" / "app-server.pid").read_text(
+                    encoding="utf-8"
+                )
+            )
+            pid = int(payload.get("pid"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+        return pid if pid > 1 else None
+
+    @staticmethod
+    def _process_cgroups(pid: int) -> tuple[str, ...]:
+        try:
+            lines = Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return ()
+        paths = []
+        for line in lines:
+            parts = line.split(":", 2)
+            controllers = parts[1].split(",") if len(parts) == 3 else []
+            is_systemd_hierarchy = len(parts) == 3 and parts[0] == "0" and parts[1] == ""
+            is_systemd_hierarchy = is_systemd_hierarchy or "name=systemd" in controllers
+            if len(parts) == 3 and is_systemd_hierarchy and parts[2].startswith("/"):
+                paths.append(parts[2].rstrip("/") or "/")
+        return tuple(paths)
+
+    @staticmethod
+    def _parse_process_starttime(payload: str) -> int:
+        tail = payload[payload.rfind(")") + 2 :].split()
+        return int(tail[19])
+
+    def _managed_daemon_executable(self) -> tuple[int, int, int] | None:
+        anchor_path = Path(self.codex_home)
+        path = anchor_path / "packages/standalone/current/bin/codex"
+        try:
+            anchor = anchor_path.resolve(strict=True)
+            resolved = path.resolve(strict=True)
+            anchor_info = anchor.stat()
+            target_info = resolved.stat()
+            relative = resolved.relative_to(anchor)
+            if (
+                not stat.S_ISDIR(anchor_info.st_mode)
+                or anchor_info.st_uid != 0
+                or anchor_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or not stat.S_ISREG(target_info.st_mode)
+                or not target_info.st_mode & stat.S_IXUSR
+            ):
+                return None
+            allowed_owners = {0, target_info.st_uid}
+            current = anchor
+            for index, part in enumerate(relative.parts):
+                current = current / part
+                info = current.stat()
+                is_target = index == len(relative.parts) - 1
+                if info.st_uid not in allowed_owners:
+                    return None
+                if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                    return None
+                if (is_target and not stat.S_ISREG(info.st_mode)) or (
+                    not is_target and not stat.S_ISDIR(info.st_mode)
+                ):
+                    return None
+        except (OSError, ValueError):
+            return None
+        return target_info.st_dev, target_info.st_ino, target_info.st_uid
+
+    def _daemon_identity_is_managed(self, identity: _DaemonProcessIdentity) -> bool:
+        managed = self._managed_daemon_executable()
+        return (
+            managed is not None
+            and (identity.executable_device, identity.executable_inode, identity.executable_uid)
+            == managed
+            and identity.process_uid == self.daemon_supervisor_uid
+            and b"app-server" in identity.argv
+            and b"--remote-control" in identity.argv
+        )
+
+    def _read_daemon_identity(self) -> _DaemonProcessIdentity | None:
+        """Read one PID/starttime/argv/exe/uid/cgroup identity snapshot."""
+        pid_path = Path(self.codex_home) / "app-server-daemon" / "app-server.pid"
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(pid_path, flags)
+        except OSError:
+            return None
+        try:
+            pidfile_info = os.fstat(descriptor)
+            if not stat.S_ISREG(pidfile_info.st_mode) or pidfile_info.st_uid != 0:
+                return None
+            raw = os.read(descriptor, 4097)
+            if len(raw) > 4096:
+                return None
+            pid = int(json.loads(raw.decode("utf-8"))["pid"])
+            if pid <= 1:
+                return None
+            process_dir = Path(f"/proc/{pid}")
+            first_starttime = self._parse_process_starttime(
+                (process_dir / "stat").read_text(encoding="utf-8")
+            )
+            argv = tuple(
+                part for part in (process_dir / "cmdline").read_bytes().split(b"\0") if part
+            )
+            exe_info = (process_dir / "exe").stat()
+            process_uid = process_dir.stat().st_uid
+            cgroups = self._process_cgroups(pid)
+            second_starttime = self._parse_process_starttime(
+                (process_dir / "stat").read_text(encoding="utf-8")
+            )
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            if second_starttime != first_starttime or os.read(descriptor, 4097) != raw:
+                return None
+            return _DaemonProcessIdentity(
+                pid=pid,
+                pidfile_device=pidfile_info.st_dev,
+                pidfile_inode=pidfile_info.st_ino,
+                starttime=first_starttime,
+                argv=argv,
+                executable_device=exe_info.st_dev,
+                executable_inode=exe_info.st_ino,
+                executable_uid=exe_info.st_uid,
+                process_uid=process_uid,
+                cgroups=cgroups,
+            )
+        except (OSError, ValueError, TypeError, KeyError, UnicodeError, json.JSONDecodeError, IndexError):
+            return None
+        finally:
+            os.close(descriptor)
+
+    def _query_systemd_unit(
+        self,
+        *arguments: str,
+        deadline: float,
+    ) -> subprocess.CompletedProcess[str] | None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            return subprocess.run(
+                ["systemctl", *arguments],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                check=False,
+                timeout=max(0.01, min(2.0, remaining)),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    def _systemd_start_contract_ready(self, deadline: float) -> bool:
+        unit = self.daemon_supervisor_unit
+        if unit is None:
+            return True
+        result = self._query_systemd_unit("is-enabled", "--quiet", unit, deadline=deadline)
+        return result is not None and result.returncode == 0
+
+    def _systemd_takeover_verified(self, deadline: float) -> bool:
+        """Bind stable unit state and cgroup to one complete daemon snapshot."""
+        unit = self.daemon_supervisor_unit
+        if unit is None:
+            return self._daemon_pid_state() == "live"
+        def query_properties() -> dict[str, str] | None:
+            result = self._query_systemd_unit(
+                "show", unit, "--property=ActiveState", "--property=UnitFileState",
+                "--property=ControlGroup", "--no-pager", deadline=deadline,
+            )
+            if result is None or result.returncode != 0:
+                return None
+            properties: dict[str, str] = {}
+            for line in result.stdout.splitlines():
+                key, separator, value = line.partition("=")
+                if separator:
+                    properties[key] = value
+            return properties
+
+        before = query_properties()
+        identity = self._read_daemon_identity()
+        after = query_properties()
+        if before is None or before != after or identity is None:
+            return False
+        if before.get("ActiveState") != "active":
+            return False
+        if before.get("UnitFileState") not in {"enabled", "enabled-runtime", "static"}:
+            return False
+        if not self._daemon_identity_is_managed(identity):
+            return False
+        control_group = before.get("ControlGroup", "").rstrip("/")
+        if not control_group.startswith("/"):
+            return False
+        return any(
+            path == control_group or path.startswith(control_group + "/")
+            for path in identity.cgroups
+        )
+
+    def _supervisor_command(self, action: str) -> list[str]:
+        if action not in {"start", "restart"}:
+            raise ValueError("unsupported daemon supervisor action")
+        command = [str(part) for part in self.daemon_supervisor_command]
+        if "{action}" in command:
+            return [action if part == "{action}" else part for part in command]
+        return [*command, action]
+
+    def _run_supervisor_action_locked(
+        self,
+        action: str,
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        deadline: float,
+        cancel_requested: Callable[[], bool] | None,
+        recovery_budget: _DaemonRecoveryBudget | None = None,
+    ) -> bool:
+        """Run the externally-owned daemon supervisor under a flock.
+
+        A timed-out contender leaves recovery to the lock holder rather than
+        issuing a second restart.  Once it acquires the lock it always
+        rechecks the pid state, which prevents a stale observation from
+        stopping a daemon another client just repaired.
+        """
+        lock = _DaemonRecoveryLock(self.daemon_recovery_lock_path)
+        if not lock.acquire(
+            deadline=deadline,
+            cancel_requested=cancel_requested,
+            closing=self._closing,
+        ):
+            return False
+        try:
+            self._raise_if_recovery_cancelled(cancel_requested)
+            state = self._daemon_pid_state()
+            if action == "restart":
+                if state != "dead":
+                    self.log.info("shared Codex daemon repair skipped: pid state=%s", state)
+                    return state == "live" and self._systemd_takeover_verified(deadline)
+                if recovery_budget is not None and not recovery_budget.claim_restart():
+                    self.log.warning("shared Codex daemon restart budget exhausted")
+                    return False
+            elif state == "live":
+                return self._systemd_takeover_verified(deadline)
+            if not self._systemd_start_contract_ready(deadline):
+                self.log.warning("shared Codex daemon supervisor is not enabled")
+                return False
+            self._run_daemon_start_interruptible(
+                self._supervisor_command(action),
+                cwd=str(cwd),
+                env=env,
+                deadline=deadline,
+                cancel_requested=cancel_requested,
+            )
+            if not self._systemd_takeover_verified(deadline):
+                self.log.warning("shared Codex daemon supervisor takeover verification failed")
+                return False
+            return True
+        except _RecoveryCancelled:
+            raise
+        except Exception as exc:
+            self.log.warning(
+                "shared Codex daemon supervisor %s failed: %s",
+                action,
+                type(exc).__name__,
+            )
+            return False
+        finally:
+            lock.release()
+
     def _start_daemon_connection_locked(
         self,
         cwd: Path,
         *,
         recovery_deadline: float | None = None,
         cancel_requested: Callable[[], bool] | None = None,
+        recovery_budget: _DaemonRecoveryBudget | None = None,
     ) -> None:
         env = os.environ.copy()
         env["CODEX_HOME"] = self.codex_home
@@ -1180,6 +1626,7 @@ class CodexAppBridge:
             if recovery_deadline is not None
             else time.monotonic() + self.daemon_recovery_timeout_sec
         )
+        budget = recovery_budget or _DaemonRecoveryBudget()
 
         def connect() -> Any:
             # Codex's Unix listener currently doesn't negotiate
@@ -1201,10 +1648,51 @@ class CodexAppBridge:
         first_error: BaseException | None = None
         last_error: BaseException | None = None
         websocket: Any = None
+        force_repair = self._daemon_repair_requested
+        self._daemon_repair_requested = False
         while websocket is None:
             self._raise_if_recovery_cancelled(cancel_requested)
             if time.monotonic() >= deadline:
                 break
+            if self.daemon_supervisor_unit is not None and self.daemon_autostart:
+                ownership_state = self._daemon_pid_state()
+                if ownership_state == "live":
+                    if not self._systemd_takeover_verified(deadline):
+                        raise _TransportError(
+                            "shared Codex daemon is not owned by its enabled systemd supervisor",
+                            fallback_safe=True,
+                        )
+                else:
+                    action = "restart" if ownership_state == "dead" else "start"
+                    if not self._run_supervisor_action_locked(
+                        action,
+                        cwd=cwd,
+                        env=env,
+                        deadline=min(deadline, time.monotonic() + self.daemon_start_timeout_sec),
+                        cancel_requested=cancel_requested,
+                        recovery_budget=budget,
+                    ):
+                        raise _TransportError(
+                            "shared Codex daemon supervisor contract is unavailable",
+                            fallback_safe=True,
+                        )
+                    force_repair = False
+            if force_repair and self.daemon_autostart:
+                # Never restart a daemon merely because a connection dropped:
+                # Remote/TUI may own a live turn.  Only a pid file that proves
+                # its process is gone authorizes the supervisor restart.
+                if self._daemon_pid_state() == "dead":
+                    self._run_supervisor_action_locked(
+                        "restart",
+                        cwd=cwd,
+                        env=env,
+                        deadline=min(deadline, time.monotonic() + self.daemon_start_timeout_sec),
+                        cancel_requested=cancel_requested,
+                        recovery_budget=budget,
+                    )
+                else:
+                    self.log.info("shared Codex daemon repair skipped: pid is live or unknown")
+                force_repair = False
             try:
                 websocket = connect()
                 break
@@ -1219,23 +1707,36 @@ class CodexAppBridge:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            try:
-                # A concurrent `daemon restart` may hold Codex's startup lock
-                # while its old PID is settling. The command can time out even
-                # though the lock becomes usable moments later, so failure here
-                # is not terminal; reconnect and retry until the bounded
-                # recovery deadline.
-                self._run_daemon_start_interruptible(
-                    [self.codex_bin, "remote-control", "start", "--json"],
-                    cwd=str(cwd),
+            state = self._daemon_pid_state()
+            if state == "dead":
+                # A stale pid/socket needs a real restart.  `start` alone is
+                # commonly a no-op for a still-active oneshot supervisor.
+                started = self._run_supervisor_action_locked(
+                    "restart",
+                    cwd=cwd,
+                    env=env,
+                    deadline=min(deadline, time.monotonic() + self.daemon_start_timeout_sec),
+                    cancel_requested=cancel_requested,
+                    recovery_budget=budget,
+                )
+            elif state == "unknown":
+                # Missing/corrupt state cannot prove ownership, so only ask
+                # the independent supervisor to start; never stop/restart.
+                started = self._run_supervisor_action_locked(
+                    "start",
+                    cwd=cwd,
                     env=env,
                     deadline=min(deadline, time.monotonic() + self.daemon_start_timeout_sec),
                     cancel_requested=cancel_requested,
                 )
-            except Exception as exc:
-                if isinstance(exc, _RecoveryCancelled):
-                    raise
-                last_error = exc
+            else:
+                # A live daemon might simply be between listener handoffs.
+                # Waiting is safer than disrupting another official client.
+                started = False
+            if not started:
+                last_error = last_error or _TransportError(
+                    f"shared Codex daemon unavailable (pid state={state})"
+                )
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 self._interruptible_recovery_wait(

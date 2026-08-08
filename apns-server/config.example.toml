@@ -76,8 +76,14 @@ allowed_ips = []
 # codex_kairos_backend = "app-server"
 # Defaults to `$CODEX_HOME/app-server-control/app-server-control.sock`.
 # codex_app_server_socket = "/root/.codex/app-server-control/app-server-control.sock"
-# Start the official daemon with `codex remote-control start --json` when its
-# socket isn't reachable. Disable only when another supervisor owns startup.
+# The bridge asks the independent `codex-remote-control.service` supervisor to
+# recover the daemon when its socket isn't reachable. Install the tracked
+# `deploy/codex_remote_control_service.py` as
+# `/usr/local/libexec/codex-remote-control-service`, install the tracked unit,
+# then daemon-reload and enable/start it. The bridge fails closed if the unit is
+# disabled/inactive after startup, or if the daemon is outside the unit cgroup.
+# This keeps the shared daemon outside cc-companion.service's cgroup.
+# Disable only when another independent supervisor owns startup.
 # codex_app_server_daemon_autostart = true
 # Fallback is disabled by default because a transport failure after turn/start
 # may have already performed tools. The bridge only marks pre-start failures as safe.

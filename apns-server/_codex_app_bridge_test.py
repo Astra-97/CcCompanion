@@ -581,7 +581,9 @@ class CodexAppBridgeTest(unittest.TestCase):
         try:
             with mock.patch(
                 "codex_app_bridge.unix_connect", side_effect=OSError("missing socket"),
-            ), mock.patch("codex_app_bridge.subprocess.run") as starter:
+            ), mock.patch("codex_app_bridge.subprocess.run") as starter, mock.patch.object(
+                bridge, "_run_supervisor_action_locked"
+            ) as supervisor:
                 with self.assertRaises(CodexAppBridgeError) as raised:
                     bridge.run_turn(
                         thread_id=None,
@@ -592,6 +594,7 @@ class CodexAppBridgeTest(unittest.TestCase):
                     )
             self.assertTrue(raised.exception.fallback_safe)
             starter.assert_not_called()
+            supervisor.assert_not_called()
         finally:
             bridge.close()
 
@@ -604,6 +607,7 @@ class CodexAppBridgeTest(unittest.TestCase):
             daemon_start_timeout_sec=0.1,
             daemon_connect_retry_sec=0.01,
             request_timeout_sec=0.2,
+            daemon_supervisor_command=["fake-supervisor"],
         )
         websocket = mock.Mock()
         # First connect sees the restart gap. The start command then times out
@@ -629,6 +633,404 @@ class CodexAppBridgeTest(unittest.TestCase):
         starter.assert_called_once()
         bridge.close()
 
+    def test_initialize_then_resume_eof_repairs_dead_daemon_once_before_submit(self):
+        socket_path = self.root / "initialize-then-eof.sock"
+        connection_count = [0]
+        daemon_state = {"value": "live"}
+
+        def handler(websocket):
+            connection_count[0] += 1
+            connection = connection_count[0]
+            for raw in websocket:
+                message = json.loads(raw)
+                method = message.get("method")
+                request_id = message.get("id")
+                if method == "initialize":
+                    websocket.send(json.dumps({"id": request_id, "result": {"userAgent": "fake"}}))
+                elif method == "thread/resume" and connection == 1:
+                    daemon_state["value"] = "dead"
+                    websocket.close()
+                    return
+                elif method == "thread/resume":
+                    websocket.send(json.dumps({
+                        "id": request_id,
+                        "result": {"thread": {"id": "thread-repaired", "turns": []}},
+                    }))
+                elif method == "turn/start":
+                    websocket.send(json.dumps({
+                        "id": request_id,
+                        "result": {"turn": {"id": "turn-repaired", "status": "inProgress", "items": []}},
+                    }))
+                    websocket.send(json.dumps({
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thread-repaired",
+                            "turnId": "turn-repaired",
+                            "item": {"id": "answer", "type": "agentMessage", "text": "repaired"},
+                        },
+                    }))
+                    websocket.send(json.dumps({
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread-repaired",
+                            "turn": {"id": "turn-repaired", "status": "completed", "items": []},
+                        },
+                    }))
+
+        server = unix_serve(handler, path=str(socket_path), compression=None)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        bridge = CodexAppBridge(
+            codex_home=str(self.root / "eof-home"),
+            daemon_socket_path=str(socket_path),
+            daemon_autostart=True,
+            request_timeout_sec=1.0,
+        )
+        try:
+            with mock.patch.object(bridge, "_daemon_pid_state", side_effect=lambda: daemon_state["value"]), mock.patch.object(
+                bridge, "_systemd_takeover_verified", return_value=True
+            ), mock.patch.object(
+                bridge,
+                "_run_supervisor_action_locked",
+                return_value=True,
+            ) as repair:
+                result = bridge.run_turn(
+                    thread_id="thread-repaired",
+                    cwd=self.root,
+                    prompt="repair without submitting twice",
+                    model="gpt-test",
+                    effort="high",
+                )
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.text, "repaired")
+            self.assertEqual(connection_count[0], 2)
+            repair.assert_called_once()
+            self.assertEqual(repair.call_args.args[0], "restart")
+        finally:
+            bridge.close()
+            server.shutdown()
+            server_thread.join(timeout=2.0)
+
+    def test_pre_submit_recovery_scope_spends_at_most_one_restart_on_total_failure(self):
+        bridge = CodexAppBridge(
+            codex_home=str(self.root / "restart-budget-home"),
+            daemon_supervisor_command=["fake-supervisor"],
+            pre_submit_reconnect_attempts=2,
+        )
+        starts = []
+
+        def fail_connect(_cwd, *, recovery_deadline, cancel_requested, recovery_budget):
+            for _ in range(2):
+                bridge._run_supervisor_action_locked(
+                    "restart",
+                    cwd=self.root,
+                    env={},
+                    deadline=recovery_deadline,
+                    cancel_requested=cancel_requested,
+                    recovery_budget=recovery_budget,
+                )
+            raise bridge_module._TransportError("connect/initialize/resume failed")
+
+        bridge._daemon_pid_state = lambda: "dead"
+        bridge._run_daemon_start_interruptible = lambda *_args, **_kwargs: starts.append("restart")
+        bridge._ensure_connected = fail_connect
+        try:
+            with self.assertRaises(bridge_module._TransportError):
+                bridge._prepare_thread_resilient(
+                    "thread-budget",
+                    cwd=self.root,
+                    model="gpt-test",
+                    effort="high",
+                    recovery_deadline=time.monotonic() + 1.0,
+                )
+            self.assertEqual(starts, ["restart"])
+        finally:
+            bridge.close()
+
+    def test_dead_pid_restarts_independent_supervisor(self):
+        home = self.root / "dead-pid-home"
+        daemon_dir = home / "app-server-daemon"
+        daemon_dir.mkdir(parents=True)
+        (daemon_dir / "app-server.pid").write_text('{"pid":99999999}', encoding="utf-8")
+        bridge = CodexAppBridge(
+            codex_home=str(home),
+            daemon_socket_path=str(self.root / "dead-pid.sock"),
+            daemon_recovery_timeout_sec=1.0,
+            daemon_supervisor_command=["fake-supervisor"],
+        )
+        websocket = mock.Mock()
+        try:
+            with mock.patch("codex_app_bridge.unix_connect", side_effect=[OSError("stale"), websocket]), mock.patch.object(
+                bridge, "_run_supervisor_action_locked", return_value=True
+            ) as supervisor, mock.patch.object(bridge, "_initialize_connection"), mock.patch.object(
+                bridge, "_websocket_reader_loop"
+            ):
+                bridge._start_daemon_connection_locked(self.root)
+            supervisor.assert_called_once()
+            self.assertEqual(supervisor.call_args.args[0], "restart")
+        finally:
+            bridge.close()
+
+    def test_reused_pid_that_is_not_remote_daemon_restarts_independent_supervisor(self):
+        home = self.root / "reused-pid-home"
+        daemon_dir = home / "app-server-daemon"
+        daemon_dir.mkdir(parents=True)
+        # This test process is alive, but its argv is not Codex's
+        # ``app-server --remote-control``.  A reused pid record must not
+        # suppress recovery forever or cause the bridge to signal this process.
+        (daemon_dir / "app-server.pid").write_text(
+            json.dumps({"pid": os.getpid()}), encoding="utf-8"
+        )
+        bridge = CodexAppBridge(
+            codex_home=str(home),
+            daemon_socket_path=str(self.root / "reused-pid.sock"),
+            daemon_recovery_timeout_sec=1.0,
+            daemon_supervisor_command=["fake-supervisor"],
+        )
+        websocket = mock.Mock()
+        try:
+            self.assertEqual(bridge._daemon_pid_state(), "dead")
+            with mock.patch("codex_app_bridge.unix_connect", side_effect=[OSError("stale"), websocket]), mock.patch.object(
+                bridge, "_run_supervisor_action_locked", return_value=True
+            ) as supervisor, mock.patch.object(bridge, "_initialize_connection"), mock.patch.object(
+                bridge, "_websocket_reader_loop"
+            ):
+                bridge._start_daemon_connection_locked(self.root)
+            supervisor.assert_called_once()
+            self.assertEqual(supervisor.call_args.args[0], "restart")
+        finally:
+            bridge.close()
+
+    def test_live_or_unknown_pid_never_requests_supervisor_restart(self):
+        for state, expected_actions in (("live", []), ("unknown", ["start"])):
+            with self.subTest(state=state):
+                bridge = CodexAppBridge(
+                    codex_home=str(self.root / f"{state}-pid-home"),
+                    daemon_socket_path=str(self.root / f"{state}-pid.sock"),
+                    daemon_recovery_timeout_sec=1.0,
+                    daemon_supervisor_command=["fake-supervisor"],
+                )
+                websocket = mock.Mock()
+                try:
+                    with mock.patch("codex_app_bridge.unix_connect", side_effect=[OSError("missing"), websocket]), mock.patch.object(
+                        bridge, "_daemon_pid_state", return_value=state
+                    ), mock.patch.object(bridge, "_run_supervisor_action_locked", return_value=True) as supervisor, mock.patch.object(
+                        bridge, "_initialize_connection"
+                    ), mock.patch.object(bridge, "_websocket_reader_loop"):
+                        bridge._start_daemon_connection_locked(self.root)
+                    self.assertEqual(
+                        [call.args[0] for call in supervisor.call_args_list],
+                        expected_actions,
+                    )
+                finally:
+                    bridge.close()
+
+    def test_competing_dead_pid_repairs_are_serialized(self):
+        home = self.root / "competing-repair-home"
+        daemon_dir = home / "app-server-daemon"
+        daemon_dir.mkdir(parents=True)
+        lock_path = self.root / "competing-repair.lock"
+        first = CodexAppBridge(
+            codex_home=str(home),
+            daemon_recovery_lock_path=str(lock_path),
+            daemon_supervisor_command=["fake-supervisor"],
+        )
+        second = CodexAppBridge(
+            codex_home=str(home),
+            daemon_recovery_lock_path=str(lock_path),
+            daemon_supervisor_command=["fake-supervisor"],
+        )
+        starts = []
+        start_lock = threading.Lock()
+        daemon_state = {"value": "dead"}
+
+        def starter(*_args, **_kwargs):
+            with start_lock:
+                starts.append("restart")
+                daemon_state["value"] = "live"
+            time.sleep(0.05)
+
+        first._run_daemon_start_interruptible = starter
+        second._run_daemon_start_interruptible = starter
+        first._daemon_pid_state = lambda: daemon_state["value"]
+        second._daemon_pid_state = lambda: daemon_state["value"]
+        results = []
+
+        def repair(bridge):
+            results.append(bridge._run_supervisor_action_locked(
+                "restart",
+                cwd=self.root,
+                env={},
+                deadline=time.monotonic() + 1.0,
+                cancel_requested=None,
+            ))
+
+        workers = [threading.Thread(target=repair, args=(bridge,)) for bridge in (first, second)]
+        try:
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=2.0)
+            self.assertTrue(all(not worker.is_alive() for worker in workers))
+            self.assertEqual(starts, ["restart"])
+            self.assertEqual(sorted(results), [True, True])
+        finally:
+            first.close()
+            second.close()
+
+    def test_bridge_close_never_stops_shared_daemon(self):
+        bridge = CodexAppBridge(codex_home=str(self.root / "close-does-not-stop-home"))
+        with mock.patch.object(bridge, "_run_supervisor_action_locked") as supervisor:
+            bridge.close()
+        supervisor.assert_not_called()
+
+    def test_disabled_systemd_supervisor_fails_closed_without_action(self):
+        bridge = CodexAppBridge(codex_home=str(self.root / "disabled-unit-home"))
+        budget = bridge_module._DaemonRecoveryBudget()
+        bridge._daemon_pid_state = lambda: "dead"
+        disabled = subprocess.CompletedProcess([], 1, "", "")
+        try:
+            with mock.patch.object(bridge, "_query_systemd_unit", return_value=disabled), mock.patch.object(
+                bridge, "_run_daemon_start_interruptible"
+            ) as starter:
+                repaired = bridge._run_supervisor_action_locked(
+                    "restart",
+                    cwd=self.root,
+                    env={},
+                    deadline=time.monotonic() + 1.0,
+                    cancel_requested=None,
+                    recovery_budget=budget,
+                )
+            self.assertFalse(repaired)
+            starter.assert_not_called()
+        finally:
+            bridge.close()
+
+    def test_systemd_takeover_requires_live_daemon_inside_unit_cgroup(self):
+        bridge = CodexAppBridge(codex_home=str(self.root / "takeover-unit-home"))
+        shown = subprocess.CompletedProcess(
+            [],
+            0,
+            "ActiveState=active\nUnitFileState=enabled\n"
+            "ControlGroup=/system.slice/codex-remote-control.service\n",
+            "",
+        )
+        identity = bridge_module._DaemonProcessIdentity(
+            pid=321,
+            pidfile_device=1,
+            pidfile_inode=2,
+            starttime=3,
+            argv=(b"codex", b"app-server", b"--remote-control"),
+            executable_device=4,
+            executable_inode=5,
+            executable_uid=0,
+            process_uid=0,
+            cgroups=("/system.slice/codex-remote-control.service/app-server",),
+        )
+        try:
+            with mock.patch.object(bridge, "_query_systemd_unit", return_value=shown), mock.patch.object(
+                bridge, "_read_daemon_identity", return_value=identity
+            ) as reader, mock.patch.object(bridge, "_daemon_identity_is_managed", return_value=True):
+                self.assertTrue(bridge._systemd_takeover_verified(time.monotonic() + 1.0))
+                reader.assert_called_once_with()
+            outside = bridge_module._DaemonProcessIdentity(
+                **{**identity.__dict__, "cgroups": ("/system.slice/cc-companion.service",)}
+            )
+            with mock.patch.object(bridge, "_query_systemd_unit", return_value=shown), mock.patch.object(
+                bridge, "_read_daemon_identity", return_value=outside
+            ), mock.patch.object(bridge, "_daemon_identity_is_managed", return_value=True):
+                self.assertFalse(bridge._systemd_takeover_verified(time.monotonic() + 1.0))
+        finally:
+            bridge.close()
+
+    def test_managed_identity_separates_installer_binary_uid_from_unit_process_uid(self):
+        home = self.root / "uid-separated-home"
+        binary = home / "packages/standalone/releases/v1/bin/codex"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"codex")
+        binary.chmod(0o755)
+        os.chown(binary.parent, 1001, 1001)
+        os.chown(binary, 1001, 1001)
+        current = home / "packages/standalone/current"
+        current.symlink_to(home / "packages/standalone/releases/v1")
+        bridge = CodexAppBridge(codex_home=str(home))
+        managed = bridge._managed_daemon_executable()
+        identity = bridge_module._DaemonProcessIdentity(
+            321, 1, 2, 3, (b"codex", b"app-server", b"--remote-control"),
+            managed[0], managed[1], 1001, 0, ("/system.slice/codex-remote-control.service",),
+        )
+        try:
+            self.assertEqual(managed[2], 1001)
+            self.assertTrue(bridge._daemon_identity_is_managed(identity))
+            wrong_process_owner = bridge_module._DaemonProcessIdentity(
+                **{**identity.__dict__, "process_uid": 1001}
+            )
+            self.assertFalse(bridge._daemon_identity_is_managed(wrong_process_owner))
+        finally:
+            bridge.close()
+
+    def test_managed_identity_rejects_group_writable_release_chain(self):
+        home = self.root / "writable-chain-home"
+        binary = home / "packages/standalone/current/bin/codex"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"codex")
+        binary.chmod(0o755)
+        binary.parent.chmod(0o775)
+        bridge = CodexAppBridge(codex_home=str(home))
+        try:
+            self.assertIsNone(bridge._managed_daemon_executable())
+        finally:
+            bridge.close()
+
+    def test_systemd_takeover_rejects_unit_state_change_around_identity_snapshot(self):
+        bridge = CodexAppBridge(codex_home=str(self.root / "changing-unit-home"))
+        active = subprocess.CompletedProcess(
+            [], 0, "ActiveState=active\nUnitFileState=enabled\nControlGroup=/system.slice/x\n", ""
+        )
+        inactive = subprocess.CompletedProcess(
+            [], 0, "ActiveState=inactive\nUnitFileState=enabled\nControlGroup=/system.slice/x\n", ""
+        )
+        identity = bridge_module._DaemonProcessIdentity(
+            1, 1, 1, 1, (b"app-server", b"--remote-control"), 1, 1, 0, 0,
+            ("/system.slice/x",),
+        )
+        try:
+            with mock.patch.object(
+                bridge, "_query_systemd_unit", side_effect=[active, inactive]
+            ), mock.patch.object(bridge, "_read_daemon_identity", return_value=identity):
+                self.assertFalse(bridge._systemd_takeover_verified(time.monotonic() + 1.0))
+        finally:
+            bridge.close()
+
+    def test_recovery_lock_rejects_symlink_and_permissive_file(self):
+        target = self.root / "lock-target"
+        target.write_text("", encoding="utf-8")
+        symlink = self.root / "lock-link"
+        symlink.symlink_to(target)
+        permissive = self.root / "permissive.lock"
+        permissive.write_text("", encoding="utf-8")
+        permissive.chmod(0o644)
+        for path in (symlink, permissive):
+            with self.subTest(path=path.name):
+                lock = bridge_module._DaemonRecoveryLock(path)
+                self.assertFalse(lock.acquire(deadline=time.monotonic() + 0.1))
+
+    def test_live_daemon_outside_systemd_unit_is_rejected_before_socket_use(self):
+        bridge = CodexAppBridge(codex_home=str(self.root / "wrong-cgroup-home"))
+        bridge._daemon_pid_state = lambda: "live"
+        try:
+            with mock.patch.object(bridge, "_systemd_takeover_verified", return_value=False), mock.patch(
+                "codex_app_bridge.unix_connect"
+            ) as connector:
+                with self.assertRaisesRegex(bridge_module._TransportError, "not owned"):
+                    bridge._start_daemon_connection_locked(
+                        self.root,
+                        recovery_deadline=time.monotonic() + 1.0,
+                    )
+            connector.assert_not_called()
+        finally:
+            bridge.close()
+
     def test_daemon_recovery_budget_is_global_across_prepare_retries(self):
         bridge = CodexAppBridge(
             codex_home=str(self.root / "global-budget-home"),
@@ -637,6 +1039,7 @@ class CodexAppBridgeTest(unittest.TestCase):
             daemon_start_timeout_sec=0.4,
             daemon_connect_retry_sec=0.1,
             pre_submit_reconnect_attempts=2,
+            daemon_supervisor_command=["fake-supervisor"],
         )
         clock = [100.0]
         start_deadlines = []
@@ -694,6 +1097,7 @@ class CodexAppBridgeTest(unittest.TestCase):
             daemon_recovery_timeout_sec=5.0,
             daemon_start_timeout_sec=5.0,
             daemon_connect_retry_sec=0.01,
+            daemon_supervisor_command=[str(fake_codex)],
         )
         cancel_event = threading.Event()
         started = threading.Event()
@@ -752,6 +1156,7 @@ class CodexAppBridgeTest(unittest.TestCase):
             daemon_socket_path=str(self.root / "close-recovery.sock"),
             daemon_recovery_timeout_sec=5.0,
             daemon_start_timeout_sec=5.0,
+            daemon_supervisor_command=[str(fake_codex)],
         )
         started = threading.Event()
         processes = []
@@ -805,6 +1210,7 @@ class CodexAppBridgeTest(unittest.TestCase):
             daemon_recovery_timeout_sec=0.28,
             daemon_start_timeout_sec=0.08,
             daemon_connect_retry_sec=0.01,
+            daemon_supervisor_command=[str(fake_codex)],
         )
         processes = []
         real_popen = subprocess.Popen
