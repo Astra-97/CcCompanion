@@ -61,6 +61,14 @@ OBSERVER_EVENT_LABELS = frozenset({
     *OBSERVER_ITEM_LABELS.values(),
 })
 OBSERVER_PHASES = frozenset(OBSERVER_PHASE_LABELS.values())
+QIAOKAIROS_REMOTE_COMPAT_LOCK_OWNER = "qiaokairos-interactive"
+QIAOKAIROS_REMOTE_SCRIPT = Path("/root/Windows-Codex-TG/scripts/qiaokairos.py")
+CODEX_RELEASE_TRUST_ANCHOR = Path("/root/.codex")
+_QIAOKAIROS_LOCK_METADATA_KEYS = frozenset({
+    "pid", "pid_starttime", "uid", "owner", "started_at", "session_id",
+    "cwd", "codex_bin", "supervisor_cwd", "supervisor_exe", "supervisor_argv",
+    "process_identity",
+})
 
 
 class CodexAppBridgeError(RuntimeError):
@@ -120,6 +128,16 @@ class _DaemonProcessIdentity:
     executable_uid: int
     process_uid: int
     cgroups: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _ProcSnapshot:
+    pid: int
+    starttime: int
+    uid: int
+    argv: tuple[str, ...]
+    executable: str
+    cwd: str
 
 
 @dataclass(frozen=True)
@@ -230,8 +248,13 @@ class _PromptProcessLock:
                 "fcntl is required for the Codex cross-process prompt lock",
                 fallback_safe=True,
             )
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        lock_file = self.path.open("a+", encoding="utf-8")
+        try:
+            lock_file = _open_trusted_prompt_lock(self.path, migrate_private=True)
+        except OSError as exc:
+            raise CodexAppBridgeError(
+                "Codex prompt lock path is not trusted",
+                fallback_safe=True,
+            ) from exc
         try:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -283,23 +306,405 @@ def prompt_lock_path(session_id: str | None, cwd: Path) -> Path:
     return lock_root / f"{digest}.lock"
 
 
-def prompt_lock_is_busy(session_id: str | None, cwd: Path) -> bool:
-    if fcntl is None:
+def _open_trusted_prompt_lock(path: Path, *, migrate_private: bool = False) -> Any:
+    """Open one prompt lock without following an attacker-controlled file.
+
+    The lock directory is normally root-owned below ``/tmp``.  We accept an
+    override for tests and deployments, but only when its final directory and
+    the lock inode are owned by this service uid and cannot be written by a
+    group or another user.  The returned fd pins the exact inode whose flock
+    and metadata are inspected, closing the rename/replacement race.
+    """
+    root = path.parent
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root_stat = root.lstat()
+    if (
+        not stat.S_ISDIR(root_stat.st_mode)
+        or root_stat.st_uid != os.geteuid()
+        or root_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise OSError("untrusted Codex prompt lock directory")
+
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        # This compatibility lock is a Linux service feature.  On a platform
+        # without O_NOFOLLOW it is safer to fail closed than read an arbitrary
+        # target via a symlink.
+        raise OSError("O_NOFOLLOW is required for Codex prompt locks")
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+    root_fd = os.open(root, directory_flags | getattr(os, "O_CLOEXEC", 0))
+    try:
+        opened_root_stat = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(opened_root_stat.st_mode)
+            or opened_root_stat.st_uid != os.geteuid()
+            or opened_root_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise OSError("untrusted Codex prompt lock directory")
+        if stat.S_IMODE(opened_root_stat.st_mode) != 0o700:
+            if not migrate_private:
+                raise OSError("Codex prompt lock directory is not private")
+            os.fchmod(root_fd, 0o700)
+            if stat.S_IMODE(os.fstat(root_fd).st_mode) != 0o700:
+                raise OSError("unable to secure Codex prompt lock directory")
+        # Resolve the lock name relative to the opened directory rather than
+        # reopening ``path``.  A rename after the checks above cannot switch
+        # this fd to another directory or another lock inode.
+        fd = os.open(path.name, flags | nofollow, 0o600, dir_fd=root_fd)
+    finally:
+        os.close(root_fd)
+    try:
+        file_stat = os.fstat(fd)
+        if (
+            not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_uid != os.geteuid()
+            or file_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise OSError("untrusted Codex prompt lock file")
+        if stat.S_IMODE(file_stat.st_mode) != 0o600:
+            if not migrate_private:
+                raise OSError("Codex prompt lock file is not private")
+            os.fchmod(fd, 0o600)
+            if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
+                raise OSError("unable to secure Codex prompt lock file")
+        return os.fdopen(fd, "r+", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _read_qiaokairos_lock_metadata(lock_file: Any) -> dict[str, Any] | None:
+    """Read a bounded, non-secret qiaokairos compatibility lock record."""
+    try:
+        lock_file.seek(0)
+        raw = lock_file.read(1025)
+        # This is intentionally small so a malicious legacy lock cannot make
+        # the service ingest arbitrary lock contents.  It contains identities,
+        # never credentials or prompt material.
+        if len(raw) > 1024:
+            return None
+        metadata = json.loads(raw)
+        if not isinstance(metadata, dict) or set(metadata) != _QIAOKAIROS_LOCK_METADATA_KEYS:
+            return None
+        if (
+            type(metadata["pid"]) is not int
+            or type(metadata["pid_starttime"]) is not int
+            or type(metadata["uid"]) is not int
+            or type(metadata["started_at"]) is not int
+            or not isinstance(metadata["owner"], str)
+            or not all(isinstance(metadata[key], str) for key in (
+                "session_id", "cwd", "codex_bin", "supervisor_cwd", "supervisor_exe",
+                "process_identity",
+            ))
+            or not isinstance(metadata["supervisor_argv"], list)
+            or not metadata["supervisor_argv"]
+            or len(metadata["supervisor_argv"]) > 16
+            or any(
+                not isinstance(argument, str) or len(argument) > 512
+                for argument in metadata["supervisor_argv"]
+            )
+            or sum(len(argument) for argument in metadata["supervisor_argv"]) > 1024
+        ):
+            return None
+        return metadata
+    except Exception:
+        return None
+
+
+def _canonical_trusted_regular_path(value: str | Path) -> str | None:
+    """Resolve one configured executable/script only if its inode is safe."""
+    try:
+        path = Path(value).expanduser().resolve(strict=True)
+        path_stat = path.stat()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if (
+        not stat.S_ISREG(path_stat.st_mode)
+        or path_stat.st_uid != os.geteuid()
+        or path_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        return None
+    return str(path)
+
+
+def _trusted_codex_release_executable(value: str | Path) -> tuple[str, int, int] | None:
+    """Resolve a configured Codex shim through its protected release chain."""
+    try:
+        anchor = CODEX_RELEASE_TRUST_ANCHOR.resolve(strict=True)
+        target = Path(value).expanduser().resolve(strict=True)
+        anchor_info = anchor.stat()
+        target_info = target.stat()
+        relative = target.relative_to(anchor)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if (
+        not stat.S_ISDIR(anchor_info.st_mode)
+        or anchor_info.st_uid != 0
+        or anchor_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or not stat.S_ISREG(target_info.st_mode)
+        or not target_info.st_mode & stat.S_IXUSR
+    ):
+        return None
+    allowed_owners = {0, target_info.st_uid}
+    current = anchor
+    try:
+        for index, part in enumerate(relative.parts):
+            current = current / part
+            info = current.stat()
+            is_target = index == len(relative.parts) - 1
+            if (
+                info.st_uid not in allowed_owners
+                or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or (is_target and not stat.S_ISREG(info.st_mode))
+                or (not is_target and not stat.S_ISDIR(info.st_mode))
+            ):
+                return None
+    except OSError:
+        return None
+    return str(target), target_info.st_dev, target_info.st_ino
+
+
+def _same_trusted_codex_release(value: str | Path, expected: tuple[str, int, int]) -> bool:
+    candidate = _trusted_codex_release_executable(value)
+    return candidate is not None and candidate == expected
+
+
+def _allowed_qiaokairos_supervisor_argv(
+    argv: tuple[str, ...],
+    *,
+    executable: str,
+    expected_script: str,
+) -> bool:
+    """Allow only Python/shebang forms that execute the trusted qia script."""
+    if len(argv) < 2 or not argv[1].startswith("/"):
         return False
+    interpreter = _canonical_trusted_regular_path(executable)
+    script = _canonical_trusted_regular_path(argv[1])
+    if not interpreter or script != expected_script:
+        return False
+    interpreter_name = Path(interpreter).name
+    if not interpreter_name.startswith("python"):
+        return False
+    argv0 = argv[0]
+    if argv0.startswith("/"):
+        interpreter_ok = _canonical_trusted_regular_path(argv0) == interpreter
+    else:
+        interpreter_ok = argv0 in {interpreter_name, "python3", "python"}
+    if not interpreter_ok:
+        return False
+    # qiaokairos has no positional arguments.  Keep its hidden maintenance
+    # switches explicit too, so a metadata-matching Python invocation cannot
+    # smuggle another interpreter mode or arbitrary script argument.
+    value_options = {"--state", "--session-root", "--shared-name", "--codex-bin"}
+    seen_no_wait = False
+    index = 2
+    while index < len(argv):
+        option = argv[index]
+        if option == "--no-wait" and not seen_no_wait:
+            seen_no_wait = True
+            index += 1
+            continue
+        if option in value_options and index + 1 < len(argv) and argv[index + 1]:
+            index += 2
+            continue
+        return False
+    return True
+
+
+def _read_proc_snapshot(pid: int) -> _ProcSnapshot | None:
+    """Take one self-consistent /proc identity snapshot, or fail closed."""
+    if pid <= 0:
+        return None
+    proc = Path("/proc") / str(pid)
+    try:
+        proc_stat = proc.stat()
+        raw_stat = (proc / "stat").read_text(encoding="utf-8", errors="strict")
+        close = raw_stat.rfind(")")
+        fields = raw_stat[close + 2:].split()
+        # /proc/<pid>/stat field 22 is starttime; after the closing ')' this
+        # becomes index 19 because field 3 is the first remaining token.
+        starttime = int(fields[19])
+        argv = tuple(
+            part.decode("utf-8", errors="surrogateescape")
+            for part in (proc / "cmdline").read_bytes().split(b"\0")
+            if part
+        )
+        executable = os.readlink(proc / "exe")
+        cwd = os.readlink(proc / "cwd")
+        # Guard PID reuse or an exit/restart while fields are read.
+        confirm = (proc / "stat").read_text(encoding="utf-8", errors="strict")
+        confirm_close = confirm.rfind(")")
+        if int(confirm[confirm_close + 2:].split()[19]) != starttime:
+            return None
+        return _ProcSnapshot(
+            pid=pid,
+            starttime=starttime,
+            uid=proc_stat.st_uid,
+            argv=argv,
+            executable=executable,
+            cwd=cwd,
+        )
+    except (OSError, ValueError, IndexError, UnicodeError):
+        return None
+
+
+def _flock_holder_pids(lock_file: Any) -> list[int] | None:
+    """Return unique kernel FLOCK holders for this exact opened lock inode."""
+    try:
+        file_stat = os.fstat(lock_file.fileno())
+        device = f"{os.major(file_stat.st_dev):02x}:{os.minor(file_stat.st_dev):02x}:{file_stat.st_ino}"
+        holders: set[int] = set()
+        for raw_line in Path("/proc/locks").read_text(encoding="ascii", errors="strict").splitlines():
+            fields = raw_line.split()
+            # e.g. "12: FLOCK ADVISORY WRITE 123 00:02:99 0 EOF".
+            if len(fields) < 6 or fields[1] != "FLOCK" or fields[5] != device:
+                continue
+            pid = int(fields[4])
+            if pid <= 0:
+                return None
+            holders.add(pid)
+        return sorted(holders)
+    except (OSError, ValueError, UnicodeError):
+        return None
+
+
+def _direct_child_pids(pid: int) -> list[int] | None:
+    try:
+        raw = (Path("/proc") / str(pid) / "task" / str(pid) / "children").read_text(
+            encoding="ascii", errors="strict",
+        )
+        children = [int(item) for item in raw.split()]
+        return children if all(child > 0 for child in children) else None
+    except (OSError, ValueError, UnicodeError):
+        return None
+
+
+def _qiaokairos_lock_holder_is_verified(
+    lock_file: Any,
+    *,
+    metadata: dict[str, Any],
+    session_id: str | None,
+    cwd: Path,
+    expected_codex_bin: str | Path | None,
+) -> bool:
+    """Verify the held flock belongs to the real shared-daemon TUI.
+
+    This is a defense against a same-uid process writing a plausible JSON
+    marker.  It deliberately relies on Linux's kernel lock table plus /proc
+    identities.  A hostile root can control both by definition; the trust
+    boundary is the root-owned service/scripts and kernel, not another root
+    principal on this host.
+    """
+    if metadata.get("owner") != QIAOKAIROS_REMOTE_COMPAT_LOCK_OWNER:
+        return False
+    expected_session = str(session_id or "").strip()
+    try:
+        expected_cwd = str(Path(cwd).expanduser().resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return False
+    expected_binary = (
+        _trusted_codex_release_executable(expected_codex_bin)
+        if expected_codex_bin is not None else None
+    )
+    expected_script = _canonical_trusted_regular_path(QIAOKAIROS_REMOTE_SCRIPT)
+    if not expected_session or not expected_binary or not expected_script:
+        return False
+    if (
+        metadata["session_id"] != expected_session
+        or metadata["cwd"] != expected_cwd
+        or metadata["codex_bin"] != expected_binary[0]
+    ):
+        return False
+    pid = metadata["pid"]
+    holders_before = _flock_holder_pids(lock_file)
+    if holders_before != [pid]:
+        return False
+    supervisor = _read_proc_snapshot(pid)
+    recorded_argv = tuple(metadata["supervisor_argv"])
+    allowed_supervisor_argv = bool(supervisor and _allowed_qiaokairos_supervisor_argv(
+        recorded_argv,
+        executable=supervisor.executable,
+        expected_script=expected_script,
+    ))
+    if supervisor is None or (
+        supervisor.starttime != metadata["pid_starttime"]
+        or supervisor.uid != os.geteuid()
+        or supervisor.uid != metadata["uid"]
+        or supervisor.executable != metadata["supervisor_exe"]
+        or supervisor.cwd != metadata["supervisor_cwd"]
+        or metadata["process_identity"] != f"{pid}:{supervisor.starttime}"
+        or supervisor.argv != recorded_argv
+        or not allowed_supervisor_argv
+    ):
+        return False
+    children = _direct_child_pids(pid)
+    if children is None or len(children) != 1:
+        return False
+    child = _read_proc_snapshot(children[0])
+    expected_argv_tail = (
+        "resume", "--remote", "unix://", "--include-non-interactive",
+        "--cd", expected_cwd, expected_session,
+    )
+    if child is None or (
+        child.uid != os.geteuid()
+        or child.cwd != expected_cwd
+        or not _same_trusted_codex_release(child.executable, expected_binary)
+        or not child.argv
+        or not _same_trusted_codex_release(child.argv[0], expected_binary)
+        or child.argv[1:] != expected_argv_tail
+    ):
+        return False
+    # Re-read the lock table after all process inspection.  If any PID exited,
+    # was replaced, or lock ownership changed during the check, stay busy.
+    return _flock_holder_pids(lock_file) == [pid]
+
+
+def prompt_lock_is_busy(
+    session_id: str | None,
+    cwd: Path,
+    *,
+    ignore_owner: str | None = None,
+    expected_codex_bin: str | Path | None = None,
+) -> bool:
+    """Check the legacy flock, optionally recognizing one trusted holder.
+
+    ``ignore_owner`` is intentionally narrow: only a currently held lock on
+    the same securely opened inode whose complete minimal metadata exactly
+    matches the supplied owner is ignored.  Missing/corrupt/legacy metadata
+    remains busy so a legacy ``codex exec`` writer is never raced.
+    """
+    if fcntl is None:
+        return True
     path = prompt_lock_path(session_id, cwd)
     lock_file = None
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        lock_file = path.open("a+", encoding="utf-8")
+        lock_file = _open_trusted_prompt_lock(path, migrate_private=True)
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        if lock_file is not None:
-            lock_file.close()
-        return True
+        try:
+            metadata = _read_qiaokairos_lock_metadata(lock_file)
+            compatible = (
+                ignore_owner == QIAOKAIROS_REMOTE_COMPAT_LOCK_OWNER
+                and metadata is not None
+                and _qiaokairos_lock_holder_is_verified(
+                    lock_file,
+                    metadata=metadata,
+                    session_id=session_id,
+                    cwd=cwd,
+                    expected_codex_bin=expected_codex_bin,
+                )
+            )
+            return not compatible
+        finally:
+            if lock_file is not None:
+                lock_file.close()
     except Exception:
         if lock_file is not None:
             lock_file.close()
-        return False
+        # A lock we cannot safely inspect is not evidence that it is safe to
+        # race.  Fail closed; callers will retry after the normal queue delay.
+        return True
     try:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
     finally:

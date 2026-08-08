@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,8 @@ from codex_app_bridge import (
     CodexAppBridge,
     CodexAppBridgeError,
     CodexPromptLockBusy,
+    prompt_lock_is_busy,
+    prompt_lock_path,
 )
 
 
@@ -220,6 +223,289 @@ child = subprocess.Popen(
 )
 Path(str(sys.argv[1]) + ".child").write_text(str(child.pid), encoding="utf-8")
 ''' + FAKE_APP_SERVER
+
+
+class PromptLockCompatibilityTest(unittest.TestCase):
+    """The shared daemon may coexist only with qiaokairos's marked lock."""
+
+    def _held_lock(self, root: Path, payload: object):
+        path = prompt_lock_path("shared-thread", root)
+        lock_file = bridge_module._open_trusted_prompt_lock(path)
+        bridge_module.fcntl.flock(lock_file.fileno(), bridge_module.fcntl.LOCK_EX)
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(json.dumps(payload, separators=(",", ":")))
+        lock_file.flush()
+        self.addCleanup(lock_file.close)
+        return path
+
+    @staticmethod
+    def _metadata() -> dict[str, object]:
+        return {
+            "pid": 101,
+            "pid_starttime": 202,
+            "uid": os.geteuid(),
+            "owner": "qiaokairos-interactive",
+            "started_at": int(time.time()),
+            "session_id": "shared-thread",
+            "cwd": "/safe/cwd",
+            "codex_bin": "/safe/codex",
+            "supervisor_cwd": "/safe/supervisor",
+            "supervisor_exe": "/safe/python",
+            "supervisor_argv": ["/safe/python", "/safe/qiaokairos.py"],
+            "process_identity": "101:202",
+        }
+
+    def test_exact_qiaokairos_owner_is_the_only_compatible_holder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"CODEX_PROMPT_LOCK_DIR": tmp}, clear=False,
+        ):
+            root = Path(tmp)
+            self._held_lock(root, self._metadata())
+            with mock.patch.object(
+                bridge_module, "_qiaokairos_lock_holder_is_verified", return_value=True,
+            ) as verified:
+                self.assertFalse(prompt_lock_is_busy(
+                    "shared-thread", root, ignore_owner="qiaokairos-interactive",
+                    expected_codex_bin="/safe/codex",
+                ))
+            verified.assert_called_once()
+            self.assertTrue(prompt_lock_is_busy(
+                "shared-thread", root, ignore_owner="some-other-owner",
+            ))
+            self.assertTrue(prompt_lock_is_busy("shared-thread", root))
+
+    def test_unknown_or_legacy_locked_metadata_fails_closed(self) -> None:
+        cases = [
+            {"pid": os.getpid(), "started_at": int(time.time())},
+            {**self._metadata(), "owner": "someone-else"},
+            {**self._metadata(), "pid": "not-an-int"},
+            {"owner": "qiaokairos-interactive"},
+            "not-a-json-object",
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+                os.environ, {"CODEX_PROMPT_LOCK_DIR": tmp}, clear=False,
+            ):
+                root = Path(tmp)
+                self._held_lock(root, payload)
+                self.assertTrue(prompt_lock_is_busy(
+                    "shared-thread", root, ignore_owner="qiaokairos-interactive",
+                ))
+
+    def test_untrusted_lock_directory_fails_closed_without_reading_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"CODEX_PROMPT_LOCK_DIR": tmp}, clear=False,
+        ):
+            root = Path(tmp)
+            root.chmod(0o777)
+            self.assertTrue(prompt_lock_is_busy(
+                "shared-thread", root, ignore_owner="qiaokairos-interactive",
+            ))
+
+    def test_idle_legacy_permissions_are_safely_migrated_before_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"CODEX_PROMPT_LOCK_DIR": tmp}, clear=False,
+        ):
+            root = Path(tmp)
+            path = prompt_lock_path("shared-thread", root)
+            path.write_text("{}", encoding="utf-8")
+            path.chmod(0o644)
+            root.chmod(0o755)
+            self.assertFalse(prompt_lock_is_busy(
+                "shared-thread", root, ignore_owner="qiaokairos-interactive",
+            ))
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+
+    def test_held_legacy_permissions_migrate_then_verify_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"CODEX_PROMPT_LOCK_DIR": tmp}, clear=False,
+        ):
+            root = Path(tmp)
+            path = self._held_lock(root, self._metadata())
+            root.chmod(0o755)
+            path.chmod(0o644)
+            with mock.patch.object(
+                bridge_module, "_qiaokairos_lock_holder_is_verified", return_value=True,
+            ):
+                self.assertFalse(prompt_lock_is_busy(
+                    "shared-thread", root, ignore_owner="qiaokairos-interactive",
+                    expected_codex_bin="/safe/codex",
+                ))
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+
+    def test_missing_fcntl_fails_closed(self) -> None:
+        with mock.patch.object(bridge_module, "fcntl", None):
+            self.assertTrue(prompt_lock_is_busy("shared-thread", Path("/tmp")))
+
+
+class QiaokairosHolderVerificationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.cwd = self.root / "cwd"
+        self.cwd.mkdir()
+        self.script = self.root / "qiaokairos.py"
+        self.binary = self.root / "codex"
+        self.interpreter = self.root / "python"
+        for path in (self.script, self.binary, self.interpreter):
+            path.write_text("trusted", encoding="utf-8")
+            path.chmod(0o700)
+        self.pid = 101
+        self.child_pid = 202
+        self.metadata = {
+            "pid": self.pid,
+            "pid_starttime": 303,
+            "uid": os.geteuid(),
+            "owner": "qiaokairos-interactive",
+            "started_at": 1,
+            "session_id": "shared-thread",
+            "cwd": str(self.cwd),
+            "codex_bin": str(self.binary),
+            "supervisor_cwd": str(self.root),
+            "supervisor_exe": str(self.interpreter),
+            "supervisor_argv": [str(self.interpreter), str(self.script)],
+            "process_identity": f"{self.pid}:303",
+        }
+        self.supervisor = bridge_module._ProcSnapshot(
+            pid=self.pid,
+            starttime=303,
+            uid=os.geteuid(),
+            argv=(str(self.interpreter), str(self.script)),
+            executable=str(self.interpreter),
+            cwd=str(self.root),
+        )
+        self.child = bridge_module._ProcSnapshot(
+            pid=self.child_pid,
+            starttime=404,
+            uid=os.geteuid(),
+            argv=(
+                str(self.binary), "resume", "--remote", "unix://", "--include-non-interactive",
+                "--cd", str(self.cwd), "shared-thread",
+            ),
+            executable=str(self.binary),
+            cwd=str(self.cwd),
+        )
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _verify(self, *, holders: object = None, supervisor: object = None, child: object = None,
+                children: object = None, metadata: object = None) -> bool:
+        holder_values = holders if holders is not None else [[self.pid], [self.pid]]
+        with mock.patch.object(bridge_module, "QIAOKAIROS_REMOTE_SCRIPT", self.script), mock.patch.object(
+            bridge_module, "_flock_holder_pids", side_effect=holder_values,
+        ), mock.patch.object(
+            bridge_module, "_trusted_codex_release_executable",
+            return_value=(str(self.binary), 11, 12),
+        ), mock.patch.object(
+            bridge_module, "_read_proc_snapshot",
+            side_effect=[supervisor if supervisor is not None else self.supervisor,
+                         child if child is not None else self.child],
+        ), mock.patch.object(
+            bridge_module, "_direct_child_pids",
+            return_value=children if children is not None else [self.child_pid],
+        ):
+            return bridge_module._qiaokairos_lock_holder_is_verified(
+                mock.sentinel.lock,
+                metadata=metadata if metadata is not None else self.metadata,
+                session_id="shared-thread",
+                cwd=self.cwd,
+                expected_codex_bin=self.binary,
+            )
+
+    def test_accepts_only_kernel_bound_real_qiaokairos_remote_child(self) -> None:
+        self.assertTrue(self._verify())
+
+    def test_accepts_env_shebang_and_verified_python3_basename_forms(self) -> None:
+        # A normal env/shebang launch exposes the resolved interpreter path.
+        self.assertTrue(self._verify())
+        metadata = dict(self.metadata)
+        metadata["supervisor_argv"] = ["python3", str(self.script)]
+        supervisor = dataclasses.replace(self.supervisor, argv=("python3", str(self.script)))
+        self.assertTrue(self._verify(metadata=metadata, supervisor=supervisor))
+        metadata["supervisor_argv"] = ["python3", str(self.script), "--no-wait"]
+        supervisor = dataclasses.replace(
+            self.supervisor, argv=("python3", str(self.script), "--no-wait"),
+        )
+        self.assertTrue(self._verify(metadata=metadata, supervisor=supervisor))
+
+    def test_rejects_owner_pid_mismatch_and_proc_race(self) -> None:
+        self.assertFalse(self._verify(holders=[[999], [999]]))
+        self.assertFalse(self._verify(holders=[[self.pid], [999]]))
+        self.assertFalse(self._verify(holders=[None]))
+
+    def test_rejects_wrong_supervisor_or_child_identity(self) -> None:
+        fake_supervisor = dataclasses.replace(self.supervisor, argv=("python", "fake.py"))
+        self.assertFalse(self._verify(supervisor=fake_supervisor))
+        fake_remote = dataclasses.replace(self.child, argv=(str(self.binary), "resume"))
+        self.assertFalse(self._verify(child=fake_remote))
+        wrong_session = dataclasses.replace(
+            self.child, argv=(*self.child.argv[:-1], "other-thread"),
+        )
+        self.assertFalse(self._verify(child=wrong_session))
+        wrong_cwd = dataclasses.replace(self.child, cwd=str(self.root))
+        self.assertFalse(self._verify(child=wrong_cwd))
+        self.assertFalse(self._verify(children=[]))
+
+    def test_rejects_tampered_supervisor_argv_interpreter_and_script_order(self) -> None:
+        extra_arg = dataclasses.replace(
+            self.supervisor, argv=(*self.supervisor.argv, "--unexpected"),
+        )
+        self.assertFalse(self._verify(supervisor=extra_arg))
+        reversed_args = dataclasses.replace(
+            self.supervisor, argv=(str(self.script), str(self.interpreter)),
+        )
+        self.assertFalse(self._verify(supervisor=reversed_args))
+        other_interpreter = self.root / "other-python"
+        other_interpreter.write_text("trusted", encoding="utf-8")
+        other_interpreter.chmod(0o700)
+        different_interpreter = dataclasses.replace(
+            self.supervisor,
+            argv=(str(other_interpreter), str(self.script)),
+            executable=str(other_interpreter),
+        )
+        self.assertFalse(self._verify(supervisor=different_interpreter))
+
+    def test_rejects_fake_basename_and_metadata_consistent_wrong_executable(self) -> None:
+        fake_basename = dict(self.metadata)
+        fake_basename["supervisor_argv"] = ["sh", str(self.script)]
+        fake_supervisor = dataclasses.replace(self.supervisor, argv=("sh", str(self.script)))
+        self.assertFalse(self._verify(metadata=fake_basename, supervisor=fake_supervisor))
+        wrong_exe = self.root / "not-python"
+        wrong_exe.write_text("trusted", encoding="utf-8")
+        wrong_exe.chmod(0o700)
+        wrong_metadata = dict(self.metadata)
+        wrong_metadata["supervisor_exe"] = str(wrong_exe)
+        wrong_metadata["supervisor_argv"] = [str(wrong_exe), str(self.script)]
+        wrong_supervisor = dataclasses.replace(
+            self.supervisor,
+            executable=str(wrong_exe),
+            argv=(str(wrong_exe), str(self.script)),
+        )
+        self.assertFalse(self._verify(metadata=wrong_metadata, supervisor=wrong_supervisor))
+
+
+class CodexReleaseChainTest(unittest.TestCase):
+    def test_real_readonly_shims_resolve_to_one_trusted_release_inode(self) -> None:
+        configured = bridge_module._trusted_codex_release_executable("/usr/bin/codex")
+        self.assertIsNotNone(configured)
+        self.assertTrue(bridge_module._same_trusted_codex_release("/root/.local/bin/codex", configured))
+        self.assertFalse(bridge_module._same_trusted_codex_release("/bin/true", configured))
+
+    def test_group_writable_release_chain_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            anchor = Path(tmp) / "codex-home"
+            target = anchor / "packages" / "release" / "bin" / "codex"
+            target.parent.mkdir(parents=True)
+            target.write_text("trusted", encoding="utf-8")
+            target.chmod(0o700)
+            with mock.patch.object(bridge_module, "CODEX_RELEASE_TRUST_ANCHOR", anchor):
+                self.assertIsNotNone(bridge_module._trusted_codex_release_executable(target))
+                (anchor / "packages").chmod(0o775)
+                self.assertIsNone(bridge_module._trusted_codex_release_executable(target))
 
 
 class CodexAppBridgeTest(unittest.TestCase):

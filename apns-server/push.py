@@ -89,6 +89,7 @@ from codex_app_bridge import (
     OBSERVER_ITEM_LABELS,
     OBSERVER_PHASE_LABELS,
     OBSERVER_PHASES,
+    QIAOKAIROS_REMOTE_COMPAT_LOCK_OWNER,
     prompt_lock_is_busy,
 )
 from codex_preferences import (
@@ -7893,13 +7894,39 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _codex_session_busy(self, session_id: str | None) -> bool:
         bridge = self.state.codex_app_bridge.snapshot()
-        if bridge.get("busy"):
-            return True
         _, cwd = self._load_codex_target()
-        return bool(
-            self._codex_exec_processes(session_id=session_id)
-            or prompt_lock_is_busy(session_id, cwd)
-        )
+        backend = str(getattr(self.state, "codex_kairos_backend", "app-server") or "app-server")
+        processes = self._codex_exec_processes(session_id=session_id)
+        if not processes:
+            # A legacy exec can be started without (or against a different)
+            # session id while still sharing this cwd.  Seeing either form is
+            # sufficient to keep App out of its incompatible writer path.
+            processes = self._codex_exec_processes(cwd=cwd)
+        if processes:
+            # A real legacy ``codex exec`` process is never compatible with a
+            # shared daemon turn, regardless of the lock metadata.
+            return True
+        if backend != "app-server":
+            return bool(bridge.get("busy") or prompt_lock_is_busy(session_id, cwd))
+
+        # qiaokairos Remote uses the same app-server and thread as the App. It
+        # still holds CodexRunner's compatibility flock so standalone clients
+        # wait correctly, but app-server can atomically steer a normal active
+        # TUI turn (or reject a non-steerable one).  Do not pre-queue that
+        # one explicitly marked holder.  Every unknown/legacy holder remains
+        # fail-closed busy in ``prompt_lock_is_busy``.
+        if prompt_lock_is_busy(
+            session_id,
+            cwd,
+            ignore_owner=QIAOKAIROS_REMOTE_COMPAT_LOCK_OWNER,
+            expected_codex_bin=getattr(self.state, "codex_bin", None),
+        ):
+            return True
+
+        # The bridge sees Remote turns too.  Let app-server adjudicate those
+        # with turn/steer rather than treating its observer as a cross-client
+        # mutex.  In-process App work is guarded by CODEX_RUNS at admission.
+        return False
 
     def _codex_exec_processes(
         self,

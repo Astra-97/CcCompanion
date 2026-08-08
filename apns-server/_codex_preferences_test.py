@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 from codex_app_bridge import CodexAppBridge, CodexAppBridgeError
+from codex_app_bridge import QIAOKAIROS_REMOTE_COMPAT_LOCK_OWNER
 from codex_preferences import (
     CodexModelCapability,
     CodexPreferenceError,
@@ -387,6 +388,57 @@ class ManualForgePreferenceTest(unittest.TestCase):
             worker_args = thread_cls.call_args.kwargs["args"]
             self.assertEqual(worker_args[-1], ("stored-model", "xhigh"))
             self.assertEqual(len(worker_args), 6)
+
+
+class SharedDaemonAdmissionTest(unittest.TestCase):
+    """The App preflight must defer Remote arbitration to app-server."""
+
+    @staticmethod
+    def _handler(*, backend: str = "app-server", bridge_busy: bool = False) -> PushHandler:
+        handler = object.__new__(PushHandler)
+        handler.state = types.SimpleNamespace(
+            codex_kairos_backend=backend,
+            codex_app_bridge=types.SimpleNamespace(snapshot=lambda: {"busy": bridge_busy}),
+            codex_bin="/safe/codex",
+        )
+        handler._load_codex_target = lambda: ("shared-thread", Path("/safe/cwd"))
+        handler._codex_exec_processes = lambda **_kwargs: []
+        return handler
+
+    def test_remote_tui_compat_lock_admits_app_server_even_when_observing_turn(self) -> None:
+        handler = self._handler(bridge_busy=True)
+        with mock.patch("push.prompt_lock_is_busy", return_value=False) as busy:
+            self.assertFalse(handler._codex_session_busy("shared-thread"))
+        busy.assert_called_once_with(
+            "shared-thread", Path("/safe/cwd"),
+            ignore_owner=QIAOKAIROS_REMOTE_COMPAT_LOCK_OWNER,
+            expected_codex_bin="/safe/codex",
+        )
+
+    def test_standalone_or_malformed_lock_stays_queued(self) -> None:
+        handler = self._handler()
+        with mock.patch("push.prompt_lock_is_busy", return_value=True):
+            self.assertTrue(handler._codex_session_busy("shared-thread"))
+
+    def test_legacy_exec_backend_never_ignores_compat_lock(self) -> None:
+        handler = self._handler(backend="legacy-exec")
+        with mock.patch("push.prompt_lock_is_busy", return_value=True) as busy:
+            self.assertTrue(handler._codex_session_busy("shared-thread"))
+        busy.assert_called_once_with("shared-thread", Path("/safe/cwd"))
+
+    def test_real_codex_exec_process_is_busy_even_for_remote_owner(self) -> None:
+        handler = self._handler()
+        handler._codex_exec_processes = lambda **_kwargs: [{"pid": 7}]
+        with mock.patch("push.prompt_lock_is_busy", side_effect=AssertionError("must not ignore exec")):
+            self.assertTrue(handler._codex_session_busy("shared-thread"))
+
+    def test_real_codex_exec_in_shared_cwd_is_busy_when_session_scan_misses(self) -> None:
+        handler = self._handler()
+        handler._codex_exec_processes = lambda **kwargs: (
+            [{"pid": 8}] if kwargs.get("cwd") is not None else []
+        )
+        with mock.patch("push.prompt_lock_is_busy", side_effect=AssertionError("must not ignore exec")):
+            self.assertTrue(handler._codex_session_busy("shared-thread"))
 
 
 if __name__ == "__main__":
