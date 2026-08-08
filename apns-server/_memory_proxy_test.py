@@ -130,13 +130,22 @@ class MemoryProxyTest(unittest.TestCase):
 
     def test_list_passes_whitelisted_params_only(self):
         handler, captured = self.run_forward(
-            "/memory/list?category=core&limit=50&evil=1&redirect=http://x", []
+            "/memory/list?category=core&subcategory=profile.preference&limit=50&evil=1&redirect=http://x", []
         )
         self.assertEqual(
             captured["url"],
-            "https://memory.xiaonancaleb.xyz/api/memories?category=core&limit=50",
+            "https://memory.xiaonancaleb.xyz/api/memories?category=core&subcategory=profile.preference&limit=50",
         )
         self.assertEqual(handler.responses[0], (200, []))
+
+    def test_unclassified_core_sentinel_is_forwarded_without_rewriting(self):
+        _, captured = self.run_forward(
+            "/memory/list?category=core&subcategory=__unclassified__&per_page=50", {}
+        )
+        self.assertEqual(
+            captured["url"],
+            "https://memory.xiaonancaleb.xyz/api/memories?category=core&subcategory=__unclassified__&per_page=50",
+        )
 
     def test_limit_clamped_and_bad_limit_dropped(self):
         _, captured = self.run_forward("/memory/list?limit=99999", [])
@@ -199,10 +208,12 @@ class MemoryProxyTest(unittest.TestCase):
         self.assertEqual(handler.responses[0][0], 404)
 
     def test_semantic_search_route(self):
-        _, captured = self.run_forward("/memory/semantic-search?query=abc&category=diary", [])
+        _, captured = self.run_forward(
+            "/memory/semantic-search?query=abc&category=core&subcategory=__unclassified__", []
+        )
         self.assertEqual(
             captured["url"],
-            "https://memory.xiaonancaleb.xyz/api/semantic-search?query=abc&category=diary",
+            "https://memory.xiaonancaleb.xyz/api/semantic-search?query=abc&category=core&subcategory=__unclassified__",
         )
 
     def test_board_and_categories_list_passthrough(self):

@@ -12265,6 +12265,7 @@ class PushHandler(BaseHTTPRequestHandler):
     _MEMORY_ALLOWED_PARAMS = (
         "query",
         "category",
+        "subcategory",
         "limit",
         "tag",
         "page",
