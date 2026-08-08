@@ -12300,6 +12300,21 @@ class PushHandler(BaseHTTPRequestHandler):
         "sort_order",
         "cursor",
     )
+    _MEMORY_CORE_SUBCATEGORIES = frozenset((
+        "directive.interaction",
+        "directive.operating",
+        "profile.stable",
+        "profile.preference",
+        "profile.sensitive",
+        "operations.tooling",
+        "operations.runbook",
+        "operations.incident",
+        "project.active",
+        "project.archive",
+        "knowledge.technical",
+        "knowledge.research",
+        "legacy",
+    ))
     _memory_token_cache: str | None = None
 
     @classmethod
@@ -12333,7 +12348,24 @@ class PushHandler(BaseHTTPRequestHandler):
             return
 
         # Whitelist-filter query params (anti SSRF / abuse).
-        qs = parse_qs(parsed.query)
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        subcategory_values = qs.get("subcategory")
+        if subcategory_values is not None:
+            if len(subcategory_values) != 1:
+                self._send_json(400, {"error": "subcategory 只能提供一次；请移除重复筛选。"})
+                return
+            category_values = qs.get("category", [])
+            category = str(category_values[0]).strip() if category_values else None
+            subcategory = str(subcategory_values[0]).strip()
+            if category != "core":
+                self._send_json(400, {"error": "subcategory 只适用于 category=core；请先选择 core，或移除 subcategory。"})
+                return
+            if not subcategory:
+                self._send_json(400, {"error": "core 子分类不能为空；请选择一个已注册的 core 子分类。"})
+                return
+            if subcategory not in self._MEMORY_CORE_SUBCATEGORIES:
+                self._send_json(400, {"error": f"core 子分类『{subcategory}』无效；请选择一个已注册的 core 子分类。"})
+                return
         params: list[tuple[str, str]] = []
         for key in self._MEMORY_ALLOWED_PARAMS:
             values = qs.get(key)

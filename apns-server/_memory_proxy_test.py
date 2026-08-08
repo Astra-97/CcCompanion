@@ -138,13 +138,28 @@ class MemoryProxyTest(unittest.TestCase):
         )
         self.assertEqual(handler.responses[0], (200, []))
 
-    def test_unclassified_core_sentinel_is_forwarded_without_rewriting(self):
+    def test_invalid_core_subcategory_scopes_are_rejected_before_upstream(self):
+        for path, error in (
+            ("/memory/list?category=core&subcategory=__unclassified__&per_page=50", "无效"),
+            ("/memory/semantic-search?query=abc&category=core&subcategory=unknown", "无效"),
+            ("/memory/list?category=core&subcategory=", "不能为空"),
+            ("/memory/list?category=daily&subcategory=profile.preference", "只适用于"),
+            ("/memory/list?subcategory=profile.preference", "只适用于"),
+        ):
+            handler = self.handler(path)
+            with patch("urllib.request.urlopen") as urlopen:
+                handler._handle_memory_get()
+            urlopen.assert_not_called()
+            self.assertEqual(handler.responses[0][0], 400)
+            self.assertIn(error, handler.responses[0][1]["error"])
+
+    def test_valid_core_subcategory_scope_is_forwarded(self):
         _, captured = self.run_forward(
-            "/memory/list?category=core&subcategory=__unclassified__&per_page=50", {}
+            "/memory/list?category=core&subcategory=legacy&per_page=50", {}
         )
         self.assertEqual(
             captured["url"],
-            "https://memory.xiaonancaleb.xyz/api/memories?category=core&subcategory=__unclassified__&per_page=50",
+            "https://memory.xiaonancaleb.xyz/api/memories?category=core&subcategory=legacy&per_page=50",
         )
 
     def test_limit_clamped_and_bad_limit_dropped(self):
@@ -209,11 +224,11 @@ class MemoryProxyTest(unittest.TestCase):
 
     def test_semantic_search_route(self):
         _, captured = self.run_forward(
-            "/memory/semantic-search?query=abc&category=core&subcategory=__unclassified__", []
+            "/memory/semantic-search?query=abc&category=core&subcategory=operations.tooling", []
         )
         self.assertEqual(
             captured["url"],
-            "https://memory.xiaonancaleb.xyz/api/semantic-search?query=abc&category=core&subcategory=__unclassified__",
+            "https://memory.xiaonancaleb.xyz/api/semantic-search?query=abc&category=core&subcategory=operations.tooling",
         )
 
     def test_board_and_categories_list_passthrough(self):
