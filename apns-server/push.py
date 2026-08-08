@@ -1791,7 +1791,7 @@ def _inject_to_tmux_session(state: "ServerState", session: str, text: str) -> tu
 # aliases are resolved to a member of TOOLBOT_MODEL_ALLOWLIST. Anything else is
 # rejected — no free-form model string ever reaches the tmux injection.
 TOOLBOT_MODEL_ALLOWLIST: frozenset = frozenset({
-    "claude-fable-5",
+    "fable",
     "claude-opus-5",
     "claude-opus-5[1m]",
     "claude-sonnet-5",
@@ -1804,9 +1804,12 @@ TOOLBOT_MODEL_ALLOWLIST: frozenset = frozenset({
     "claude-haiku-4-5-20251001",
 })
 TOOLBOT_MODEL_ALIASES: dict[str, str] = {
-    "fable": "claude-fable-5",
-    "fable5": "claude-fable-5",
-    "fable-5": "claude-fable-5",
+    "fable": "fable",
+    "fable5": "fable",
+    "fable-5": "fable",
+    # Old app menus may have cached this full id.  Accept it as input, but
+    # canonicalize before any Claude Code command is injected.
+    "claude-fable-5": "fable",
     "opus": "claude-opus-4-6",
     "opus-1m": "claude-opus-4-6[1m]",
     "opus4.7": "claude-opus-4-7",
@@ -1833,7 +1836,7 @@ _models_menu_lock = threading.Lock()
 
 # 内置静态回退清单（与安卓端离线回退清单保持一致）。
 _STATIC_MODEL_MENU: list[dict[str, str]] = [
-    {"alias": "fable", "label": "Fable 5", "id": "claude-fable-5"},
+    {"alias": "fable", "label": "Fable 5", "id": "fable"},
     {"alias": "opus5", "label": "Opus 5", "id": "claude-opus-5"},
     {"alias": "opus5-1m", "label": "Opus 5 1M", "id": "claude-opus-5[1m]"},
     {"alias": "opus4.8", "label": "Opus 4.8", "id": "claude-opus-4-8"},
@@ -1900,8 +1903,15 @@ def _build_model_menu(ids: list[str]) -> list[dict[str, str]]:
     menu: list[dict[str, str]] = []
     seen_aliases: set[str] = set()
     seen_ids: set[str] = set()
-    for mid in ids:
-        entry = _derive_model_menu_entry(mid)
+    for raw_mid in ids:
+        # Anthropic's model listing may still advertise the legacy full id.
+        # Claude Code itself expects the short selector, including when the
+        # value comes from an otherwise-valid dynamic app menu.
+        mid = "fable" if raw_mid == "claude-fable-5" else raw_mid
+        if mid == "fable":
+            entry = dict(_STATIC_MODEL_MENU[0])
+        else:
+            entry = _derive_model_menu_entry(mid)
         if entry["alias"] in seen_aliases or mid in seen_ids:
             continue
         menu.append(entry)
@@ -1915,6 +1925,25 @@ def _build_model_menu(ids: list[str]) -> list[dict[str, str]]:
     return menu
 
 
+def _canonicalize_cached_model_menu(menu: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Replace pre-2.1.198 Fable cache entries with the CLI selector."""
+    canonical: list[dict[str, str]] = []
+    seen_aliases: set[str] = set()
+    seen_ids: set[str] = set()
+    for raw_entry in menu:
+        entry = dict(raw_entry)
+        if str(entry.get("id") or "").strip().lower() == "claude-fable-5":
+            entry = dict(_STATIC_MODEL_MENU[0])
+        alias = str(entry.get("alias") or "").strip()
+        model_id = str(entry.get("id") or "").strip()
+        if not alias or not model_id or alias in seen_aliases or model_id in seen_ids:
+            continue
+        canonical.append(entry)
+        seen_aliases.add(alias)
+        seen_ids.add(model_id)
+    return canonical
+
+
 def get_dynamic_model_menu(force_refresh: bool = False) -> tuple[list[dict[str, str]], str]:
     """返回 (菜单, 来源)。来源 ∈ {"live", "cache", "cache-stale", "static"}。"""
     now = time.time()
@@ -1925,7 +1954,12 @@ def get_dynamic_model_menu(force_refresh: bool = False) -> tuple[list[dict[str, 
                 cached = json.loads(_MODELS_CACHE_PATH.read_text())
         except Exception:
             cached = None
-        cached_menu = (cached or {}).get("menu") or None
+        raw_cached_menu = (cached or {}).get("menu") or None
+        cached_menu = (
+            _canonicalize_cached_model_menu(raw_cached_menu)
+            if isinstance(raw_cached_menu, list)
+            else None
+        )
         cached_at = float((cached or {}).get("fetched_at") or 0)
         if cached_menu and not force_refresh and now - cached_at < _MODELS_CACHE_TTL_SECONDS:
             return cached_menu, "cache"

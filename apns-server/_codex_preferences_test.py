@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+import time
 import threading
 import types
 import unittest
@@ -19,7 +20,16 @@ from codex_preferences import (
     parse_codex_model_catalog,
     validate_codex_selection,
 )
-from push import PushHandler, TOOLBOT_EFFORT_LEVELS
+from push import (
+    PushHandler,
+    TOOLBOT_EFFORT_LEVELS,
+    TOOLBOT_MODEL_ALIASES,
+    TOOLBOT_MODEL_ALLOWLIST,
+    _STATIC_MODEL_MENU,
+    _build_model_menu,
+    _canonicalize_cached_model_menu,
+    get_dynamic_model_menu,
+)
 
 
 def catalog_payload() -> dict:
@@ -288,6 +298,52 @@ class ToolbotEffortTest(unittest.TestCase):
         authed_post = handler("/codex/preferences", "POST", {"X-Auth-Token": "secret"})
         authed_post.do_POST()
         authed_post._handle_codex_preferences_post.assert_called_once()
+
+
+class ToolbotFableModelTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.handler = object.__new__(PushHandler)
+        self.calls: list[tuple[str, str, dict]] = []
+        self.handler._inject_to_session = lambda session, text, **kwargs: (
+            self.calls.append((session, text, kwargs)) or (True, "")
+        )
+
+    def test_aliases_resolve_and_model_command_injects_fable(self) -> None:
+        self.assertIn("fable", TOOLBOT_MODEL_ALLOWLIST)
+        self.assertNotIn("claude-fable-5", TOOLBOT_MODEL_ALLOWLIST)
+        for choice in ("fable", "fable5", "fable-5", "claude-fable-5"):
+            with self.subTest(choice=choice):
+                self.assertEqual(TOOLBOT_MODEL_ALIASES[choice], "fable")
+                self.assertEqual(self.handler._resolve_toolbot_model(choice), "fable")
+                ok, _result = self.handler._run_toolbot_command("model", choice)
+                self.assertTrue(ok)
+                self.assertEqual(self.calls.pop()[0:2], ("cctg", "/model fable"))
+
+    def test_static_and_dynamic_menus_expose_only_fable(self) -> None:
+        self.assertEqual(_STATIC_MODEL_MENU[0], {
+            "alias": "fable", "label": "Fable 5", "id": "fable",
+        })
+        live_menu = _build_model_menu(["claude-fable-5", "claude-opus-5"])
+        cached_menu = _canonicalize_cached_model_menu([
+            {"alias": "fable5", "label": "Fable 5", "id": "claude-fable-5"},
+            {"alias": "opus5", "label": "Opus 5", "id": "claude-opus-5"},
+        ])
+        for menu in (live_menu, cached_menu):
+            fable_entries = [entry for entry in menu if entry["id"] == "fable"]
+            self.assertEqual(fable_entries, [{"alias": "fable", "label": "Fable 5", "id": "fable"}])
+            self.assertFalse(any(entry["id"] == "claude-fable-5" for entry in menu))
+
+    def test_cached_dynamic_menu_is_canonicalized_before_return(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "models_cache.json"
+            cache.write_text(json.dumps({
+                "fetched_at": time.time(),
+                "menu": [{"alias": "fable5", "label": "Fable 5", "id": "claude-fable-5"}],
+            }), encoding="utf-8")
+            with mock.patch("push._MODELS_CACHE_PATH", cache):
+                menu, source = get_dynamic_model_menu()
+        self.assertEqual(source, "cache")
+        self.assertEqual(menu, [{"alias": "fable", "label": "Fable 5", "id": "fable"}])
 
 
 class ManualForgePreferenceTest(unittest.TestCase):
