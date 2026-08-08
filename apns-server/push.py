@@ -12315,6 +12315,11 @@ class PushHandler(BaseHTTPRequestHandler):
         "knowledge.research",
         "legacy",
     ))
+    _MEMORY_DIARY_SUBCATEGORIES = frozenset((
+        "diary.general",
+        "diary.worklog",
+        "diary.health",
+    ))
     _memory_token_cache: str | None = None
 
     @classmethod
@@ -12355,16 +12360,26 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "subcategory 只能提供一次；请移除重复筛选。"})
                 return
             category_values = qs.get("category", [])
+            if not category_values:
+                self._send_json(400, {"error": "subcategory 只适用于 category=core 或 diary；请先选择这两个分类之一，或移除 subcategory。"})
+                return
+            if len(category_values) != 1:
+                self._send_json(400, {"error": "使用 subcategory 时 category 必须且只能提供一次。"})
+                return
             category = str(category_values[0]).strip() if category_values else None
             subcategory = str(subcategory_values[0]).strip()
-            if category != "core":
-                self._send_json(400, {"error": "subcategory 只适用于 category=core；请先选择 core，或移除 subcategory。"})
+            valid_subcategories = {
+                "core": self._MEMORY_CORE_SUBCATEGORIES,
+                "diary": self._MEMORY_DIARY_SUBCATEGORIES,
+            }.get(category)
+            if valid_subcategories is None:
+                self._send_json(400, {"error": "subcategory 只适用于 category=core 或 diary；请先选择这两个分类之一，或移除 subcategory。"})
                 return
             if not subcategory:
-                self._send_json(400, {"error": "core 子分类不能为空；请选择一个已注册的 core 子分类。"})
+                self._send_json(400, {"error": f"{category} 子分类不能为空；请选择一个已注册的 {category} 子分类。"})
                 return
-            if subcategory not in self._MEMORY_CORE_SUBCATEGORIES:
-                self._send_json(400, {"error": f"core 子分类『{subcategory}』无效；请选择一个已注册的 core 子分类。"})
+            if subcategory not in valid_subcategories:
+                self._send_json(400, {"error": f"{category} 子分类『{subcategory}』无效；请选择一个已注册的 {category} 子分类。"})
                 return
         params: list[tuple[str, str]] = []
         for key in self._MEMORY_ALLOWED_PARAMS:
