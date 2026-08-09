@@ -2055,7 +2055,7 @@ class LinkPreviewTests(unittest.TestCase):
                 )
         self.assertEqual(
             self._serve_attachment("ordinary.jpg", head=False).headers["Cache-Control"],
-            "public, max-age=86400",
+            "private, no-store",
         )
 
     def test_xhs_cli_adapter_passes_upgraded_short_url_only_via_stdin(self):

@@ -60,6 +60,7 @@ try:
     import tomllib
 except ModuleNotFoundError:
     import tomli as tomllib
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -157,6 +158,356 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_CONFIG = HERE / "config.toml"
 CLIENT_LOG_PATH = HERE / "client_logs.jsonl"
 CLIENT_LOG_MAX_FIELD = 20_000
+WINDOWS_PWA_ROOT = HERE.parent / "windows-pwa"
+
+
+# The installed web/PWA client is deliberately a same-origin client.  It must
+# never receive the long-lived server secret (or the memory service token) just
+# to make normal chat requests.  A short-lived, opaque HttpOnly cookie is the
+# only browser credential.  Keep this separate from the Android onboarding
+# token, which remains a backwards-compatible native-client protocol.
+WEB_SESSION_COOKIE_NAME = "__Host-cccompanion"
+WEB_SESSION_CONTRACT_VERSION = "2026-08-09"
+
+
+class WebSessionStore:
+    """Small in-memory store for same-origin PWA sessions.
+
+    Tokens are random opaque handles, are never persisted, and are discarded
+    on a server restart.  This is intentional: a restart revokes browser
+    access instead of leaving another long-lived credential on disk.
+    """
+
+    def __init__(self, ttl_seconds: int = 12 * 60 * 60):
+        self.ttl_seconds = max(300, min(int(ttl_seconds), 7 * 24 * 60 * 60))
+        self._lock = threading.Lock()
+        self._sessions: dict[str, dict[str, Any]] = {}
+
+    def create(self) -> tuple[str, float]:
+        token = secrets.token_urlsafe(32)
+        expires_at = time.time() + self.ttl_seconds
+        with self._lock:
+            self._prune_locked()
+            self._sessions[token] = {
+                "expires_at": expires_at,
+                # This is intentionally distinct from the cookie and is only
+                # returned in the same-origin JSON bootstrap response.  PWA
+                # code keeps it in memory, never local/session storage.
+                "csrf_token": secrets.token_urlsafe(32),
+            }
+        return token, expires_at
+
+    def valid(self, token: Any) -> bool:
+        candidate = str(token or "")
+        if not candidate:
+            return False
+        with self._lock:
+            self._prune_locked()
+            session = self._sessions.get(candidate) or {}
+            expires_at = float(session.get("expires_at") or 0)
+            return bool(expires_at > time.time())
+
+    def csrf_token(self, token: Any) -> str:
+        candidate = str(token or "")
+        with self._lock:
+            self._prune_locked()
+            session = self._sessions.get(candidate) or {}
+            return str(session.get("csrf_token") or "")
+
+    def csrf_matches(self, token: Any, supplied: Any) -> bool:
+        expected = self.csrf_token(token)
+        candidate = str(supplied or "")
+        return bool(expected and candidate and hmac.compare_digest(expected, candidate))
+
+    def revoke(self, token: Any) -> None:
+        with self._lock:
+            self._sessions.pop(str(token or ""), None)
+
+    def _prune_locked(self) -> None:
+        now = time.time()
+        for token, session in list(self._sessions.items()):
+            if float((session or {}).get("expires_at") or 0) <= now:
+                self._sessions.pop(token, None)
+
+
+class StagedAttachmentStore:
+    """Ephemeral, session-owned browser uploads awaiting one chat send."""
+
+    MAX_FILE_BYTES = 50 * 1024 * 1024
+    DEFAULT_READ_TIMEOUT_SECONDS = 120
+    MAX_READ_TIMEOUT_SECONDS = 300
+
+    def __init__(
+        self,
+        root: Path,
+        ttl_seconds: int = 15 * 60,
+        *,
+        max_pending_files: int = 10,
+        max_pending_bytes: int = 64 * 1024 * 1024,
+        read_timeout_seconds: int = DEFAULT_READ_TIMEOUT_SECONDS,
+    ):
+        self.root = root
+        self.root.mkdir(parents=True, exist_ok=True)
+        try:
+            self.root.chmod(0o700)
+        except OSError:
+            pass
+        self._sweep_orphan_parts()
+        self.ttl_seconds = max(60, min(int(ttl_seconds), 60 * 60))
+        self.max_pending_files = max(1, min(int(max_pending_files), 10))
+        self.max_pending_bytes = max(1, min(int(max_pending_bytes), 128 * 1024 * 1024))
+        # This timeout is applied to the HTTP connection by the caller.  It
+        # bounds a stalled raw socket read; stage_stream also checks its
+        # deadline after each read for stream implementations without socket
+        # timeout support.
+        self.read_timeout_seconds = max(5, min(int(read_timeout_seconds), self.MAX_READ_TIMEOUT_SECONDS))
+        self._lock = threading.RLock()
+        self._items: dict[str, dict[str, Any]] = {}
+        self._reservations: dict[str, dict[str, Any]] = {}
+
+    def _sweep_orphan_parts(self) -> None:
+        """Remove only our own stranded staging parts after a process restart."""
+        pattern = re.compile(r"[A-Za-z0-9_-]{20,128}(?:\.[a-z0-9]{1,15})?\.part\Z")
+        try:
+            root = self.root.resolve(strict=True)
+            for candidate in root.iterdir():
+                try:
+                    info = candidate.lstat()
+                    if (
+                        candidate.parent != root
+                        or not stat.S_ISREG(info.st_mode)
+                        or stat.S_ISLNK(info.st_mode)
+                        or not pattern.fullmatch(candidate.name)
+                    ):
+                        continue
+                    candidate.unlink()
+                except OSError:
+                    continue
+        except OSError:
+            return
+
+    def stage_stream(
+        self,
+        *,
+        owner: str,
+        contact_id: str,
+        filename: str,
+        attachment_type: str,
+        extension: str,
+        length: int,
+        stream: Any,
+    ) -> dict[str, Any]:
+        attachment_id = secrets.token_urlsafe(24)
+        created_at = time.time()
+        stage_path = self.root / f"{attachment_id}{extension}.part"
+        length = int(length)
+        with self._lock:
+            self._cleanup_locked()
+            pending = [item for item in self._items.values() if item.get("owner") == owner]
+            reserved = [item for item in self._reservations.values() if item.get("owner") == owner]
+            if len(pending) + len(reserved) >= self.max_pending_files:
+                raise ValueError("pending_attachment_file_limit")
+            pending_bytes = sum(int(item.get("size") or 0) for item in pending + reserved)
+            if length > self.max_pending_bytes or pending_bytes + length > self.max_pending_bytes:
+                raise ValueError("pending_attachment_byte_limit")
+            reservation = {
+                "id": attachment_id,
+                "owner": owner,
+                "size": length,
+                "path": stage_path,
+                "created_at": created_at,
+                "canceled": False,
+            }
+            self._reservations[attachment_id] = reservation
+            # Create the visible staging inode before releasing the lock.  A
+            # concurrent cancel can then unlink this exact file; it cannot
+            # race ahead and have a blocked writer create a fresh .part after
+            # cancellation has already freed the reservation.
+            try:
+                handle = stage_path.open("xb")
+            except Exception:
+                self._reservations.pop(attachment_id, None)
+                raise
+        remaining = length
+        try:
+            with handle:
+                while remaining:
+                    read_started = time.monotonic()
+                    chunk = stream.read(min(remaining, 65536))
+                    if time.monotonic() - read_started > self.read_timeout_seconds:
+                        raise TimeoutError("upload_read_timeout")
+                    if not chunk:
+                        raise ValueError("incomplete_upload")
+                    # cancel/logout/TTL removes the reservation and unlinks
+                    # the visible .part immediately, even while this thread
+                    # is blocked in read().  Never publish a late writer.
+                    with self._lock:
+                        if self._reservations.get(attachment_id) is not reservation or reservation.get("canceled"):
+                            raise ValueError("upload_canceled")
+                    handle.write(chunk)
+                    remaining -= len(chunk)
+            stage_path.chmod(0o600)
+        except Exception:
+            try:
+                stage_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            with self._lock:
+                if self._reservations.get(attachment_id) is reservation:
+                    self._reservations.pop(attachment_id, None)
+            raise
+        item = {
+            "id": attachment_id,
+            "owner": owner,
+            "contact_id": contact_id,
+            "filename": filename,
+            "attachment_type": attachment_type,
+            "extension": extension,
+            "size": int(length),
+            "path": stage_path,
+            "created_at": created_at,
+        }
+        with self._lock:
+            self._cleanup_locked()
+            current = self._reservations.get(attachment_id)
+            if current is not reservation or bool(reservation.get("canceled")):
+                try:
+                    stage_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise ValueError("upload_canceled")
+            self._reservations.pop(attachment_id, None)
+            self._items[attachment_id] = item
+        return self._public(item)
+
+    def consume(self, *, owner: str, contact_id: str, attachment_ids: Any, destination: Path) -> list[dict[str, Any]]:
+        if not isinstance(attachment_ids, list) or not attachment_ids or len(attachment_ids) > 10:
+            raise ValueError("invalid_attachment_ids")
+        ids = [str(value or "") for value in attachment_ids]
+        if len(set(ids)) != len(ids) or any(not value or len(value) > 128 for value in ids):
+            raise ValueError("invalid_attachment_ids")
+        with self._lock:
+            self._cleanup_locked()
+            items = [self._items.get(value) for value in ids]
+            if any(item is None for item in items):
+                raise ValueError("attachment_missing_or_expired")
+            checked = [dict(item) for item in items if isinstance(item, dict)]
+            if any(item["owner"] != owner or item["contact_id"] != contact_id for item in checked):
+                raise ValueError("attachment_owner_or_contact_mismatch")
+            # Reserve all IDs together while holding the lock.  No second
+            # request can observe or consume any of them after this point.
+            for item in checked:
+                self._items.pop(item["id"], None)
+            moved: list[dict[str, Any]] = []
+            try:
+                for item in checked:
+                    stored_name = f"{secrets.token_hex(16)}{item['extension']}"
+                    target = destination / stored_name
+                    item["stored_path"] = target
+                    os.replace(item["path"], target)
+                    item["stored_name"] = stored_name
+                    moved.append(item)
+            except Exception:
+                # Reservations stay consumed on failure; a retry can never
+                # cause duplicate AI turns.  Roll back *all* possible output
+                # and staging paths before surfacing the error, so a failed
+                # batch never leaves a permanent sensitive attachment orphan.
+                for item in checked:
+                    try:
+                        Path(item.get("stored_path") or "").unlink(missing_ok=True)
+                    except (OSError, TypeError, ValueError):
+                        pass
+                    try:
+                        Path(item["path"]).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                raise
+        return [self._public(item, consumed=True) | {
+            "stored_path": str(item["stored_path"]),
+            "attachment_url": f"/attachments/{item['stored_name']}",
+        } for item in moved]
+
+    def cancel(self, *, owner: str, attachment_ids: Any | None = None) -> int:
+        requested = None
+        if attachment_ids is not None:
+            if not isinstance(attachment_ids, list):
+                raise ValueError("invalid_attachment_ids")
+            requested = {str(value or "") for value in attachment_ids}
+        removed = 0
+        with self._lock:
+            for attachment_id, item in list(self._items.items()):
+                if item.get("owner") != owner or (requested is not None and attachment_id not in requested):
+                    continue
+                self._items.pop(attachment_id, None)
+                try:
+                    Path(item["path"]).unlink(missing_ok=True)
+                except OSError:
+                    pass
+                removed += 1
+            for attachment_id, reservation in list(self._reservations.items()):
+                if reservation.get("owner") == owner and (
+                    requested is None or str(reservation.get("id") or "") in requested
+                ):
+                    reservation["canceled"] = True
+                    self._reservations.pop(attachment_id, None)
+                    try:
+                        Path(reservation["path"]).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    removed += 1
+        return removed
+
+    def cleanup_expired(self) -> int:
+        with self._lock:
+            return self._cleanup_locked()
+
+    def purge(self) -> int:
+        with self._lock:
+            items = list(self._items.values())
+            self._items.clear()
+            reservations = list(self._reservations.values())
+            self._reservations.clear()
+            for reservation in reservations:
+                reservation["canceled"] = True
+        for item in items + reservations:
+            try:
+                Path(item["path"]).unlink(missing_ok=True)
+            except OSError:
+                pass
+        return len(items) + len(reservations)
+
+    def _cleanup_locked(self) -> int:
+        deadline = time.time() - self.ttl_seconds
+        removed = 0
+        for attachment_id, item in list(self._items.items()):
+            if float(item.get("created_at") or 0) >= deadline:
+                continue
+            self._items.pop(attachment_id, None)
+            try:
+                Path(item["path"]).unlink(missing_ok=True)
+            except OSError:
+                pass
+            removed += 1
+        for attachment_id, reservation in list(self._reservations.items()):
+            if float(reservation.get("created_at") or 0) < deadline:
+                reservation["canceled"] = True
+                self._reservations.pop(attachment_id, None)
+                try:
+                    Path(reservation["path"]).unlink(missing_ok=True)
+                except OSError:
+                    pass
+                removed += 1
+        return removed
+
+    @staticmethod
+    def _public(item: dict[str, Any], *, consumed: bool = False) -> dict[str, Any]:
+        return {
+            "attachment_id": str(item["id"]),
+            "filename": str(item["filename"]),
+            "type": str(item["attachment_type"]),
+            "size": int(item["size"]),
+            "consumed": consumed,
+        }
 
 
 class KairosRecallIndex:
@@ -2062,6 +2413,17 @@ class ServerState:
         self.public_server_url: str = (
             public_server_url or "https://companion-vps2.xiaonancaleb.xyz"
         ).rstrip("/")
+        # Browser/PWA sessions are purpose-scoped authentication, not a way to
+        # copy `shared_secret` into JavaScript, localStorage, or a shortcut URL.
+        # The __Host cookie prefix requires HTTPS/Secure and is intentionally
+        # never weakened for a public or development deployment.
+        self.web_session_enabled: bool = bool(server_cfg.get("web_session_enabled", True))
+        try:
+            web_session_ttl = int(server_cfg.get("web_session_ttl_seconds", 12 * 60 * 60))
+        except (TypeError, ValueError):
+            web_session_ttl = 12 * 60 * 60
+        self.web_sessions = WebSessionStore(web_session_ttl)
+        self.web_session_secure_cookie: bool = True
 
         xhs_login_cfg = config.get("xhs_login", {})
         raw_import_command = xhs_login_cfg.get("import_command")
@@ -2309,6 +2671,39 @@ class ServerState:
         attachments_dir = Path(self.token_store_path).expanduser().parent / "attachments"
         attachments_dir.mkdir(parents=True, exist_ok=True)
         self.attachments_dir = attachments_dir
+        try:
+            staged_max_bytes = int(server_cfg.get("pwa_staged_attachment_max_bytes", 64 * 1024 * 1024))
+        except (TypeError, ValueError):
+            staged_max_bytes = 64 * 1024 * 1024
+        try:
+            staged_read_timeout = int(
+                server_cfg.get(
+                    "pwa_staged_attachment_read_timeout_seconds",
+                    StagedAttachmentStore.DEFAULT_READ_TIMEOUT_SECONDS,
+                )
+            )
+        except (TypeError, ValueError):
+            staged_read_timeout = StagedAttachmentStore.DEFAULT_READ_TIMEOUT_SECONDS
+        self.staged_attachments = StagedAttachmentStore(
+            attachments_dir / ".pwa-staging",
+            max_pending_bytes=staged_max_bytes,
+            read_timeout_seconds=staged_read_timeout,
+        )
+        self._staged_attachment_cleanup_stop = threading.Event()
+
+        def _cleanup_staged_attachments() -> None:
+            while not self._staged_attachment_cleanup_stop.wait(60):
+                try:
+                    self.staged_attachments.cleanup_expired()
+                except Exception:
+                    logger.exception("staged attachment cleanup failed")
+
+        self._staged_attachment_cleanup_thread = threading.Thread(
+            target=_cleanup_staged_attachments,
+            name="cc-pwa-attachment-cleanup",
+            daemon=True,
+        )
+        self._staged_attachment_cleanup_thread.start()
         link_cfg = config.get("link_preview", {})
         if not isinstance(link_cfg, dict):
             link_cfg = {}
@@ -2669,6 +3064,11 @@ class ServerState:
 
     def shutdown(self):
         try:
+            self._staged_attachment_cleanup_stop.set()
+            self.staged_attachments.purge()
+        except Exception:
+            logger.exception("staged attachment cleanup failed during shutdown")
+        try:
             self.kairos_terminal.release()
         except KairosTerminalUnavailable:
             logger.exception("Kairos terminal did not confirm release during shutdown")
@@ -2801,7 +3201,80 @@ class PushHandler(BaseHTTPRequestHandler):
         if not self.state.shared_secret:
             return True
         token = self.headers.get("X-Auth-Token", "") or self.headers.get("X-Auth", "")
-        return token == self.state.shared_secret
+        return bool(token) and hmac.compare_digest(token, self.state.shared_secret)
+
+    def _web_session_token(self) -> str:
+        """Read only the opaque PWA cookie; malformed Cookie is unauthenticated."""
+        try:
+            raw_cookie = self.headers.get("Cookie", "") or ""
+            parsed = SimpleCookie()
+            parsed.load(raw_cookie)
+            morsel = parsed.get(WEB_SESSION_COOKIE_NAME)
+            return str(morsel.value if morsel is not None else "")
+        except Exception:
+            return ""
+
+    def _web_session_matches(self, *, require_allowed_route: bool = True) -> bool:
+        if not bool(getattr(self.state, "web_session_enabled", False)):
+            return False
+        if require_allowed_route and not self._web_session_route_allowed():
+            return False
+        sessions = getattr(self.state, "web_sessions", None)
+        validate = getattr(sessions, "valid", None)
+        return bool(callable(validate) and validate(self._web_session_token()))
+
+    def _web_session_route_allowed(self) -> bool:
+        """Keep the PWA cookie strictly less powerful than shared_secret.
+
+        The allow-list contains the provider-neutral UI contract and the
+        existing user-facing operations it delegates to.  It intentionally
+        excludes admin, token, push, system and arbitrary process endpoints.
+        """
+        from urllib.parse import urlparse
+
+        path = urlparse(self.path).path
+        method = str(getattr(self, "command", "GET") or "GET").upper()
+        # Keep this tied to the shipped Windows PWA, rather than allowing the
+        # browser cookie to become a substitute for the native admin secret.
+        get_exact = {
+            "/chat/contacts", "/chat/history", "/chat/draft", "/chat/status",
+            "/chat/stream",
+        }
+        get_prefixes = ("/memory/",)
+        post_exact = {
+            "/web/session/logout", "/chat/send", "/chat/stop", "/chat/upload", "/chat/upload/cancel",
+        }
+        if method in {"GET", "HEAD"}:
+            return (
+                path in get_exact
+                or path.startswith(get_prefixes)
+                or self._pwa_attachment_request_allowed()
+            )
+        if method == "POST":
+            return path in post_exact
+        return False
+
+    def _pwa_attachment_request_allowed(self) -> bool:
+        """Permit a browser session to fetch one already-rendered flat file."""
+        from urllib.parse import urlparse, unquote
+
+        if str(getattr(self, "command", "") or "").upper() not in {"GET", "HEAD"}:
+            return False
+        parsed = urlparse(self.path)
+        if parsed.query or not parsed.path.startswith("/attachments/"):
+            return False
+        raw_name = parsed.path[len("/attachments/"):]
+        if not raw_name or unquote(raw_name) != raw_name:
+            return False
+        if (
+            "/" in raw_name
+            or "\\" in raw_name
+            or raw_name.startswith(".")
+            or raw_name.endswith(".part")
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,160}", raw_name)
+        ):
+            return False
+        return True
 
     def _voice_internal_auth_matches(self) -> bool:
         try:
@@ -2816,7 +3289,7 @@ class PushHandler(BaseHTTPRequestHandler):
         )
 
     def _require_auth(self) -> bool:
-        if self._auth_matches():
+        if self._auth_matches() or self._web_session_matches():
             return True
         if not self.state.strict_auth:
             ip = self.client_address[0] if self.client_address else "unknown"
@@ -2831,12 +3304,57 @@ class PushHandler(BaseHTTPRequestHandler):
         return False
 
     def _require_write_auth(self) -> bool:
-        return self._require_auth()
+        if self._auth_matches():
+            return True
+        if self._web_session_matches():
+            if self._web_session_write_matches():
+                return True
+            self._send_json(403, {"error": "web_session_csrf_forbidden"})
+            return False
+        if not self.state.strict_auth:
+            ip = self.client_address[0] if self.client_address else "unknown"
+            logger.warning(
+                "unauthenticated write allowed strict_auth=false ip=%s method=%s path=%s",
+                ip,
+                self.command,
+                self.path,
+            )
+            return True
+        self._send_json(401, {"error": "unauthorized"})
+        return False
+
+    def _web_session_origin_matches(self) -> bool:
+        """Require the configured exact PWA origin; no subdomain wildcards."""
+        from urllib.parse import urlparse
+
+        origin = str(self.headers.get("Origin", "") or "").rstrip("/")
+        configured = str(getattr(self.state, "public_server_url", "") or "").rstrip("/")
+        parsed = urlparse(configured)
+        expected = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
+        return bool(origin and expected and hmac.compare_digest(origin, expected))
+
+    def _web_session_write_matches(self) -> bool:
+        if str(getattr(self, "command", "") or "").upper() != "POST":
+            return False
+        if not self._web_session_origin_matches():
+            return False
+        sessions = getattr(self.state, "web_sessions", None)
+        csrf_matches = getattr(sessions, "csrf_matches", None)
+        supplied = self.headers.get("X-CC-Web-CSRF", "") or ""
+        return bool(callable(csrf_matches) and csrf_matches(self._web_session_token(), supplied))
 
     def _is_public_get(self) -> bool:
-        if self.path == "/health" and not self.headers.get("X-Forwarded-For"):
+        from urllib.parse import urlparse
+
+        path = urlparse(self.path).path
+        if path == "/health" and not self.headers.get("X-Forwarded-For"):
             return True
-        return self.path in {"/version"}
+        # The shell itself is safe to cache/install before login; every API
+        # call remains cookie-authenticated.  No config, tokens, or runtime
+        # files are reachable through this allow-list.
+        if path == "/web/pwa" or path.startswith("/web/pwa/"):
+            return True
+        return path in {"/version"}
 
     def _clean_contact_id(self, value: Any) -> str:
         contact_id = str(value or "xiaoke").strip().lower()
@@ -2887,6 +3405,20 @@ class PushHandler(BaseHTTPRequestHandler):
         if contact_suffix:
             return f"{base}:{contact_suffix}"
         return base
+
+    def _consume_pwa_staged_attachments(self, body: dict[str, Any], contact_id: str) -> list[dict[str, Any]]:
+        """Consume staged browser uploads exactly once for this send request."""
+        if "attachment_ids" not in body:
+            return []
+        attachment_ids = body.pop("attachment_ids")
+        if not self._web_session_matches():
+            raise ValueError("attachment_ids require a PWA web session")
+        return self.state.staged_attachments.consume(
+            owner=self._web_session_token(),
+            contact_id=contact_id,
+            attachment_ids=attachment_ids,
+            destination=self.state.attachments_dir,
+        )
 
     @staticmethod
     def _client_log_value(value: Any, *, limit: int = CLIENT_LOG_MAX_FIELD) -> Any:
@@ -3638,7 +4170,13 @@ class PushHandler(BaseHTTPRequestHandler):
         self._send_json(403, {"error": "ip not allowed"})
         return False
 
-    def _send_json(self, status: int, body: dict[str, Any]):
+    def _send_json(
+        self,
+        status: int,
+        body: dict[str, Any],
+        *,
+        extra_headers: dict[str, str] | None = None,
+    ):
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         accept_enc = self.headers.get("Accept-Encoding", "")
         use_gzip = "gzip" in accept_enc and len(data) > 512
@@ -3648,6 +4186,15 @@ class PushHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         if use_gzip:
             self.send_header("Content-Encoding", "gzip")
+        private_headers = {
+            "Cache-Control": "no-store",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        }
+        private_headers.update(extra_headers or {})
+        for name, value in private_headers.items():
+            self.send_header(str(name), str(value))
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -3689,10 +4236,160 @@ class PushHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _web_session_cookie(self, token: str, *, max_age: int) -> str:
+        """Build a host-only HttpOnly cookie without reflecting user input."""
+        parts = [
+            f"{WEB_SESSION_COOKIE_NAME}={token}",
+            "Path=/",
+            "HttpOnly",
+            "SameSite=Strict",
+            f"Max-Age={max(0, int(max_age))}",
+        ]
+        # `__Host-` cookies are valid only with Secure.  Do not offer an HTTP
+        # downgrade switch that would silently cause browsers to reject it.
+        parts.append("Secure")
+        return "; ".join(parts)
+
+    def _pwa_upload_limits(self) -> dict[str, int]:
+        staged = getattr(self.state, "staged_attachments", None)
+        return {
+            "max_file_bytes": int(getattr(staged, "MAX_FILE_BYTES", 50 * 1024 * 1024)),
+            "max_pending_files": int(getattr(staged, "max_pending_files", 10)),
+            "max_pending_bytes": int(getattr(staged, "max_pending_bytes", 64 * 1024 * 1024)),
+            "ttl_seconds": int(getattr(staged, "ttl_seconds", 15 * 60)),
+            "read_timeout_seconds": int(
+                getattr(staged, "read_timeout_seconds", StagedAttachmentStore.DEFAULT_READ_TIMEOUT_SECONDS)
+            ),
+        }
+
+    @contextmanager
+    def _pwa_upload_read_timeout(self):
+        """Bound one browser raw-upload read without changing later requests."""
+        staged = getattr(self.state, "staged_attachments", None)
+        timeout = int(getattr(
+            staged,
+            "read_timeout_seconds",
+            StagedAttachmentStore.DEFAULT_READ_TIMEOUT_SECONDS,
+        ))
+        connection = getattr(self, "connection", None)
+        setter = getattr(connection, "settimeout", None)
+        getter = getattr(connection, "gettimeout", None)
+        if not callable(setter):
+            yield
+            return
+        try:
+            original = getter() if callable(getter) else None
+            setter(timeout)
+        except OSError:
+            # stage_stream still applies a post-read deadline below.  A socket
+            # that cannot accept a timeout is not reason to widen privileges.
+            yield
+            return
+        try:
+            yield
+        finally:
+            try:
+                setter(original)
+            except OSError:
+                pass
+
+    def _handle_web_session_create(self, body: dict[str, Any]) -> None:
+        """Log the PWA in without ever returning native-client credentials."""
+        if not bool(getattr(self.state, "web_session_enabled", False)):
+            self._send_json(404, {"ok": False, "error": "web_session_disabled"})
+            return
+        client_ip = self.client_address[0] if self.client_address else "unknown"
+        if client_ip in self._login_locked_ips:
+            self._send_json(403, {"ok": False, "error": "locked"})
+            return
+        username = str(body.get("username", "") or "")
+        password = str(body.get("password", "") or "")
+        expected_username = str(getattr(self.state, "login_username", "") or "")
+        expected_password = str(getattr(self.state, "login_password", "") or "")
+        matches = bool(
+            expected_username
+            and expected_password
+            and hmac.compare_digest(username.encode("utf-8"), expected_username.encode("utf-8"))
+            and hmac.compare_digest(password.encode("utf-8"), expected_password.encode("utf-8"))
+        )
+        if not matches:
+            self._login_fail_counts[client_ip] = self._login_fail_counts.get(client_ip, 0) + 1
+            if self._login_fail_counts[client_ip] >= 3:
+                self._login_locked_ips.add(client_ip)
+                self._send_json(403, {"ok": False, "error": "locked"})
+            else:
+                self._send_json(401, {"ok": False, "error": "invalid_credentials"})
+            return
+        self._login_fail_counts.pop(client_ip, None)
+        token, expires_at = self.state.web_sessions.create()
+        csrf_token = self.state.web_sessions.csrf_token(token)
+        max_age = max(0, int(expires_at - time.time()))
+        self._send_json(
+            200,
+            {
+                "ok": True,
+                "authenticated": True,
+                "contract_version": WEB_SESSION_CONTRACT_VERSION,
+                "csrf_token": csrf_token,
+                "upload_limits": self._pwa_upload_limits(),
+                "expires_at": datetime.fromtimestamp(expires_at, timezone.utc).isoformat(),
+            },
+            extra_headers={
+                "Set-Cookie": self._web_session_cookie(token, max_age=max_age),
+                "Cache-Control": "no-store",
+            },
+        )
+
+    def _handle_web_session_get(self) -> None:
+        if not self._web_session_matches(require_allowed_route=False):
+            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return
+        token = self._web_session_token()
+        csrf_token = self.state.web_sessions.csrf_token(token)
+        self._send_json(
+            200,
+            {
+                "ok": True,
+                "authenticated": True,
+                "contract_version": WEB_SESSION_CONTRACT_VERSION,
+                "csrf_token": csrf_token,
+                "upload_limits": self._pwa_upload_limits(),
+            },
+            extra_headers={"Cache-Control": "no-store"},
+        )
+
+    def _handle_web_session_logout(self) -> None:
+        token = self._web_session_token()
+        staged = getattr(self.state, "staged_attachments", None)
+        cancel = getattr(staged, "cancel", None)
+        if callable(cancel) and token:
+            cancel(owner=token)
+        sessions = getattr(self.state, "web_sessions", None)
+        revoke = getattr(sessions, "revoke", None)
+        if callable(revoke):
+            revoke(token)
+        self._send_json(
+            200,
+            {"ok": True},
+            extra_headers={
+                "Set-Cookie": self._web_session_cookie("", max_age=0),
+                "Cache-Control": "no-store",
+            },
+        )
+
     # ---------- routes ----------
 
     def do_GET(self):
+        from urllib.parse import urlparse
+
+        request_path = urlparse(self.path).path
         if not self._is_public_get() and not self._check_ip_allowed():
+            return
+        # PWA bootstrap has to answer without an X-Auth-Token header.  It
+        # validates only the HttpOnly session cookie itself and never emits a
+        # server or memory credential.
+        if request_path == "/web/session":
+            self._handle_web_session_get()
             return
         if not self._is_public_get() and not self._require_auth():
             return
@@ -3738,6 +4435,9 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/chat/list-preview"):
             self._handle_chat_list_preview()
+            return
+        if self.path == "/chat/contacts" or self.path.startswith("/chat/contacts?"):
+            self._handle_chat_contacts()
             return
         if self.path.startswith("/chat/history"):
             self._handle_chat_history()
@@ -3875,7 +4575,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     ts = {**ts, "member_id": str(pending[-1].get("member_id") or "")}
             self._send_json(200, {"ok": True, **ts})
             return
-        if self.path == "/chat/status":
+        if self.path == "/chat/status" or self.path.startswith("/chat/status?"):
             self._handle_chat_status()
             return
         if self.path.startswith("/chat/stream"):
@@ -4043,16 +4743,17 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path == "/version":
             self._send_json(200, {"ok": True, "version": self.server_version})
             return
+        if request_path == "/web/pwa" or request_path.startswith("/web/pwa/"):
+            self._handle_windows_pwa_asset(request_path)
+            return
         if self.path == "/web/chat" or self.path.startswith("/web/chat?"):
-            from urllib.parse import urlparse, parse_qs
-            _qs = parse_qs(urlparse(self.path).query)
-            _qt = _qs.get("token", [None])[0]
-            if _qt and self.state.shared_secret and _qt == self.state.shared_secret:
-                self._serve_web_chat(auth_token=_qt)
-            elif not self.state.strict_auth or self._auth_matches():
+            # Do not revive the historical `?token=shared_secret` shortcut:
+            # it placed a reusable credential into browser JS and URLs.  The
+            # same-origin PWA must establish an HttpOnly web session first.
+            if self._web_session_matches(require_allowed_route=False):
                 self._serve_web_chat(auth_token=None)
             else:
-                self._send_json(401, {"error": "unauthorized — use /web/chat?token=YOUR_SECRET"})
+                self._send_json(401, {"error": "web_session_required"})
             return
         if self.path == "/gomoku/state":
             self._handle_gomoku_state()
@@ -4195,16 +4896,11 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _handle_attachment_head(self):
         """HEAD for /attachments/<filename>, returning headers without body."""
-        from urllib.parse import unquote
-        rel = self.path[len("/attachments/"):]
-        rel = unquote(rel.split("?", 1)[0])
-        if "/" in rel or ".." in rel or rel.startswith("."):
+        resolved = self._safe_attachment_target()
+        if resolved is None:
             self._send_json(400, {"error": "bad filename"})
             return
-        target = self.state.attachments_dir / rel
-        if not target.exists() or not target.is_file():
-            self._send_json(404, {"error": "not found"})
-            return
+        rel, target = resolved
         ext = target.suffix.lower()
         mime = _ATTACHMENT_MIME_MAP.get(ext, "application/octet-stream")
         try:
@@ -4216,11 +4912,56 @@ class PushHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(length))
         self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Cache-Control", _attachment_cache_control(rel))
+        self.send_header("Cache-Control", "private, no-store")
+        self.send_header("Pragma", "no-cache")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Disposition", f'inline; filename="{rel}"')
         self.end_headers()
 
+    def _safe_attachment_target(self) -> tuple[str, Path] | None:
+        """Resolve one flat regular attachment without following symlinks."""
+        from urllib.parse import urlparse, unquote
+
+        try:
+            parsed = urlparse(self.path)
+            raw = parsed.path[len("/attachments/"):]
+            rel = unquote(raw)
+            if (
+                not raw
+                or "/" in rel
+                or "\\" in rel
+                or ".." in rel
+                or rel.startswith(".")
+                or not rel
+            ):
+                return None
+            root = Path(self.state.attachments_dir).resolve(strict=True)
+            candidate = root / rel
+            info = candidate.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                return None
+            target = candidate.resolve(strict=True)
+            if target.parent != root or not target.is_relative_to(root):
+                return None
+            return rel, target
+        except (OSError, RuntimeError, ValueError):
+            return None
+
     def do_POST(self):
+        from urllib.parse import urlparse
+
+        request_path = urlparse(self.path).path
+        if request_path == "/web/session":
+            if not self._check_ip_allowed():
+                return
+            try:
+                body = self._read_body()
+            except Exception as e:
+                self._send_json(400, {"ok": False, "error": f"bad json: {e}"})
+                return
+            self._handle_web_session_create(body)
+            return
         if not self._check_ip_allowed():
             return
         if self.path == "/login":
@@ -4232,6 +4973,14 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_login(body)
             return
         if not self._require_write_auth():
+            return
+        if request_path == "/chat/upload/cancel":
+            try:
+                body = self._read_body()
+            except Exception as e:
+                self._send_json(400, {"ok": False, "error": f"bad json: {e}"})
+                return
+            self._handle_pwa_upload_cancel(body)
             return
         # /chat/upload 走 multipart 不解析 JSON 直接 handle raw (现在含 query string)
         if self.path.startswith("/ai-chat/upload"):
@@ -4354,6 +5103,8 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_task_action(body, "clear_history")
         elif self.path == "/task/append-ephemeral":
             self._handle_task_append_ephemeral(body)
+        elif self.path == "/web/session/logout":
+            self._handle_web_session_logout()
         elif self.path == "/chat/send":
             self._handle_chat_send(body)
         elif self.path == "/voice-call/cancel":
@@ -4367,9 +5118,12 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_xhs_login_import(body)
             return
         elif self.path == "/chat/stop":
-            # Stopping the live Claude TUI is remote control.  The handler also
-            # requires exact turn/session fencing before it emits any key.
-            if not self.state.allow_remote_control:
+            # XiaoKe Stop emits literal tmux Ctrl-C and remains under the
+            # remote-control gate.  Kairos is a separate app-server request
+            # with its own contact+turn fence; it must not inherit a tmux-only
+            # configuration switch.
+            requested_stop_contact = str(body.get("contact_id") or "").strip()
+            if requested_stop_contact != "kairos" and not self.state.allow_remote_control:
                 self._send_json(403, {"error": "remote_control disabled", "hint": "set allow_remote_control=true in config.toml"})
                 return
             self._handle_chat_stop(body)
@@ -4999,22 +5753,40 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": str(e)})
 
     def _handle_chat_status(self):
-        """chat 状态栏: typing / online / sleeping
-        - typing: typing_state.is_typing
-        - online: 最近 5 分钟有 assistant turn (我在干活 / 刚回过)
-        - sleeping: 否则 (主 chain 没 turn 长时间)
-        """
+        """Provider-neutral status while preserving per-contact busy state."""
         try:
             from datetime import datetime as _dt
-            typing = self.state.typing_state.get("is_typing", False)
-            if typing:
+            contact_id = self._contact_id_from_query()
+            typing_state = self._typing_for_contact(contact_id)
+            typing = bool(typing_state.get("is_typing", False))
+            draft = self._chat_draft_snapshot(contact_id)
+            reply_state = str(draft.get("reply_state") or "idle")
+            provider_busy = False
+            if contact_id == "kairos":
+                # Codex can be active before its first draft delta; retain the
+                # bridge's busy observation so a web client never offers an
+                # unsafe second send just because draft text is still empty.
+                provider_busy = bool(self._codex_busy_snapshot().get("busy"))
+            busy = typing or bool(draft.get("is_active")) or provider_busy
+            stop_request = self._contact_stop_request(
+                contact_id,
+                typing_state=typing_state,
+                draft=draft,
+            )
+            if busy:
                 self._send_json(200, {
                     "ok": True,
+                    "contact_id": contact_id,
                     "status": "typing",
-                    "since": self.state.typing_state.get("since"),
+                    "busy": True,
+                    "is_typing": typing,
+                    "since": typing_state.get("since"),
+                    "reply_state": reply_state if reply_state != "idle" else "generating",
+                    "draft": draft,
+                    "stop_request": stop_request,
                 })
                 return
-            last_records = self.state.chat.tail(20)
+            last_records = self._chat_for_contact(contact_id).tail(20)
             last_ts = None
             for r in reversed(last_records):
                 if r.get("role") == "assistant":
@@ -5029,10 +5801,50 @@ class PushHandler(BaseHTTPRequestHandler):
                         status = "online"
                 except Exception:
                     pass
-            self._send_json(200, {"ok": True, "status": status, "last_turn": last_ts})
+            self._send_json(200, {
+                "ok": True,
+                "contact_id": contact_id,
+                "status": status,
+                "busy": False,
+                "is_typing": False,
+                "reply_state": reply_state,
+                "last_turn": last_ts,
+                "draft": draft,
+                "stop_request": stop_request,
+            })
         except Exception as e:
             logger.exception("chat status fail")
             self._send_json(500, {"error": str(e)})
+
+    @staticmethod
+    def _contact_stop_request(
+        contact_id: str,
+        *,
+        typing_state: dict[str, Any],
+        draft: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return a safe, prefilled generic-stop request; never guess IDs."""
+        user_ts = str(
+            draft.get("user_ts")
+            or typing_state.get("since")
+            or ""
+        )
+        if contact_id == "xiaoke":
+            session = str(typing_state.get("session") or "")
+            return {
+                "supported": bool(user_ts and session),
+                "body": {
+                    "contact_id": "xiaoke",
+                    "user_ts": user_ts,
+                    "session": session,
+                },
+            }
+        if contact_id in {"kairos", "kimi"}:
+            return {
+                "supported": bool(user_ts),
+                "body": {"contact_id": contact_id, "user_ts": user_ts},
+            }
+        return {"supported": False, "body": {"contact_id": contact_id}}
 
     def _chat_status_payload(self) -> dict[str, Any]:
         from datetime import datetime as _dt
@@ -6407,6 +7219,49 @@ class PushHandler(BaseHTTPRequestHandler):
         lines.append("请先读取这些文件，再结合用户原话作答；若文件内容不足或抓取不完整，请明确说明。")
         return "\n".join(lines)
 
+    def _handle_windows_pwa_asset(self, request_path: str) -> None:
+        """Serve only tracked PWA shell assets under one same-origin prefix."""
+        from urllib.parse import unquote
+        import mimetypes
+
+        try:
+            root = WINDOWS_PWA_ROOT.resolve(strict=True)
+            suffix = unquote(str(request_path or "")).removeprefix("/web/pwa").lstrip("/")
+            relative = "index.html" if not suffix else suffix
+            # URL paths are POSIX-style even when the browser runs on Windows.
+            if "\\" in relative or any(part in {"", ".", ".."} for part in relative.split("/")):
+                self._send_json(404, {"error": "not found"})
+                return
+            raw_candidate = root.joinpath(*relative.split("/"))
+            raw_info = raw_candidate.lstat()
+            if stat.S_ISLNK(raw_info.st_mode) or not stat.S_ISREG(raw_info.st_mode):
+                self._send_json(404, {"error": "not found"})
+                return
+            candidate = raw_candidate.resolve(strict=True)
+            if not candidate.is_relative_to(root):
+                self._send_json(404, {"error": "not found"})
+                return
+            # PWA shell assets are a deliberately narrow static format set;
+            # never let this route turn into a generic source/runtime browser.
+            allowed_suffixes = {".html", ".js", ".css", ".svg", ".webmanifest", ".png", ".ico"}
+            if candidate.suffix.lower() not in allowed_suffixes:
+                self._send_json(404, {"error": "not found"})
+                return
+            mime = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
+            if candidate.suffix.lower() == ".js":
+                mime = "text/javascript"
+            data = candidate.read_bytes()
+        except (OSError, ValueError):
+            self._send_json(404, {"error": "not found"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", f"{mime}; charset=utf-8" if mime.startswith("text/") or mime in {"application/javascript", "application/json"} else mime)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
     def _serve_web_chat(self, auth_token=None):
         html = WEB_CHAT_HTML
         if auth_token:
@@ -6426,7 +7281,10 @@ class PushHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", "private, no-store")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         self.wfile.write(data)
 
@@ -6480,6 +7338,105 @@ class PushHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         self._send_json(200, {"ok": True, "contacts": result})
+
+    def _handle_chat_contacts(self) -> None:
+        """Versioned contact contract for native and same-origin web clients.
+
+        A client never chooses a provider endpoint directly.  It always sends
+        the stable `contact_id` to the common chat endpoints, while this
+        manifest tells it which optional controls are meaningful.  That keeps
+        Xiaoke's Claude/tmux turn fencing and Kairos's app-server queue fully
+        isolated behind the server even when both are open in one desktop UI.
+        """
+        definitions: tuple[dict[str, Any], ...] = (
+            {
+                "id": "xiaoke",
+                "display_name": "小克",
+                "provider": "claude-code",
+                "terminal_target": "",  # default CC tmux session, never a browser path
+                "capabilities": ["chat", "history", "draft", "busy", "stop", "attachments", "terminal"],
+                "stop_fields": ["contact_id", "user_ts", "session"],
+            },
+            {
+                "id": "kairos",
+                "display_name": "Kairos",
+                "provider": "codex-app-server",
+                "terminal_target": KAIROS_TERMINAL_ALIAS,
+                "capabilities": [
+                    "chat", "history", "draft", "busy", "stop", "attachments", "terminal",
+                    "model_preferences", "session_control", "memory_recall",
+                ],
+                "stop_fields": ["contact_id", "user_ts"],
+            },
+            {
+                "id": "kimi",
+                "display_name": "Kimi",
+                "provider": "kimi-acp",
+                "terminal_target": "",
+                "capabilities": ["chat", "history", "draft", "busy", "stop", "attachments"],
+                "stop_fields": ["contact_id", "user_ts"],
+            },
+            {
+                "id": "hajiki",
+                "display_name": "哈基米",
+                "provider": "contact-local",
+                "terminal_target": "",
+                "capabilities": ["history"],
+                "stop_fields": [],
+            },
+            {
+                "id": "apples",
+                "display_name": "苹果幼稚园",
+                "provider": "group-router",
+                "terminal_target": "",
+                "capabilities": ["chat", "history", "draft", "busy", "attachments"],
+                "stop_fields": [],
+            },
+            {
+                "id": "toolbot",
+                "display_name": "小克·工具版",
+                "provider": "task-observer",
+                "terminal_target": "",
+                "capabilities": ["history"],
+                "stop_fields": [],
+            },
+        )
+        contacts: list[dict[str, Any]] = []
+        for definition in definitions:
+            contact_id = str(definition["id"])
+            if contact_id not in self.state.contact_chats:
+                continue
+            capabilities = list(definition["capabilities"])
+            contacts.append({
+                "id": contact_id,
+                "display_name": definition["display_name"],
+                "provider": definition["provider"],
+                "capabilities": capabilities,
+                "read_only": "chat" not in capabilities,
+                "terminal_target": definition["terminal_target"],
+                # One semantic stop request; the backend routes it to the
+                # exact provider-specific interrupt implementation.
+                "stop": {
+                    "supported": "stop" in capabilities,
+                    "endpoint": "/chat/stop" if "stop" in capabilities else "",
+                    "required_fields": list(definition["stop_fields"]),
+                },
+            })
+        self._send_json(200, {
+            "ok": True,
+            "contract_version": WEB_SESSION_CONTRACT_VERSION,
+            "chat_endpoints": {
+                "history": "/chat/history?contact_id={contact_id}",
+                "draft": "/chat/draft?contact_id={contact_id}",
+                # Status is the PWA's one polling surface for per-contact
+                # busy, typing, draft and stop fencing.  Do not advertise the
+                # legacy /chat/typing route: browser cookies cannot call it.
+                "status": "/chat/status?contact_id={contact_id}",
+                "send": "/chat/send",
+                "stop": "/chat/stop",
+            },
+            "contacts": contacts,
+        })
 
     def _handle_chat_draft(self):
         contact_id = self._contact_id_from_query()
@@ -7036,6 +7993,27 @@ class PushHandler(BaseHTTPRequestHandler):
         else:
             body["metadata"] = clean_user_metadata
         contact_id = self._contact_id_from_body(body)
+        try:
+            staged_attachments = self._consume_pwa_staged_attachments(body, contact_id)
+        except ValueError as exc:
+            self._send_json(409, {"ok": False, "error": str(exc)})
+            return
+        if staged_attachments:
+            body["_pwa_staged_attachments"] = staged_attachments
+            existing_metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+            body["metadata"] = {
+                **existing_metadata,
+                "attachments": [
+                    {
+                        "attachment_id": item["attachment_id"],
+                        "attachment_url": item["attachment_url"],
+                        "filename": item["filename"],
+                        "type": item["type"],
+                        "size": item["size"],
+                    }
+                    for item in staged_attachments
+                ],
+            }
         # Health context is a private structured hint for XiaoKe only.  Strip
         # it before dispatching any other contact so it cannot cross into
         # Kairos/Kimi/apples/ai-custom history.
@@ -7097,7 +8075,8 @@ class PushHandler(BaseHTTPRequestHandler):
         # 2026-07-18 互动卡片: /chat/card_action 复用本管线并靠 metadata 标
         # {"via": "card", ...}; 普通 App 发消息不带 metadata, 行为不变。
         metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else None
-        if not text and not location:
+        staged_attachments = list(body.get("_pwa_staged_attachments") or [])
+        if not text and not location and not staged_attachments:
             self._send_json(400, {"error": "text or location required"})
             return
         link_bundle = self._enrich_user_links(text)
@@ -7154,13 +8133,23 @@ class PushHandler(BaseHTTPRequestHandler):
                 metadata=metadata,
                 injection_text="\n\n".join(
                     part
-                    for part in (text, link_context, health_context_prompt, voice_reply_instruction)
+                    for part in (
+                        text,
+                        link_context,
+                        health_context_prompt,
+                        voice_reply_instruction,
+                        "\n".join(
+                            f"[用户发了{'图片' if item.get('type') == 'image' else '文件'}: {item.get('filename')}]\n本地路径: {item.get('stored_path')}"
+                            for item in staged_attachments
+                        ),
+                    )
                     if part
                 ),
             )
             return
         # 写 user 历史
         chat = self._chat_for_contact(contact_id)
+        primary_attachment = staged_attachments[0] if staged_attachments else {}
         try:
             rec = chat.append(
                 role="user",
@@ -7169,6 +8158,9 @@ class PushHandler(BaseHTTPRequestHandler):
                 quoted_ts=quoted_ts,
                 location=location,
                 metadata=metadata,
+                attachment_url=primary_attachment.get("attachment_url") or None,
+                attachment_type=primary_attachment.get("type") or None,
+                attachment_filename=primary_attachment.get("filename") or None,
             )
         except Exception as exc:
             self._release_xiaoke_send_reservation(turn_token)
@@ -7212,6 +8204,12 @@ class PushHandler(BaseHTTPRequestHandler):
             injected = f"{injected}\n\n{health_context_prompt}"
         if voice_reply_instruction:
             injected = f"{injected}\n\n{voice_reply_instruction}"
+        if staged_attachments:
+            attachment_hint = "\n".join(
+                f"[用户发了{'图片' if item.get('type') == 'image' else '文件'}: {item.get('filename')}]\n本地路径: {item.get('stored_path')}"
+                for item in staged_attachments
+            )
+            injected = f"{injected}\n\n{attachment_hint}"
         # App-originated XiaoKe text turns deliberately bypass the development
         # channel even when it is enabled.  POST /messages acknowledges only
         # that a notification was queued; it does not provide a synchronous
@@ -7643,9 +8641,30 @@ class PushHandler(BaseHTTPRequestHandler):
         the request is a benign no-op.  The dedicated XiaoKe Claude session's
         established interrupt is one literal terminal Ctrl-C.
         """
+        # Stop targets are intentionally exact, stable contract IDs.  Do not
+        # normalize user-controlled variants here: XiaoKe's established stop
+        # fence treats `XIAOKE` as an unknown target rather than risking a
+        # Ctrl-C on a caller-selected terminal.
         contact_id = str(body.get("contact_id") or "").strip()
         user_ts = str(body.get("user_ts") or "").strip()
         session = str(body.get("session") or "").strip()
+        # Provider-neutral desktop/mobile contract: Kairos uses the Codex
+        # app-server interrupt path, but clients should not need to know that
+        # or manufacture a separate `/codex/abort` request.  The cancel is
+        # still fenced by this contact and (when supplied) exact user turn.
+        if contact_id == "kairos":
+            if not user_ts:
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "user_ts is required to stop a Kairos turn",
+                })
+                return
+            self._handle_codex_abort({
+                "contact_id": "kairos",
+                "user_ts": user_ts,
+                "cancel_pending": True,
+            })
+            return
         if contact_id == "kimi":
             self._handle_kimi_chat_stop(user_ts)
             return
@@ -9887,29 +10906,38 @@ class PushHandler(BaseHTTPRequestHandler):
     def _handle_kairos_chat_send(self, body: dict[str, Any], contact_id: str):
         text = body.get("text", "").strip()
         quoted_ts = body.get("quoted_ts") or None
-        if not text:
+        staged_attachments = list(body.get("_pwa_staged_attachments") or [])
+        if not text and not staged_attachments:
             self._send_json(400, {"error": "text required"})
             return
 
         link_bundle = self._enrich_user_links(text)
         metadata = merge_preview_metadata(body.get("metadata"), link_bundle)
         chat = self._chat_for_contact(contact_id)
+        primary_attachment = staged_attachments[0] if staged_attachments else {}
         rec = chat.append(
             role="user",
             text=text,
             source="cc-app:kairos",
             quoted_ts=quoted_ts,
             metadata=metadata,
+            attachment_url=primary_attachment.get("attachment_url") or None,
+            attachment_type=primary_attachment.get("type") or None,
+            attachment_filename=primary_attachment.get("filename") or None,
         )
         self._set_typing_for_contact(contact_id, {"is_typing": True, "since": rec["ts"]})
         self._clear_chat_draft(contact_id)
         self._enqueue_kairos_task({
             "contact_id": contact_id,
-            "text": text,
+            "text": text or "[用户发送了附件]",
             "quoted_ts": quoted_ts,
             "user_ts": rec["ts"],
             "queued_at": rec["ts"],
-            "image_paths": [],
+            "image_paths": [
+                str(item.get("stored_path"))
+                for item in staged_attachments
+                if item.get("type") == "image" and item.get("stored_path")
+            ],
             "link_context": link_bundle.prompt_context,
         })
         self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec, "queued": True})
@@ -10609,9 +11637,11 @@ class PushHandler(BaseHTTPRequestHandler):
         import time as _t
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         # 先发当前 latest
         latest = self.state.pet.latest()
@@ -10749,9 +11779,11 @@ class PushHandler(BaseHTTPRequestHandler):
         contact_filter = self._contact_id_from_query()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         try:
             self.wfile.write(f"data: {json.dumps({'event': 'connected', 'contact_id': contact_filter}, ensure_ascii=False)}\n\n".encode("utf-8"))
@@ -11556,6 +12588,20 @@ class PushHandler(BaseHTTPRequestHandler):
         # ACK 之后再起异步线程做 APNs / notification 不影响 client 5s timeout
         threading.Thread(target=_async_side_effects, daemon=True).start()
 
+    def _handle_pwa_upload_cancel(self, body: dict[str, Any]) -> None:
+        if not self._web_session_matches():
+            self._send_json(403, {"ok": False, "error": "pwa_session_required"})
+            return
+        try:
+            removed = self.state.staged_attachments.cancel(
+                owner=self._web_session_token(),
+                attachment_ids=body.get("attachment_ids"),
+            )
+        except ValueError as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        self._send_json(200, {"ok": True, "canceled": removed})
+
     def _handle_chat_upload(self):
         """raw POST + query string (header 不支持非 ASCII char 中文 caption 会丢字)
         ?filename=foo.jpg&role=user&text=caption&quoted_ts=...
@@ -11606,19 +12652,74 @@ class PushHandler(BaseHTTPRequestHandler):
                 filename = unquote(filename)
         except Exception:
             pass
+        filename = str(filename or "")
+        # The public response returns this display name, while only a UUID
+        # filename is ever written server-side.  Reject path/control payloads
+        # instead of echoing them into history or UI metadata.
+        if (
+            not filename
+            or len(filename.encode("utf-8", errors="ignore")) > 240
+            or Path(filename).name != filename
+            or "\\" in filename
+            or any(ord(char) < 32 or ord(char) == 127 for char in filename)
+        ):
+            self._send_json(400, {"error": "invalid filename"})
+            return
 
         try:
             length = int(self.headers.get("Content-Length", 0))
         except Exception:
             length = 0
-        if length <= 0 or length > 50 * 1024 * 1024:  # 50MB cap
+        if length <= 0 or length > StagedAttachmentStore.MAX_FILE_BYTES:
             self._send_json(400, {"error": "invalid content-length (max 50MB)"})
             return
 
         # 推断 type
         ext = Path(filename).suffix.lower()
+        if len(ext) > 16 or not re.fullmatch(r"(?:\.[a-z0-9]{1,15})?", ext):
+            self._send_json(400, {"error": "invalid file type"})
+            return
         image_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
         atype = "image" if ext in image_exts else "file"
+
+        # Browser/PWA uploads are staging-only.  They never append history or
+        # wake an AI until one later `/chat/send` atomically consumes their
+        # attachment IDs for the same authenticated session and contact.
+        if self._web_session_matches():
+            if role != "user" or text or quoted_ts or location is not None:
+                self._send_json(400, {"error": "pwa upload only stages a user file; send caption with /chat/send"})
+                return
+            try:
+                with self._pwa_upload_read_timeout():
+                    staged = self.state.staged_attachments.stage_stream(
+                        owner=self._web_session_token(),
+                        contact_id=contact_id,
+                        filename=filename,
+                        attachment_type=atype,
+                        extension=ext,
+                        length=length,
+                        stream=self.rfile,
+                    )
+            except TimeoutError:
+                # Remaining raw bytes cannot safely be treated as a later HTTP
+                # request after a timed-out upload.
+                self.close_connection = True
+                self._send_json(408, {"error": "upload_read_timeout"})
+                return
+            except ValueError:
+                self._send_json(400, {"error": "incomplete upload"})
+                return
+            except Exception:
+                logger.exception("pwa staged upload failed")
+                self._send_json(500, {"error": "upload staging failed"})
+                return
+            self._send_json(201, {
+                "ok": True,
+                "contact_id": contact_id,
+                "attachments": [staged],
+                "upload_limits": self._pwa_upload_limits(),
+            })
+            return
 
         # uuid 命名 + 保留 extension
         stored_name = f"{_uuid.uuid4().hex}{ext}"
@@ -11931,18 +13032,11 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _handle_attachment_get(self):
         """静态服务 attachment 文件 — GET /attachments/<filename>"""
-        from urllib.parse import unquote
-        # path = /attachments/foo.jpg
-        rel = self.path[len("/attachments/"):]
-        rel = unquote(rel.split("?", 1)[0])
-        # 防 path traversal
-        if "/" in rel or ".." in rel or rel.startswith("."):
+        resolved = self._safe_attachment_target()
+        if resolved is None:
             self._send_json(400, {"error": "bad filename"})
             return
-        target = self.state.attachments_dir / rel
-        if not target.exists() or not target.is_file():
-            self._send_json(404, {"error": "not found"})
-            return
+        rel, target = resolved
         # MIME 简单推断
         ext = target.suffix.lower()
         mime = _ATTACHMENT_MIME_MAP.get(ext, "application/octet-stream")
@@ -11955,8 +13049,11 @@ class PushHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(length))
         self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Cache-Control", _attachment_cache_control(rel))
+        self.send_header("Cache-Control", "private, no-store")
+        self.send_header("Pragma", "no-cache")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Disposition", f'inline; filename="{rel}"')
         self.end_headers()
         try:
             with target.open("rb") as f:

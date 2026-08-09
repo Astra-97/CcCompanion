@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#161512" />
+    <meta name="description" content="CcCompanion private operations desk" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" href="./assets/cc-mark.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./src/styles.css" />
+    <title>CcCompanion · Desk</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#conversation">跳到对话</a>
+    <div class="grain" aria-hidden="true"></div>
+    <section class="login-panel" id="login-panel" aria-labelledby="login-title" hidden>
+      <form class="login-card" id="login-form">
+        <p class="eyebrow">CCCOMPANION · PRIVATE DESK</p>
+        <h1 id="login-title">回到桌面。</h1>
+        <p>使用你的 CcCompanion 登录信息建立此浏览器会话。密码不会写入应用存储。</p>
+        <label>账号<input id="login-username" name="username" autocomplete="username" required /></label>
+        <label>密码<input id="login-password" name="password" type="password" autocomplete="current-password" required /></label>
+        <p id="login-error" class="login-error" aria-live="polite"></p>
+        <button id="login-submit" class="send-button" type="submit">进入工作台 <span aria-hidden="true">↗</span></button>
+      </form>
+    </section>
+    <main class="desk-shell" aria-label="CcCompanion 私人工作台">
+      <aside class="rail" aria-label="联系人">
+        <header class="rail-brand">
+          <svg class="mark" aria-hidden="true"><use href="#cc-mark" /></svg>
+          <span>Cc<span>Companion</span></span>
+        </header>
+        <nav id="contact-list" class="contact-list" aria-label="切换联系人"></nav>
+        <div class="rail-footer">
+          <button class="icon-button" id="install-button" type="button" title="安装到 Windows" aria-label="安装到 Windows" hidden>↓</button>
+          <button class="icon-button" id="appearance-button" type="button" title="切换显示密度" aria-label="切换显示密度">◒</button>
+        </div>
+      </aside>
+
+      <section class="conversation" id="conversation" aria-label="当前对话">
+        <header class="conversation-head">
+          <div class="contact-heading">
+            <span class="signal-dot" id="signal-dot" aria-hidden="true"></span>
+            <div><p class="eyebrow" id="contact-mode">PRIVATE CHANNEL</p><h1 id="contact-name">小克</h1></div>
+          </div>
+          <div class="head-actions">
+            <span class="connection-state" id="connection-state" aria-live="polite">已连接</span>
+            <button class="text-button" id="memory-button" type="button">记忆库 <span aria-hidden="true">↗</span></button>
+            <button class="text-button logout-button" id="logout-button" type="button">退出</button>
+          </div>
+        </header>
+
+        <div class="conversation-scroll" id="conversation-scroll" tabindex="-1">
+          <div class="date-rule"><span>今天 · 08 AUG</span></div>
+          <div id="activity-strip" aria-live="polite"></div>
+          <ol class="messages" id="message-list" aria-label="消息记录"></ol>
+        </div>
+
+        <form class="composer" id="composer" aria-label="发送消息">
+          <div id="attachment-tray" class="attachment-tray" aria-label="待发送附件"></div>
+          <label class="attach-button" for="attachment-input" title="添加图片或文件">
+            <span aria-hidden="true">＋</span><span class="sr-only">添加附件</span>
+          </label>
+          <input id="attachment-input" type="file" multiple hidden />
+          <textarea id="message-input" rows="1" placeholder="写给小克…" aria-label="消息内容"></textarea>
+          <div class="composer-actions">
+            <span class="shortcut-hint">Enter 发送 · ⇧Enter 换行</span>
+            <button class="stop-button" id="upload-cancel-button" type="button" hidden>取消上传</button>
+            <button class="send-button" id="send-button" type="submit"><span>发送</span><span aria-hidden="true">↗</span></button>
+            <button class="stop-button" id="stop-button" type="button" hidden>停止</button>
+          </div>
+        </form>
+      </section>
+
+      <aside class="side-notes" aria-label="工作台状态">
+        <section class="instrument" aria-labelledby="instrument-title">
+          <p class="eyebrow">LIVE INSTRUMENT</p><h2 id="instrument-title">本次工作</h2>
+          <dl class="instrument-grid">
+            <div><dt>通道</dt><dd id="state-channel">小克 / CC</dd></div>
+            <div><dt>状态</dt><dd id="state-status">待命</dd></div>
+            <div><dt>会话</dt><dd id="state-session">独立历史</dd></div>
+          </dl>
+        </section>
+        <section class="workers-panel" aria-labelledby="workers-title">
+          <div class="panel-heading"><div><p class="eyebrow">COLLABORATION</p><h2 id="workers-title">协作现场</h2></div><span id="worker-total" class="count-pill">0</span></div>
+          <div id="worker-list" class="worker-list" aria-live="polite"></div>
+        </section>
+        <section class="quiet-note"><span aria-hidden="true">✦</span><p>联系人各自保留独立历史、草稿和忙碌状态。</p></section>
+      </aside>
+    </main>
+
+    <dialog class="memory-dialog" id="memory-dialog" aria-labelledby="memory-title">
+      <div class="memory-head"><div><p class="eyebrow">MEMORY ATLAS</p><h2 id="memory-title">记忆库</h2></div><button class="icon-button" id="memory-close" type="button" aria-label="关闭记忆库">×</button></div>
+      <p class="memory-intro">分类从后端 taxonomy 自动读取；新增分类无需更新 Windows App。</p>
+      <div class="taxonomy" id="taxonomy" aria-live="polite"></div>
+      <div class="memory-results" id="memory-results"><p>选择一个分类查看记忆。</p></div>
+    </dialog>
+
+    <template id="svg-defs"><svg xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style="display:none"><symbol id="cc-mark" viewBox="0 0 24 24"><path d="M3 12 12 3l9 9-9 9-9 9Zm4.2 0L12 7.2l4.8 4.8L12 16.8 7.2 12Z" fill="currentColor"/></symbol></svg></template>
+    <script type="module" src="./src/app.js"></script>
+  </body>
+</html>

@@ -50,6 +50,19 @@ allow_public_bind = false
 # CcCompanion 阉割版用户不需要改此项。
 allow_remote_control = false
 
+# Windows PWA / browser login uses an opaque, in-memory HttpOnly cookie.  It
+# never exposes `shared_secret`, the memory token, or an Android auth token to
+# JavaScript/localStorage.  It requires HTTPS (`__Host-` + Secure cookies);
+# sessions are forgotten on server restart and expire automatically.
+web_session_enabled = true
+web_session_ttl_seconds = 43200
+# PWA raw uploads are staged per web session before one `/chat/send` consumes
+# them.  Hard ceiling: 10 pending files/session and 128 MiB even if configured
+# higher; default 64 MiB cumulative staged bytes/session.
+pwa_staged_attachment_max_bytes = 67108864
+# A stalled upload socket is bounded (5..300 seconds); default 120 seconds.
+pwa_staged_attachment_read_timeout_seconds = 120
+
 # IP 访问白名单. 空列表=不限制.
 # 可选值例: ["127.0.0.1", "10.0.0.0/8", "192.168.0.0/16", "172.16.0.0/12"]
 allowed_ips = []
