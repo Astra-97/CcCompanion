@@ -3094,12 +3094,14 @@ class PushHandler(BaseHTTPRequestHandler):
         activity_text: str | None = None,
         activity_count: int = 0,
         activity_items: list[str] | None = None,
+        worker_activity_items: list[dict[str, Any]] | None = None,
     ) -> None:
         draft_text = str(text or "")
         if not draft_text.strip():
             return
         now = datetime.now(timezone.utc).isoformat()
         items = [str(item).strip() for item in (activity_items or []) if str(item).strip()]
+        worker_items = self._sanitize_worker_activity_items(worker_activity_items)
         with self.state.chat_draft_lock:
             self.state.chat_drafts[contact_id] = {
                 "contact_id": contact_id,
@@ -3119,6 +3121,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 "activity_text": activity_text or "",
                 "activity_count": max(0, int(activity_count or 0)),
                 "activity_items": items,
+                "worker_activity_items": worker_items,
             }
             self.state.chat_reply_states[contact_id] = {
                 "reply_state": "generating",
@@ -3135,6 +3138,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 "activity_text": activity_text or "",
                 "activity_count": max(0, int(activity_count or 0)),
                 "activity_items": items,
+                "worker_activity_items": worker_items,
             }
 
     def _clear_chat_draft(self, contact_id: str) -> None:
@@ -3216,9 +3220,11 @@ class PushHandler(BaseHTTPRequestHandler):
         activity_text: str,
         activity_count: int,
         activity_items: list[str] | None = None,
+        worker_activity_items: list[dict[str, Any]] | None = None,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         items = [str(item).strip() for item in (activity_items or []) if str(item).strip()]
+        worker_items = self._sanitize_worker_activity_items(worker_activity_items)
         with self.state.chat_draft_lock:
             for bucket_name in ("chat_reply_states", "chat_drafts"):
                 bucket = getattr(self.state, bucket_name)
@@ -3228,7 +3234,85 @@ class PushHandler(BaseHTTPRequestHandler):
                 state["activity_text"] = str(activity_text or "")
                 state["activity_count"] = max(0, int(activity_count or 0))
                 state["activity_items"] = items
+                if worker_activity_items is not None:
+                    state["worker_activity_items"] = worker_items
                 state["updated_at"] = now
+
+    @staticmethod
+    def _sanitize_worker_activity_items(value: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        """Keep the draft API's collaboration view bounded and display-safe."""
+        if not isinstance(value, list):
+            return []
+        merged: dict[str, dict[str, Any]] = {}
+        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./-")
+        status_rank = {"running": 0, "completed": 1, "interrupted": 2, "failed": 3}
+        for raw in value[:12]:
+            if not isinstance(raw, dict):
+                continue
+            worker_id = str(raw.get("worker_id") or raw.get("id") or raw.get("name") or "").strip()
+            if (
+                not worker_id
+                or len(worker_id) > 160
+                or worker_id[0] not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+                or any(char not in allowed for char in worker_id)
+            ):
+                digest = hashlib.sha256(worker_id.encode("utf-8", "replace")).hexdigest()[:16]
+                worker_id = f"anonymous-{digest}"
+            name = str(raw.get("name") or "").strip()
+            valid_fallback = (
+                name == "协作 worker"
+                or (
+                    name.startswith("协作 worker-")
+                    and len(name) == len("协作 worker-") + 8
+                    and all(char in "0123456789abcdef" for char in name[-8:].lower())
+                )
+            )
+            valid_identifier = (
+                bool(name)
+                and len(name) <= 160
+                and name[0] in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+                and all(char in allowed for char in name)
+            )
+            if not valid_fallback and not valid_identifier:
+                name = f"协作 worker-{worker_id[-8:]}"
+            status = str(raw.get("status") or "running").lower()
+            if status not in status_rank:
+                status = "running"
+            try:
+                count = int(raw.get("count") or 0)
+            except (TypeError, ValueError):
+                count = 0
+            current = merged.get(worker_id)
+            next_count = max(0, min(count, 999))
+            if current is None:
+                merged[worker_id] = {
+                    "worker_id": worker_id,
+                    "name": name,
+                    "status": status,
+                    "count": next_count,
+                }
+            else:
+                current["count"] = max(int(current.get("count") or 0), next_count)
+                if status_rank[status] > status_rank[str(current.get("status") or "running")]:
+                    current["status"] = status
+                # Prefer the first non-anonymous display name for determinism.
+                if str(current.get("name") or "").startswith("协作 worker") and not name.startswith("协作 worker"):
+                    current["name"] = name
+        return list(merged.values())
+
+    @classmethod
+    def _terminalize_worker_activity_items(
+        cls,
+        value: list[dict[str, Any]],
+        status: str,
+    ) -> list[dict[str, Any]]:
+        """Converge only running workers; existing terminal states never regress."""
+        terminal = status if status in {"completed", "interrupted", "failed"} else "failed"
+        result = cls._sanitize_worker_activity_items(value)
+        for worker in result:
+            if worker.get("status") == "running":
+                worker["status"] = terminal
+        return result
 
     def _set_chat_completed(
         self,
@@ -3365,6 +3449,15 @@ class PushHandler(BaseHTTPRequestHandler):
                 if isinstance(draft.get("activity_items"), list)
                 else reply_state.get("activity_items")
                 if isinstance(reply_state.get("activity_items"), list)
+                else []
+            ),
+            # Optional after the first client rollout.  Older Android builds
+            # simply ignore this field and retain the existing tool card.
+            "worker_activity_items": self._sanitize_worker_activity_items(
+                draft.get("worker_activity_items")
+                if isinstance(draft.get("worker_activity_items"), list)
+                else reply_state.get("worker_activity_items")
+                if isinstance(reply_state.get("worker_activity_items"), list)
                 else []
             ),
         }
@@ -9212,20 +9305,57 @@ class PushHandler(BaseHTTPRequestHandler):
         source = "codex:kairos"
         activity_count = 0
         activity_items: list[str] = []
+        worker_activity_items: list[dict[str, Any]] = []
         wait_started_at = time.monotonic()
         max_queue_wait_sec = 900.0
         if user_ts:
             self.state.mark_kairos_pending_run(contact_id, user_ts, text)
 
         def _append_activity_card() -> None:
-            if not activity_items or task.get("activity_appended"):
+            if task.get("activity_appended"):
                 return
             for activity in activity_items:
                 chat.append(role="task", text=activity, source="codex:kairos:activity")
+            for worker in worker_activity_items:
+                name = str(worker.get("name") or "协作 worker")
+                count = max(1, int(worker.get("count") or 0))
+                status = str(worker.get("status") or "running")
+                status_text = {
+                    "running": "进行中",
+                    "completed": "已完成",
+                    "interrupted": "已中断",
+                    "failed": "失败",
+                }.get(status, "进行中")
+                chat.append(
+                    role="task",
+                    text=f"{name} 忙活了 {count} 下 · {status_text}",
+                    source="codex:kairos:worker",
+                )
             task["activity_appended"] = True
 
-        def _append_assistant(message: str, append_source: str = source) -> None:
+        def _terminalize_workers(status: str) -> None:
+            if status not in {"completed", "interrupted", "failed"}:
+                return
+            terminalized = self._terminalize_worker_activity_items(worker_activity_items, status)
+            changed = terminalized != worker_activity_items
+            worker_activity_items[:] = terminalized
+            if changed:
+                self._set_chat_activity(
+                    contact_id,
+                    activity_text=str(task.get("activity_text") or ""),
+                    activity_count=activity_count,
+                    activity_items=activity_items,
+                    worker_activity_items=worker_activity_items,
+                )
+
+        def _append_assistant(
+            message: str,
+            append_source: str = source,
+            *,
+            worker_terminal_status: str = "completed",
+        ) -> None:
             nonlocal assistant_appended
+            _terminalize_workers(worker_terminal_status)
             _append_activity_card()
             assistant_rec = chat.append(
                 role="assistant",
@@ -9251,6 +9381,7 @@ class PushHandler(BaseHTTPRequestHandler):
 
         def _append_interrupted_draft() -> None:
             nonlocal assistant_appended
+            _terminalize_workers("interrupted")
             _append_activity_card()
             draft_text = _current_draft_text()
             if draft_text:
@@ -9278,6 +9409,7 @@ class PushHandler(BaseHTTPRequestHandler):
 
         def _append_uncertain_draft(detail: str) -> None:
             nonlocal assistant_appended
+            _terminalize_workers("failed")
             _append_activity_card()
             draft_text = _current_draft_text()
             notice = (
@@ -9423,6 +9555,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         activity_text=str(task.get("activity_text") or ""),
                         activity_count=activity_count,
                         activity_items=activity_items,
+                        worker_activity_items=worker_activity_items,
                     )
                     self.state.update_kairos_pending_draft(contact_id, user_ts, live_text)
 
@@ -9436,9 +9569,48 @@ class PushHandler(BaseHTTPRequestHandler):
                 def _on_turn_accepted(accepted_thread_id: str) -> None:
                     _commit_recall_for_session(accepted_thread_id)
 
-                def _on_activity(activity_text: str) -> None:
+                def _on_activity(activity_event: Any) -> None:
                     nonlocal activity_count
-                    activity = str(activity_text or "").strip()
+                    if isinstance(activity_event, dict) and activity_event.get("kind") == "collaboration_worker":
+                        name = str(activity_event.get("name") or "协作 worker")
+                        status = str(activity_event.get("status") or "running")
+                        try:
+                            count_delta = int(activity_event.get("count_delta") or 0)
+                        except (TypeError, ValueError):
+                            count_delta = 0
+                        worker_id = str(activity_event.get("worker_id") or name)
+                        existing = next(
+                            (item for item in worker_activity_items if item.get("worker_id") == worker_id),
+                            None,
+                        )
+                        if existing is None:
+                            existing = {
+                                "worker_id": worker_id,
+                                "name": name,
+                                "status": "running",
+                                "count": 0,
+                            }
+                            worker_activity_items.append(existing)
+                        status_rank = {"running": 0, "completed": 1, "interrupted": 2, "failed": 3}
+                        old_status = str(existing.get("status") or "running")
+                        if status_rank.get(status, 0) > status_rank.get(old_status, 0):
+                            existing["status"] = status
+                        existing["count"] = max(0, int(existing.get("count") or 0) + max(0, count_delta))
+                        # Only the allowlisted category reaches the observer;
+                        # worker names and task payloads stay out of terminal logs.
+                        if run_id:
+                            CODEX_RUNS.set_observer_phase(run_id, "running")
+                            CODEX_RUNS.publish_observer_event(run_id, "subAgentActivity")
+                        self._set_chat_activity(
+                            contact_id,
+                            activity_text=str(task.get("activity_text") or ""),
+                            activity_count=activity_count,
+                            activity_items=activity_items,
+                            worker_activity_items=worker_activity_items,
+                        )
+                        return
+
+                    activity = str(activity_event or "").strip()
                     if not activity:
                         return
                     if run_id:
@@ -9452,6 +9624,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         activity_text=activity,
                         activity_count=activity_count,
                         activity_items=activity_items,
+                        worker_activity_items=worker_activity_items,
                     )
 
                 session_root = Path(os.environ.get("CODEX_SESSION_ROOT", "~/.codex/sessions")).expanduser()
@@ -9578,6 +9751,7 @@ class PushHandler(BaseHTTPRequestHandler):
                                     "Kairos 的 app-server 接入失败了，这条消息没有进入模型。"
                                     "我没有自动切回旧链路，避免在状态不明时重复执行。",
                                     append_source=f"{source}:app-server-error",
+                                    worker_terminal_status="failed",
                                 )
                                 return
                             logger.warning("kairos app-server pre-start failure; using legacy exec fallback")
@@ -9667,6 +9841,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     _append_assistant(
                         "Kairos 这次生成失败了，app-server 已保留原 thread；你可以重发这条消息。",
                         append_source=f"{source}:app-server-failed",
+                        worker_terminal_status="failed",
                     )
                     return
                 if thread_id:
@@ -9698,7 +9873,10 @@ class PushHandler(BaseHTTPRequestHandler):
                     )
             except Exception:
                 logger.exception("kairos codex queue worker failed")
-                _append_assistant("Kairos 接入出错：后端生成进程异常退出。你可以重发这条，我不会让它静默消失。")
+                _append_assistant(
+                    "Kairos 接入出错：后端生成进程异常退出。你可以重发这条，我不会让它静默消失。",
+                    worker_terminal_status="failed",
+                )
             finally:
                 if run_id:
                     CODEX_RUNS.finish(run_id)
@@ -12284,6 +12462,7 @@ class PushHandler(BaseHTTPRequestHandler):
     # /memory/<name> -> upstream /api path (GET-only whitelist)
     _MEMORY_ROUTES: dict[str, str] = {
         "/memory/stats": "/api/stats",
+        "/memory/taxonomy": "/api/taxonomy",
         "/memory/categories": "/api/categories",
         "/memory/list": "/api/memories",
         "/memory/semantic-search": "/api/semantic-search",
@@ -12300,32 +12479,6 @@ class PushHandler(BaseHTTPRequestHandler):
         "sort_order",
         "cursor",
     )
-    _MEMORY_CORE_SUBCATEGORIES = frozenset((
-        "directive.interaction",
-        "directive.operating",
-        "profile.stable",
-        "profile.preference",
-        "profile.sensitive",
-        "operations.tooling",
-        "operations.runbook",
-        "operations.incident",
-        "project.active",
-        "project.archive",
-        "knowledge.technical",
-        "knowledge.research",
-        "legacy",
-    ))
-    _MEMORY_DIARY_SUBCATEGORIES = frozenset((
-        "diary.general",
-        "diary.worklog",
-        "diary.health",
-    ))
-    _MEMORY_XIAYIZHOU_SUBCATEGORIES = frozenset((
-        "xiayizhou.qiqi_game_copy",
-        "xiayizhou.astra_review",
-        "xiayizhou.astra_fanfic",
-        "xiayizhou.other",
-    ))
     _memory_token_cache: str | None = None
 
     @classmethod
@@ -12367,26 +12520,22 @@ class PushHandler(BaseHTTPRequestHandler):
                 return
             category_values = qs.get("category", [])
             if not category_values:
-                self._send_json(400, {"error": "subcategory 只适用于 category=core、diary 或 xiayizhou；请先选择这三个分类之一，或移除 subcategory。"})
+                self._send_json(400, {"error": "使用 subcategory 时必须同时提供一个 category。"})
                 return
             if len(category_values) != 1:
                 self._send_json(400, {"error": "使用 subcategory 时 category 必须且只能提供一次。"})
                 return
             category = str(category_values[0]).strip() if category_values else None
             subcategory = str(subcategory_values[0]).strip()
-            valid_subcategories = {
-                "core": self._MEMORY_CORE_SUBCATEGORIES,
-                "diary": self._MEMORY_DIARY_SUBCATEGORIES,
-                "xiayizhou": self._MEMORY_XIAYIZHOU_SUBCATEGORIES,
-            }.get(category)
-            if valid_subcategories is None:
-                self._send_json(400, {"error": "subcategory 只适用于 category=core、diary 或 xiayizhou；请先选择这三个分类之一，或移除 subcategory。"})
-                return
             if not subcategory:
-                self._send_json(400, {"error": f"{category} 子分类不能为空；请选择一个已注册的 {category} 子分类。"})
+                self._send_json(400, {"error": "subcategory 不能为空。"})
                 return
-            if subcategory not in valid_subcategories:
-                self._send_json(400, {"error": f"{category} 子分类『{subcategory}』无效；请选择一个已注册的 {category} 子分类。"})
+            taxonomy_status, registered_subcategories = self._memory_taxonomy_subcategories(category, token)
+            if taxonomy_status != 200:
+                self._send_json(taxonomy_status, {"error": "memory taxonomy unavailable"})
+                return
+            if subcategory not in registered_subcategories:
+                self._send_json(400, {"error": f"{category} 子分类『{subcategory}』无效；请从记忆库 taxonomy 返回的已注册子分类中选择。"})
                 return
         params: list[tuple[str, str]] = []
         for key in self._MEMORY_ALLOWED_PARAMS:
@@ -12428,6 +12577,36 @@ class PushHandler(BaseHTTPRequestHandler):
 
         status, payload = self._memory_request(url, token)
         self._send_json(status, payload)
+
+    def _memory_taxonomy_subcategories(self, category: str, token: str) -> tuple[int, frozenset[str]]:
+        """Return only registered keys for one category from the upstream taxonomy contract.
+
+        The proxy deliberately does not mirror taxonomy registries: a new
+        backend category becomes selectable without changing this service.
+        Malformed or unavailable metadata fails closed for subcategory filters,
+        while old backends remain browse-compatible when no subcategory is sent.
+        """
+        status, payload = self._memory_request(self._MEMORY_UPSTREAM_BASE + "/api/taxonomy", token)
+        if status != 200 or not isinstance(payload, dict):
+            return 502, frozenset()
+        categories = payload.get("categories")
+        if not isinstance(categories, list):
+            return 502, frozenset()
+        for item in categories[:100]:
+            if not isinstance(item, dict) or item.get("key") != category:
+                continue
+            subcategories = item.get("subcategories")
+            if not isinstance(subcategories, list):
+                return 502, frozenset()
+            keys = {
+                str(subcategory.get("key")).strip()
+                for subcategory in subcategories[:500]
+                if isinstance(subcategory, dict)
+                and isinstance(subcategory.get("key"), str)
+                and subcategory.get("key").strip()
+            }
+            return 200, frozenset(keys)
+        return 200, frozenset()
 
     @staticmethod
     def _memory_request(url: str, token: str) -> tuple[int, Any]:

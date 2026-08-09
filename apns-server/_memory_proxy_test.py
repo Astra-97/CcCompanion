@@ -15,6 +15,34 @@ from unittest.mock import patch
 from push import PushHandler
 
 
+_TAXONOMY = {
+    "version": 1,
+    "categories": [
+        {
+            "key": "core",
+            "label": "深层",
+            "subcategories": [
+                {"key": "profile.preference", "label": "偏好", "count": 1},
+                {"key": "operations.tooling", "label": "工具使用", "count": 0},
+                {"key": "legacy", "label": "历史兼容", "count": 0},
+            ],
+        },
+        {
+            "key": "diary",
+            "label": "日记",
+            "subcategories": [{"key": "diary.worklog", "label": "牛马日志", "count": 1}],
+        },
+        {
+            "key": "xiayizhou",
+            "label": "夏以昼",
+            "subcategories": [
+                {"key": "xiayizhou.astra_fanfic", "label": "Astra 写的同人文", "count": 16},
+            ],
+        },
+    ],
+}
+
+
 class _FakeResponse:
     def __init__(self, status: int, payload):
         self.status = status
@@ -75,11 +103,12 @@ class MemoryProxyTest(unittest.TestCase):
 
     # ---------- route whitelist ----------
 
-    def test_all_five_routes_mapped(self):
+    def test_all_six_routes_mapped(self):
         self.assertEqual(
             PushHandler._MEMORY_ROUTES,
             {
                 "/memory/stats": "/api/stats",
+                "/memory/taxonomy": "/api/taxonomy",
                 "/memory/categories": "/api/categories",
                 "/memory/list": "/api/memories",
                 "/memory/semantic-search": "/api/semantic-search",
@@ -103,16 +132,18 @@ class MemoryProxyTest(unittest.TestCase):
 
     # ---------- forwarding ----------
 
-    def run_forward(self, path: str, upstream_payload, upstream_status: int = 200):
+    def run_forward(self, path: str, upstream_payload, upstream_status: int = 200, taxonomy_payload=_TAXONOMY):
         handler = self.handler(path)
         captured = {}
 
         def fake_urlopen(req, timeout=None):
             captured["url"] = req.full_url
+            captured.setdefault("urls", []).append(req.full_url)
             captured["headers"] = dict(req.headers)
             captured["method"] = req.get_method()
             captured["timeout"] = timeout
-            return _FakeResponse(upstream_status, upstream_payload)
+            payload = taxonomy_payload if req.full_url.endswith("/api/taxonomy") else upstream_payload
+            return _FakeResponse(upstream_status, payload)
 
         with patch.object(PushHandler, "_memory_token", classmethod(lambda cls: "tok-abc")), \
                 patch("urllib.request.urlopen", side_effect=fake_urlopen):
@@ -138,20 +169,26 @@ class MemoryProxyTest(unittest.TestCase):
         )
         self.assertEqual(handler.responses[0], (200, []))
 
-    def test_invalid_subcategory_scopes_are_rejected_before_upstream(self):
+    def test_invalid_subcategory_scopes_are_rejected_against_upstream_taxonomy(self):
         for path, error in (
             ("/memory/list?category=core&subcategory=__unclassified__&per_page=50", "无效"),
             ("/memory/semantic-search?query=abc&category=core&subcategory=unknown", "无效"),
-            ("/memory/list?category=core&subcategory=", "不能为空"),
-            ("/memory/list?category=diary&subcategory=", "不能为空"),
-            ("/memory/list?category=diary&category=core&subcategory=diary.general", "只能提供一次"),
             ("/memory/list?category=diary&subcategory=diary.unknown", "无效"),
             ("/memory/list?category=diary&subcategory=profile.preference", "无效"),
             ("/memory/list?category=xiayizhou&subcategory=unknown", "无效"),
             ("/memory/list?category=xiayizhou&subcategory=profile.preference", "无效"),
             ("/memory/list?category=core&subcategory=diary.general", "无效"),
-            ("/memory/list?category=daily&subcategory=profile.preference", "只适用于"),
-            ("/memory/list?subcategory=profile.preference", "只适用于"),
+        ):
+            handler, captured = self.run_forward(path, [])
+            self.assertEqual(handler.responses[0][0], 400)
+            self.assertIn(error, handler.responses[0][1]["error"])
+            self.assertEqual(captured["urls"], ["https://memory.xiaonancaleb.xyz/api/taxonomy"])
+
+    def test_malformed_subcategory_scope_is_rejected_before_taxonomy_lookup(self):
+        for path, error in (
+            ("/memory/list?category=core&subcategory=", "不能为空"),
+            ("/memory/list?category=diary&category=core&subcategory=diary.general", "只能提供一次"),
+            ("/memory/list?subcategory=profile.preference", "必须同时提供"),
         ):
             handler = self.handler(path)
             with patch("urllib.request.urlopen") as urlopen:
@@ -186,6 +223,33 @@ class MemoryProxyTest(unittest.TestCase):
             captured["url"],
             "https://memory.xiaonancaleb.xyz/api/memories?category=xiayizhou&subcategory=xiayizhou.astra_fanfic&per_page=50",
         )
+
+    def test_dynamic_taxonomy_allows_a_new_backend_category_without_proxy_changes(self):
+        taxonomy = {
+            "version": 1,
+            "categories": [{
+                "key": "future",
+                "label": "未来",
+                "subcategories": [{"key": "future.experimental", "label": "实验", "count": 3}],
+            }],
+        }
+        _, captured = self.run_forward(
+            "/memory/list?category=future&subcategory=future.experimental",
+            {},
+            taxonomy_payload=taxonomy,
+        )
+        self.assertEqual(
+            captured["urls"],
+            [
+                "https://memory.xiaonancaleb.xyz/api/taxonomy",
+                "https://memory.xiaonancaleb.xyz/api/memories?category=future&subcategory=future.experimental",
+            ],
+        )
+
+    def test_taxonomy_route_is_forwarded_unchanged(self):
+        handler, captured = self.run_forward("/memory/taxonomy", _TAXONOMY)
+        self.assertEqual(captured["url"], "https://memory.xiaonancaleb.xyz/api/taxonomy")
+        self.assertEqual(handler.responses[0], (200, _TAXONOMY))
 
     def test_limit_clamped_and_bad_limit_dropped(self):
         _, captured = self.run_forward("/memory/list?limit=99999", [])

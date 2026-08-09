@@ -26,7 +26,12 @@ except ImportError:  # pragma: no cover - production is Linux.
 
 
 UpdateCallback = Callable[[str], None]
-ActivityCallback = Callable[[str], None]
+# Most activity is still represented by a short, display-safe label.  A
+# collaboration item can additionally carry a sanitised worker identity and
+# lifecycle state so the client can show a compact worker card without ever
+# receiving the delegated prompt or tool payload.
+ActivityValue = str | dict[str, Any]
+ActivityCallback = Callable[[ActivityValue], None]
 ThreadCallback = Callable[[str], None]
 TurnAcceptedCallback = Callable[[str], None]
 MarkerProvider = Callable[[str], tuple[str, int, int] | None]
@@ -229,6 +234,7 @@ class _ActiveTurn:
     final_messages: OrderedDict[str, str] = field(default_factory=OrderedDict)
     completed_items: set[str] = field(default_factory=set)
     activity_items: set[str] = field(default_factory=set)
+    worker_items: dict[str, tuple[str, str]] = field(default_factory=dict)
     observer_events: list[tuple[int, str]] = field(default_factory=list)
     observer_event_keys: set[str] = field(default_factory=set)
     pending_notifications: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
@@ -2658,6 +2664,29 @@ class CodexAppBridge:
                 if summary:
                     self._safe_callback(active.on_activity, f"思考摘要：{summary}")
             return
+        if item_type in {"collabAgentToolCall", "subAgentActivity"}:
+            worker_activity = self._collaboration_activity(item, completed=completed)
+            if worker_activity is not None:
+                with active.condition:
+                    previous_worker = active.worker_items.get(item_id) if item_id else None
+                    if previous_worker is not None:
+                        worker_activity["worker_id"], worker_activity["name"] = previous_worker
+                    elif item_id:
+                        active.worker_items[item_id] = (
+                            str(worker_activity["worker_id"]),
+                            str(worker_activity["name"]),
+                        )
+                    if not completed:
+                        activity_key = item_id or (
+                            f"{item_type}:{worker_activity['worker_id']}"
+                        )
+                        if activity_key in active.activity_items:
+                            return
+                        active.activity_items.add(activity_key)
+                self._safe_callback(active.on_activity, worker_activity)
+            # The worker record is the only client-facing representation for
+            # collaboration items, preventing a duplicate generic tool row.
+            return
         if completed:
             return
         label = self._activity_label(item)
@@ -2694,6 +2723,75 @@ class CodexAppBridge:
         }.get(item_type, "")
 
     @staticmethod
+    def _collaboration_activity(item: dict[str, Any], *, completed: bool) -> dict[str, Any] | None:
+        """Return a bounded, prompt-free worker lifecycle record.
+
+        App-server versions have used a few different field spellings.  Only
+        a conservative identifier-shaped value is ever surfaced; task text,
+        commentary, command output and arbitrary display labels are ignored.
+        Older payloads therefore degrade to the generic ``协作 worker`` row.
+        """
+        item_type = str(item.get("type") or "")
+        if item_type not in {"collabAgentToolCall", "subAgentActivity"}:
+            return None
+
+        candidate: Any = None
+        for key in ("agentName", "agent_name", "workerName", "worker_name", "taskName", "task_name"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                candidate = value
+                break
+        if candidate is None:
+            agent = item.get("agent")
+            if isinstance(agent, dict):
+                for key in ("name", "agentName", "agent_name", "taskName", "task_name"):
+                    value = agent.get(key)
+                    if isinstance(value, str) and value.strip():
+                        candidate = value
+                        break
+
+        worker_id, name = CodexAppBridge._safe_worker_identity_name(candidate, item_id=str(item.get("id") or ""))
+        raw_status = str(item.get("status") or item.get("state") or item.get("phase") or "").lower()
+        if completed:
+            status = "failed" if raw_status in {"failed", "error"} or item.get("error") else "completed"
+        else:
+            status = "failed" if raw_status in {"failed", "error"} else "running"
+        return {
+            "kind": "collaboration_worker",
+            "worker_id": worker_id,
+            "name": name,
+            "status": status,
+            # A started item is one unit of visible worker activity.  A final
+            # item updates status only, so it cannot inflate the count.
+            "count_delta": 0 if completed else 1,
+        }
+
+    @staticmethod
+    def _safe_worker_identity_name(value: Any, *, item_id: str = "") -> tuple[str, str]:
+        """Return a canonical aggregation key and a safe, non-colliding label."""
+        raw = str(value or "").strip().replace("\\", "/")
+        segments = [segment for segment in raw.strip("/").split("/") if segment]
+        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
+        safe_segments = bool(segments) and all(
+            len(segment) <= 80
+            and segment[0] in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            and all(char in allowed for char in segment)
+            and segment not in {".", ".."}
+            for segment in segments
+        )
+        canonical = "/".join(segments) if safe_segments else ""
+        if canonical and len(canonical) <= 160:
+            display = canonical.removeprefix("root/")
+            return canonical, display
+
+        # The hash differentiates anonymous/unsafe workers without disclosing
+        # their rejected label. item_id keeps truly anonymous concurrent items
+        # distinct and remains stable across notification replay.
+        basis = raw or f"item:{item_id}" or "anonymous"
+        digest = hashlib.sha256(basis.encode("utf-8", "replace")).hexdigest()[:16]
+        return f"anonymous-{digest}", f"协作 worker-{digest[:8]}"
+
+    @staticmethod
     def _observer_activity_label(item_type: str) -> str:
         """Map only trusted item types to terminal-safe status text."""
         return OBSERVER_ITEM_LABELS.get(str(item_type or ""), "")
@@ -2723,7 +2821,7 @@ class CodexAppBridge:
                 del active.observer_events[:-40]
 
     @staticmethod
-    def _safe_callback(callback: Callable[[str], None] | None, value: str) -> None:
+    def _safe_callback(callback: Callable[[ActivityValue], None] | None, value: ActivityValue) -> None:
         if callback is None:
             return
         try:

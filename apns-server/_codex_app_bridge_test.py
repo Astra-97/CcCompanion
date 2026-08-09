@@ -581,6 +581,136 @@ class CodexAppBridgeTest(unittest.TestCase):
             for entry in thread_entries
         ))
 
+    def test_collaboration_worker_activity_is_prompt_free_and_tracks_lifecycle(self):
+        started = self.bridge._collaboration_activity({
+            "type": "collabAgentToolCall",
+            "agent_name": "/root/xiayizhou_subcategory_ui",
+            "task": "this must never be sent to the client",
+        }, completed=False)
+        completed = self.bridge._collaboration_activity({
+            "type": "collabAgentToolCall",
+            "agent_name": "/root/xiayizhou_subcategory_ui",
+            "status": "completed",
+            "task": "this must never be sent to the client",
+        }, completed=True)
+        unsafe = self.bridge._collaboration_activity({
+            "type": "subAgentActivity",
+            "agentName": "untrusted name with prompt words",
+        }, completed=False)
+
+        self.assertEqual(
+            started,
+            {
+                "kind": "collaboration_worker",
+                "worker_id": "root/xiayizhou_subcategory_ui",
+                "name": "xiayizhou_subcategory_ui",
+                "status": "running",
+                "count_delta": 1,
+            },
+        )
+        self.assertEqual(completed["name"], "xiayizhou_subcategory_ui")
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["count_delta"], 0)
+        self.assertTrue(unsafe["worker_id"].startswith("anonymous-"))
+        self.assertTrue(unsafe["name"].startswith("协作 worker-"))
+
+    def test_collaboration_items_emit_structured_worker_events_not_generic_tool_rows(self):
+        activities = []
+        active = bridge_module._ActiveTurn(
+            thread_id="thread-test",
+            on_update=None,
+            on_activity=activities.append,
+        )
+        item = {
+            "id": "worker-1",
+            "type": "collabAgentToolCall",
+            "task_name": "render_worker_activity",
+            "task": "private delegated instruction",
+        }
+
+        self.bridge._handle_item(active, item, completed=False)
+        self.bridge._handle_item(active, {**item, "status": "completed"}, completed=True)
+
+        self.assertEqual(
+            activities,
+            [
+                {
+                    "kind": "collaboration_worker",
+                    "worker_id": "render_worker_activity",
+                    "name": "render_worker_activity",
+                    "status": "running",
+                    "count_delta": 1,
+                },
+                {
+                    "kind": "collaboration_worker",
+                    "worker_id": "render_worker_activity",
+                    "name": "render_worker_activity",
+                    "status": "completed",
+                    "count_delta": 0,
+                },
+            ],
+        )
+
+    def test_duplicate_worker_started_item_is_counted_once(self):
+        activities = []
+        active = bridge_module._ActiveTurn(
+            thread_id="thread-test",
+            on_update=None,
+            on_activity=activities.append,
+        )
+        item = {
+            "id": "stable-worker-item",
+            "type": "subAgentActivity",
+            "agent_name": "/root/a/review",
+        }
+
+        self.bridge._handle_item(active, item, completed=False)
+        self.bridge._handle_item(active, dict(item), completed=False)
+
+        self.assertEqual(len(activities), 1)
+        self.assertEqual(activities[0]["count_delta"], 1)
+
+    def test_sparse_completed_item_reuses_started_worker_identity(self):
+        activities = []
+        active = bridge_module._ActiveTurn(
+            thread_id="thread-test",
+            on_update=None,
+            on_activity=activities.append,
+        )
+        self.bridge._handle_item(active, {
+            "id": "worker-sparse",
+            "type": "collabAgentToolCall",
+            "agent_name": "/root/a/review",
+        }, completed=False)
+        self.bridge._handle_item(active, {
+            "id": "worker-sparse",
+            "type": "collabAgentToolCall",
+            "status": "completed",
+        }, completed=True)
+
+        self.assertEqual(activities[1]["worker_id"], "root/a/review")
+        self.assertEqual(activities[1]["name"], "a/review")
+        self.assertEqual(activities[1]["status"], "completed")
+
+    def test_same_basename_workers_keep_distinct_canonical_identities_and_names(self):
+        left = self.bridge._collaboration_activity({
+            "id": "left",
+            "type": "collabAgentToolCall",
+            "agent_name": "/root/a/review",
+        }, completed=False)
+        right = self.bridge._collaboration_activity({
+            "id": "right",
+            "type": "collabAgentToolCall",
+            "agent_name": "/root/b/review",
+        }, completed=False)
+
+        self.assertEqual(left["worker_id"], "root/a/review")
+        self.assertEqual(left["name"], "a/review")
+        self.assertEqual(right["worker_id"], "root/b/review")
+        self.assertEqual(right["name"], "b/review")
+        self.assertNotEqual(left["worker_id"], right["worker_id"])
+        self.assertNotEqual(left["name"], right["name"])
+
     def test_default_transport_uses_shared_unix_websocket(self):
         socket_path = self.root / "daemon.sock"
         methods = []

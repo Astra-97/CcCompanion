@@ -308,6 +308,65 @@ class KairosCancelTest(unittest.TestCase):
         self.assertEqual(generating["text"], "")
         self.assertEqual(generating["activity_count"], 0)
 
+    def test_draft_snapshot_exposes_only_bounded_worker_lifecycle_fields(self):
+        handler = object.__new__(PushHandler)
+        handler.state = types.SimpleNamespace(
+            chat_draft_lock=threading.Lock(),
+            chat_drafts={},
+            chat_reply_states={},
+        )
+
+        handler._set_chat_generating("test", user_ts="worker-turn")
+        handler._set_chat_activity(
+            "test",
+            activity_text="",
+            activity_count=0,
+            worker_activity_items=[
+                {"name": "taxonomy_worker", "status": "completed", "count": 3},
+                {"name": "unsafe worker label", "status": "not-a-status", "count": 9999},
+            ],
+        )
+
+        snapshot = handler._chat_draft_snapshot("test")
+        workers = snapshot["worker_activity_items"]
+        self.assertEqual(
+            workers[0],
+            {
+                "worker_id": "taxonomy_worker",
+                "name": "taxonomy_worker",
+                "status": "completed",
+                "count": 3,
+            },
+        )
+        self.assertTrue(workers[1]["worker_id"].startswith("anonymous-"))
+        self.assertTrue(workers[1]["name"].startswith("协作 worker-"))
+        self.assertEqual(workers[1]["status"], "running")
+        self.assertEqual(workers[1]["count"], 999)
+
+    def test_worker_aggregation_uses_canonical_identity_not_display_basename(self):
+        workers = PushHandler._sanitize_worker_activity_items([
+            {"worker_id": "root/a/review", "name": "a/review", "status": "running", "count": 1},
+            {"worker_id": "root/b/review", "name": "b/review", "status": "completed", "count": 2},
+            {"worker_id": "root/a/review", "name": "a/review", "status": "completed", "count": 3},
+        ])
+
+        self.assertEqual([worker["worker_id"] for worker in workers], ["root/a/review", "root/b/review"])
+        self.assertEqual(workers[0]["status"], "completed")
+        self.assertEqual(workers[0]["count"], 3)
+        self.assertEqual(workers[1]["status"], "completed")
+
+    def test_turn_interruption_and_failure_terminalize_running_workers(self):
+        workers = [
+            {"worker_id": "root/a", "name": "a", "status": "running", "count": 2},
+            {"worker_id": "root/b", "name": "b", "status": "completed", "count": 1},
+        ]
+
+        interrupted = PushHandler._terminalize_worker_activity_items(workers, "interrupted")
+        failed = PushHandler._terminalize_worker_activity_items(workers, "failed")
+
+        self.assertEqual([worker["status"] for worker in interrupted], ["interrupted", "completed"])
+        self.assertEqual([worker["status"] for worker in failed], ["failed", "completed"])
+
     def test_terminal_reply_state_is_not_active_even_when_interrupted_text_is_retained(self):
         handler = object.__new__(PushHandler)
         handler.state = types.SimpleNamespace(
