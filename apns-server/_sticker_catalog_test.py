@@ -2,8 +2,13 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import MagicMock, patch
 
-from sticker_catalog import StickerCatalogService, is_valid_sticker_name
+from sticker_catalog import (
+    STICKER_CATALOG_USER_AGENT,
+    StickerCatalogService,
+    is_valid_sticker_name,
+)
 
 
 class StickerCatalogTests(unittest.TestCase):
@@ -54,6 +59,23 @@ class StickerCatalogTests(unittest.TestCase):
             "manifest_path": "/missing.json", "public_base_url": "http://not-https.example"
         }]})
         self.assertEqual([], service.snapshot()["stickers"])
+
+    def test_remote_manifest_uses_fixed_non_secret_user_agent(self):
+        response = MagicMock()
+        response.read.return_value = '{"stickers":[{"name":"爱","file":"爱.gif"}]}'.encode("utf-8")
+        response.__enter__.return_value = response
+        opener = MagicMock()
+        opener.open.return_value = response
+        service = StickerCatalogService({"enabled": True, "sources": [{
+            "manifest_url": "https://assets.example/stickers/catalog.json",
+            "public_base_url": "https://assets.example/stickers",
+        }]})
+        with patch("sticker_catalog.build_opener", return_value=opener):
+            self.assertEqual(["爱"], [item["name"] for item in service.snapshot()["stickers"]])
+        request = opener.open.call_args.args[0]
+        self.assertEqual(STICKER_CATALOG_USER_AGENT, request.get_header("User-agent"))
+        self.assertNotIn("token", request.header_items().__repr__().lower())
+        self.assertNotIn("secret", request.header_items().__repr__().lower())
 
 
 if __name__ == "__main__":

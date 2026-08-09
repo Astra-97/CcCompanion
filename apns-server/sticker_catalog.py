@@ -35,6 +35,9 @@ _MAX_MANIFEST_BYTES = 512 * 1024
 _MAX_STICKERS = 512
 _MAX_NAME_CHARS = 80
 _IMAGE_EXTENSIONS = {".gif", ".png", ".jpg", ".jpeg", ".webp"}
+# Cloudflare's bot policy rejects urllib's default user agent on the existing
+# static host. This is a fixed product identifier, not an auth credential.
+STICKER_CATALOG_USER_AGENT = "CcCompanion-StickerCatalog/1.0"
 
 
 def is_valid_sticker_name(value: Any) -> bool:
@@ -154,7 +157,13 @@ class StickerCatalogService:
             data = source.manifest_path.read_bytes()
         else:
             assert source.manifest_url is not None
-            request = Request(source.manifest_url, headers={"Accept": "application/json"})
+            request = Request(
+                source.manifest_url,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": STICKER_CATALOG_USER_AGENT,
+                },
+            )
             opener = build_opener(_NoRedirect())
             with opener.open(request, timeout=5) as response:  # nosec B310: operator-configured HTTPS only
                 data = response.read(_MAX_MANIFEST_BYTES + 1)
