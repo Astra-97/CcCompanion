@@ -33,7 +33,8 @@
         <nav id="contact-list" class="contact-list" aria-label="切换联系人"></nav>
         <div class="rail-footer">
           <button class="icon-button" id="install-button" type="button" title="安装到 Windows" aria-label="安装到 Windows" hidden>↓</button>
-          <button class="icon-button" id="appearance-button" type="button" title="切换显示密度" aria-label="切换显示密度">◒</button>
+          <button class="icon-button" id="appearance-button" type="button" title="切换显示模式" aria-label="切换显示模式：默认">◒</button>
+          <span class="sr-only" id="appearance-status" aria-live="polite">显示模式：默认</span>
         </div>
       </aside>
 
@@ -45,23 +46,25 @@
           </div>
           <div class="head-actions">
             <span class="connection-state" id="connection-state" aria-live="polite">已连接</span>
+            <button class="text-button worker-toggle" id="worker-toggle" type="button" aria-controls="side-notes" aria-expanded="false">现场 <span aria-hidden="true">↗</span></button>
             <button class="text-button" id="memory-button" type="button">记忆库 <span aria-hidden="true">↗</span></button>
             <button class="text-button logout-button" id="logout-button" type="button">退出</button>
           </div>
         </header>
 
         <div class="conversation-scroll" id="conversation-scroll" tabindex="-1">
-          <div class="date-rule"><span>今天 · 08 AUG</span></div>
+          <div class="date-rule"><span id="date-rule-label">今天</span></div>
           <div id="activity-strip" aria-live="polite"></div>
           <ol class="messages" id="message-list" aria-label="消息记录"></ol>
+          <button class="latest-button" id="latest-button" type="button" hidden>回到最新 <span aria-hidden="true">↓</span></button>
         </div>
 
         <form class="composer" id="composer" aria-label="发送消息">
           <div id="attachment-tray" class="attachment-tray" aria-label="待发送附件"></div>
-          <label class="attach-button" for="attachment-input" title="添加图片或文件">
+          <label class="attach-button" for="attachment-input" title="添加图片或文件" role="button" tabindex="0" aria-label="添加图片或文件">
             <span aria-hidden="true">＋</span><span class="sr-only">添加附件</span>
           </label>
-          <input id="attachment-input" type="file" multiple hidden />
+          <input id="attachment-input" class="file-input" type="file" multiple tabindex="-1" />
           <textarea id="message-input" rows="1" placeholder="写给小克…" aria-label="消息内容"></textarea>
           <div class="composer-actions">
             <span class="shortcut-hint">Enter 发送 · ⇧Enter 换行</span>
@@ -72,7 +75,8 @@
         </form>
       </section>
 
-      <aside class="side-notes" aria-label="工作台状态">
+      <aside class="side-notes" id="side-notes" aria-label="工作台状态" aria-hidden="false">
+        <div class="drawer-head"><p class="eyebrow">LIVE INSTRUMENT</p><button class="icon-button" id="worker-close" type="button" aria-label="关闭协作现场">×</button></div>
         <section class="instrument" aria-labelledby="instrument-title">
           <p class="eyebrow">LIVE INSTRUMENT</p><h2 id="instrument-title">本次工作</h2>
           <dl class="instrument-grid">
@@ -86,6 +90,10 @@
           <div id="worker-list" class="worker-list" aria-live="polite"></div>
         </section>
         <section class="quiet-note"><span aria-hidden="true">✦</span><p>联系人各自保留独立历史、草稿和忙碌状态。</p></section>
+        <div class="drawer-tools" aria-label="工作台设置">
+          <button class="text-button" id="drawer-appearance-button" type="button">显示模式</button>
+          <button class="text-button logout-button" id="drawer-logout-button" type="button">退出工作台</button>
+        </div>
       </aside>
     </main>
 

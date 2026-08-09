@@ -306,7 +306,7 @@ export function createMockAdapter() {
       states[contactId] = normalizeLiveState({ reply_state: 'idle', status_text: '已停止' }); emitState(contactId);
     },
     async getTaxonomy() { return clone(MOCK_TAXONOMY); },
-    async listMemories({ subcategory }) { return clone(MOCK_MEMORIES[subcategory] || [{ title: '暂时没有可展示的条目', body: '此分类已从 taxonomy 读取。', timestamp: '—' }]); },
+    async listMemories({ category, subcategory }) { return clone(MOCK_MEMORIES[subcategory || category] || [{ title: '暂时没有可展示的条目', body: '此分类已从 taxonomy 读取。', timestamp: '—' }]); },
     async uploadAttachments(_contactId, files, { onProgress } = {}) { return files.map((file, index) => { onProgress?.({ index, totalFiles: files.length, loaded: file.size, total: file.size, file }); return { attachment_id: `mock-${crypto.randomUUID()}`, filename: file.name, type: file.type || 'file', size: file.size }; }); },
     async cancelUploads() { return { ok: true, canceled: 0 }; },
     subscribe(listener, { contactId } = {}) {

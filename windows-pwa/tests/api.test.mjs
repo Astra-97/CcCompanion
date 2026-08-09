@@ -3,6 +3,7 @@ import test from 'node:test';
 import { readFile } from 'node:fs/promises';
 import { createHttpAdapter, createMockAdapter, normalizeLiveState, normalizeRecord } from '../src/api.js';
 import { createPwaBootstrap, isExplicitMockMode } from '../src/bootstrap.js';
+import { createComposerState } from '../src/composer-state.js';
 
 test('normalizes bounded worker activity without relying on server naming', () => {
   assert.deepEqual(normalizeLiveState({
@@ -137,6 +138,28 @@ test('uses the server-advertised pending total-byte and file-count limits', asyn
   assert.equal(uploads, 0);
 });
 
+test('memory adapter preserves category-only canonical scopes for top-level taxonomy entries', async () => {
+  const calls = [];
+  const adapter = createHttpAdapter({ request: async (path) => { calls.push(path); return { memories: [] }; } });
+  await adapter.listMemories({ category: 'archive' });
+  await adapter.listMemories({ category: 'archive', subcategory: 'archive.letters' });
+  assert.equal(calls[0], '/memory/list?category=archive');
+  assert.equal(calls[1], '/memory/list?category=archive&subcategory=archive.letters');
+});
+
+test('composer operations isolate concurrent contacts, cancellation, and stale finalizers', () => {
+  const composers = createComposerState();
+  const xiaoke = composers.begin('xiaoke'); const kairos = composers.begin('kairos');
+  composers.setProgress('xiaoke', xiaoke, '1/2 · 50%'); composers.setProgress('kairos', kairos, '1/1 · 40%');
+  assert.equal(composers.current('xiaoke').progress, '1/2 · 50%');
+  assert.equal(composers.current('kairos').progress, '1/1 · 40%');
+  composers.cancel('xiaoke'); assert.equal(xiaoke.controller.signal.aborted, true); assert.equal(kairos.controller.signal.aborted, false);
+  composers.finish('xiaoke', xiaoke); assert.equal(composers.current('xiaoke'), null); assert.equal(composers.current('kairos'), kairos);
+  const retry = composers.begin('xiaoke'); composers.finish('xiaoke', xiaoke);
+  assert.equal(composers.current('xiaoke'), retry, 'an old operation cannot clear a new one');
+  composers.cancelAll(); assert.equal(retry.controller.signal.aborted, true); assert.equal(kairos.controller.signal.aborted, true);
+});
+
 test('staged attachment failures cancel owned IDs and preserve server 409 errors', async () => {
   const calls = []; let uploadCount = 0;
   const adapter = createHttpAdapter({
@@ -166,6 +189,12 @@ test('mock adapter maintains separate contact histories', async () => {
   await adapter.stop('kairos', live.stopRequest);
 });
 
+test('mock adapter resolves a top-level category without manufacturing a subcategory key', async () => {
+  const adapter = createMockAdapter();
+  const entries = await adapter.listMemories({ category: 'archive' });
+  assert.equal(entries[0].title, '归档记忆');
+});
+
 test('mock is explicit while production bootstrap checks the cookie session', async () => {
   assert.equal(isExplicitMockMode({ search: '?mock=1' }, {}), true);
   assert.equal(isExplicitMockMode({ search: '' }, {}), false);
@@ -189,4 +218,45 @@ test('PWA shell declares installability and has no secret persistence', async ()
   assert.doesNotMatch(source, /shared_secret|localStorage\.setItem|sessionStorage\.setItem|credentials:\s*'include'/);
   assert.match(source, /credentials:\s*'same-origin'/);
   assert.match(source, /cache:\s*'no-store'/);
+});
+
+test('PWA source contracts preserve responsive, private, and accessible behavior', async () => {
+  const [html, app, css, serviceWorker] = await Promise.all([
+    readFile(new URL('../index.html', import.meta.url), 'utf8'),
+    readFile(new URL('../src/app.js', import.meta.url), 'utf8'),
+    readFile(new URL('../src/styles.css', import.meta.url), 'utf8'),
+    readFile(new URL('../sw.js', import.meta.url), 'utf8'),
+  ]);
+  assert.match(html, /id="latest-button"/);
+  assert.match(html, /class="file-input"/);
+  assert.match(html, /id="appearance-status" aria-live="polite"/);
+  assert.match(html, /id="drawer-appearance-button"/);
+  assert.match(html, /role="button" tabindex="0" aria-label="添加图片或文件"/);
+  assert.match(app, /const contactId = state\.activeContactId/);
+  assert.match(app, /adapter\.uploadAttachments\(contactId, queued/);
+  assert.match(app, /adapter\.sendMessage\(contactId,/);
+  assert.match(app, /createComposerState/);
+  assert.match(app, /state\.composerState\.begin\(contactId\)/);
+  assert.match(app, /state\.composerState\.isCurrent\(contactId, operation\)/);
+  assert.match(app, /state\.composerState\.cancelAll\(\)/);
+  assert.match(app, /Object\.hasOwn\(state\.scrollTops, id\)/);
+  assert.match(app, /workerDrawerQuery\.addEventListener\('change', syncWorkerPanel\)/);
+  assert.match(app, /function closeWorkers\(\) \{ setWorkers\(false, \{ returnFocus: true \}\); \}/);
+  assert.match(app, /Intl\.DateTimeFormat\('zh-CN'/);
+  assert.match(app, /if \(!subs\.length\)/);
+  assert.match(app, /state\.followLatest\[state\.activeContactId\] !== false && nearBottom\(\)/);
+  assert.match(app, /body\.dataset\.appearance = state\.appearance/);
+  assert.match(app, /appearance-status'\)\.textContent/);
+  assert.match(css, /height:100dvh/);
+  assert.match(css, /safe-area-inset-bottom/);
+  assert.match(css, /@media \(max-width:720px\)/);
+  assert.match(css, /prefers-reduced-motion:reduce/);
+  assert.match(css, /a:focus-visible,input:focus-visible/);
+  assert.match(css, /--dim:#aba193/);
+  assert.match(css, /attachment-chip button,.taxonomy-choices button\{min-width:44px/);
+  assert.equal((css.match(/@media \(max-width:390px\)/g) || []).length, 1);
+  assert.match(css, /\.head-actions \.worker-toggle,\.head-actions #memory-button\{display:inline-block\}/);
+  assert.match(serviceWorker, /web\\\/session\|chat\|memory\|attachments/);
+  assert.match(serviceWorker, /const isShellAsset = ASSETS\.some/);
+  assert.match(serviceWorker, /if \(url\.origin !== self\.location\.origin \|\| !isShellAsset \|\| isPrivateRoute\) return/);
 });

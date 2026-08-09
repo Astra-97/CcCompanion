@@ -9,11 +9,13 @@ export const MOCK_TAXONOMY = {
   categories: [
     { key: 'core', label: 'Core', subcategories: [{ key: 'core.profile', label: '个人档案', count: 44 }, { key: 'core.preference', label: '偏好', count: 26 }] },
     { key: 'diary', label: '日记', subcategories: [{ key: 'diary.worklog', label: '牛马日志', count: 108 }, { key: 'diary.life', label: '生活', count: 72 }] },
+    { key: 'archive', label: '归档', count: 3, subcategories: [] },
     { key: 'xiayizhou', label: '夏以昼', subcategories: [{ key: 'xiayizhou.qiqi_game_copy', label: '七七整理的游戏文案', count: 1520 }, { key: 'xiayizhou.astra_review', label: '文案品鉴', count: 17 }, { key: 'xiayizhou.astra_fanfic', label: 'Astra 同人文', count: 16 }, { key: 'xiayizhou.other', label: '其他', count: 25 }] },
   ],
 };
 
 export const MOCK_MEMORIES = {
+  archive: [{ title: '归档记忆', body: '顶级分类也保留自己的 canonical key。', timestamp: '已整理' }],
   'xiayizhou.astra_review': [{ title: '夏以昼专区 · 文案品鉴', body: '把感受和拆解保留在同一条来源链中。', timestamp: '刚刚同步' }],
   'xiayizhou.astra_fanfic': [{ title: '夏以昼 · 同人文', body: '你的创作和游戏原文保持独立归类。', timestamp: '33 篇已向量化' }],
   'xiayizhou.qiqi_game_copy': [{ title: '七七整理的游戏文案', body: '已迁移为受控二级分类。', timestamp: '1520 条' }],
