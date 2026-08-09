@@ -1,5 +1,5 @@
-const CACHE = 'cccompanion-desk-v3';
-const ASSETS = ['./', './index.html', './manifest.webmanifest', './src/styles.css?v=3', './src/api.js', './src/bootstrap.js', './src/composer-state.js', './src/data.js', './src/pairing-code.js', './src/app.js', './assets/cc-mark.svg', './assets/icon-192.png', './assets/icon-512.png'];
+const CACHE = 'cccompanion-desk-v4';
+const ASSETS = ['./', './index.html', './manifest.webmanifest', './src/styles.css?v=4', './src/api.js', './src/bootstrap.js', './src/composer-state.js', './src/data.js', './src/pairing-code.js', './src/app.js', './assets/cc-mark.svg', './assets/icon-192.png', './assets/icon-512.png'];
 self.addEventListener('activate', (event) => event.waitUntil(
   caches.keys()
     .then((keys) => Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key))))

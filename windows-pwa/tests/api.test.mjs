@@ -6,6 +6,21 @@ import { createPwaBootstrap, isExplicitMockMode } from '../src/bootstrap.js';
 import { createComposerState } from '../src/composer-state.js';
 import { PAIRING_ALPHABET, formatPairingCode, normalizePairingCode } from '../src/pairing-code.js';
 
+function hexToken(css, token) {
+  const match = css.match(new RegExp(`--${token}:(#[0-9a-fA-F]{6})`));
+  assert.ok(match, `missing --${token}`);
+  return match[1];
+}
+
+function contrastRatio(first, second) {
+  const luminance = (hex) => {
+    const [red, green, blue] = hex.slice(1).match(/../g).map((part) => parseInt(part, 16) / 255).map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+  };
+  const [light, dark] = [luminance(first), luminance(second)].sort((a, b) => b - a);
+  return (light + 0.05) / (dark + 0.05);
+}
+
 test('normalizes bounded worker activity without relying on server naming', () => {
   assert.deepEqual(normalizeLiveState({
     busy: true, reply_state: 'generating', status_text: '生成中', draft: { text: 'partial', activity_count: 2,
@@ -223,6 +238,21 @@ test('pairing normalization accepts only the shared eight-character alphabet', (
   }
 });
 
+test('warm paper palette preserves AA text and visible control boundaries', async () => {
+  const css = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
+  const paper = hexToken(css, 'paper');
+  for (const token of ['ink', 'muted', 'dim', 'placeholder', 'oxide', 'brass', 'moss', 'danger']) {
+    assert.ok(contrastRatio(hexToken(css, token), paper) >= 4.5, `${token} must be AA against paper`);
+  }
+  assert.ok(contrastRatio(hexToken(css, 'control-border'), paper) >= 3, 'control boundary must remain visible');
+  assert.match(css, /\.avatar\{color:var\(--paper\)\}/);
+  assert.match(css, /\.login-card input\{[^}]*border:1px solid var\(--control-border\)/);
+  assert.match(css, /input::placeholder\{color:var\(--placeholder\);opacity:1\}/);
+  assert.match(css, /\.contact-button\.is-active\{border-color:var\(--brass\);box-shadow:inset 3px 0 0 var\(--brass\);padding-left:12px/);
+  assert.match(css, /\.contact-button\.is-active \.contact-copy strong\{font-weight:700/);
+  assert.match(css, /\.send-button:disabled\{opacity:1;background:var\(--brass-wash\);color:var\(--muted\);cursor:not-allowed\}/);
+});
+
 test('PWA shell declares installability and has no secret persistence', async () => {
   const [manifest, serviceWorker, source] = await Promise.all([
     readFile(new URL('../manifest.webmanifest', import.meta.url), 'utf8'),
@@ -230,11 +260,13 @@ test('PWA shell declares installability and has no secret persistence', async ()
     readFile(new URL('../src/api.js', import.meta.url), 'utf8'),
   ]);
   assert.match(manifest, /"display": "standalone"/);
+  assert.match(manifest, /"background_color": "#fff6ec"/);
+  assert.match(manifest, /"theme_color": "#fff6ec"/);
   assert.match(manifest, /icon-192\.png/);
   assert.match(manifest, /icon-512\.png/);
   assert.match(serviceWorker, /addEventListener\('fetch'/);
-  assert.match(serviceWorker, /cccompanion-desk-v3/);
-  assert.match(serviceWorker, /src\/styles\.css\?v=3/);
+  assert.match(serviceWorker, /cccompanion-desk-v4/);
+  assert.match(serviceWorker, /src\/styles\.css\?v=4/);
   assert.match(serviceWorker, /src\/pairing-code\.js/);
   assert.doesNotMatch(source, /shared_secret|localStorage\.setItem|sessionStorage\.setItem|credentials:\s*'include'/);
   assert.match(source, /credentials:\s*'same-origin'/);
@@ -250,7 +282,7 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   ]);
   assert.match(html, /id="latest-button"/);
   assert.match(html, /id="pairing-code"/);
-  assert.match(html, /href="\.\/src\/styles\.css\?v=3"/);
+  assert.match(html, /href="\.\/src\/styles\.css\?v=4"/);
   assert.match(html, /autocomplete="one-time-code"/);
   assert.match(html, /id="pairing-form"/);
   assert.match(html, /<details class="password-fallback">/);
@@ -293,7 +325,13 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   assert.match(css, /@media \(max-width:720px\)/);
   assert.match(css, /prefers-reduced-motion:reduce/);
   assert.match(css, /a:focus-visible,input:focus-visible/);
-  assert.match(css, /--dim:#aba193/);
+  assert.match(html, /name="theme-color" content="#fff6ec"/);
+  assert.match(css, /color-scheme:light/);
+  assert.match(css, /--paper:#fff6ec/);
+  assert.match(css, /--surface:#ffefdf/);
+  assert.match(css, /--ink:#2a170f/);
+  assert.match(css, /--oxide:#a35347/);
+  assert.match(css, /--dim:#79513c/);
   assert.match(css, /#pairing-code/);
   assert.match(css, /\[hidden\]\{display:none!important\}/);
   assert.match(css, /attachment-chip button,.taxonomy-choices button\{min-width:44px/);
