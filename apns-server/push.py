@@ -12320,6 +12320,12 @@ class PushHandler(BaseHTTPRequestHandler):
         "diary.worklog",
         "diary.health",
     ))
+    _MEMORY_XIAYIZHOU_SUBCATEGORIES = frozenset((
+        "xiayizhou.qiqi_game_copy",
+        "xiayizhou.astra_review",
+        "xiayizhou.astra_fanfic",
+        "xiayizhou.other",
+    ))
     _memory_token_cache: str | None = None
 
     @classmethod
@@ -12361,7 +12367,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 return
             category_values = qs.get("category", [])
             if not category_values:
-                self._send_json(400, {"error": "subcategory 只适用于 category=core 或 diary；请先选择这两个分类之一，或移除 subcategory。"})
+                self._send_json(400, {"error": "subcategory 只适用于 category=core、diary 或 xiayizhou；请先选择这三个分类之一，或移除 subcategory。"})
                 return
             if len(category_values) != 1:
                 self._send_json(400, {"error": "使用 subcategory 时 category 必须且只能提供一次。"})
@@ -12371,9 +12377,10 @@ class PushHandler(BaseHTTPRequestHandler):
             valid_subcategories = {
                 "core": self._MEMORY_CORE_SUBCATEGORIES,
                 "diary": self._MEMORY_DIARY_SUBCATEGORIES,
+                "xiayizhou": self._MEMORY_XIAYIZHOU_SUBCATEGORIES,
             }.get(category)
             if valid_subcategories is None:
-                self._send_json(400, {"error": "subcategory 只适用于 category=core 或 diary；请先选择这两个分类之一，或移除 subcategory。"})
+                self._send_json(400, {"error": "subcategory 只适用于 category=core、diary 或 xiayizhou；请先选择这三个分类之一，或移除 subcategory。"})
                 return
             if not subcategory:
                 self._send_json(400, {"error": f"{category} 子分类不能为空；请选择一个已注册的 {category} 子分类。"})

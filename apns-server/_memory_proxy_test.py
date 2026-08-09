@@ -147,6 +147,8 @@ class MemoryProxyTest(unittest.TestCase):
             ("/memory/list?category=diary&category=core&subcategory=diary.general", "只能提供一次"),
             ("/memory/list?category=diary&subcategory=diary.unknown", "无效"),
             ("/memory/list?category=diary&subcategory=profile.preference", "无效"),
+            ("/memory/list?category=xiayizhou&subcategory=unknown", "无效"),
+            ("/memory/list?category=xiayizhou&subcategory=profile.preference", "无效"),
             ("/memory/list?category=core&subcategory=diary.general", "无效"),
             ("/memory/list?category=daily&subcategory=profile.preference", "只适用于"),
             ("/memory/list?subcategory=profile.preference", "只适用于"),
@@ -174,6 +176,15 @@ class MemoryProxyTest(unittest.TestCase):
         self.assertEqual(
             captured["url"],
             "https://memory.xiaonancaleb.xyz/api/semantic-search?query=abc&category=diary&subcategory=diary.worklog&limit=5",
+        )
+
+    def test_valid_xiayizhou_subcategory_scope_is_forwarded(self):
+        _, captured = self.run_forward(
+            "/memory/list?category=xiayizhou&subcategory=xiayizhou.astra_fanfic&per_page=50", {}
+        )
+        self.assertEqual(
+            captured["url"],
+            "https://memory.xiaonancaleb.xyz/api/memories?category=xiayizhou&subcategory=xiayizhou.astra_fanfic&per_page=50",
         )
 
     def test_limit_clamped_and_bad_limit_dropped(self):
