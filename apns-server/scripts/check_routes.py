@@ -13,7 +13,7 @@ HANDLER_PATH = ROOT / "push.py"
 
 EXPECTED_ROUTE_COUNTS = {
     # Includes the same-origin PWA session bootstrap and contact contract.
-    "do_GET": 104,
+    "do_GET": 106,
     "do_POST": 107,
 }
 
@@ -24,6 +24,7 @@ CRITICAL_ROUTES = {
         "/web/session",
         "/chat/contacts",
         "/chat/history",
+        "/stickers/catalog",
         "/chain/sessions",
         "/tmux/capture",
         "/tmux/sessions",

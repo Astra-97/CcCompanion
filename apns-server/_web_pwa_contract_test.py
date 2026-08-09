@@ -472,6 +472,25 @@ class WebPwaContractTest(unittest.TestCase):
         handler.do_GET()
         self.assertEqual(called, ["status"])
 
+    def test_sticker_catalog_is_a_cookie_read_route_and_has_no_model_url_input(self):
+        store = WebSessionStore(300)
+        token, _ = store.create()
+        handler = self.handler("/stickers/catalog", "GET")
+        handler.state = types.SimpleNamespace(
+            web_session_enabled=True,
+            web_sessions=store,
+            sticker_catalog=types.SimpleNamespace(snapshot=lambda: {
+                "ok": True, "version": "v1", "stickers": [{"name": "爱", "url": "https://assets.example/%E7%88%B1.gif"}],
+            }),
+        )
+        handler.headers = {"Cookie": f"__Host-cccompanion={token}"}
+        self.assertTrue(handler._web_session_matches())
+        handler._handle_sticker_catalog()
+        status, payload, kwargs = handler.responses[-1]
+        self.assertEqual(status, 200)
+        self.assertEqual("爱", payload["stickers"][0]["name"])
+        self.assertEqual("no-store", kwargs["extra_headers"]["Cache-Control"])
+
     def test_contact_manifest_exposes_both_primary_providers_with_common_endpoints(self):
         handler = self.handler()
         handler.state = types.SimpleNamespace(contact_chats={

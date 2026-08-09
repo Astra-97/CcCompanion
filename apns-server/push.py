@@ -71,6 +71,7 @@ from token_store import TokenStore
 from device_token_store import DeviceTokenStore
 from task_queue import TaskQueue
 from chat_history import ChatHistory, ChatStreamBus, EphemeralTaskBuffer
+from sticker_catalog import StickerCatalogService
 from diary_stream import DiaryStream
 from group_chat import GroupChatStore
 from calendar_store import CalendarStore, CATEGORIES, CATEGORY_LABELS
@@ -2486,6 +2487,10 @@ class ServerState:
         self.allow_remote_control: bool = bool(server_cfg.get("allow_remote_control", False))
         self.allowed_ips: list[str] = list(server_cfg.get("allowed_ips", []) or [])
         self.default_session: str = server_cfg.get("default_session", "cc")
+        # Inline [bqb:name] sticker catalog.  It is intentionally separate
+        # from chat payloads: clients receive only operator-derived static
+        # asset URLs and never interpret a model-provided URL as a sticker.
+        self.sticker_catalog = StickerCatalogService(config.get("stickers", {}))
         self.kairos_terminal = KairosTerminalBridge()
         self.channel_transport_enabled: bool = bool(server_cfg.get("channel_transport_enabled", False))
         self.channel_transport_url: str = str(
@@ -3412,7 +3417,7 @@ class PushHandler(BaseHTTPRequestHandler):
         # browser cookie to become a substitute for the native admin secret.
         get_exact = {
             "/chat/contacts", "/chat/history", "/chat/draft", "/chat/status",
-            "/chat/stream",
+            "/chat/stream", "/stickers/catalog",
         }
         get_prefixes = ("/memory/",)
         post_exact = {
@@ -4998,6 +5003,9 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/chat/history"):
             self._handle_chat_history()
+            return
+        if self.path == "/stickers/catalog" or self.path.startswith("/stickers/catalog?"):
+            self._handle_sticker_catalog()
             return
         if self.path.startswith("/chat/draft"):
             self._handle_chat_draft()
@@ -12406,6 +12414,20 @@ class PushHandler(BaseHTTPRequestHandler):
                     _t.sleep(1.0)
         finally:
             self.state.chat_stream_bus.unsubscribe(q)
+
+    def _handle_sticker_catalog(self) -> None:
+        """GET /stickers/catalog — safe dynamic catalog for ``[bqb:name]``.
+
+        The service owns the source of image URLs.  Catalog manifests only
+        carry names + filenames; ``StickerCatalogService`` derives HTTPS URLs
+        from operator configuration and silently drops malformed entries.
+        """
+        catalog = getattr(self.state, "sticker_catalog", None)
+        snapshot = getattr(catalog, "snapshot", None)
+        if not callable(snapshot):
+            self._send_json(200, {"ok": True, "version": "disabled", "stickers": []})
+            return
+        self._send_json(200, snapshot(), extra_headers={"Cache-Control": "no-store"})
 
     def _handle_pet_activity_post(self, body: dict[str, Any]):
         """POST /pet/activity — chain hook 推 streaming terminal display 行.

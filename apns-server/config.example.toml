@@ -221,6 +221,29 @@ ghp_token = ""
 # 返回给 Android 的外网 VPS 地址。真实部署可改成当前 HTTPS 域名。
 server_url = "https://companion-vps2.xiaonancaleb.xyz"
 
+# Dynamic inline sticker protocol: a model may write `[bqb:爱]`; clients only
+# render it after resolving the exact name through GET /stickers/catalog.
+# The Companion backend is the sole catalog/URL source.  It derives each URL
+# from `public_base_url` + the filename in a manifest, and ignores arbitrary
+# manifest `url` fields, unknown filenames, duplicate names, paths, and unsafe
+# names.  Add sticker files + regenerate the manifest on the static host; no
+# Android/PWA code update is required.
+#
+# Each JSON manifest is `{ "version": 1, "stickers": [
+#   { "name": "憋不住笑了", "file": "憋不住笑了.gif" }
+# ] }`. `name` must be exactly the filename minus .gif/.png/.jpg/.jpeg/.webp.
+# Configure either a local `manifest_path` or an HTTPS `manifest_url`.
+[stickers]
+enabled = false
+cache_seconds = 300
+max_items = 512
+# [[stickers.sources]]
+# manifest_url = "https://test.xiaonancaleb.xyz/stickers/catalog.json"
+# public_base_url = "https://test.xiaonancaleb.xyz/stickers/"
+# [[stickers.sources]]
+# manifest_url = "https://test.xiaonancaleb.xyz/xiaodou/catalog.json"
+# public_base_url = "https://test.xiaonancaleb.xyz/xiaodou/"
+
 [xhs_login]
 # Android 专用 WebView 登录能力；nonce 最长十分钟且只可使用一次。
 ttl_seconds = 300
