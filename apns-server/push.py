@@ -2744,6 +2744,10 @@ class ServerState:
         self.chat_draft_lock = threading.Lock()
         self.chat_drafts: dict[str, dict[str, Any]] = {}
         self.chat_reply_states: dict[str, dict[str, Any]] = {}
+        # Monotonic per-contact revisions for the transient SSE view.  A
+        # browser must never let a delayed terminal event for an old turn hide
+        # a newer draft.  This is deliberately process-local just like drafts.
+        self.chat_stream_revisions: dict[str, int] = {}
         self.kimi_turn_lock = threading.RLock()
         self.kimi_active_turn: dict[str, Any] = {}
         self.kimi_prepare_token = ""
@@ -3783,6 +3787,135 @@ class PushHandler(BaseHTTPRequestHandler):
             self.state.xiaoke_send_reservation = {}
             return True
 
+    # Draft SSE is intentionally a small projection of the polling state, not
+    # a transport for runner metadata.  In particular it never includes a
+    # session id, source, prompt, task, cwd, command, attachment path, or any
+    # bridge error detail.  The text itself is the assistant's already
+    # renderable partial reply; final history remains authoritative.
+    _CHAT_DRAFT_SSE_TEXT_LIMIT = 32 * 1024
+    _CHAT_DRAFT_SSE_ACTIVITY_LIMIT = 160
+
+    def _next_chat_stream_revision_locked(self, contact_id: str) -> int:
+        """Advance a per-contact transient revision. Caller holds draft lock."""
+        revisions = getattr(self.state, "chat_stream_revisions", None)
+        if not isinstance(revisions, dict):
+            revisions = {}
+            self.state.chat_stream_revisions = revisions
+        next_revision = int(revisions.get(contact_id) or 0) + 1
+        revisions[contact_id] = next_revision
+        return next_revision
+
+    @staticmethod
+    def _same_chat_turn(existing: dict[str, Any] | None, user_ts: str | None) -> bool:
+        """True unless both sides identify different user turns.
+
+        Older transports do not always provide a user timestamp, so an empty
+        identity remains backward-compatible.  Once both identities exist,
+        however, a late callback must never overwrite the newer foreground
+        turn merely because it shares a contact id.
+        """
+        if not isinstance(existing, dict):
+            return True
+        old = str(existing.get("user_ts") or "")
+        new = str(user_ts or "")
+        return not (old and new and old != new)
+
+    @staticmethod
+    def _chat_state_is_terminal(existing: dict[str, Any] | None) -> bool:
+        if not isinstance(existing, dict):
+            return False
+        return (
+            not bool(existing.get("is_active", True))
+            or str(existing.get("reply_state") or "") in {"completed", "interrupted", "failed"}
+        )
+
+    @classmethod
+    def _safe_chat_draft_sse_activity(cls, value: Any) -> str:
+        """Only forward fixed observer labels, never raw bridge activity."""
+        text = str(value or "").strip()
+        if text in OBSERVER_EVENT_LABELS or text in OBSERVER_PHASES or text == "等上一条结束":
+            return text[:cls._CHAT_DRAFT_SSE_ACTIVITY_LIMIT]
+        return "正在处理（详情已隐藏）" if text else ""
+
+    @classmethod
+    def _build_chat_draft_sse_event(
+        cls,
+        contact_id: str,
+        state: dict[str, Any] | None,
+        *,
+        kind: str = "draft",
+        terminal: bool = False,
+        refresh_history: bool = False,
+    ) -> dict[str, Any]:
+        """Build the bounded public projection for one draft lifecycle event."""
+        state = state if isinstance(state, dict) else {}
+        reply_state = str(state.get("reply_state") or "idle")
+        if reply_state not in {"queued", "generating", "completed", "interrupted", "failed", "cleared"}:
+            reply_state = "idle"
+        payload: dict[str, Any] = {
+            "event": kind,
+            "contact_id": contact_id,
+            "turn_id": str(state.get("user_ts") or ""),
+            "reply_state": reply_state,
+            "revision": max(0, int(state.get("stream_revision") or 0)),
+            "updated_at": str(state.get("updated_at") or ""),
+        }
+        if kind == "draft":
+            # A full draft snapshot lets a client recover from a dropped SSE
+            # event without reconstructing deltas.  It is bounded so each
+            # subscriber queue has a known worst case.
+            text = str(state.get("text") or "")
+            if len(text) > cls._CHAT_DRAFT_SSE_TEXT_LIMIT:
+                text = text[-cls._CHAT_DRAFT_SSE_TEXT_LIMIT:]
+                payload["text_truncated"] = True
+            payload.update({
+                "text": text,
+                "queued_at": str(state.get("queued_at") or ""),
+                "started_at": str(state.get("started_at") or ""),
+                "activity_text": cls._safe_chat_draft_sse_activity(state.get("activity_text")),
+                "activity_count": max(0, min(int(state.get("activity_count") or 0), 999)),
+                "worker_activity_items": cls._sanitize_worker_activity_items(
+                    state.get("worker_activity_items")
+                    if isinstance(state.get("worker_activity_items"), list) else []
+                ),
+            })
+        else:
+            # Terminal events never repeat model text.  A client refreshes
+            # append-only history to obtain the persisted canonical answer.
+            payload.update({
+                "terminal": bool(terminal),
+                "refresh_history": bool(refresh_history),
+                "final_ts": str(state.get("final_ts") or ""),
+            })
+        return payload
+
+    def _publish_chat_draft_sse(
+        self,
+        contact_id: str,
+        state: dict[str, Any] | None,
+        *,
+        kind: str = "draft",
+        terminal: bool = False,
+        refresh_history: bool = False,
+    ) -> None:
+        """Publish after releasing ``chat_draft_lock``; never stream a snapshot."""
+        bus = getattr(self.state, "chat_stream_bus", None)
+        publish = getattr(bus, "publish", None)
+        if not callable(publish):
+            return
+        try:
+            publish(self._build_chat_draft_sse_event(
+                contact_id,
+                state,
+                kind=kind,
+                terminal=terminal,
+                refresh_history=refresh_history,
+            ))
+        except Exception:
+            # A live observer is an optimization.  Draft mutation and final
+            # history persistence must not fail because a subscriber is gone.
+            logger.debug("chat draft SSE publish failed", exc_info=True)
+
     def _set_chat_draft(
         self,
         contact_id: str,
@@ -3805,7 +3938,17 @@ class PushHandler(BaseHTTPRequestHandler):
         items = [str(item).strip() for item in (activity_items or []) if str(item).strip()]
         worker_items = self._sanitize_worker_activity_items(worker_activity_items)
         with self.state.chat_draft_lock:
-            self.state.chat_drafts[contact_id] = {
+            existing = self.state.chat_drafts.get(contact_id) or self.state.chat_reply_states.get(contact_id)
+            # A model callback can race a persisted terminal state for the
+            # same turn.  Never let that late delta resurrect the old draft;
+            # a subsequent turn must enter through queued/generating first.
+            if (
+                not self._same_chat_turn(existing if isinstance(existing, dict) else None, user_ts)
+                or self._chat_state_is_terminal(existing if isinstance(existing, dict) else None)
+            ):
+                return
+            revision = self._next_chat_stream_revision_locked(contact_id)
+            draft_state = {
                 "contact_id": contact_id,
                 "is_active": True,
                 "text": draft_text,
@@ -3824,8 +3967,10 @@ class PushHandler(BaseHTTPRequestHandler):
                 "activity_count": max(0, int(activity_count or 0)),
                 "activity_items": items,
                 "worker_activity_items": worker_items,
+                "stream_revision": revision,
             }
-            self.state.chat_reply_states[contact_id] = {
+            self.state.chat_drafts[contact_id] = draft_state
+            reply_state = {
                 "reply_state": "generating",
                 "status_text": "生成中",
                 "updated_at": now,
@@ -3841,12 +3986,26 @@ class PushHandler(BaseHTTPRequestHandler):
                 "activity_count": max(0, int(activity_count or 0)),
                 "activity_items": items,
                 "worker_activity_items": worker_items,
+                "stream_revision": revision,
             }
+            self.state.chat_reply_states[contact_id] = reply_state
+            event_state = dict(draft_state)
+        self._publish_chat_draft_sse(contact_id, event_state)
 
-    def _clear_chat_draft(self, contact_id: str) -> None:
+    def _clear_chat_draft(self, contact_id: str, *, user_ts: str | None = None) -> None:
         with self.state.chat_draft_lock:
+            existing = self.state.chat_drafts.get(contact_id) or self.state.chat_reply_states.get(contact_id)
+            if not self._same_chat_turn(existing if isinstance(existing, dict) else None, user_ts):
+                return
             self.state.chat_drafts.pop(contact_id, None)
             self.state.chat_reply_states.pop(contact_id, None)
+            event_state = {
+                "reply_state": "cleared",
+                "user_ts": user_ts or (existing.get("user_ts") if isinstance(existing, dict) else "") or "",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "stream_revision": self._next_chat_stream_revision_locked(contact_id),
+            }
+        self._publish_chat_draft_sse(contact_id, event_state, kind="lifecycle")
 
     def _set_chat_queued(
         self,
@@ -3862,12 +4021,18 @@ class PushHandler(BaseHTTPRequestHandler):
         now = datetime.now(timezone.utc).isoformat()
         with self.state.chat_draft_lock:
             draft = self.state.chat_drafts.get(contact_id)
+            existing = draft if isinstance(draft, dict) else self.state.chat_reply_states.get(contact_id)
+            if (
+                not self._same_chat_turn(existing if isinstance(existing, dict) else None, user_ts)
+                and not self._chat_state_is_terminal(existing if isinstance(existing, dict) else None)
+            ):
+                return
             if isinstance(draft, dict) and not bool(draft.get("is_active")):
                 draft_user_ts = str(draft.get("user_ts") or "")
                 next_user_ts = str(user_ts or "")
                 if next_user_ts and draft_user_ts and draft_user_ts != next_user_ts:
                     self.state.chat_drafts.pop(contact_id, None)
-            self.state.chat_reply_states[contact_id] = {
+            reply_state = {
                 "reply_state": "queued",
                 "status_text": "已排队",
                 "updated_at": now,
@@ -3882,7 +4047,11 @@ class PushHandler(BaseHTTPRequestHandler):
                 "activity_text": activity_text or "",
                 "activity_count": 0,
                 "activity_items": [],
+                "stream_revision": self._next_chat_stream_revision_locked(contact_id),
             }
+            self.state.chat_reply_states[contact_id] = reply_state
+            event_state = dict(reply_state)
+        self._publish_chat_draft_sse(contact_id, event_state)
 
     def _set_chat_generating(
         self,
@@ -3896,8 +4065,14 @@ class PushHandler(BaseHTTPRequestHandler):
     ) -> str:
         now = started_at or datetime.now(timezone.utc).isoformat()
         with self.state.chat_draft_lock:
+            existing = self.state.chat_drafts.get(contact_id) or self.state.chat_reply_states.get(contact_id)
+            if (
+                not self._same_chat_turn(existing if isinstance(existing, dict) else None, user_ts)
+                and not self._chat_state_is_terminal(existing if isinstance(existing, dict) else None)
+            ):
+                return now
             self.state.chat_drafts.pop(contact_id, None)
-            self.state.chat_reply_states[contact_id] = {
+            reply_state = {
                 "reply_state": "generating",
                 "status_text": "生成中",
                 "updated_at": now,
@@ -3912,7 +4087,11 @@ class PushHandler(BaseHTTPRequestHandler):
                 "activity_text": "",
                 "activity_count": 0,
                 "activity_items": [],
+                "stream_revision": self._next_chat_stream_revision_locked(contact_id),
             }
+            self.state.chat_reply_states[contact_id] = reply_state
+            event_state = dict(reply_state)
+        self._publish_chat_draft_sse(contact_id, event_state)
         return now
 
     def _set_chat_activity(
@@ -3923,15 +4102,19 @@ class PushHandler(BaseHTTPRequestHandler):
         activity_count: int,
         activity_items: list[str] | None = None,
         worker_activity_items: list[dict[str, Any]] | None = None,
+        user_ts: str | None = None,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         items = [str(item).strip() for item in (activity_items or []) if str(item).strip()]
         worker_items = self._sanitize_worker_activity_items(worker_activity_items)
         with self.state.chat_draft_lock:
+            event_state = None
             for bucket_name in ("chat_reply_states", "chat_drafts"):
                 bucket = getattr(self.state, bucket_name)
                 state = bucket.get(contact_id)
                 if not isinstance(state, dict):
+                    continue
+                if not self._same_chat_turn(state, user_ts) or self._chat_state_is_terminal(state):
                     continue
                 state["activity_text"] = str(activity_text or "")
                 state["activity_count"] = max(0, int(activity_count or 0))
@@ -3939,6 +4122,13 @@ class PushHandler(BaseHTTPRequestHandler):
                 if worker_activity_items is not None:
                     state["worker_activity_items"] = worker_items
                 state["updated_at"] = now
+                state["stream_revision"] = self._next_chat_stream_revision_locked(contact_id)
+                # Prefer the draft because it carries partial text.  If a
+                # delta has not arrived yet, reply_state is still enough.
+                if bucket_name == "chat_drafts" or event_state is None:
+                    event_state = dict(state)
+        if event_state is not None:
+            self._publish_chat_draft_sse(contact_id, event_state)
 
     @staticmethod
     def _sanitize_worker_activity_items(value: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -4028,8 +4218,11 @@ class PushHandler(BaseHTTPRequestHandler):
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self.state.chat_draft_lock:
+            existing = self.state.chat_drafts.get(contact_id) or self.state.chat_reply_states.get(contact_id)
+            if not self._same_chat_turn(existing if isinstance(existing, dict) else None, user_ts):
+                return
             self.state.chat_drafts.pop(contact_id, None)
-            self.state.chat_reply_states[contact_id] = {
+            reply_state = {
                 "reply_state": "completed",
                 "status_text": "已完成",
                 "updated_at": now,
@@ -4045,7 +4238,54 @@ class PushHandler(BaseHTTPRequestHandler):
                 "activity_count": 0,
                 "activity_items": [],
                 "expires_at": time.time() + ttl_sec,
+                "stream_revision": self._next_chat_stream_revision_locked(contact_id),
             }
+            self.state.chat_reply_states[contact_id] = reply_state
+            event_state = dict(reply_state)
+        self._publish_chat_draft_sse(
+            contact_id, event_state, kind="lifecycle", terminal=True, refresh_history=True,
+        )
+
+    def _set_chat_failed(
+        self,
+        contact_id: str,
+        *,
+        user_ts: str | None = None,
+        final_ts: str | None = None,
+        source: str | None = None,
+        session_id: str | None = None,
+        ttl_sec: float = 15.0,
+    ) -> None:
+        """Terminal failure with a history-refresh signal for live clients."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self.state.chat_draft_lock:
+            existing = self.state.chat_drafts.get(contact_id) or self.state.chat_reply_states.get(contact_id)
+            if not self._same_chat_turn(existing if isinstance(existing, dict) else None, user_ts):
+                return
+            self.state.chat_drafts.pop(contact_id, None)
+            reply_state = {
+                "reply_state": "failed",
+                "status_text": "处理失败",
+                "updated_at": now,
+                "source": source or "",
+                "session_id": session_id or "",
+                "user_ts": user_ts or "",
+                "final_ts": final_ts or "",
+                "queued_at": "",
+                "started_at": "",
+                "completed_at": now,
+                "queue_position": 0,
+                "activity_text": "",
+                "activity_count": 0,
+                "activity_items": [],
+                "expires_at": time.time() + ttl_sec,
+                "stream_revision": self._next_chat_stream_revision_locked(contact_id),
+            }
+            self.state.chat_reply_states[contact_id] = reply_state
+            event_state = dict(reply_state)
+        self._publish_chat_draft_sse(
+            contact_id, event_state, kind="lifecycle", terminal=True, refresh_history=True,
+        )
 
     def _set_chat_interrupted(
         self,
@@ -4060,6 +4300,12 @@ class PushHandler(BaseHTTPRequestHandler):
         now = datetime.now(timezone.utc).isoformat()
         with self.state.chat_draft_lock:
             draft = self.state.chat_drafts.get(contact_id)
+            existing = draft if isinstance(draft, dict) else self.state.chat_reply_states.get(contact_id)
+            # An interrupt callback is correlated to one exact user turn.  A
+            # late interrupt must be a no-op before it can pop a newer draft
+            # or overwrite its reply state.
+            if not self._same_chat_turn(existing if isinstance(existing, dict) else None, user_ts):
+                return
             if isinstance(draft, dict):
                 draft_user_ts = str(draft.get("user_ts") or "")
                 if not user_ts or not draft_user_ts or draft_user_ts == str(user_ts):
@@ -4071,12 +4317,13 @@ class PushHandler(BaseHTTPRequestHandler):
                         "completed_at": now,
                         "final_ts": final_ts or str(draft.get("final_ts") or ""),
                         "expires_at": time.time() + ttl_sec,
+                        "stream_revision": self._next_chat_stream_revision_locked(contact_id),
                     })
                 else:
                     # Never freeze an older/different turn under the cancelled
                     # turn's state identity.
                     self.state.chat_drafts.pop(contact_id, None)
-            self.state.chat_reply_states[contact_id] = {
+            reply_state = {
                 "reply_state": "interrupted",
                 "status_text": "已中断",
                 "updated_at": now,
@@ -4092,7 +4339,13 @@ class PushHandler(BaseHTTPRequestHandler):
                 "activity_count": 0,
                 "activity_items": [],
                 "expires_at": time.time() + ttl_sec,
+                "stream_revision": self._next_chat_stream_revision_locked(contact_id),
             }
+            self.state.chat_reply_states[contact_id] = reply_state
+            event_state = dict(reply_state)
+        self._publish_chat_draft_sse(
+            contact_id, event_state, kind="lifecycle", terminal=True, refresh_history=True,
+        )
 
     def _chat_draft_snapshot(self, contact_id: str) -> dict[str, Any]:
         if contact_id == "kairos":
@@ -4108,7 +4361,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 self.state.chat_drafts.pop(contact_id, None)
                 draft = {}
             if (
-                reply_state.get("reply_state") in {"completed", "interrupted"}
+                reply_state.get("reply_state") in {"completed", "interrupted", "failed"}
                 and float(reply_state.get("expires_at") or 0) < time.time()
             ):
                 self.state.chat_reply_states.pop(contact_id, None)
@@ -4116,7 +4369,7 @@ class PushHandler(BaseHTTPRequestHandler):
         state_name = str(draft.get("reply_state") or reply_state.get("reply_state") or "idle")
         if state_name == "replying":
             state_name = "generating"
-        if state_name not in {"idle", "queued", "generating", "completed", "interrupted"}:
+        if state_name not in {"idle", "queued", "generating", "completed", "interrupted", "failed"}:
             state_name = "idle"
         status_text = str(draft.get("status_text") or reply_state.get("status_text") or "")
         if not status_text:
@@ -4125,7 +4378,16 @@ class PushHandler(BaseHTTPRequestHandler):
                 "generating": "生成中",
                 "completed": "已完成",
                 "interrupted": "已中断",
+                "failed": "处理失败",
             }.get(state_name, "")
+        try:
+            stream_revision = max(
+                0,
+                int(draft.get("stream_revision") or reply_state.get("stream_revision") or 0),
+            )
+        except (TypeError, ValueError):
+            stream_revision = 0
+        turn_id = str(draft.get("user_ts") or reply_state.get("user_ts") or "")
         return {
             "contact_id": contact_id,
             # Foreground turn lifecycle starts before the first answer delta.
@@ -4138,7 +4400,12 @@ class PushHandler(BaseHTTPRequestHandler):
             "session_id": draft.get("session_id") or "",
             "reply_state": state_name,
             "status_text": status_text,
-            "user_ts": draft.get("user_ts") or reply_state.get("user_ts") or "",
+            # Public ordering identity for polling/SSE reconciliation.  It is
+            # deliberately just the existing opaque user timestamp plus the
+            # process-local counter, never a bridge session or runner field.
+            "turn_id": turn_id,
+            "revision": stream_revision,
+            "user_ts": turn_id,
             "final_ts": draft.get("final_ts") or reply_state.get("final_ts") or "",
             "queued_at": draft.get("queued_at") or reply_state.get("queued_at") or "",
             "started_at": draft.get("started_at") or reply_state.get("started_at") or "",
@@ -10678,6 +10945,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     activity_count=activity_count,
                     activity_items=activity_items,
                     worker_activity_items=worker_activity_items,
+                    user_ts=user_ts,
                 )
 
         def _append_assistant(
@@ -10696,7 +10964,12 @@ class PushHandler(BaseHTTPRequestHandler):
                 metadata={"kairos_user_ts": user_ts} if user_ts else None,
             )
             assistant_appended = True
-            self._set_chat_completed(
+            terminal_setter = (
+                self._set_chat_failed
+                if worker_terminal_status == "failed"
+                else self._set_chat_completed
+            )
+            terminal_setter(
                 contact_id,
                 user_ts=user_ts,
                 final_ts=str(assistant_rec.get("ts") or ""),
@@ -10939,6 +11212,7 @@ class PushHandler(BaseHTTPRequestHandler):
                             activity_count=activity_count,
                             activity_items=activity_items,
                             worker_activity_items=worker_activity_items,
+                            user_ts=user_ts,
                         )
                         return
 
@@ -10957,6 +11231,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         activity_count=activity_count,
                         activity_items=activity_items,
                         worker_activity_items=worker_activity_items,
+                        user_ts=user_ts,
                     )
 
                 session_root = Path(os.environ.get("CODEX_SESSION_ROOT", "~/.codex/sessions")).expanduser()
@@ -12083,6 +12358,11 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         self._send_json(200, {"ok": True, "canceled": True, "stopped": False})
 
+    @staticmethod
+    def _chat_stream_event_matches_contact(rec: Any, contact_id: str) -> bool:
+        """The bus is shared; an SSE connection may see only its own contact."""
+        return isinstance(rec, dict) and str(rec.get("contact_id") or "") == str(contact_id or "")
+
     def _handle_chat_stream(self):
         """GET /chat/stream?contact_id=xiaoke — SSE 实时推流式回复 chunk.
         Auth: 走 do_GET 顶层 _require_auth (同 /chat/history).
@@ -12109,7 +12389,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 wrote = False
                 if q:
                     rec = q.popleft()
-                    if rec.get("contact_id") != contact_filter:
+                    if not self._chat_stream_event_matches_contact(rec, contact_filter):
                         continue
                     try:
                         self.wfile.write(f"data: {json.dumps(rec, ensure_ascii=False)}\n\n".encode("utf-8"))

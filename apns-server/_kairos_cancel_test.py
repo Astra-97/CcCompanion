@@ -259,7 +259,7 @@ class KairosCancelTest(unittest.TestCase):
         self.assertEqual(expired["reply_state"], "idle")
         self.assertEqual(expired["text"], "")
 
-    def test_interrupted_state_never_relabels_a_different_turn_draft(self):
+    def test_late_interrupted_state_cannot_touch_a_different_turn_draft(self):
         handler = object.__new__(PushHandler)
         handler.state = types.SimpleNamespace(
             chat_draft_lock=threading.Lock(),
@@ -269,8 +269,9 @@ class KairosCancelTest(unittest.TestCase):
 
         handler._set_chat_interrupted("test", user_ts="new")
 
-        self.assertNotIn("test", handler.state.chat_drafts)
-        self.assertEqual(handler.state.chat_reply_states["test"]["user_ts"], "new")
+        self.assertEqual(handler.state.chat_drafts["test"]["user_ts"], "old")
+        self.assertEqual(handler.state.chat_drafts["test"]["text"], "older")
+        self.assertNotIn("test", handler.state.chat_reply_states)
 
     def test_new_queued_turn_drops_previous_interrupted_draft(self):
         handler = object.__new__(PushHandler)

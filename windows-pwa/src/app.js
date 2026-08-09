@@ -1,6 +1,8 @@
-import { createPwaBootstrap } from './bootstrap.js';
-import { createComposerState } from './composer-state.js';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js';
+import { createPwaBootstrap } from './bootstrap.js?v=6';
+import { createComposerState } from './composer-state.js?v=6';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=6';
+import { composeLiveMessages, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=6';
+import { normalizeLiveState } from './api.js?v=6';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -18,7 +20,7 @@ const bootstrap = createPwaBootstrap();
 const adapter = bootstrap.adapter;
 const state = {
   contacts: [], activeContactId: '', histories: {}, live: {}, taxonomy: null,
-  selectedScope: null, deferredInstall: null, loginBound: false, stopLive: null,
+  selectedScope: null, deferredInstall: null, loginBound: false, stopLive: null, streams: {}, epoch: 0,
   composerState: createComposerState(), appearance: 'default', followLatest: {}, scrollTops: {},
 };
 const contactList = $('#contact-list'); const messages = $('#message-list'); const input = $('#message-input');
@@ -72,7 +74,7 @@ function updateLatestControl() { const follow = state.followLatest[state.activeC
 function scrollLatest() { const scroll = $('#conversation-scroll'); scroll.scrollTop = scroll.scrollHeight; state.followLatest[state.activeContactId] = true; updateLatestControl(); }
 function renderMessages({ forceLatest = false } = {}) {
   const shouldFollow = forceLatest || (state.followLatest[state.activeContactId] !== false && nearBottom());
-  const history = state.histories[state.activeContactId] || []; messages.replaceChildren(...history.map((message) => {
+  const history = composeLiveMessages(state.histories[state.activeContactId] || [], state.live[state.activeContactId], { contactId: state.activeContactId, stream: state.streams[state.activeContactId] }); messages.replaceChildren(...history.map((message) => {
     const item = el('li', { class: `message ${message.role === 'user' ? 'from-user' : 'from-assistant'}` });
     const meta = el('div', { class: 'message-meta' }, [el('span', { text: message.role === 'user' ? 'ASTRA' : contact().name.toUpperCase() }), el('time', { text: message.time || '刚刚' })]);
     const body = el('p', { class: 'message-body', text: message.body || '…' }); if (message.streaming) body.classList.add('is-streaming'); item.append(meta, body);
@@ -102,14 +104,17 @@ function renderAll(options) { renderContacts(); renderHeader(); renderActivities
 
 async function switchContact(id) {
   if (id === state.activeContactId) return;
+  const epoch = ++state.epoch;
   state.scrollTops[state.activeContactId] = $('#conversation-scroll').scrollTop; composer().text = input.value; state.activeContactId = id;
   input.value = composer(id).text; state.followLatest[id] ??= true; autoResize(); syncWorkerPanel(); renderAll({ forceLatest: !Object.hasOwn(state.scrollTops, id) });
   if (Object.hasOwn(state.scrollTops, id)) requestAnimationFrame(() => { $('#conversation-scroll').scrollTop = state.scrollTops[id]; updateLatestControl(); });
-  await refreshContact(id); watchLive(id);
+  if (await refreshContact(id, { epoch }) && epoch === state.epoch && id === state.activeContactId) watchLive(id, epoch);
 }
-async function refreshContact(id) {
-  try { const [history, live] = await Promise.all([adapter.getHistory(id), adapter.getLiveState(id)]); state.histories[id] = history; state.live[id] = live; if (id === state.activeContactId) renderAll(); else renderContacts(); }
+async function refreshContact(id, { epoch = state.epoch } = {}) {
+  try { const [history, live] = await Promise.all([adapter.getHistory(id), adapter.getLiveState(id)]); if (epoch !== state.epoch) return false; state.histories[id] = history; state.live[id] = live; if (id === state.activeContactId) renderAll(); else renderContacts(); }
   catch (error) { $('#connection-state').textContent = '离线草稿'; console.warn('CcCompanion adapter unavailable', error); }
+  if (epoch !== state.epoch) return false;
+  return true;
 }
 function updateMessage(contactId, message) { const history = state.histories[contactId] || []; const found = history.findIndex(({ id }) => id === message.id); if (found >= 0) history[found] = message; else history.push(message); state.histories[contactId] = history; }
 async function send(event) {
@@ -152,11 +157,22 @@ function renderTaxonomy() {
 }
 async function selectMemory(scope) { state.selectedScope = scope; renderTaxonomy(); const result = $('#memory-results'); result.replaceChildren(el('p', { class: 'loading', text: '正在读取记忆…' })); try { const entries = await adapter.listMemories(scope); result.replaceChildren(...entries.map((entry) => el('article', { class: 'memory-card' }, [el('small', { text: entry.timestamp || entry.created_at || '记忆条目' }), el('h3', { text: entry.title || entry.content?.slice(0, 40) || '无标题' }), el('p', { text: entry.body || entry.content || '' })]))); } catch { result.replaceChildren(el('p', { class: 'error', text: '这个分类暂时无法读取。' })); } }
 function applyLiveEvent(event) {
-  if (event.type === 'message') updateMessage(event.contactId, event.message); if (event.type === 'state') state.live[event.contactId] = event.state; if (event.type === 'snapshot') { state.histories[event.contactId] = event.history; state.live[event.contactId] = event.state; }
-  if (event.type === 'stream') { const payload = event.payload || {}; const streamId = `stream-${payload.stream_id || 'current'}`; const history = state.histories[event.contactId] || []; let item = history.find(({ id }) => id === streamId); if (!item) { item = { id: streamId, role: 'assistant', body: '', time: '现在', streaming: true }; history.push(item); } if (payload.event === 'chunk') item.body += String(payload.text || ''); if (payload.event === 'done') item.streaming = false; state.histories[event.contactId] = history; }
+  if (event.type === 'message') updateMessage(event.contactId, event.message); if (event.type === 'state') state.live[event.contactId] = event.state; if (event.type === 'snapshot') { state.histories[event.contactId] = event.history; state.live[event.contactId] = event.state; state.streams[event.contactId] = reconcileSnapshotStream(state.streams[event.contactId], event.state); }
+  if (event.type === 'stream') {
+    const next = reduceStreamDraft(state.streams[event.contactId], event.payload);
+    state.streams[event.contactId] = next;
+    const incomingTurnId = String(event.payload?.turn_id || event.payload?.turnId || event.payload?.stream_id || 'current');
+    const incomingRevision = String(event.payload?.revision ?? event.payload?.draft_revision ?? '');
+    const acceptedDraft = event.payload?.event === 'draft' && next?.turnId === incomingTurnId && String(next?.revision ?? '') === incomingRevision && (!event.payload?.updated_at || next?.updatedAt === event.payload.updated_at);
+    if (acceptedDraft) state.live[event.contactId] = normalizeLiveState({
+      ...(state.live[event.contactId] || {}), busy: true, reply_state: event.payload.reply_state || 'generating', turn_id: incomingTurnId, revision: incomingRevision, updated_at: event.payload.updated_at || '',
+      draft: { text: event.payload.text || '', activity_text: event.payload.activity_text || '', activity_count: event.payload.activity_count || 0, worker_activity_items: event.payload.worker_activity_items || [] },
+    });
+    if (next?.terminal && event.payload?.refresh_history) void refreshContact(event.contactId, { epoch: state.epoch });
+  }
   if (event.type === 'connection' && event.contactId === state.activeContactId && !event.online) $('#connection-state').textContent = '正在重连'; if (event.contactId === state.activeContactId) renderAll(); else renderContacts();
 }
-function watchLive(contactId) { state.stopLive?.(); state.stopLive = adapter.subscribe(applyLiveEvent, { contactId }); }
+function watchLive(contactId, epoch = state.epoch) { state.stopLive?.(); state.stopLive = adapter.subscribe((event) => { if (epoch === state.epoch && contactId === state.activeContactId) applyLiveEvent(event); }, { contactId }); }
 const workerDrawerQuery = window.matchMedia('(max-width:1199px)');
 function syncWorkerPanel() {
   const panel = $('#side-notes'); const drawer = workerDrawerQuery.matches;
@@ -175,7 +191,7 @@ $('#attachment-input').addEventListener('change', (event) => { const draft = com
 $('.attach-button').addEventListener('keydown', (event) => { if ((event.key === 'Enter' || event.key === ' ') && !$('#attachment-input').disabled) { event.preventDefault(); $('#attachment-input').click(); } });
 $('#upload-cancel-button').addEventListener('click', () => state.composerState.cancel(state.activeContactId)); $('#stop-button').addEventListener('click', () => adapter.stop(state.activeContactId, state.live[state.activeContactId]?.stopRequest).catch(() => { $('#connection-state').textContent = '停止请求失效'; }));
 $('#memory-button').addEventListener('click', openMemory); $('#memory-close').addEventListener('click', () => $('#memory-dialog').close()); $('#worker-toggle').addEventListener('click', () => setWorkers(!document.body.classList.contains('workers-open'))); $('#worker-close').addEventListener('click', closeWorkers);
-async function logout() { state.composerState.cancelAll(); try { await adapter.logout(); } finally { state.stopLive?.(); state.stopLive = null; state.contacts = []; state.histories = {}; state.live = {}; state.composerState = createComposerState(); state.activeContactId = ''; renderAll(); if (!bootstrap.mock) showLogin(); } }
+async function logout() { state.epoch += 1; state.composerState.cancelAll(); try { await adapter.logout(); } finally { state.stopLive?.(); state.stopLive = null; state.contacts = []; state.histories = {}; state.live = {}; state.streams = {}; state.composerState = createComposerState(); state.activeContactId = ''; renderAll(); if (!bootstrap.mock) showLogin(); } }
 $('#logout-button').addEventListener('click', logout); $('#drawer-logout-button').addEventListener('click', logout);
 $('#appearance-button').addEventListener('click', cycleAppearance); $('#drawer-appearance-button').addEventListener('click', cycleAppearance);
 window.addEventListener('keydown', (event) => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); input.focus(); } if (event.altKey && /^[1-9]$/.test(event.key)) { const target = state.contacts[Number(event.key) - 1]; if (target) switchContact(target.id); } if (event.key === 'Escape') { if ($('#memory-dialog').open) $('#memory-dialog').close(); if (document.body.classList.contains('workers-open')) closeWorkers(); } });

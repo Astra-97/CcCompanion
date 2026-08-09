@@ -1,11 +1,11 @@
-const CACHE = 'cccompanion-desk-v4';
-const ASSETS = ['./', './index.html', './manifest.webmanifest', './src/styles.css?v=4', './src/api.js', './src/bootstrap.js', './src/composer-state.js', './src/data.js', './src/pairing-code.js', './src/app.js', './assets/cc-mark.svg', './assets/icon-192.png', './assets/icon-512.png'];
+const CACHE = 'cccompanion-desk-v6';
+const ASSETS = ['./', './index.html', './manifest.webmanifest', './src/styles.css?v=6', './src/api.js?v=6', './src/bootstrap.js?v=6', './src/composer-state.js?v=6', './src/data.js?v=6', './src/pairing-code.js?v=6', './src/live-messages.js?v=6', './src/app.js?v=6', './assets/cc-mark.svg', './assets/icon-192.png', './assets/icon-512.png'];
 self.addEventListener('activate', (event) => event.waitUntil(
   caches.keys()
     .then((keys) => Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key))))
     .then(() => self.clients.claim()),
 ));
-self.addEventListener('install', (event) => event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(ASSETS))));
+self.addEventListener('install', (event) => event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(ASSETS)).then(() => self.skipWaiting())));
 self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
   const url = new URL(event.request.url);

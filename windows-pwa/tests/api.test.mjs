@@ -5,6 +5,7 @@ import { createHttpAdapter, createMockAdapter, normalizeLiveState, normalizeReco
 import { createPwaBootstrap, isExplicitMockMode } from '../src/bootstrap.js';
 import { createComposerState } from '../src/composer-state.js';
 import { PAIRING_ALPHABET, formatPairingCode, normalizePairingCode } from '../src/pairing-code.js';
+import { composeLiveMessages, reconcileSnapshotStream, reduceStreamDraft } from '../src/live-messages.js';
 
 function hexToken(css, token) {
   const match = css.match(new RegExp(`--${token}:(#[0-9a-fA-F]{6})`));
@@ -27,7 +28,7 @@ test('normalizes bounded worker activity without relying on server naming', () =
       worker_activity_items: [{ worker_id: 'layout', name: 'windows_pwa_shell', status: 'running', count: 3 }] },
     stop_request: { supported: true, body: { contact_id: 'kairos', user_ts: 'turn-1' } },
   }), {
-    busy: true, replyState: 'generating', statusText: '生成中', draft: 'partial', activityText: '', activityCount: 2,
+    busy: true, replyState: 'generating', turnId: '', revision: '', updatedAt: '', statusText: '生成中', draft: 'partial', activityText: '', activityCount: 2,
     stopRequest: { supported: true, body: { contact_id: 'kairos', user_ts: 'turn-1' } },
     workers: [{ id: 'layout', name: 'windows_pwa_shell', state: 'running', count: 3 }],
   });
@@ -124,6 +125,59 @@ test('production live subscription performs network snapshots and accepts same-c
   assert.ok(calls.includes('/chat/stream?contact_id=kairos'));
   assert.equal(events.find(({ type }) => type === 'snapshot').history[0].body, 'poll result');
   assert.equal(events.find(({ type }) => type === 'stream').payload.text, 'live');
+});
+
+test('live subscription keeps bounded hidden polling and reconnects immediately when visible again', async () => {
+  const timers = []; const cleared = new Set(); const listeners = {}; const calls = []; const stream = { close() { this.closed = true; } }; let streamOpens = 0;
+  const clock = { setTimeout(fn, delay) { const timer = { fn, delay }; timers.push(timer); return timer; }, clearTimeout(timer) { cleared.add(timer); } };
+  const visibility = { visibilityState: 'hidden', addEventListener(name, fn) { listeners[name] = fn; }, removeEventListener() {} };
+  const adapter = createHttpAdapter({
+    request: async (path) => { calls.push(path); return path.startsWith('/chat/history') ? { records: [] } : { busy: false }; },
+    clock, visibility, network: { navigator: { onLine: true }, addEventListener() {}, removeEventListener() {} }, eventSourceFactory: () => { streamOpens += 1; return stream; },
+  });
+  const stop = adapter.subscribe(() => {}, { contactId: 'kairos' });
+  assert.equal(timers[0].delay, 0, 'initial snapshot is scheduled once');
+  await timers.shift().fn();
+  assert.equal(timers.at(-1).delay, 15_000, 'hidden pages still reconcile the authoritative snapshot');
+  assert.equal(stream.closed, undefined, 'hidden state does not discard the live SSE connection');
+  visibility.visibilityState = 'visible'; listeners.visibilitychange();
+  assert.equal(timers.at(-1).delay, 0, 'visible recovery polls immediately');
+  assert.equal(streamOpens, 1, 'visibility recovery does not open a duplicate SSE connection');
+  assert.equal(calls.filter((path) => path.startsWith('/chat/history')).length, 1);
+  stop();
+  assert.equal(stream.closed, true, 'cleanup closes SSE');
+});
+
+test('Kairos draft is one transient row, SSE cannot duplicate it, and final history replaces it', () => {
+  const history = [{ id: 'old', role: 'assistant', body: 'already there', time: '10:00' }];
+  let stream = reduceStreamDraft(null, { event: 'draft', turn_id: 'turn-1', reply_state: 'generating', text: 'partial reply', updated_at: '2026-08-09T11:26:01Z' });
+  stream = reduceStreamDraft(stream, { event: 'draft', turn_id: 'turn-1', reply_state: 'generating', text: 'partial reply revised', updated_at: '2026-08-09T11:26:02Z' });
+  const withDraft = composeLiveMessages(history, { busy: true, draft: 'stale poll value' }, { contactId: 'kairos', stream });
+  assert.equal(withDraft.length, 2);
+  assert.equal(withDraft.at(-1).id, 'live-draft-kairos');
+  assert.equal(withDraft.at(-1).body, 'partial reply revised');
+  const finalHistory = [...history, { id: 'final', role: 'assistant', body: 'partial reply revised', time: '10:01' }];
+  assert.equal(composeLiveMessages(finalHistory, { busy: false, draft: '' }, { contactId: 'kairos', stream }).length, 2, 'persisted final wins without a duplicate transient');
+  const terminal = reduceStreamDraft(stream, { event: 'lifecycle', contact_id: 'kairos', turn_id: 'turn-1', reply_state: 'completed', terminal: true, refresh_history: true, updated_at: '2026-08-09T11:26:03Z' });
+  assert.equal(terminal.terminal, true);
+  assert.equal(terminal.refreshHistory, true);
+  const newer = reduceStreamDraft(null, { event: 'draft', turn_id: 'turn-2', text: 'new turn', updated_at: '2026-08-09T11:27:00Z' });
+  assert.equal(reduceStreamDraft(newer, { event: 'lifecycle', turn_id: 'turn-1', terminal: true, updated_at: '2026-08-09T11:26:03Z' }).turnId, 'turn-2', 'old lifecycle cannot erase a newer draft');
+  assert.equal(composeLiveMessages(history, { busy: true, draft: '' }, { contactId: 'kairos', stream: { body: '', streaming: true } }).length, 1, 'busy without text has no empty bubble');
+  assert.equal(composeLiveMessages(history, { busy: false, replyState: 'completed', draft: 'expired draft' }, { contactId: 'kairos' }).length, 1, 'idle terminal snapshots never revive an expired draft');
+  let revised = reduceStreamDraft(null, { event: 'draft', turn_id: 'turn-r', revision: 2, text: 'new', updated_at: '2026-08-09T11:30:02Z' });
+  revised = reduceStreamDraft(revised, { event: 'draft', turn_id: 'turn-r', revision: 1, text: 'old', updated_at: '2026-08-09T11:30:03Z' });
+  assert.equal(revised.body, 'new', 'lower revision cannot overwrite a newer draft');
+  const tombstone = reduceStreamDraft(revised, { event: 'lifecycle', turn_id: 'turn-r', revision: 2, terminal: true, updated_at: '2026-08-09T11:30:04Z' });
+  assert.equal(reduceStreamDraft(tombstone, { event: 'draft', turn_id: 'turn-r', revision: 2, text: 'late', updated_at: '2026-08-09T11:30:05Z' }).terminal, true, 'terminal tombstone rejects a late same-revision draft');
+  const pollWins = composeLiveMessages(history, { busy: true, replyState: 'generating', turnId: 'turn-r', revision: 3, updatedAt: '2026-08-09T11:30:06Z', draft: 'poll recovers full text' }, { contactId: 'kairos', stream: revised });
+  assert.equal(pollWins.at(-1).body, 'poll recovers full text', 'newer authoritative poll heals missed SSE chunks');
+  assert.equal(reduceStreamDraft(null, { event: 'done', stream_id: 'legacy', text: 'complete legacy reply' }).body, 'complete legacy reply', 'legacy done text is a full recovery payload');
+  for (const replyState of ['completed', 'interrupted', 'failed']) {
+    const reconciled = reconcileSnapshotStream({ turnId: 'turn-r', revision: '2', body: 'lost lifecycle', streaming: true, updatedAt: '2026-08-09T11:30:02Z' }, { busy: false, replyState, turnId: 'turn-r', revision: '2', updatedAt: '2026-08-09T11:30:03Z' });
+    assert.equal(reconciled.terminal, true, `${replyState} poll snapshot closes a missed lifecycle`);
+    assert.equal(composeLiveMessages(history, { busy: false, replyState, turnId: 'turn-r' }, { contactId: 'kairos', stream: reconciled }).length, 1);
+  }
 });
 
 test('stages raw attachment bytes then sends only returned attachment IDs with memory-only CSRF', async () => {
@@ -265,8 +319,10 @@ test('PWA shell declares installability and has no secret persistence', async ()
   assert.match(manifest, /icon-192\.png/);
   assert.match(manifest, /icon-512\.png/);
   assert.match(serviceWorker, /addEventListener\('fetch'/);
-  assert.match(serviceWorker, /cccompanion-desk-v4/);
-  assert.match(serviceWorker, /src\/styles\.css\?v=4/);
+  assert.match(serviceWorker, /cccompanion-desk-v6/);
+  assert.match(serviceWorker, /src\/styles\.css\?v=6/);
+  assert.match(serviceWorker, /src\/app\.js\?v=6/);
+  assert.match(serviceWorker, /src\/live-messages\.js/);
   assert.match(serviceWorker, /src\/pairing-code\.js/);
   assert.doesNotMatch(source, /shared_secret|localStorage\.setItem|sessionStorage\.setItem|credentials:\s*'include'/);
   assert.match(source, /credentials:\s*'same-origin'/);
@@ -282,7 +338,8 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   ]);
   assert.match(html, /id="latest-button"/);
   assert.match(html, /id="pairing-code"/);
-  assert.match(html, /href="\.\/src\/styles\.css\?v=4"/);
+  assert.match(html, /href="\.\/src\/styles\.css\?v=6"/);
+  assert.match(html, /src="\.\/src\/app\.js\?v=6"/);
   assert.match(html, /autocomplete="one-time-code"/);
   assert.match(html, /id="pairing-form"/);
   assert.match(html, /<details class="password-fallback">/);

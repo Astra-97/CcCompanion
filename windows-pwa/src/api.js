@@ -1,4 +1,4 @@
-import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY } from './data.js';
+import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY } from './data.js?v=6';
 
 const clone = (value) => structuredClone(value);
 const now = () => new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
@@ -14,13 +14,16 @@ export function normalizeLiveState(raw = {}) {
   return {
     busy,
     replyState,
+    turnId: String(raw.turn_id || raw.turnId || draft.turn_id || draft.turnId || raw.user_ts || draft.user_ts || ''),
+    revision: String(raw.revision || raw.draft_revision || draft.revision || draft.draft_revision || ''),
+    updatedAt: String(raw.updated_at || raw.updatedAt || draft.updated_at || draft.updatedAt || ''),
     statusText: raw.status_text || raw.statusText || raw.status || draft.status_text || (busy ? '正在处理' : '待命'),
     draft: draft.text || '',
     activityText: draft.activity_text || raw.activity_text || raw.activityText || '',
     activityCount: Number(draft.activity_count || raw.activity_count || raw.activityCount || 0),
-    stopRequest: raw.stop_request && typeof raw.stop_request === 'object' ? {
-      supported: Boolean(raw.stop_request.supported),
-      body: raw.stop_request.body && typeof raw.stop_request.body === 'object' ? clone(raw.stop_request.body) : null,
+    stopRequest: (raw.stop_request || raw.stopRequest) && typeof (raw.stop_request || raw.stopRequest) === 'object' ? {
+      supported: Boolean((raw.stop_request || raw.stopRequest).supported),
+      body: (raw.stop_request || raw.stopRequest).body && typeof (raw.stop_request || raw.stopRequest).body === 'object' ? clone((raw.stop_request || raw.stopRequest).body) : null,
     } : { supported: false, body: null },
     workers: Array.isArray(draft.worker_activity_items) ? draft.worker_activity_items.map((item) => {
       const lifecycle = item.status || item.state; // `status` is the current server contract; state remains legacy-compatible.
@@ -194,29 +197,40 @@ export function createHttpAdapter({ baseUrl = '', request = defaultRequest, uplo
     /** SSE deltas plus bounded, abortable history/status polling fallback. */
     subscribe(listener, { contactId } = {}) {
       if (!contactId) throw new Error('contactId is required for a production live subscription');
-      let stopped = false; let pollTimer = null; let reconnectTimer = null; let stream = null; let controller = null; let failureDelay = 1_000;
+      const VISIBLE_POLL_MS = 4_000; const BUSY_POLL_MS = 1_000; const HIDDEN_POLL_MS = 15_000;
+      let stopped = false; let pollTimer = null; let reconnectTimer = null; let stream = null; let controller = null; let pollInFlight = false; let failureDelay = 1_000;
       const isHidden = () => visibility?.visibilityState === 'hidden';
       const closeStream = () => { if (stream) { stream.close?.(); stream = null; } };
-      const schedulePoll = (delay) => { if (!stopped) pollTimer = clock.setTimeout(poll, delay); };
-      const scheduleReconnect = (delay) => { if (!stopped && !isHidden) reconnectTimer = clock.setTimeout(connectStream, delay); };
-      const poll = async () => {
+      const schedulePoll = (delay) => {
         if (stopped) return;
-        if (isHidden() || network?.navigator?.onLine === false) { schedulePoll(30_000); return; }
-        controller?.abort(); controller = new AbortController();
+        if (pollTimer) clock.clearTimeout(pollTimer);
+        pollTimer = clock.setTimeout(() => { pollTimer = null; return poll(); }, delay);
+      };
+      const scheduleReconnect = (delay) => {
+        if (stopped || network?.navigator?.onLine === false || stream || reconnectTimer) return;
+        reconnectTimer = clock.setTimeout(() => { reconnectTimer = null; connectStream(); }, delay);
+      };
+      const poll = async () => {
+        if (stopped || pollInFlight) return;
+        if (network?.navigator?.onLine === false) { schedulePoll(HIDDEN_POLL_MS); return; }
+        pollInFlight = true; const requestController = new AbortController(); controller = requestController;
         try {
-          const [history, state] = await Promise.all([this.getHistory(contactId, { signal: controller.signal }), this.getLiveState(contactId, { signal: controller.signal })]);
+          const [history, state] = await Promise.all([this.getHistory(contactId, { signal: requestController.signal }), this.getLiveState(contactId, { signal: requestController.signal })]);
           if (stopped) return;
           listener({ type: 'snapshot', contactId, history, state });
           failureDelay = 1_000;
-          schedulePoll(state.busy ? 1_000 : 4_000);
+          schedulePoll(isHidden() ? HIDDEN_POLL_MS : (state.busy ? BUSY_POLL_MS : VISIBLE_POLL_MS));
         } catch (error) {
-          if (!stopped) listener({ type: 'connection', contactId, online: false, error });
-          schedulePoll(failureDelay); failureDelay = Math.min(failureDelay * 2, 30_000);
+          if (!stopped && error.name !== 'AbortError') listener({ type: 'connection', contactId, online: false, error });
+          if (!stopped) schedulePoll(isHidden() ? HIDDEN_POLL_MS : failureDelay);
+          failureDelay = Math.min(failureDelay * 2, 30_000);
+        } finally {
+          if (controller === requestController) controller = null;
+          pollInFlight = false;
         }
       };
       const connectStream = () => {
-        if (stopped || isHidden() || network?.navigator?.onLine === false || !eventSourceFactory) return;
-        closeStream();
+        if (stopped || network?.navigator?.onLine === false || !eventSourceFactory || stream) return;
         try {
           stream = eventSourceFactory(url(`/chat/stream?contact_id=${encodeURIComponent(contactId)}`));
           stream.onopen = () => { failureDelay = 1_000; listener({ type: 'connection', contactId, online: true }); };
@@ -226,12 +240,12 @@ export function createHttpAdapter({ baseUrl = '', request = defaultRequest, uplo
           stream.onerror = () => { closeStream(); listener({ type: 'connection', contactId, online: false }); scheduleReconnect(failureDelay); failureDelay = Math.min(failureDelay * 2, 30_000); };
         } catch (error) { listener({ type: 'connection', contactId, online: false, error }); scheduleReconnect(failureDelay); failureDelay = Math.min(failureDelay * 2, 30_000); }
       };
-      const onVisibility = () => { if (stopped) return; if (isHidden()) { closeStream(); controller?.abort(); return; } if (pollTimer) clock.clearTimeout(pollTimer); poll(); connectStream(); };
-      const onOnline = () => { if (!stopped) { poll(); connectStream(); } };
+      const onVisibility = () => { if (stopped) return; if (!isHidden()) { schedulePoll(0); connectStream(); } else if (!pollInFlight) schedulePoll(HIDDEN_POLL_MS); };
+      const onOnline = () => { if (!stopped) { schedulePoll(0); connectStream(); } };
       const onOffline = () => { closeStream(); controller?.abort(); listener({ type: 'connection', contactId, online: false }); };
       visibility?.addEventListener?.('visibilitychange', onVisibility);
       network?.addEventListener?.('online', onOnline); network?.addEventListener?.('offline', onOffline);
-      poll(); connectStream();
+      schedulePoll(0); connectStream();
       return () => { stopped = true; controller?.abort(); if (pollTimer) clock.clearTimeout(pollTimer); if (reconnectTimer) clock.clearTimeout(reconnectTimer); closeStream(); visibility?.removeEventListener?.('visibilitychange', onVisibility); network?.removeEventListener?.('online', onOnline); network?.removeEventListener?.('offline', onOffline); };
     },
   };
