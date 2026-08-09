@@ -14,5 +14,6 @@ export function createPwaBootstrap({ locationLike = globalThis.location, windowL
     adapter,
     checkSession: () => adapter.getWebSession(),
     establishSession: ({ username, password }) => adapter.createWebSession({ username, password }),
+    establishPairingSession: ({ code }) => adapter.pairWebSession({ code }),
   };
 }

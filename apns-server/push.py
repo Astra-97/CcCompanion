@@ -168,6 +168,8 @@ WINDOWS_PWA_ROOT = HERE.parent / "windows-pwa"
 # token, which remains a backwards-compatible native-client protocol.
 WEB_SESSION_COOKIE_NAME = "__Host-cccompanion"
 WEB_SESSION_CONTRACT_VERSION = "2026-08-09"
+WEB_PAIRING_MAX_BODY_BYTES = 1024
+WEB_PAIRING_BODY_TIMEOUT_SECONDS = 5
 
 
 class WebSessionStore:
@@ -228,6 +230,115 @@ class WebSessionStore:
         for token, session in list(self._sessions.items()):
             if float((session or {}).get("expires_at") or 0) <= now:
                 self._sessions.pop(token, None)
+
+
+class WebPairingStore:
+    """One-time, short-lived pairing codes for minting PWA sessions.
+
+    Only an HMAC digest of a code is retained.  The HMAC key and every pairing
+    record are process-local, so restarting the server revokes all outstanding
+    codes.  Pairing failures are tracked in a bounded, temporary per-IP map to
+    slow online guessing without making a code's state observable.
+    """
+
+    CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+    CODE_LENGTH = 8  # 32^8 == 40 bits; omits visually ambiguous characters.
+    TTL_SECONDS = 5 * 60
+    MAX_PENDING = 32
+    MAX_FAILURES = 5
+    FAILURE_WINDOW_SECONDS = 60
+    LOCK_SECONDS = 60
+    MAX_TRACKED_IPS = 1024
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._digest_key = secrets.token_bytes(32)
+        self._codes: dict[bytes, float] = {}
+        self._failures: dict[str, dict[str, float]] = {}
+
+    def create(self) -> tuple[str, float]:
+        expires_at = time.time() + self.TTL_SECONDS
+        with self._lock:
+            self._prune_locked()
+            # The capacity check happens after expiring old records.  A full
+            # store cannot be used to evict someone else's still-valid code.
+            if len(self._codes) >= self.MAX_PENDING:
+                raise RuntimeError("pairing_capacity")
+            # A collision is extraordinarily unlikely, but never hand out the
+            # same active code to two devices if it ever happens.
+            for _ in range(8):
+                code = "".join(secrets.choice(self.CODE_ALPHABET) for _ in range(self.CODE_LENGTH))
+                digest = self._digest(code)
+                if digest not in self._codes:
+                    self._codes[digest] = expires_at
+                    return code, expires_at
+        raise RuntimeError("pairing_generation")
+
+    def consume(self, code: Any, *, client_ip: str) -> bool:
+        """Atomically consume a valid code, recording only failed attempts."""
+        candidate = code if self.is_valid_code(code) else ""
+        now = time.time()
+        with self._lock:
+            self._prune_locked(now)
+            if self._ip_locked_locked(client_ip, now):
+                return False
+            # Malformed codes use an impossible digest, then receive the same
+            # failure and rate-limit treatment as every other bad attempt.
+            expires_at = self._codes.pop(self._digest(candidate), None)
+            if expires_at is not None and expires_at > now:
+                self._failures.pop(client_ip, None)
+                return True
+            self._record_failure_locked(client_ip, now)
+            return False
+
+    @classmethod
+    def is_valid_code(cls, code: Any) -> bool:
+        return bool(
+            isinstance(code, str)
+            and len(code) == cls.CODE_LENGTH
+            and all(char in cls.CODE_ALPHABET for char in code)
+        )
+
+    def _digest(self, code: str) -> bytes:
+        return hmac.new(self._digest_key, code.encode("utf-8", "surrogatepass"), hashlib.sha256).digest()
+
+    def _ip_locked_locked(self, client_ip: str, now: float) -> bool:
+        record = self._failures.get(client_ip)
+        if not record:
+            return False
+        if float(record.get("locked_until") or 0) <= now:
+            if float(record.get("last_failure") or 0) + self.FAILURE_WINDOW_SECONDS <= now:
+                self._failures.pop(client_ip, None)
+            else:
+                record["locked_until"] = 0
+            return False
+        return True
+
+    def _record_failure_locked(self, client_ip: str, now: float) -> None:
+        record = self._failures.get(client_ip)
+        if record is None:
+            if len(self._failures) >= self.MAX_TRACKED_IPS:
+                oldest_ip = min(self._failures, key=lambda ip: self._failures[ip].get("last_failure", 0))
+                self._failures.pop(oldest_ip, None)
+            record = {"count": 0, "last_failure": now, "locked_until": 0}
+            self._failures[client_ip] = record
+        if float(record.get("last_failure") or 0) + self.FAILURE_WINDOW_SECONDS <= now:
+            record["count"] = 0
+        record["count"] = float(record.get("count") or 0) + 1
+        record["last_failure"] = now
+        if record["count"] >= self.MAX_FAILURES:
+            record["locked_until"] = now + self.LOCK_SECONDS
+
+    def _prune_locked(self, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        for digest, expires_at in list(self._codes.items()):
+            if expires_at <= now:
+                self._codes.pop(digest, None)
+        for client_ip, record in list(self._failures.items()):
+            last_failure = float(record.get("last_failure") or 0)
+            locked_until = float(record.get("locked_until") or 0)
+            if locked_until <= now and last_failure + self.FAILURE_WINDOW_SECONDS <= now:
+                self._failures.pop(client_ip, None)
 
 
 class StagedAttachmentStore:
@@ -2423,6 +2534,7 @@ class ServerState:
         except (TypeError, ValueError):
             web_session_ttl = 12 * 60 * 60
         self.web_sessions = WebSessionStore(web_session_ttl)
+        self.web_pairings = WebPairingStore()
         self.web_session_secure_cookie: bool = True
 
         xhs_login_cfg = config.get("xhs_login", {})
@@ -3202,6 +3314,64 @@ class PushHandler(BaseHTTPRequestHandler):
             return True
         token = self.headers.get("X-Auth-Token", "") or self.headers.get("X-Auth", "")
         return bool(token) and hmac.compare_digest(token, self.state.shared_secret)
+
+    def _native_pairing_auth_matches(self) -> bool:
+        """Fail closed for credential minting, unlike legacy optional auth."""
+        expected = str(getattr(self.state, "shared_secret", "") or "")
+        supplied = self.headers.get("X-Auth-Token", "") or self.headers.get("X-Auth", "")
+        if not expected or not supplied:
+            return False
+        try:
+            return hmac.compare_digest(
+                str(supplied).encode("utf-8"), expected.encode("utf-8")
+            )
+        except UnicodeError:
+            return False
+
+    def _trusted_proxy_header_ip(self, name: str) -> tuple[bool, str | None]:
+        """Return (present, validated IP) for one non-list proxy header."""
+        get_all = getattr(self.headers, "get_all", None)
+        if callable(get_all):
+            values = get_all(name)
+            if values is None:
+                return False, None
+            if len(values) != 1:
+                return True, None
+            # `HTTPMessage.get()` cannot distinguish an absent header from a
+            # present-but-empty one.  Presence itself matters for Cloudflare:
+            # an empty value must fail safe, not enable X-Real-IP fallback.
+            raw = values[0]
+        else:
+            raw = self.headers.get(name)
+            if raw is None:
+                return False, None
+        supplied = str(raw)
+        if not supplied or supplied != supplied.strip() or "," in supplied:
+            return True, None
+        try:
+            return True, str(ipaddress.ip_address(supplied))
+        except ValueError:
+            return True, None
+
+    def _trusted_client_ip(self) -> str:
+        """Trust Cloudflare/nginx client headers only from a loopback peer."""
+        peer = str(self.client_address[0] if self.client_address else "")
+        try:
+            parsed_peer = ipaddress.ip_address(peer)
+        except ValueError:
+            return peer
+        if not parsed_peer.is_loopback:
+            return str(parsed_peer)
+        # cloudflared is the production public path and sets CF-Connecting-IP.
+        # If it is present but malformed, fail safe to the peer rather than
+        # accepting a second header supplied through a confusing proxy chain.
+        cf_present, cf_ip = self._trusted_proxy_header_ip("CF-Connecting-IP")
+        if cf_present:
+            return cf_ip or str(parsed_peer)
+        # Direct nginx deployments explicitly overwrite this header with
+        # `$remote_addr`, so it is a safe loopback-only fallback.
+        _real_present, real_ip = self._trusted_proxy_header_ip("X-Real-IP")
+        return real_ip or str(parsed_peer)
 
     def _web_session_token(self) -> str:
         """Read only the opaque PWA cookie; malformed Cookie is unauthenticated."""
@@ -4150,7 +4320,7 @@ class PushHandler(BaseHTTPRequestHandler):
         allowed = self.state.allowed_ips
         if not allowed:
             return True
-        ip_text = self.client_address[0] if self.client_address else ""
+        ip_text = self._trusted_client_ip()
         try:
             client_ip = ipaddress.ip_address(ip_text)
         except ValueError:
@@ -4203,7 +4373,7 @@ class PushHandler(BaseHTTPRequestHandler):
     _login_locked_ips: set[str] = set()
 
     def _handle_login(self, body: dict[str, Any]):
-        client_ip = self.client_address[0]
+        client_ip = self._trusted_client_ip()
         if client_ip in self._login_locked_ips:
             self._send_json(403, {"ok": False, "error": "locked"})
             return
@@ -4293,12 +4463,80 @@ class PushHandler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
+    @contextmanager
+    def _pairing_body_read_timeout(self):
+        """Keep credential-bootstrap JSON reads short even on keep-alive."""
+        connection = getattr(self, "connection", None)
+        setter = getattr(connection, "settimeout", None)
+        getter = getattr(connection, "gettimeout", None)
+        if not callable(setter):
+            yield
+            return
+        try:
+            original = getter() if callable(getter) else None
+            setter(WEB_PAIRING_BODY_TIMEOUT_SECONDS)
+        except OSError:
+            yield
+            return
+        try:
+            yield
+        finally:
+            try:
+                setter(original)
+            except OSError:
+                pass
+
+    def _reject_pairing_request(self) -> None:
+        """Close rather than leave an invalid bounded request on keep-alive."""
+        self.close_connection = True
+        self._send_json(400, {"ok": False, "error": "invalid_pairing_request"})
+
+    def _read_pairing_json_object(self) -> dict[str, Any] | None:
+        """Read exactly one small JSON object for either pairing endpoint."""
+        transfer_encoding = str(self.headers.get("Transfer-Encoding", "") or "")
+        content_type = str(self.headers.get("Content-Type", "") or "")
+        raw_length = self.headers.get("Content-Length")
+        get_all = getattr(self.headers, "get_all", None)
+        all_lengths = get_all("Content-Length") if callable(get_all) else None
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        if (
+            transfer_encoding
+            or media_type != "application/json"
+            or raw_length is None
+            or (all_lengths is not None and len(all_lengths) != 1)
+            or not re.fullmatch(r"[0-9]+", str(raw_length))
+        ):
+            self._reject_pairing_request()
+            return None
+        length = int(str(raw_length))
+        if length > WEB_PAIRING_MAX_BODY_BYTES:
+            self._reject_pairing_request()
+            return None
+        try:
+            with self._pairing_body_read_timeout():
+                raw = self.rfile.read(length)
+        except Exception:
+            self._reject_pairing_request()
+            return None
+        if not isinstance(raw, bytes) or len(raw) != length:
+            self._reject_pairing_request()
+            return None
+        try:
+            body = json.loads(raw)
+        except Exception:
+            self._reject_pairing_request()
+            return None
+        if not isinstance(body, dict):
+            self._reject_pairing_request()
+            return None
+        return body
+
     def _handle_web_session_create(self, body: dict[str, Any]) -> None:
         """Log the PWA in without ever returning native-client credentials."""
         if not bool(getattr(self.state, "web_session_enabled", False)):
             self._send_json(404, {"ok": False, "error": "web_session_disabled"})
             return
-        client_ip = self.client_address[0] if self.client_address else "unknown"
+        client_ip = self._trusted_client_ip()
         if client_ip in self._login_locked_ips:
             self._send_json(403, {"ok": False, "error": "locked"})
             return
@@ -4321,6 +4559,10 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(401, {"ok": False, "error": "invalid_credentials"})
             return
         self._login_fail_counts.pop(client_ip, None)
+        self._issue_web_session()
+
+    def _issue_web_session(self) -> None:
+        """Mint the one opaque cookie response shared by login and pairing."""
         token, expires_at = self.state.web_sessions.create()
         csrf_token = self.state.web_sessions.csrf_token(token)
         max_age = max(0, int(expires_at - time.time()))
@@ -4339,6 +4581,54 @@ class PushHandler(BaseHTTPRequestHandler):
                 "Cache-Control": "no-store",
             },
         )
+
+    def _handle_web_pairing_create(self) -> None:
+        """Let an authenticated native client display one short pairing code."""
+        if not bool(getattr(self.state, "web_session_enabled", False)):
+            self._send_json(404, {"ok": False, "error": "web_session_disabled"})
+            return
+        pairings = getattr(self.state, "web_pairings", None)
+        create = getattr(pairings, "create", None)
+        if not callable(create):
+            self._send_json(503, {"ok": False, "error": "pairing_unavailable"})
+            return
+        try:
+            pairing_code, _expires_at = create()
+        except RuntimeError:
+            self._send_json(429, {"ok": False, "error": "pairing_unavailable"})
+            return
+        self._send_json(
+            200,
+            {
+                "pairing_code": pairing_code,
+                "expires_in_seconds": WebPairingStore.TTL_SECONDS,
+                "display_name": "Astra",
+            },
+            extra_headers={"Cache-Control": "no-store"},
+        )
+
+    def _handle_web_session_pair(self, body: dict[str, Any]) -> None:
+        """Exchange a same-origin one-time code for a PWA HttpOnly session."""
+        if not bool(getattr(self.state, "web_session_enabled", False)):
+            self._send_json(404, {"ok": False, "error": "web_session_disabled"})
+            return
+        if not self._web_session_origin_matches():
+            self._send_json(403, {"ok": False, "error": "pairing_origin_forbidden"})
+            return
+        pairings = getattr(self.state, "web_pairings", None)
+        consume = getattr(pairings, "consume", None)
+        client_ip = self._trusted_client_ip()
+        code = body.get("code") if isinstance(body, dict) else None
+        if not callable(consume) or not consume(code, client_ip=client_ip):
+            # Do not reveal whether a code never existed, expired, was already
+            # used, or is being throttled after failed online guesses.
+            self._send_json(
+                401,
+                {"ok": False, "error": "invalid_pairing_code"},
+                extra_headers={"Cache-Control": "no-store"},
+            )
+            return
+        self._issue_web_session()
 
     def _handle_web_session_get(self) -> None:
         if not self._web_session_matches(require_allowed_route=False):
@@ -4952,6 +5242,29 @@ class PushHandler(BaseHTTPRequestHandler):
         from urllib.parse import urlparse
 
         request_path = urlparse(self.path).path
+        if request_path == "/web/pairing/create":
+            if not self._check_ip_allowed():
+                return
+            # Read and drain the native JSON before responding, so an Android
+            # keep-alive connection never carries request bytes into its next
+            # request.  The optional display_name is deliberately ignored.
+            if self._read_pairing_json_object() is None:
+                return
+            # This is deliberately stricter than normal request auth: a PWA
+            # cookie is not an authority to create more browser credentials.
+            if not self._native_pairing_auth_matches():
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            self._handle_web_pairing_create()
+            return
+        if request_path == "/web/session/pair":
+            if not self._check_ip_allowed():
+                return
+            body = self._read_pairing_json_object()
+            if body is None:
+                return
+            self._handle_web_session_pair(body)
+            return
         if request_path == "/web/session":
             if not self._check_ip_allowed():
                 return

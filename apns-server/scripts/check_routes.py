@@ -14,7 +14,7 @@ HANDLER_PATH = ROOT / "push.py"
 EXPECTED_ROUTE_COUNTS = {
     # Includes the same-origin PWA session bootstrap and contact contract.
     "do_GET": 104,
-    "do_POST": 105,
+    "do_POST": 107,
 }
 
 CRITICAL_ROUTES = {
@@ -32,6 +32,8 @@ CRITICAL_ROUTES = {
     "do_POST": {
         "/chat/send",
         "/web/session",
+        "/web/session/pair",
+        "/web/pairing/create",
         "/chat/regenerate",
         "/chain/abort",
         "/chain/new_session",

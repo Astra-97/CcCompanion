@@ -1,5 +1,6 @@
 import { createPwaBootstrap } from './bootstrap.js';
 import { createComposerState } from './composer-state.js';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -185,5 +186,25 @@ async function start() {
   try { state.contacts = await adapter.contacts(); if (!state.contacts.length) throw new Error('没有可用联系人'); state.activeContactId = state.contacts.find(({ id }) => id === 'xiaoke')?.id || state.contacts[0].id; state.contacts.forEach(({ id }) => { state.histories[id] = []; state.live[id] = { replyState: 'idle', statusText: '待命', workers: [] }; composer(id); state.followLatest[id] = true; }); await Promise.all(state.contacts.map(({ id }) => refreshContact(id))); watchLive(state.activeContactId); renderAll({ forceLatest: true }); }
   catch (error) { $('#connection-state').textContent = '连接不可用'; console.warn('PWA bootstrap failed', error); }
 }
-function showLogin() { const panel = $('#login-panel'); panel.hidden = false; $('#login-username').focus(); if (state.loginBound) return; state.loginBound = true; $('#login-form').addEventListener('submit', async (event) => { event.preventDefault(); const submit = $('#login-submit'); const error = $('#login-error'); submit.disabled = true; error.textContent = ''; try { await bootstrap.establishSession({ username: $('#login-username').value, password: $('#login-password').value }); panel.hidden = true; await start(); } catch { error.textContent = '登录未通过，请检查账号或连接。'; } finally { submit.disabled = false; } }); }
+function pairingError(error) {
+  if (error?.status === 429) return '尝试次数过多，请稍后再生成新码。';
+  if ([400, 401, 404, 410].includes(error?.status)) return '配对码无效或已过期；请在 Android 上刷新后重试。';
+  return '暂时无法连接；请检查网络后重试。';
+}
+function showLogin() {
+  const panel = $('#login-panel'); const codeInput = $('#pairing-code'); const pairingSubmit = $('#pairing-submit');
+  panel.hidden = false; codeInput.focus();
+  if (state.loginBound) return;
+  state.loginBound = true;
+  codeInput.addEventListener('input', () => { codeInput.value = formatPairingCode(codeInput.value); pairingSubmit.disabled = !normalizePairingCode(codeInput.value); $('#pairing-error').textContent = ''; });
+  $('#pairing-form').addEventListener('submit', async (event) => {
+    event.preventDefault(); const code = normalizePairingCode(codeInput.value); const error = $('#pairing-error');
+    if (!code || pairingSubmit.disabled) return;
+    pairingSubmit.disabled = true; pairingSubmit.textContent = '正在连接…'; error.textContent = '';
+    try { await bootstrap.establishPairingSession({ code }); codeInput.value = ''; panel.hidden = true; await start(); }
+    catch (reason) { error.textContent = pairingError(reason); codeInput.focus(); }
+    finally { codeInput.value = ''; pairingSubmit.textContent = '连接工作台 ↗'; pairingSubmit.disabled = true; }
+  });
+  $('#login-form').addEventListener('submit', async (event) => { event.preventDefault(); const submit = $('#login-submit'); const error = $('#login-error'); submit.disabled = true; error.textContent = ''; try { await bootstrap.establishSession({ username: $('#login-username').value, password: $('#login-password').value }); panel.hidden = true; await start(); } catch { error.textContent = '登录未通过，请检查账号或连接。'; } finally { $('#login-password').value = ''; submit.disabled = false; } });
+}
 renderAll(); start();

@@ -15,15 +15,27 @@
     <a class="skip-link" href="#conversation">跳到对话</a>
     <div class="grain" aria-hidden="true"></div>
     <section class="login-panel" id="login-panel" aria-labelledby="login-title" hidden>
-      <form class="login-card" id="login-form">
+      <section class="login-card" aria-describedby="pairing-intro">
         <p class="eyebrow">CCCOMPANION · PRIVATE DESK</p>
-        <h1 id="login-title">回到桌面。</h1>
-        <p>使用你的 CcCompanion 登录信息建立此浏览器会话。密码不会写入应用存储。</p>
-        <label>账号<input id="login-username" name="username" autocomplete="username" required /></label>
-        <label>密码<input id="login-password" name="password" type="password" autocomplete="current-password" required /></label>
-        <p id="login-error" class="login-error" aria-live="polite"></p>
-        <button id="login-submit" class="send-button" type="submit">进入工作台 <span aria-hidden="true">↗</span></button>
-      </form>
+        <h1 id="login-title">连接这台设备。</h1>
+        <p id="pairing-intro">在 Android 的“连接 iPad / Windows”里生成一次性设备配对码。它只用于建立当前浏览器会话。</p>
+        <form id="pairing-form" novalidate>
+          <label for="pairing-code">一次性设备配对码</label>
+          <input id="pairing-code" name="code" inputmode="text" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" maxlength="9" pattern="[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4} [23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}" placeholder="2345 ABCD" aria-describedby="pairing-help pairing-error" required />
+          <p id="pairing-help" class="login-help">8 位大写码；可用 23456789、A–H、J–N、P–Z（不使用 0、1、I、O）。粘贴时会自动分组。</p>
+          <p id="pairing-error" class="login-error" aria-live="polite"></p>
+          <button id="pairing-submit" class="send-button" type="submit" disabled>连接工作台 <span aria-hidden="true">↗</span></button>
+        </form>
+        <details class="password-fallback">
+          <summary>使用账号密码应急登录</summary>
+          <form id="login-form">
+            <label>账号<input id="login-username" name="username" autocomplete="username" required /></label>
+            <label>密码<input id="login-password" name="password" type="password" autocomplete="current-password" required /></label>
+            <p id="login-error" class="login-error" aria-live="polite"></p>
+            <button id="login-submit" class="send-button" type="submit">进入工作台 <span aria-hidden="true">↗</span></button>
+          </form>
+        </details>
+      </section>
     </section>
     <main class="desk-shell" aria-label="CcCompanion 私人工作台">
       <aside class="rail" aria-label="联系人">

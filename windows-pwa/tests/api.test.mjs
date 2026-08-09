@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { createHttpAdapter, createMockAdapter, normalizeLiveState, normalizeRecord } from '../src/api.js';
 import { createPwaBootstrap, isExplicitMockMode } from '../src/bootstrap.js';
 import { createComposerState } from '../src/composer-state.js';
+import { PAIRING_ALPHABET, formatPairingCode, normalizePairingCode } from '../src/pairing-code.js';
 
 test('normalizes bounded worker activity without relying on server naming', () => {
   assert.deepEqual(normalizeLiveState({
@@ -205,6 +206,23 @@ test('mock is explicit while production bootstrap checks the cookie session', as
   assert.deepEqual(calls, ['/web/session']);
 });
 
+test('pairing uses the unauthenticated same-origin endpoint and accepts its session payload', async () => {
+  const calls = [];
+  const adapter = createHttpAdapter({ request: async (path, options = {}) => { calls.push({ path, options }); return { ok: true, csrf_token: 'pair-csrf', upload_limits: { max_file_bytes: 7, max_pending_files: 2, max_pending_bytes: 9 } }; } });
+  await adapter.pairWebSession({ code: 'ABCD1234' });
+  assert.deepEqual(calls, [{ path: '/web/session/pair', options: { method: 'POST', body: { code: 'ABCD1234' } } }]);
+  assert.equal(adapter.getUploadLimits().max_file_bytes, 7);
+});
+
+test('pairing normalization accepts only the shared eight-character alphabet', () => {
+  assert.equal(PAIRING_ALPHABET, '23456789ABCDEFGHJKLMNPQRSTUVWXYZ');
+  assert.equal(normalizePairingCode('2345 abcd'), '2345ABCD');
+  assert.equal(formatPairingCode('2345abcd'), '2345 ABCD');
+  for (const rejected of ['1234ABCD', '0234ABCD', 'I234ABCD', 'O234ABCD', '2345ABCD9', '2345-ABCD!']) {
+    assert.equal(normalizePairingCode(rejected), '', rejected);
+  }
+});
+
 test('PWA shell declares installability and has no secret persistence', async () => {
   const [manifest, serviceWorker, source] = await Promise.all([
     readFile(new URL('../manifest.webmanifest', import.meta.url), 'utf8'),
@@ -228,6 +246,10 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
     readFile(new URL('../sw.js', import.meta.url), 'utf8'),
   ]);
   assert.match(html, /id="latest-button"/);
+  assert.match(html, /id="pairing-code"/);
+  assert.match(html, /autocomplete="one-time-code"/);
+  assert.match(html, /id="pairing-form"/);
+  assert.match(html, /<details class="password-fallback">/);
   const csp = html.match(/<meta http-equiv="Content-Security-Policy" content="([^"]+)"/);
   assert.ok(csp, 'the static shell declares a CSP before body scripts can execute');
   assert.ok(html.indexOf(csp[0]) < html.indexOf('<script'), 'CSP appears before every script tag');
@@ -245,6 +267,9 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   assert.match(html, /id="drawer-appearance-button"/);
   assert.match(html, /role="button" tabindex="0" aria-label="添加图片或文件"/);
   assert.match(app, /const contactId = state\.activeContactId/);
+  assert.match(app, /establishPairingSession/);
+  assert.match(app, /normalizePairingCode/);
+  assert.match(html, /23456789ABCDEFGHJKLMNPQRSTUVWXYZ/);
   assert.match(app, /adapter\.uploadAttachments\(contactId, queued/);
   assert.match(app, /adapter\.sendMessage\(contactId,/);
   assert.match(app, /createComposerState/);
@@ -265,6 +290,7 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   assert.match(css, /prefers-reduced-motion:reduce/);
   assert.match(css, /a:focus-visible,input:focus-visible/);
   assert.match(css, /--dim:#aba193/);
+  assert.match(css, /#pairing-code/);
   assert.match(css, /attachment-chip button,.taxonomy-choices button\{min-width:44px/);
   assert.equal((css.match(/@media \(max-width:390px\)/g) || []).length, 1);
   assert.match(css, /\.head-actions \.worker-toggle,\.head-actions #memory-button\{display:inline-block\}/);

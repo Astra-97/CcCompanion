@@ -123,6 +123,9 @@ export function createHttpAdapter({ baseUrl = '', request = defaultRequest, uplo
   return {
     async getWebSession() { return acceptSession(await call(url('/web/session'))); },
     async createWebSession(credentials) { return acceptSession(await call(url('/web/session'), { method: 'POST', body: credentials })); },
+    // This endpoint intentionally does not use `call`: pairing starts without a
+    // session, and must not inherit a stale CSRF header from a previous login.
+    async pairWebSession({ code }) { return acceptSession(await request(url('/web/session/pair'), { method: 'POST', body: { code } })); },
     async logout() { const result = await call(url('/web/session/logout'), { method: 'POST', body: {} }); csrfToken = ''; return result; },
     getUploadLimits() { return { ...uploadLimits }; },
     async contacts() {
@@ -264,7 +267,11 @@ async function defaultRequest(path, options = {}) {
     body: options.body ? JSON.stringify(options.body) : undefined,
     signal: options.signal,
   });
-  if (!response.ok) throw new Error(`Request failed: ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(`Request failed: ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
   return response.json();
 }
 
@@ -278,6 +285,7 @@ export function createMockAdapter() {
   return {
     async getWebSession() { return { ok: true, authenticated: true, mock: true, csrf_token: 'mock', upload_limits: { max_file_bytes: 50 * 1024 * 1024, max_pending_files: 10, max_pending_bytes: 64 * 1024 * 1024 } }; },
     async createWebSession() { return { ok: true, authenticated: true, mock: true, csrf_token: 'mock', upload_limits: { max_file_bytes: 50 * 1024 * 1024, max_pending_files: 10, max_pending_bytes: 64 * 1024 * 1024 } }; },
+    async pairWebSession() { return { ok: true, authenticated: true, mock: true, csrf_token: 'mock', upload_limits: { max_file_bytes: 50 * 1024 * 1024, max_pending_files: 10, max_pending_bytes: 64 * 1024 * 1024 } }; },
     getUploadLimits() { return { max_file_bytes: 50 * 1024 * 1024, max_pending_files: 10, max_pending_bytes: 64 * 1024 * 1024 }; },
     async logout() { return { ok: true, mock: true }; },
     async contacts() { return clone(MOCK_CONTACTS); },

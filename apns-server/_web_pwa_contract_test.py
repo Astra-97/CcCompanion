@@ -12,6 +12,7 @@ import tempfile
 import threading
 import types
 import unittest
+from http.client import parse_headers
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,6 +20,7 @@ from push import (
     KAIROS_TERMINAL_ALIAS,
     PushHandler,
     StagedAttachmentStore,
+    WebPairingStore,
     WEB_SESSION_CONTRACT_VERSION,
     WebSessionStore,
 )
@@ -44,6 +46,324 @@ class WebPwaContractTest(unittest.TestCase):
         self.assertFalse(store.valid("not-a-session"))
         store.revoke(token)
         self.assertFalse(store.valid(token))
+
+    def test_native_pairing_create_requires_shared_secret_not_web_cookie(self):
+        pairings = WebPairingStore()
+        handler = self.handler("/web/pairing/create", "POST")
+        handler.state = types.SimpleNamespace(
+            web_session_enabled=True,
+            web_pairings=pairings,
+            web_sessions=WebSessionStore(300),
+            shared_secret="native-only",
+        )
+        handler._check_ip_allowed = lambda: True
+        handler.headers = {
+            "X-Auth-Token": "native-only",
+            "Content-Type": "application/json",
+            "Content-Length": "26",
+        }
+        handler.rfile = io.BytesIO(b'{"display_name":"ignored"}')
+        handler.do_POST()
+        status, payload, kwargs = handler.responses[-1]
+        self.assertEqual(status, 200)
+        code = payload["pairing_code"]
+        self.assertEqual(len(code), WebPairingStore.CODE_LENGTH)
+        self.assertTrue(set(code).issubset(set(WebPairingStore.CODE_ALPHABET)))
+        self.assertEqual(payload["expires_in_seconds"], 300)
+        self.assertEqual(payload["display_name"], "Astra")
+        self.assertEqual(kwargs["extra_headers"]["Cache-Control"], "no-store")
+        self.assertNotIn(code, repr(pairings._codes))
+
+        cookie_only = self.handler("/web/pairing/create", "POST")
+        cookie_only.state = handler.state
+        cookie_only._check_ip_allowed = lambda: True
+        web_token, _ = handler.state.web_sessions.create()
+        cookie_only.headers = {
+            "Cookie": f"__Host-cccompanion={web_token}",
+            "Content-Type": "application/json",
+            "Content-Length": "2",
+        }
+        cookie_only.rfile = io.BytesIO(b"{}")
+        cookie_only.do_POST()
+        self.assertEqual(cookie_only.responses[-1][0], 401)
+        self.assertEqual(len(pairings._codes), 1)
+
+    def test_pairing_request_body_is_bounded_drained_and_fail_closed(self):
+        pairings = WebPairingStore()
+        handler = self.handler("/web/pairing/create", "POST")
+        handler.state = types.SimpleNamespace(
+            web_session_enabled=True,
+            web_pairings=pairings,
+            shared_secret="native-only",
+        )
+        handler._check_ip_allowed = lambda: True
+        handler.headers = {
+            "X-Auth-Token": "native-only",
+            "Content-Type": "application/json; charset=utf-8",
+            "Content-Length": "2",
+        }
+        handler.rfile = io.BytesIO(b"{}")
+        handler.do_POST()
+        self.assertEqual(handler.responses[-1][0], 200)
+        self.assertEqual(handler.rfile.read(), b"")
+
+        no_secret = self.handler("/web/pairing/create", "POST")
+        no_secret.state = types.SimpleNamespace(
+            web_session_enabled=True,
+            web_pairings=WebPairingStore(),
+            shared_secret="",
+        )
+        no_secret._check_ip_allowed = lambda: True
+        no_secret.headers = {
+            "X-Auth-Token": "anything",
+            "Content-Type": "application/json",
+            "Content-Length": "2",
+        }
+        no_secret.rfile = io.BytesIO(b"{}")
+        no_secret.do_POST()
+        self.assertEqual(no_secret.responses[-1][0], 401)
+
+        invalid = self.handler("/web/session/pair", "POST")
+        invalid.state = types.SimpleNamespace(allowed_ips=[])
+        invalid.headers = {"Content-Type": "application/json"}  # Missing length.
+        invalid.rfile = io.BytesIO(b'{"code":"ABCDEFGH"}')
+        invalid.do_POST()
+        self.assertEqual(invalid.responses[-1][0], 400)
+        self.assertTrue(invalid.close_connection)
+
+        oversized = self.handler("/web/session/pair", "POST")
+        oversized.state = types.SimpleNamespace(allowed_ips=[])
+        oversized.headers = {
+            "Content-Type": "application/json",
+            "Content-Length": "1025",
+        }
+        oversized.rfile = io.BytesIO(b"")
+        oversized.do_POST()
+        self.assertEqual(oversized.responses[-1][0], 400)
+        self.assertTrue(oversized.close_connection)
+
+        pairing_code, _ = pairings.create()
+        malformed_code_body = b'{"code":"O0I1O0I1"}'
+        malformed_code = self.handler("/web/session/pair", "POST")
+        malformed_code.state = types.SimpleNamespace(
+            allowed_ips=[],
+            web_session_enabled=True,
+            web_pairings=pairings,
+            web_sessions=WebSessionStore(300),
+            public_server_url="https://desk.example",
+        )
+        malformed_code.headers = {
+            "Origin": "https://desk.example",
+            "Content-Type": "application/json",
+            "Content-Length": str(len(malformed_code_body)),
+        }
+        malformed_code.rfile = io.BytesIO(malformed_code_body)
+        malformed_code.do_POST()
+        self.assertEqual(malformed_code.responses[-1][0:2], (401, {
+            "ok": False, "error": "invalid_pairing_code",
+        }))
+        self.assertIn(pairings._digest(pairing_code), pairings._codes)
+
+    def test_pairing_reader_uses_short_socket_timeout(self):
+        class SocketProbe:
+            def __init__(self):
+                self.calls = []
+
+            def gettimeout(self):
+                return 17
+
+            def settimeout(self, value):
+                self.calls.append(value)
+
+        handler = self.handler("/web/session/pair", "POST")
+        handler.headers = {"Content-Type": "application/json", "Content-Length": "2"}
+        handler.rfile = io.BytesIO(b"{}")
+        handler.connection = SocketProbe()
+        self.assertEqual(handler._read_pairing_json_object(), {})
+        self.assertEqual(handler.connection.calls, [5, 17])
+
+    def test_pairing_requires_exact_origin_and_issues_same_web_session_response(self):
+        pairings = WebPairingStore()
+        code, _ = pairings.create()
+        state = types.SimpleNamespace(
+            web_session_enabled=True,
+            web_pairings=pairings,
+            web_sessions=WebSessionStore(300),
+            public_server_url="https://desk.example",
+        )
+        handler = self.handler("/web/session/pair", "POST")
+        handler.state = state
+        handler.headers = {"Origin": "https://other.example"}
+        handler._handle_web_session_pair({"code": code})
+        self.assertEqual(handler.responses[-1][0], 403)
+
+        handler.headers = {"Origin": "https://desk.example"}
+        handler._handle_web_session_pair({"code": code})
+        status, payload, kwargs = handler.responses[-1]
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["authenticated"])
+        self.assertTrue(payload["csrf_token"])
+        self.assertIn("upload_limits", payload)
+        self.assertEqual(kwargs["extra_headers"]["Cache-Control"], "no-store")
+        cookie = kwargs["extra_headers"]["Set-Cookie"]
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Strict", cookie)
+        self.assertIn("Secure", cookie)
+
+    def test_pairing_is_one_time_expires_and_fails_indistinguishably(self):
+        pairings = WebPairingStore()
+        code, _ = pairings.create()
+        self.assertTrue(pairings.consume(code, client_ip="10.0.0.1"))
+        self.assertFalse(pairings.consume(code, client_ip="10.0.0.2"))
+        self.assertFalse(pairings.consume("NOTACODE", client_ip="10.0.0.3"))
+        expiring_code, _ = pairings.create()
+        pairings._codes[pairings._digest(expiring_code)] = 0
+        self.assertFalse(pairings.consume(expiring_code, client_ip="10.0.0.4"))
+        capped = WebPairingStore()
+        capped.MAX_PENDING = 1
+        capped.create()
+        with self.assertRaisesRegex(RuntimeError, "pairing_capacity"):
+            capped.create()
+
+        state = types.SimpleNamespace(
+            web_session_enabled=True,
+            web_pairings=pairings,
+            web_sessions=WebSessionStore(300),
+            public_server_url="https://desk.example",
+        )
+        handler = self.handler("/web/session/pair", "POST")
+        handler.state = state
+        handler.headers = {"Origin": "https://desk.example"}
+        handler._handle_web_session_pair({"code": "NOTACODE"})
+        missing_response = handler.responses[-1]
+        handler._handle_web_session_pair({"code": expiring_code})
+        expired_response = handler.responses[-1]
+        self.assertEqual(missing_response[0:2], expired_response[0:2])
+        self.assertEqual(missing_response[2]["extra_headers"]["Cache-Control"], "no-store")
+
+    def test_pairing_consume_is_atomic_and_failure_lock_recovers(self):
+        pairings = WebPairingStore()
+        code, _ = pairings.create()
+        start = threading.Barrier(2)
+        results = []
+
+        def consume(index: int) -> None:
+            start.wait()
+            results.append(pairings.consume(code, client_ip=f"10.0.1.{index}"))
+
+        first = threading.Thread(target=consume, args=(1,))
+        second = threading.Thread(target=consume, args=(2,))
+        first.start()
+        second.start()
+        first.join(2)
+        second.join(2)
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(results.count(False), 1)
+
+        recovery_code, _ = pairings.create()
+        client_ip = "10.0.2.1"
+        with patch("push.time.time", return_value=1_000):
+            for _ in range(WebPairingStore.MAX_FAILURES):
+                self.assertFalse(pairings.consume("WRONGCODE", client_ip=client_ip))
+            self.assertFalse(pairings.consume(recovery_code, client_ip=client_ip))
+        with patch("push.time.time", return_value=1_061):
+            self.assertTrue(pairings.consume(recovery_code, client_ip=client_ip))
+
+    def test_pairing_rate_key_trusts_cloudflare_then_nginx_only_from_loopback(self):
+        handler = self.handler("/web/session/pair", "POST")
+        handler.headers = {"X-Real-IP": "203.0.113.10"}
+        self.assertEqual(handler._trusted_client_ip(), "203.0.113.10")
+        handler.headers = {
+            "CF-Connecting-IP": "203.0.113.11",
+            "X-Real-IP": "203.0.113.10",
+        }
+        self.assertEqual(handler._trusted_client_ip(), "203.0.113.11")
+        handler.headers = {
+            "CF-Connecting-IP": "203.0.113.11, 198.51.100.1",
+            "X-Real-IP": "203.0.113.10",
+        }
+        self.assertEqual(handler._trusted_client_ip(), "127.0.0.1")
+        handler.headers = {
+            "CF-Connecting-IP": "not-an-ip",
+            "X-Real-IP": "203.0.113.10",
+        }
+        self.assertEqual(handler._trusted_client_ip(), "127.0.0.1")
+        handler.client_address = ("198.51.100.9", 1)
+        handler.headers = {
+            "CF-Connecting-IP": "203.0.113.11",
+            "X-Real-IP": "203.0.113.10",
+        }
+        self.assertEqual(handler._trusted_client_ip(), "198.51.100.9")
+
+        pairings = WebPairingStore()
+        state = types.SimpleNamespace(
+            web_session_enabled=True,
+            web_pairings=pairings,
+            web_sessions=WebSessionStore(300),
+            public_server_url="https://desk.example",
+        )
+        first = self.handler("/web/session/pair", "POST")
+        first.state = state
+        first.headers = {"Origin": "https://desk.example", "CF-Connecting-IP": "203.0.113.10"}
+        first._handle_web_session_pair({"code": "WRONGCODE"})
+        second = self.handler("/web/session/pair", "POST")
+        second.state = state
+        second.headers = {"Origin": "https://desk.example", "CF-Connecting-IP": "203.0.113.11"}
+        second._handle_web_session_pair({"code": "WRONGCODE"})
+        self.assertEqual(set(pairings._failures), {"203.0.113.10", "203.0.113.11"})
+
+    def test_cloudflare_present_empty_or_duplicate_fails_safe_without_xreal_fallback(self):
+        handler = self.handler("/web/session/pair", "POST")
+        handler.headers = parse_headers(io.BytesIO(
+            b"CF-Connecting-IP:\r\nX-Real-IP: 203.0.113.10\r\n\r\n"
+        ))
+        self.assertEqual(handler.headers.get_all("CF-Connecting-IP"), [""])
+        self.assertEqual(handler._trusted_client_ip(), "127.0.0.1")
+        handler.headers = parse_headers(io.BytesIO(
+            b"CF-Connecting-IP: 203.0.113.10\r\n"
+            b"CF-Connecting-IP: 203.0.113.11\r\n"
+            b"X-Real-IP: 203.0.113.12\r\n\r\n"
+        ))
+        self.assertEqual(handler.headers.get_all("CF-Connecting-IP"), [
+            "203.0.113.10", "203.0.113.11",
+        ])
+        self.assertEqual(handler._trusted_client_ip(), "127.0.0.1")
+
+    def test_legacy_login_rate_key_uses_trusted_client_ip(self):
+        PushHandler._login_fail_counts.clear()
+        PushHandler._login_locked_ips.clear()
+        self.addCleanup(PushHandler._login_fail_counts.clear)
+        self.addCleanup(PushHandler._login_locked_ips.clear)
+        state = types.SimpleNamespace(login_username="astra", login_password="correct")
+
+        first = self.handler("/login", "POST")
+        first.state = state
+        first.headers = {"CF-Connecting-IP": "203.0.113.20"}
+        first._handle_login({"username": "astra", "password": "wrong"})
+        second = self.handler("/login", "POST")
+        second.state = state
+        second.headers = {"CF-Connecting-IP": "203.0.113.21"}
+        second._handle_login({"username": "astra", "password": "wrong"})
+        self.assertEqual(set(PushHandler._login_fail_counts), {"203.0.113.20", "203.0.113.21"})
+
+        invalid_cf = self.handler("/login", "POST")
+        invalid_cf.state = state
+        invalid_cf.headers = {
+            "CF-Connecting-IP": "not-an-ip",
+            "X-Real-IP": "203.0.113.22",
+        }
+        invalid_cf._handle_login({"username": "astra", "password": "wrong"})
+        self.assertIn("127.0.0.1", PushHandler._login_fail_counts)
+
+        spoofed_direct = self.handler("/login", "POST")
+        spoofed_direct.state = state
+        spoofed_direct.client_address = ("198.51.100.23", 1)
+        spoofed_direct.headers = {
+            "CF-Connecting-IP": "203.0.113.24",
+            "X-Real-IP": "203.0.113.25",
+        }
+        spoofed_direct._handle_login({"username": "astra", "password": "wrong"})
+        self.assertIn("198.51.100.23", PushHandler._login_fail_counts)
 
     def test_web_session_route_is_scoped_not_admin_or_token_access(self):
         handler = self.handler("/chat/send", "POST")
