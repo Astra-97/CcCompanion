@@ -228,6 +228,18 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
     readFile(new URL('../sw.js', import.meta.url), 'utf8'),
   ]);
   assert.match(html, /id="latest-button"/);
+  const csp = html.match(/<meta http-equiv="Content-Security-Policy" content="([^"]+)"/);
+  assert.ok(csp, 'the static shell declares a CSP before body scripts can execute');
+  assert.ok(html.indexOf(csp[0]) < html.indexOf('<script'), 'CSP appears before every script tag');
+  assert.match(csp[1], /default-src 'self'/);
+  assert.match(csp[1], /script-src 'self'/);
+  assert.match(csp[1], /connect-src 'self'/);
+  assert.match(csp[1], /worker-src 'self'/);
+  assert.match(csp[1], /manifest-src 'self'/);
+  assert.match(csp[1], /img-src 'self' data:/);
+  assert.doesNotMatch(csp[1], /unsafe-(?:inline|eval)|static\.cloudflareinsights\.com/);
+  assert.doesNotMatch(html, /style="/);
+  assert.match(html, /class="svg-defs"/);
   assert.match(html, /class="file-input"/);
   assert.match(html, /id="appearance-status" aria-live="polite"/);
   assert.match(html, /id="drawer-appearance-button"/);
