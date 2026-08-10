@@ -194,6 +194,11 @@ class CodexRemoteControlServiceTest(unittest.TestCase):
         unit = (Path(__file__).parent / "deploy" / "codex-remote-control.service").read_text(
             encoding="utf-8"
         )
+        properties = {}
+        for line in unit.splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                properties[key] = value
         self.assertIn(
             "ExecStart=/usr/local/libexec/codex-remote-control-service start --service-uid 0", unit
         )
@@ -202,6 +207,18 @@ class CodexRemoteControlServiceTest(unittest.TestCase):
         )
         self.assertIn("RemainAfterExit=yes", unit)
         self.assertIn("WantedBy=multi-user.target", unit)
+        self.assertGreaterEqual(
+            int(properties["TimeoutStartSec"]),
+            service.WORST_CASE_TAKEOVER_TIMEOUT + service.SYSTEMD_TIMEOUT_MARGIN,
+        )
+        self.assertGreaterEqual(
+            int(properties["TimeoutStopSec"]),
+            service.WORST_CASE_STOP_TIMEOUT + service.SYSTEMD_TIMEOUT_MARGIN,
+        )
+        self.assertIn("new wrapper -> new unit -> systemctl daemon-reload", unit)
+        self.assertIn(
+            "old unit -> systemctl daemon-reload (new wrapper remains) -> old wrapper", unit
+        )
 
 
 if __name__ == "__main__":

@@ -26,6 +26,17 @@ DEFAULT_CODEX_HOME = Path("/root/.codex")
 DEFAULT_CODEX = DEFAULT_CODEX_HOME / "packages/standalone/current/bin/codex"
 DEFAULT_LOCK = Path("/run/lock/codex-remote-control-service.lock")
 DEFAULT_PROC_ROOT = Path("/proc")
+DEFAULT_COMMAND_TIMEOUT = 45.0
+DEFAULT_STATE_TIMEOUT = 15.0
+
+# A takeover can stop and start the official daemon.  Each phase gets one CLI
+# timeout and one state-settle timeout, so systemd's start budget must exceed
+# 2 * (DEFAULT_COMMAND_TIMEOUT + DEFAULT_STATE_TIMEOUT).  A plain stop needs
+# one such phase.  The tracked unit keeps another ten seconds for interpreter
+# startup, flock acquisition, and systemd bookkeeping.
+WORST_CASE_TAKEOVER_TIMEOUT = 2 * (DEFAULT_COMMAND_TIMEOUT + DEFAULT_STATE_TIMEOUT)
+WORST_CASE_STOP_TIMEOUT = DEFAULT_COMMAND_TIMEOUT + DEFAULT_STATE_TIMEOUT
+SYSTEMD_TIMEOUT_MARGIN = 10.0
 
 
 @dataclass(frozen=True)
@@ -298,8 +309,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--lock", type=Path, default=DEFAULT_LOCK)
     parser.add_argument("--proc-root", type=Path, default=DEFAULT_PROC_ROOT, help=argparse.SUPPRESS)
     parser.add_argument("--service-uid", type=int, default=0, help=argparse.SUPPRESS)
-    parser.add_argument("--command-timeout", type=float, default=45.0, help=argparse.SUPPRESS)
-    parser.add_argument("--state-timeout", type=float, default=15.0, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--command-timeout", type=float, default=DEFAULT_COMMAND_TIMEOUT,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--state-timeout", type=float, default=DEFAULT_STATE_TIMEOUT,
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args(argv)
 
     args.lock.parent.mkdir(parents=True, exist_ok=True)

@@ -12,10 +12,18 @@ Group=root
 UMask=0077
 Environment=CODEX_HOME=/root/.codex
 Environment=CODEX_REMOTE_CODEX=/root/.codex/packages/standalone/current/bin/codex
+# Compatibility-safe upgrade order:
+#   new wrapper -> new unit -> systemctl daemon-reload
+# The new wrapper accepts both the old and new unit command lines.  Roll back
+# in the inverse compatibility order, keeping the new wrapper in place until
+# systemd has forgotten the new unit's --service-uid option:
+#   old unit -> systemctl daemon-reload (new wrapper remains) -> old wrapper
 ExecStart=/usr/local/libexec/codex-remote-control-service start --service-uid 0
 ExecStop=/usr/local/libexec/codex-remote-control-service stop --service-uid 0
-TimeoutStartSec=75
-TimeoutStopSec=60
+# Worst-case takeover is stop(45+15s) + start(45+15s) = 120s.  A plain stop
+# is 60s.  Keep ten seconds beyond each wrapper budget for process overhead.
+TimeoutStartSec=130
+TimeoutStopSec=70
 StandardOutput=null
 StandardError=journal
 SyslogIdentifier=codex-remote-control
