@@ -3303,6 +3303,16 @@ class PushHandler(BaseHTTPRequestHandler):
 
     server_version = "CcAPNsServer/0.1"
 
+    # This is deliberately an explicit public-App allow-list, rather than all
+    # current/future bus contacts.  Adding an internal observer or privileged
+    # contact to ``state.contact_chats`` must not silently expose it through an
+    # all-contact background subscription.
+    _CHAT_STREAM_APP_CONTACTS = frozenset({
+        "xiaoke", "apples", "kairos", "kimi",
+    })
+    _CHAT_STREAM_FOREGROUND_HEARTBEAT_SECONDS = 1.0
+    _CHAT_STREAM_BACKGROUND_HEARTBEAT_SECONDS = 25.0
+
     def log_message(self, format: str, *args):
         logger.info("%s %s", self.address_string(), format % args)
 
@@ -12371,49 +12381,167 @@ class PushHandler(BaseHTTPRequestHandler):
         """The bus is shared; an SSE connection may see only its own contact."""
         return isinstance(rec, dict) and str(rec.get("contact_id") or "") == str(contact_id or "")
 
+    @classmethod
+    def _public_chat_stream_event(cls, rec: Any) -> dict[str, Any] | None:
+        """Return the bounded public SSE projection, dropping unknown events.
+
+        Draft producers already use ``_build_chat_draft_sse_event``.  This
+        second allow-list at the transport boundary prevents a future producer
+        from accidentally adding runner/session metadata to the public wire.
+        """
+        if not isinstance(rec, dict):
+            return None
+        kind = str(rec.get("event") or "")
+        if kind in {"chunk", "done"}:
+            keys = ("event", "stream_id", "contact_id", "text", "seq", "ts", "persisted")
+        elif kind == "draft":
+            keys = (
+                "event", "contact_id", "turn_id", "reply_state", "revision",
+                "updated_at", "text", "text_truncated", "queued_at", "started_at",
+                "activity_text", "activity_count", "worker_activity_items",
+            )
+        elif kind == "lifecycle":
+            keys = (
+                "event", "contact_id", "turn_id", "reply_state", "revision",
+                "updated_at", "terminal", "refresh_history", "final_ts",
+            )
+        else:
+            return None
+        payload = {key: rec[key] for key in keys if key in rec}
+        if kind == "draft":
+            text = str(payload.get("text") or "")
+            if len(text) > cls._CHAT_DRAFT_SSE_TEXT_LIMIT:
+                text = text[-cls._CHAT_DRAFT_SSE_TEXT_LIMIT:]
+                payload["text_truncated"] = True
+            payload["text"] = text
+            payload["activity_text"] = cls._safe_chat_draft_sse_activity(
+                payload.get("activity_text")
+            )
+            payload["worker_activity_items"] = cls._sanitize_worker_activity_items(
+                payload.get("worker_activity_items")
+                if isinstance(payload.get("worker_activity_items"), list) else []
+            )
+        return payload
+
+    def _chat_stream_explicit_auth_matches(self) -> bool:
+        """Fail closed for the wider all-contact subscription."""
+        return bool(self._native_pairing_auth_matches() or self._web_session_matches())
+
+    def _chat_stream_subscription(
+        self,
+    ) -> tuple[str, frozenset[str], float] | None:
+        """Parse one unambiguous stream target and fixed heartbeat profile."""
+        qs = self._query_params()
+        contacts_values = qs.get("contacts", [])
+        contact_values = qs.get("contact_id", []) + qs.get("contactId", [])
+        heartbeat_values = qs.get("heartbeat", [])
+
+        if len(heartbeat_values) > 1 or (
+            heartbeat_values and heartbeat_values[0] not in {"foreground", "background"}
+        ):
+            self._send_json(400, {"error": "heartbeat must be foreground or background"})
+            return None
+        heartbeat_mode = heartbeat_values[0] if heartbeat_values else "foreground"
+        heartbeat_seconds = (
+            self._CHAT_STREAM_BACKGROUND_HEARTBEAT_SECONDS
+            if heartbeat_mode == "background"
+            else self._CHAT_STREAM_FOREGROUND_HEARTBEAT_SECONDS
+        )
+
+        if contacts_values:
+            if contacts_values != ["all"] or contact_values:
+                self._send_json(400, {"error": "use exactly contacts=all without contact_id"})
+                return None
+            # Unlike the legacy single-contact route, wildcard never inherits
+            # strict_auth=false compatibility.  It requires an actual native
+            # secret or an authenticated same-origin web session.
+            if not self._chat_stream_explicit_auth_matches():
+                self._send_json(401, {"error": "unauthorized"})
+                return None
+            available = getattr(self.state, "contact_chats", {})
+            allowed = frozenset(
+                contact_id for contact_id in self._CHAT_STREAM_APP_CONTACTS
+                if contact_id in available
+            )
+            return "all", allowed, heartbeat_seconds
+
+        contact_filter = self._contact_id_from_query()
+        return contact_filter, frozenset({contact_filter}), heartbeat_seconds
+
+    @staticmethod
+    def _wait_for_chat_stream_event(bus: Any, q: Any, timeout: float) -> bool:
+        wait_for_events = getattr(bus, "wait_for_events", None)
+        if callable(wait_for_events):
+            return bool(wait_for_events(q, timeout))
+        # Compatibility for test/dummy buses.  The production ChatStreamBus
+        # always takes the condition-variable path above.
+        time.sleep(min(max(float(timeout), 0.0), 0.05))
+        return bool(q)
+
     def _handle_chat_stream(self):
         """GET /chat/stream?contact_id=xiaoke — SSE 实时推流式回复 chunk.
         Auth: 走 do_GET 顶层 _require_auth (同 /chat/history).
         client 断线靠现有 2s history polling 兜底, 不丢最终稿.
         """
-        import time as _t
-        contact_filter = self._contact_id_from_query()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Pragma", "no-cache")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Connection", "keep-alive")
-        self.end_headers()
-        try:
-            self.wfile.write(f"data: {json.dumps({'event': 'connected', 'contact_id': contact_filter}, ensure_ascii=False)}\n\n".encode("utf-8"))
-            self.wfile.flush()
-        except Exception:
+        subscription = self._chat_stream_subscription()
+        if subscription is None:
             return
-        q = self.state.chat_stream_bus.subscribe()
+        contact_filter, allowed_contacts, heartbeat_seconds = subscription
+        bus = self.state.chat_stream_bus
+        # Subscribe before emitting the connected frame: a producer can now
+        # publish during response setup without falling into a setup-time gap.
+        q = bus.subscribe()
         try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            # Disable nginx response buffering even when this endpoint is
+            # reached through a generic proxy location without an SSE-specific
+            # ``proxy_buffering off`` directive.
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            connected: dict[str, Any] = {"event": "connected"}
+            if contact_filter == "all":
+                connected.update({
+                    "contacts": "all",
+                    "heartbeat": "background" if heartbeat_seconds > 1 else "foreground",
+                })
+            else:
+                # Preserve the exact legacy connected frame for foreground clients.
+                connected["contact_id"] = contact_filter
+            try:
+                self.wfile.write(
+                    f"data: {json.dumps(connected, ensure_ascii=False)}\n\n".encode("utf-8")
+                )
+                self.wfile.flush()
+            except Exception:
+                return
             while True:
-                wrote = False
-                if q:
+                while q:
                     rec = q.popleft()
-                    if not self._chat_stream_event_matches_contact(rec, contact_filter):
+                    public_rec = self._public_chat_stream_event(rec)
+                    if public_rec is None:
+                        continue
+                    event_contact = str(public_rec.get("contact_id") or "")
+                    if event_contact not in allowed_contacts:
                         continue
                     try:
-                        self.wfile.write(f"data: {json.dumps(rec, ensure_ascii=False)}\n\n".encode("utf-8"))
+                        self.wfile.write(f"data: {json.dumps(public_rec, ensure_ascii=False)}\n\n".encode("utf-8"))
                         self.wfile.flush()
-                        wrote = True
                     except Exception:
-                        break
-                if not wrote:
+                        return
+                if not self._wait_for_chat_stream_event(bus, q, heartbeat_seconds):
                     try:
                         self.wfile.write(b": keepalive\n\n")
                         self.wfile.flush()
                     except Exception:
                         break
-                    _t.sleep(1.0)
         finally:
-            self.state.chat_stream_bus.unsubscribe(q)
+            bus.unsubscribe(q)
 
     def _handle_sticker_catalog(self) -> None:
         """GET /stickers/catalog — safe dynamic catalog for ``[bqb:name]``.

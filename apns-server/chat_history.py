@@ -39,24 +39,52 @@ class ChatStreamBus:
 
     def __init__(self):
         self._subscribers: list[deque[dict[str, Any]]] = []
-        self._lock = threading.Lock()
+        # A condition keeps network heartbeats infrequent without making a
+        # newly-published chat event wait for the next heartbeat deadline.
+        # Subscriber queues stay bounded so a slow/disconnected client cannot
+        # apply backpressure to chat producers or grow memory without limit.
+        self._condition = threading.Condition()
 
     def subscribe(self) -> deque[dict[str, Any]]:
         q: deque[dict[str, Any]] = deque(maxlen=50)
-        with self._lock:
+        with self._condition:
             self._subscribers.append(q)
         return q
 
     def unsubscribe(self, q: deque[dict[str, Any]]):
         # 注意用身份比较: list.remove 走 __eq__, 两个内容相同的 deque 会误删别人的队列
-        with self._lock:
+        with self._condition:
             self._subscribers = [s for s in self._subscribers if s is not q]
+            self._condition.notify_all()
 
     def publish(self, rec: dict[str, Any]):
-        with self._lock:
-            subs = list(self._subscribers)
-        for q in subs:
-            q.append(rec)
+        with self._condition:
+            for q in self._subscribers:
+                q.append(rec)
+            self._condition.notify_all()
+
+    def wait_for_events(
+        self,
+        q: deque[dict[str, Any]],
+        timeout: float,
+    ) -> bool:
+        """Wait until ``q`` has data or is unsubscribed.
+
+        The queue check and condition wait happen under the same lock as
+        ``publish`` so a notification cannot be lost in between them.
+        """
+        bounded_timeout = max(0.0, min(float(timeout), 30.0))
+        with self._condition:
+            self._condition.wait_for(
+                lambda: bool(q) or not any(s is q for s in self._subscribers),
+                timeout=bounded_timeout,
+            )
+            return bool(q)
+
+    def subscriber_count(self) -> int:
+        """Small diagnostics/test surface; never exposes subscriber queues."""
+        with self._condition:
+            return len(self._subscribers)
 
 
 class EphemeralTaskBuffer:
