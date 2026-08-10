@@ -12425,7 +12425,7 @@ class PushHandler(BaseHTTPRequestHandler):
         catalog = getattr(self.state, "sticker_catalog", None)
         snapshot = getattr(catalog, "snapshot", None)
         if not callable(snapshot):
-            self._send_json(200, {"ok": True, "version": "disabled", "stickers": []})
+            self._send_json(200, {"ok": True, "version": "disabled", "categories": [], "stickers": []})
             return
         self._send_json(200, snapshot(), extra_headers={"Cache-Control": "no-store"})
 

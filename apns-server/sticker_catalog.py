@@ -7,8 +7,8 @@ URL from an operator-configured HTTPS base plus a filename in a manifest.
 
 Manifests are intentionally tiny JSON documents, for example::
 
-    {"version": 1, "stickers": [
-      {"name": "憋不住笑了", "file": "憋不住笑了.gif"}
+    {"version": 1, "category": {"id": "xiaodou", "name": "小黄豆"}, "stickers": [
+      {"name": "小黄豆·抱抱·2", "file": "小黄豆·抱抱·2.gif", "label": "抱抱"}
     ]}
 
 They may be local files or HTTPS URLs configured by the operator.  A manifest
@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 _MAX_MANIFEST_BYTES = 512 * 1024
 _MAX_STICKERS = 512
 _MAX_NAME_CHARS = 80
+_MAX_CATEGORY_ID_CHARS = 48
 _IMAGE_EXTENSIONS = {".gif", ".png", ".jpg", ".jpeg", ".webp"}
 # Cloudflare's bot policy rejects urllib's default user agent on the existing
 # static host. This is a fixed product identifier, not an auth credential.
@@ -54,6 +55,43 @@ def is_valid_sticker_name(value: Any) -> bool:
         return False
     forbidden = set("[]:/\\?#%")
     return all(unicodedata.category(ch)[0] != "C" and ch not in forbidden for ch in value)
+
+
+def _safe_display_label(raw: Any, fallback: str) -> str:
+    """Use an optional safe display label, otherwise preserve the token name.
+
+    Labels are never part of the ``[bqb:name]`` protocol or URL construction.
+    Treating malformed labels as absent preserves the sticker for older
+    manifests while keeping untrusted display text out of the catalog.
+    """
+    return raw if is_valid_sticker_name(raw) else fallback
+
+
+def is_valid_category_id(value: Any) -> bool:
+    """Return true only for a stable, wire-safe category identifier.
+
+    Category IDs are server-defined data that clients may cache and group by;
+    they are deliberately narrower than human-visible category names.  This
+    also prevents a manifest from smuggling a control sequence into a future
+    client implementation.
+    """
+    if not isinstance(value, str) or not (1 <= len(value) <= _MAX_CATEGORY_ID_CHARS):
+        return False
+    return all(
+        ("a" <= ch <= "z") or ("0" <= ch <= "9") or ch in {"-", "_"}
+        for ch in value
+    ) and value[0] not in {"-", "_"} and value[-1] not in {"-", "_"}
+
+
+def _safe_category(raw: Any) -> dict[str, str] | None:
+    """Validate category metadata as all-or-nothing optional data."""
+    if not isinstance(raw, dict):
+        return None
+    category_id = raw.get("id")
+    category_name = raw.get("name")
+    if not is_valid_category_id(category_id) or not is_valid_sticker_name(category_name):
+        return None
+    return {"id": category_id, "name": category_name}
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -100,7 +138,13 @@ def _safe_catalog_entry(item: Any, base_url: str) -> dict[str, str] | None:
     # impossible even when somebody accidentally publishes a bad manifest.
     if suffix not in _IMAGE_EXTENSIONS or stem != name:
         return None
-    return {"name": name, "url": f"{base_url}/{quote(filename, safe='-._~()')}"}
+    entry = {"name": name, "url": f"{base_url}/{quote(filename, safe='-._~()')}"}
+    label = _safe_display_label(item.get("label"), name)
+    # Omit the field when it is equivalent to the protocol token.  That keeps
+    # legacy payloads stable; newer clients fall back to `name` when absent.
+    if label != name:
+        entry["label"] = label
+    return entry
 
 
 @dataclass(frozen=True)
@@ -108,6 +152,8 @@ class _Source:
     manifest_path: Path | None
     manifest_url: str | None
     public_base_url: str
+    category: dict[str, str] | None
+    category_configured: bool
 
 
 class StickerCatalogService:
@@ -127,7 +173,12 @@ class StickerCatalogService:
         self.sources = self._parse_sources(cfg)
         self._lock = threading.Lock()
         self._cached_at = 0.0
-        self._cached: dict[str, Any] = {"ok": True, "version": "disabled", "stickers": []}
+        self._cached: dict[str, Any] = {
+            "ok": True,
+            "version": "disabled",
+            "categories": [],
+            "stickers": [],
+        }
 
     @staticmethod
     def _parse_sources(cfg: dict[str, Any]) -> tuple[_Source, ...]:
@@ -148,7 +199,24 @@ class StickerCatalogService:
             # it is allowed to end in .json and may have a path.
             if manifest_path is None and manifest_url is None:
                 continue
-            sources.append(_Source(manifest_path, manifest_url, base_url))
+            # Operator configuration takes priority over manifest metadata.  A
+            # partial or malformed config category is not repaired from the
+            # manifest: it yields no category, so a typo cannot silently put
+            # stickers into an unexpected group.
+            has_config_category = "category_id" in raw or "category_name" in raw
+            category = None
+            if has_config_category:
+                category = _safe_category({
+                    "id": raw.get("category_id"),
+                    "name": raw.get("category_name"),
+                })
+            sources.append(_Source(
+                manifest_path,
+                manifest_url,
+                base_url,
+                category,
+                has_config_category,
+            ))
         return tuple(sources)
 
     @staticmethod
@@ -173,8 +241,10 @@ class StickerCatalogService:
 
     def _build_catalog(self) -> dict[str, Any]:
         if not self.enabled or not self.sources:
-            return {"ok": True, "version": "disabled", "stickers": []}
+            return {"ok": True, "version": "disabled", "categories": [], "stickers": []}
         stickers: list[dict[str, str]] = []
+        categories: list[dict[str, str]] = []
+        categories_by_id: dict[str, dict[str, str]] = {}
         seen_names: set[str] = set()
         for source in self.sources:
             try:
@@ -187,10 +257,31 @@ class StickerCatalogService:
             raw_items = raw_manifest.get("stickers") if isinstance(raw_manifest, dict) else raw_manifest
             if not isinstance(raw_items, list):
                 continue
+            # A source category set in config wins over the manifest.  Without
+            # source config, a manifest may opt into a category, but only with
+            # a complete valid {id, name} object.  Bad metadata fails closed
+            # to uncategorised stickers and can never affect the token/URL.
+            category = source.category
+            if category is None and not source.category_configured and isinstance(raw_manifest, dict):
+                category = _safe_category(raw_manifest.get("category"))
+            category_id = category["id"] if category is not None else None
             for raw_item in raw_items:
                 entry = _safe_catalog_entry(raw_item, source.public_base_url)
                 if entry is None or entry["name"] in seen_names:
                     continue
+                if category_id is not None:
+                    # Return only categories that have a visible sticker.
+                    # Equal ID/name pairs merge across sources.  An ID reused
+                    # with a different name fails closed to uncategorised for
+                    # the conflicting source: the sticker remains visible but
+                    # is never silently placed in the first source's group.
+                    registered_category = categories_by_id.get(category_id)
+                    if registered_category is None:
+                        categories_by_id[category_id] = category
+                        categories.append(category)
+                        entry["category_id"] = category_id
+                    elif registered_category["name"] == category["name"]:
+                        entry["category_id"] = category_id
                 seen_names.add(entry["name"])
                 stickers.append(entry)
                 if len(stickers) >= self.max_items:
@@ -198,9 +289,13 @@ class StickerCatalogService:
             if len(stickers) >= self.max_items:
                 break
         fingerprint = hashlib.sha256(
-            json.dumps(stickers, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            json.dumps(
+                {"categories": categories, "stickers": stickers},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
         ).hexdigest()[:16]
-        return {"ok": True, "version": fingerprint, "stickers": stickers}
+        return {"ok": True, "version": fingerprint, "categories": categories, "stickers": stickers}
 
     def snapshot(self) -> dict[str, Any]:
         now = time.monotonic()

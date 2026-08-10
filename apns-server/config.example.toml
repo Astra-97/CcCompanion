@@ -229,9 +229,31 @@ server_url = "https://companion-vps2.xiaonancaleb.xyz"
 # names.  Add sticker files + regenerate the manifest on the static host; no
 # Android/PWA code update is required.
 #
+# A catalog response also carries `categories: [{ "id", "name" }]`; a
+# sticker with a category includes the matching stable `category_id`. Existing
+# clients/manifests remain compatible: old manifests simply yield an empty
+# category list and stickers without `category_id`.
+#
+# Categories are server data, so new categories need no Android/PWA update.
+# Prefer the operator-owned source `category_id` + `category_name` below. Both
+# are required together; malformed/partial values fail closed to uncategorised
+# stickers. If those two fields are absent, a manifest can safely provide a
+# top-level `{ "category": { "id": "xiaodou", "name": "小黄豆" } }`.
+# Source config wins over manifest metadata. IDs must be lower-case ASCII
+# letters/digits with internal `-`/`_`; names use the same safe rules as sticker
+# token names. Sources may merge only when both ID and name match. If a later
+# source reuses an ID with a different name, its stickers remain available but
+# fail closed to uncategorised instead of being placed in the first category.
+#
 # Each JSON manifest is `{ "version": 1, "stickers": [
-#   { "name": "憋不住笑了", "file": "憋不住笑了.gif" }
-# ] }`. `name` must be exactly the filename minus .gif/.png/.jpg/.jpeg/.webp.
+#   { "name": "哥哥熊·抱抱·2", "file": "哥哥熊·抱抱·2.gif", "label": "抱抱" }
+# ] }`. `name` is the immutable `[bqb:name]` token and must be globally unique
+# across all sources as well as exactly the filename minus
+# .gif/.png/.jpg/.jpeg/.webp. Optional `label` is only the picker display name,
+# so duplicate-looking stickers can use distinct filenames/tokens. It cannot
+# affect URL construction. It must be NFC, trimmed, at most 80 characters, and
+# contain no controls or protocol delimiters; an invalid/missing label falls
+# back to `name` and is omitted from the response for old-client compatibility.
 # Configure either a local `manifest_path` or an HTTPS `manifest_url`.
 [stickers]
 enabled = false
@@ -240,9 +262,13 @@ max_items = 512
 # [[stickers.sources]]
 # manifest_url = "https://test.xiaonancaleb.xyz/stickers/catalog.json"
 # public_base_url = "https://test.xiaonancaleb.xyz/stickers/"
+# category_id = "self-mockery-bear"
+# category_name = "自嘲熊"
 # [[stickers.sources]]
 # manifest_url = "https://test.xiaonancaleb.xyz/xiaodou/catalog.json"
 # public_base_url = "https://test.xiaonancaleb.xyz/xiaodou/"
+# category_id = "xiaodou"
+# category_name = "小黄豆"
 
 [xhs_login]
 # Android 专用 WebView 登录能力；nonce 最长十分钟且只可使用一次。
