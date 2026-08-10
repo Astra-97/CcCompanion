@@ -14188,6 +14188,7 @@ class PushHandler(BaseHTTPRequestHandler):
         "tag",
         "page",
         "per_page",
+        "sort_by",
         "sort_order",
         "cursor",
     )
@@ -14276,6 +14277,16 @@ class PushHandler(BaseHTTPRequestHandler):
                 value = str(requested_page_size)
             elif key == "sort_order":
                 if value not in ("asc", "desc"):
+                    continue
+            elif key == "sort_by":
+                # Only the paginated memory list owns this contract. Drop
+                # duplicates and unknown values instead of forwarding an
+                # ambiguous cursor fingerprint to another memory route.
+                if (
+                    upstream_path != "/api/memories"
+                    or len(values) != 1
+                    or value not in ("createdAt", "updatedAt")
+                ):
                     continue
             elif key == "cursor":
                 if len(raw_value) > 1024 or not re.fullmatch(r"[A-Za-z0-9_-]+", raw_value):

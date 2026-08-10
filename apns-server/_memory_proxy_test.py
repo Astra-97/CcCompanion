@@ -259,19 +259,47 @@ class MemoryProxyTest(unittest.TestCase):
 
     def test_paginated_list_params_are_forwarded_and_validated(self):
         _, captured = self.run_forward(
-            "/memory/list?page=3&per_page=50&sort_order=asc", []
+            "/memory/list?page=3&per_page=50&sort_by=updatedAt&sort_order=asc", []
         )
         self.assertEqual(
             captured["url"],
-            "https://memory.xiaonancaleb.xyz/api/memories?page=3&per_page=50&sort_order=asc",
+            "https://memory.xiaonancaleb.xyz/api/memories?page=3&per_page=50&sort_by=updatedAt&sort_order=asc",
         )
 
         _, captured = self.run_forward(
-            "/memory/list?page=oops&per_page=7&sort_order=sideways", []
+            "/memory/list?page=oops&per_page=7&sort_by=editedAt&sort_order=sideways", []
         )
         self.assertNotIn("page=", captured["url"])
         self.assertNotIn("per_page=", captured["url"])
+        self.assertNotIn("sort_by=", captured["url"])
         self.assertNotIn("sort_order=", captured["url"])
+
+    def test_list_sort_by_accepts_only_one_known_value(self):
+        for sort_by in ("createdAt", "updatedAt"):
+            _, captured = self.run_forward(f"/memory/list?sort_by={sort_by}", [])
+            self.assertEqual(
+                captured["url"],
+                f"https://memory.xiaonancaleb.xyz/api/memories?sort_by={sort_by}",
+            )
+
+        for query in (
+            "sort_by=created_at",
+            "sort_by=",
+            "sort_by=createdAt&sort_by=updatedAt",
+        ):
+            _, captured = self.run_forward(f"/memory/list?{query}", [])
+            self.assertNotIn("sort_by=", captured["url"])
+
+    def test_sort_by_is_not_forwarded_to_search_or_board(self):
+        _, captured = self.run_forward(
+            "/memory/semantic-search?query=abc&sort_by=updatedAt", [],
+        )
+        self.assertEqual(
+            captured["url"],
+            "https://memory.xiaonancaleb.xyz/api/semantic-search?query=abc",
+        )
+        _, captured = self.run_forward("/memory/board?sort_by=updatedAt", {})
+        self.assertEqual(captured["url"], "https://memory.xiaonancaleb.xyz/api/board")
 
     def test_paginated_board_params_are_forwarded(self):
         _, captured = self.run_forward(
