@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone full-duplex voice-call WebSocket server.
+"""Standalone turn-based voice-call WebSocket server.
 
 Endpoint: ws://0.0.0.0:8765/voice-call/stream
 
@@ -119,6 +119,23 @@ WS_CLOSE_TIMEOUT = _env_int("CC_VOICE_WS_CLOSE_TIMEOUT", 10)
 # Hard ceiling on a single ws.send(); a stalled client must not wedge the whole
 # session forever on a full TCP send buffer.
 WS_SEND_TIMEOUT_SEC = float(_env_int("CC_VOICE_WS_SEND_TIMEOUT_SEC", 30))
+TURN_TERMINAL_SEND_TIMEOUT_SEC = float(
+    _env_int("CC_VOICE_TURN_TERMINAL_SEND_TIMEOUT_SEC", 2)
+)
+TURN_TERMINAL_CLOSE_TIMEOUT_SEC = float(
+    _env_int("CC_VOICE_TURN_TERMINAL_CLOSE_TIMEOUT_SEC", 1)
+)
+
+# TTS delivery deliberately runs only a little ahead of the phone's playback
+# clock.  MiniMax can produce PCM much faster than real time; forwarding it at
+# provider speed used to leave Android with 10-15 seconds queued in AudioTrack,
+# so a reconnect or end-of-turn race sounded like speech was cut off.  Keep a
+# small cushion for jitter without turning the handset into the backpressure
+# buffer.  The first chunk is still sent immediately.
+TTS_PACING_LEAD_SEC = max(
+    0.0, float(_env_int("CC_VOICE_TTS_PACING_LEAD_MS", 200)) / 1000.0
+)
+TTS_BYTES_PER_SEC = SAMPLE_RATE * 2  # mono PCM s16le
 
 # Anti ASR hallucination (third line of defense): classic Whisper-style
 # hallucination phrases emitted on silence/noise. Matched against the
@@ -153,12 +170,31 @@ ASR_HALLUCINATION_SUBSTRINGS = ("字幕由", "amara.org")
 # types it asked for. That is the whole point: an APK built before a frame type
 # existed must keep seeing exactly the stream it was written against, so the
 # protocol can grow without a forced app update.
-SERVER_CAPABILITIES = ("thinking_frames", "app_ping", "error_severity")
+SERVER_CAPABILITIES = (
+    "thinking_frames",
+    "app_ping",
+    "error_severity",
+    "turn_accepted_v1",
+)
 # How often to remind a thinking_frames client that the LLM is still chewing.
 THINKING_TICK_SEC = float(_env_int("CC_VOICE_THINKING_TICK_SEC", 5))
 
 ASR_TIMEOUT_SEC = 90
-TTS_TIMEOUT_SEC = 90
+# A single absolute 90-second deadline used to include helper startup,
+# provider generation *and* real-time delivery to the phone.  A healthy long
+# reply could therefore be killed at 90 seconds.  Timeouts now describe the
+# actual failure modes: no first frame, no next frame while actively reading,
+# and a generous independent safety ceiling for the whole helper lifetime.
+TTS_FIRST_FRAME_TIMEOUT_SEC = float(
+    _env_int("CC_VOICE_TTS_FIRST_FRAME_TIMEOUT_SEC", 45)
+)
+TTS_FRAME_IDLE_TIMEOUT_SEC = float(
+    _env_int("CC_VOICE_TTS_FRAME_IDLE_TIMEOUT_SEC", 30)
+)
+TTS_TOTAL_TIMEOUT_SEC = float(_env_int("CC_VOICE_TTS_TOTAL_TIMEOUT_SEC", 900))
+# Compatibility alias for callers/tests that still patch the old name.  Its
+# meaning is now the first-frame timeout, not an absolute stream deadline.
+TTS_TIMEOUT_SEC = TTS_FIRST_FRAME_TIMEOUT_SEC
 LIVE_REPLY_TIMEOUT_SEC = 180
 # Halved from 1.0s: this poll is a loopback HTTP call, and the old interval added
 # up to a full second of dead air to *every* turn after the reply had already
@@ -595,7 +631,103 @@ async def _read_exact(stream: asyncio.StreamReader, n: int) -> bytes:
         return bytes(e.partial)
 
 
-async def stream_stackchan_tts(text: str, timeout: float):
+class _TtsReadInterrupted(Exception):
+    """Internal control flow: the caller interrupted a blocked helper read."""
+
+
+class _TtsSendInterrupted(Exception):
+    """Internal control flow: the caller interrupted a blocked WS send."""
+
+
+async def _read_exact_interruptibly(
+    stream: asyncio.StreamReader,
+    n: int,
+    *,
+    deadline: float,
+    interrupt_event: Optional[asyncio.Event],
+) -> bytes:
+    """Read one frame segment against one absolute deadline.
+
+    Header and payload callers pass the same deadline.  This prevents a slow
+    producer from earning a fresh timeout merely by dribbling a header before
+    stalling on its payload.
+    """
+    loop = asyncio.get_running_loop()
+    remaining = deadline - loop.time()
+    if remaining <= 0:
+        raise asyncio.TimeoutError
+    read_task = asyncio.create_task(_read_exact(stream, n))
+    interrupt_task: Optional[asyncio.Task] = None
+    waiters: set[asyncio.Task] = {read_task}
+    if interrupt_event is not None:
+        if interrupt_event.is_set():
+            read_task.cancel()
+            with contextlib.suppress(BaseException):
+                await read_task
+            raise _TtsReadInterrupted
+        interrupt_task = asyncio.create_task(interrupt_event.wait())
+        waiters.add(interrupt_task)
+    try:
+        done, _pending = await asyncio.wait(
+            waiters,
+            timeout=remaining,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            raise asyncio.TimeoutError
+        if interrupt_task is not None and interrupt_task in done:
+            raise _TtsReadInterrupted
+        return read_task.result()
+    finally:
+        for task in waiters:
+            if not task.done():
+                task.cancel()
+        for task in waiters:
+            with contextlib.suppress(BaseException):
+                await task
+
+
+async def _send_tts_chunk_interruptibly(
+    ws: ServerConnection,
+    payload: bytes,
+    *,
+    interrupt_event: asyncio.Event,
+    timeout: float,
+) -> None:
+    """Send one PCM frame while allowing an interrupt to win immediately."""
+    if interrupt_event.is_set():
+        raise _TtsSendInterrupted
+    send_task = asyncio.create_task(ws.send(payload))
+    interrupt_task = asyncio.create_task(interrupt_event.wait())
+    waiters = {send_task, interrupt_task}
+    try:
+        done, _pending = await asyncio.wait(
+            waiters,
+            timeout=max(0.001, timeout),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            raise asyncio.TimeoutError
+        if interrupt_task in done:
+            raise _TtsSendInterrupted
+        send_task.result()
+    finally:
+        for task in waiters:
+            if not task.done():
+                task.cancel()
+        for task in waiters:
+            with contextlib.suppress(BaseException):
+                await task
+
+
+async def stream_stackchan_tts(
+    text: str,
+    timeout: float,
+    *,
+    idle_timeout: float = TTS_FRAME_IDLE_TIMEOUT_SEC,
+    total_timeout: float = TTS_TOTAL_TIMEOUT_SEC,
+    interrupt_event: Optional[asyncio.Event] = None,
+):
     """Spawn ``stackchan_voice_call.py tts_stream`` and yield framed events.
 
     Yields ``("meta", dict)`` once, then ``("pcm", bytes)`` per chunk, then
@@ -631,20 +763,47 @@ async def stream_stackchan_tts(text: str, timeout: float):
 
     try:
         assert proc.stdout is not None
-        deadline = asyncio.get_running_loop().time() + timeout
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        total_deadline = started_at + total_timeout
+        first_pcm_deadline = min(total_deadline, started_at + timeout)
+        saw_audio = False
+        next_frame_deadline: Optional[float] = None
         while True:
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                yield ("error", "tts_stream helper timed out")
+            if interrupt_event is not None and interrupt_event.is_set():
+                return
+            now = loop.time()
+            if now >= total_deadline:
+                yield ("error", "tts_stream helper total timeout")
                 with contextlib.suppress(ProcessLookupError):
                     proc.kill()
                 return
+            # META and unknown frames never refresh either phase.  Before the
+            # first non-empty PCM, all header+payload reads share the original
+            # first-PCM deadline.  Thereafter each complete valid PCM gives the
+            # *next* complete frame one idle window; header and payload share it.
+            if saw_audio:
+                if next_frame_deadline is None:
+                    next_frame_deadline = min(
+                        total_deadline, loop.time() + max(0.001, idle_timeout)
+                    )
+                frame_deadline = next_frame_deadline
+            else:
+                frame_deadline = first_pcm_deadline
             try:
-                header = await asyncio.wait_for(
-                    _read_exact(proc.stdout, 7), timeout=remaining
+                header = await _read_exact_interruptibly(
+                    proc.stdout,
+                    7,
+                    deadline=frame_deadline,
+                    interrupt_event=interrupt_event,
                 )
+            except _TtsReadInterrupted:
+                return
             except asyncio.TimeoutError:
-                yield ("error", "tts_stream helper timed out")
+                timed_out = "total" if loop.time() >= total_deadline else (
+                    "frame idle" if saw_audio else "first frame"
+                )
+                yield ("error", f"tts_stream helper {timed_out} timeout")
                 with contextlib.suppress(ProcessLookupError):
                     proc.kill()
                 return
@@ -665,7 +824,26 @@ async def stream_stackchan_tts(text: str, timeout: float):
                 with contextlib.suppress(ProcessLookupError):
                     proc.kill()
                 return
-            payload = await _read_exact(proc.stdout, length) if length else b""
+            if length:
+                try:
+                    payload = await _read_exact_interruptibly(
+                        proc.stdout,
+                        length,
+                        deadline=frame_deadline,
+                        interrupt_event=interrupt_event,
+                    )
+                except _TtsReadInterrupted:
+                    return
+                except asyncio.TimeoutError:
+                    timed_out = "total" if loop.time() >= total_deadline else (
+                        "frame idle" if saw_audio else "first frame"
+                    )
+                    yield ("error", f"tts_stream helper {timed_out} timeout")
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.kill()
+                    return
+            else:
+                payload = b""
             if length and len(payload) != length:
                 yield ("error", "tts_stream truncated payload")
                 return
@@ -675,7 +853,16 @@ async def stream_stackchan_tts(text: str, timeout: float):
                 except Exception:
                     yield ("meta", {})
             elif ftype == _TTS_FRAME_PCM:
-                yield ("pcm", payload)
+                if payload:
+                    saw_audio = True
+                    yield ("pcm", payload)
+                    # Consumer-side playback pacing may suspend this generator;
+                    # start the provider idle clock only when reading resumes.
+                    next_frame_deadline = min(
+                        total_deadline, loop.time() + max(0.001, idle_timeout)
+                    )
+                else:
+                    yield ("pcm", payload)
             elif ftype == _TTS_FRAME_END:
                 yield ("end", None)
                 return
@@ -694,11 +881,16 @@ async def stream_stackchan_tts(text: str, timeout: float):
             stderr_task.cancel()
             with contextlib.suppress(BaseException):
                 await stderr_task
-        with contextlib.suppress(ProcessLookupError):
-            if proc.returncode is None:
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
                 proc.terminate()
-        with contextlib.suppress(BaseException):
-            await asyncio.wait_for(proc.wait(), timeout=2)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=0.5)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                with contextlib.suppress(BaseException):
+                    await asyncio.wait_for(proc.wait(), timeout=0.5)
 
 
 def write_wav(path: Path, pcm: bytes, *, sample_rate: int = SAMPLE_RATE) -> None:
@@ -848,7 +1040,67 @@ async def send_json(ws: ServerConnection, payload: dict[str, Any]) -> None:
         raise
 
 
-async def send_error(ws: ServerConnection, msg: str, *, fatal: bool = False) -> None:
+class TurnTerminalDeliveryError(Exception):
+    """An accepted turn could not deliver its terminal state."""
+
+
+async def _force_reconnect_after_terminal_failure(
+    ws: ServerConnection,
+    *,
+    terminal_type: str,
+    turn_id: str,
+) -> None:
+    """Boundedly close, then abort if needed, so a muted client reconnects."""
+    logger.warning(
+        "voice_turn_terminal_failed type=%s turn_id=%s action=reconnect",
+        terminal_type,
+        turn_id or "-",
+    )
+    close = getattr(ws, "close", None)
+    if callable(close) and getattr(ws, "close_code", None) is None:
+        try:
+            await asyncio.wait_for(
+                close(code=1011, reason="turn terminal delivery failed"),
+                timeout=max(0.05, TURN_TERMINAL_CLOSE_TIMEOUT_SEC),
+            )
+        except Exception:
+            pass
+    if getattr(ws, "close_code", None) is None:
+        transport = getattr(ws, "transport", None)
+        abort = getattr(transport, "abort", None)
+        if callable(abort):
+            with contextlib.suppress(Exception):
+                abort()
+
+
+async def send_turn_terminal_json(
+    ws: ServerConnection,
+    payload: dict[str, Any],
+) -> None:
+    """Deliver an accepted-turn terminal or force the socket to reconnect."""
+    terminal_type = str(payload.get("type") or "unknown")
+    turn_id = str(payload.get("turn_id") or "")
+    try:
+        await asyncio.wait_for(
+            send_json(ws, payload),
+            timeout=max(0.05, TURN_TERMINAL_SEND_TIMEOUT_SEC),
+        )
+    except Exception as exc:
+        await _force_reconnect_after_terminal_failure(
+            ws, terminal_type=terminal_type, turn_id=turn_id
+        )
+        raise TurnTerminalDeliveryError(
+            f"{terminal_type} delivery failed"
+        ) from exc
+
+
+async def send_error(
+    ws: ServerConnection,
+    msg: str,
+    *,
+    fatal: bool = False,
+    turn_id: str = "",
+) -> None:
     """Send an error frame tagged with whether the *call* is over.
 
     Historically every error frame looked identical, so the Android client tore
@@ -856,7 +1108,111 @@ async def send_error(ws: ServerConnection, msg: str, *, fatal: bool = False) -> 
     "this turn didn't work, say it again" from "this session can never work".
     Old clients ignore the extra key.
     """
-    await send_json(ws, {"type": "error", "msg": msg, "fatal": fatal})
+    payload: dict[str, Any] = {"type": "error", "msg": msg, "fatal": fatal}
+    if turn_id:
+        payload["turn_id"] = turn_id
+        await send_turn_terminal_json(ws, payload)
+    else:
+        await send_json(ws, payload)
+
+
+async def send_turn_accepted(
+    ws: ServerConnection,
+    capabilities: frozenset,
+    *,
+    session_id: str,
+    turn_id: str,
+    speech_ms: int,
+) -> bool:
+    """Tell a capable client that endpointing is complete and it may mute.
+
+    This must only be called *after* VAD has received its full trailing-silence
+    window.  Sending it when speech merely starts would make a strict
+    half-duplex client mute before the server can ever finish endpointing.
+    """
+    if "turn_accepted_v1" not in capabilities:
+        return False
+    await send_json(
+        ws,
+        {
+            "type": "turn_accepted",
+            "turn_id": turn_id,
+            "speech_ms": max(0, int(speech_ms)),
+        },
+    )
+    logger.info(
+        "voice_turn_event=%s",
+        json.dumps(
+            {
+                "event": "turn_accepted_sent",
+                "session_id": session_id or "-",
+                "turn_id": turn_id or "-",
+                "speech_ms": max(0, int(speech_ms)),
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ),
+    )
+    return True
+
+
+TURN_RELEASE_REASONS = frozenset(
+    {
+        "audio_too_short",
+        "asr_ghost_rejected",
+        "asr_hallucination_rejected",
+        "empty_transcript",
+        "empty_reply",
+        "interrupted_pre_tts",
+        "tts_not_started",
+        "internal_abort",
+    }
+)
+
+
+async def send_turn_released(
+    ws: ServerConnection,
+    capabilities: frozenset,
+    *,
+    session_id: str,
+    turn_id: str,
+    reason_code: str,
+) -> bool:
+    """Release a negotiated accepted turn that produced no TTS terminal.
+
+    ``tts_end``, ``tts_interrupted`` and ``error`` remain their own terminal
+    frames.  This frame only closes silent/filtered/pre-TTS paths.  Old clients
+    never receive it, and a socket already known closed is not written to.
+    """
+    if "turn_accepted_v1" not in capabilities:
+        return False
+    if getattr(ws, "close_code", None) is not None:
+        return False
+    safe_reason = (
+        reason_code if reason_code in TURN_RELEASE_REASONS else "internal_abort"
+    )
+    await send_turn_terminal_json(
+        ws,
+        {
+            "type": "turn_released",
+            "turn_id": turn_id,
+            "reason_code": safe_reason,
+        },
+    )
+    logger.info(
+        "voice_turn_event=%s",
+        json.dumps(
+            {
+                "event": "turn_released_sent",
+                "session_id": session_id or "-",
+                "turn_id": turn_id or "-",
+                "reason_code": safe_reason,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ),
+    )
+    return True
 
 
 @contextlib.asynccontextmanager
@@ -933,12 +1289,107 @@ async def stream_tts_audio(
     return True
 
 
+def _tts_pacing_delay(
+    *,
+    audio_started_at: float,
+    now: float,
+    bytes_sent: int,
+    next_bytes: int,
+    lead_sec: float,
+) -> float:
+    """Return how long to wait before sending the next PCM frame.
+
+    The calculation includes ``next_bytes``, which bounds the queue after the
+    send instead of merely before it.  A first frame smaller than the lead is
+    immediate, preserving time-to-first-audio.
+    """
+    audio_after_send = (bytes_sent + next_bytes) / TTS_BYTES_PER_SEC
+    playback_elapsed = max(0.0, now - audio_started_at)
+    return max(0.0, audio_after_send - playback_elapsed - max(0.0, lead_sec))
+
+
+def _tts_log_event(
+    event: str,
+    *,
+    session_id: str,
+    turn_id: str,
+    info: dict[str, Any],
+    reason: str = "",
+    elapsed_ms: Optional[int] = None,
+) -> None:
+    """Write a machine-readable TTS lifecycle event without reply text."""
+    payload: dict[str, Any] = {
+        "event": event,
+        "session_id": session_id or "-",
+        "turn_id": turn_id or "-",
+        "bytes": int(info.get("bytes") or 0),
+        "frames": int(info.get("frames") or info.get("chunks") or 0),
+        "elapsed_ms": int(
+            (info.get("total_ms") or 0) if elapsed_ms is None else elapsed_ms
+        ),
+    }
+    if reason:
+        # Keep the journal useful without logging provider/user content.
+        payload["reason"] = reason[:64]
+    logger.info(
+        "voice_tts_event=%s",
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+    )
+
+
+def _tts_error_reason(error: str) -> str:
+    value = (error or "").lower()
+    if "first frame timeout" in value:
+        return "provider_first_frame_timeout"
+    if "frame idle timeout" in value:
+        return "provider_frame_idle_timeout"
+    if "total timeout" in value:
+        return "provider_total_timeout"
+    if "send timeout" in value:
+        return "ws_send_timeout"
+    if "ws closed" in value:
+        return "ws_closed"
+    if "protocol" in value or "truncated" in value:
+        return "helper_protocol"
+    return "provider_or_helper"
+
+
+async def send_tts_terminal_frame(
+    ws: ServerConnection,
+    frame_type: str,
+    *,
+    session_id: str,
+    turn_id: str,
+    info: dict[str, Any],
+) -> None:
+    """Send a backward-compatible terminal frame and record its lifecycle."""
+    await send_turn_terminal_json(
+        ws,
+        {
+            "type": frame_type,
+            "turn_id": turn_id,
+            "bytes": int(info.get("bytes") or 0),
+            "frames": int(info.get("frames") or info.get("chunks") or 0),
+            "elapsed_ms": int(info.get("total_ms") or 0),
+        },
+    )
+    event = "tts_end_sent" if frame_type == "tts_end" else "tts_interrupted_sent"
+    _tts_log_event(
+        event, session_id=session_id, turn_id=turn_id, info=info
+    )
+
+
 async def stream_tts_from_helper(
     ws: ServerConnection,
     text: str,
     interrupt_event: asyncio.Event,
     *,
     timeout: float = TTS_TIMEOUT_SEC,
+    idle_timeout: float = TTS_FRAME_IDLE_TIMEOUT_SEC,
+    total_timeout: float = TTS_TOTAL_TIMEOUT_SEC,
+    pacing_lead_sec: float = TTS_PACING_LEAD_SEC,
+    session_id: str = "-",
+    turn_id: str = "-",
 ) -> tuple[bool, dict[str, Any]]:
     """Real-streaming TTS path.
 
@@ -946,19 +1397,22 @@ async def stream_tts_from_helper(
     chunk to the WebSocket the moment it arrives from MiniMax. Returns
     ``(completed, info)`` where ``info`` records timing / chunk counts.
 
-    The Android side already accepts arbitrary-size binary frames and feeds
-    them to ``AudioTrack`` in MODE_STREAM, so we don't need to slice into 20ms
-    pieces here — passing through MiniMax's own chunking minimizes first-audio
-    latency.
+    The Android side accepts arbitrary-size binary frames and feeds them to
+    ``AudioTrack`` in MODE_STREAM.  Provider chunks are capped and paced close
+    to the playback clock: the first audio remains immediate, while the phone
+    never becomes a many-seconds-deep queue for a fast provider.
     """
     info: dict[str, Any] = {
         "chunks": 0,
+        "frames": 0,
         "bytes": 0,
         "first_chunk_ms": None,
         "total_ms": None,
         "sample_rate": SAMPLE_RATE,
         "source_sample_rate": None,
         "started": False,
+        "last_ws_send_ms": None,
+        "provider_end_ms": None,
     }
     t0 = time.monotonic()
     ratecv_state = None
@@ -966,8 +1420,16 @@ async def stream_tts_from_helper(
     started = False
     interrupted = False
     error: Optional[str] = None
+    provider_ended = False
+    audio_started_at: Optional[float] = None
 
-    async for kind, data in stream_stackchan_tts(text, timeout=timeout):
+    async for kind, data in stream_stackchan_tts(
+        text,
+        timeout=timeout,
+        idle_timeout=idle_timeout,
+        total_timeout=total_timeout,
+        interrupt_event=interrupt_event,
+    ):
         if interrupt_event.is_set():
             interrupted = True
             break
@@ -976,7 +1438,21 @@ async def stream_tts_from_helper(
             info["source_sample_rate"] = source_sr
         elif kind == "pcm":
             if not started:
-                await send_json(ws, {"type": "tts_start", "sampleRate": SAMPLE_RATE})
+                try:
+                    await send_json(
+                        ws,
+                        {
+                            "type": "tts_start",
+                            "sampleRate": SAMPLE_RATE,
+                            "encoding": "pcm_s16le",
+                            "channels": 1,
+                            "sampleWidthBytes": 2,
+                            "turn_id": turn_id,
+                        },
+                    )
+                except ConnectionClosed:
+                    error = "ws closed before tts_start"
+                    break
                 started = True
                 info["started"] = True
             pcm_chunk: bytes = data  # type: ignore[assignment]
@@ -994,11 +1470,40 @@ async def stream_tts_from_helper(
                     sent_all = False
                     break
                 part = pcm_chunk[offset : offset + MAX_TTS_CHUNK_BYTES]
+                now = time.monotonic()
+                if audio_started_at is None:
+                    audio_started_at = now
+                delay = _tts_pacing_delay(
+                    audio_started_at=audio_started_at,
+                    now=now,
+                    bytes_sent=int(info["bytes"]),
+                    next_bytes=len(part),
+                    lead_sec=pacing_lead_sec,
+                )
+                if delay > 0:
+                    try:
+                        await asyncio.wait_for(interrupt_event.wait(), timeout=delay)
+                    except asyncio.TimeoutError:
+                        pass
+                    if interrupt_event.is_set():
+                        interrupted = True
+                        sent_all = False
+                        break
                 try:
                     # Guard the send: on a stalled client the TCP send buffer
                     # fills and a bare `await ws.send()` would hang this session
-                    # forever with no diagnostic.
-                    await asyncio.wait_for(ws.send(part), timeout=WS_SEND_TIMEOUT_SEC)
+                    # forever.  Race it with the turn interrupt as well, so a
+                    # user never waits up to the send timeout to stop playback.
+                    await _send_tts_chunk_interruptibly(
+                        ws,
+                        part,
+                        interrupt_event=interrupt_event,
+                        timeout=WS_SEND_TIMEOUT_SEC,
+                    )
+                except _TtsSendInterrupted:
+                    interrupted = True
+                    sent_all = False
+                    break
                 except ConnectionClosed:
                     error = "ws closed"
                     sent_all = False
@@ -1013,23 +1518,60 @@ async def stream_tts_from_helper(
                 if info["first_chunk_ms"] is None:
                     info["first_chunk_ms"] = int((time.monotonic() - t0) * 1000)
                 info["chunks"] += 1
+                info["frames"] += 1
                 info["bytes"] += len(part)
+                info["last_ws_send_ms"] = int((time.monotonic() - t0) * 1000)
             if not sent_all:
                 break
         elif kind == "end":
+            provider_ended = True
+            info["total_ms"] = int((time.monotonic() - t0) * 1000)
+            info["provider_end_ms"] = info["total_ms"]
+            _tts_log_event(
+                "provider_end",
+                session_id=session_id,
+                turn_id=turn_id,
+                info=info,
+            )
             break
         elif kind == "error":
             error = str(data)
             break
 
+    if interrupt_event.is_set():
+        interrupted = True
     info["total_ms"] = int((time.monotonic() - t0) * 1000)
+    if info["frames"]:
+        _tts_log_event(
+            "last_ws_send",
+            session_id=session_id,
+            turn_id=turn_id,
+            info=info,
+            elapsed_ms=int(info.get("last_ws_send_ms") or 0),
+        )
+    if interrupted:
+        _tts_log_event(
+            "interrupted",
+            session_id=session_id,
+            turn_id=turn_id,
+            info=info,
+            reason="client_interrupt",
+        )
+    elif error:
+        _tts_log_event(
+            "error",
+            session_id=session_id,
+            turn_id=turn_id,
+            info=info,
+            reason=_tts_error_reason(error),
+        )
     if error and not started:
         # Nothing was streamed — report the error to the caller.
         info["error"] = error
         return False, info
     if error:
         info["error"] = error
-    completed = started and not interrupted and not error
+    completed = started and provider_ended and not interrupted and not error
     return completed, info
 
 
@@ -1040,15 +1582,27 @@ async def handle_utterance(
     contact_id: str,
     speech_ms: int = 0,
     capabilities: frozenset = frozenset(),
+    session_id: str = "-",
+    turn_id: str = "-",
 ) -> None:
     """ASR -> LLM -> TTS for a single utterance. Caller has already cleared
     interrupt_event."""
-    if len(pcm) < FRAME_BYTES * 5:  # < ~100ms — too short
-        return
-
     wav_path = Path(f"/tmp/voice_ws_{uuid.uuid4().hex}.wav")
     tts_path: Optional[Path] = None
+    terminal_sent = False
+    release_reason = "internal_abort"
+
+    async def turn_error(msg: str, *, fatal: bool = False) -> None:
+        nonlocal terminal_sent
+        # Mark before awaiting: delivery failure already forces reconnect and
+        # must not trigger a second, competing turn_released send in finally.
+        terminal_sent = True
+        await send_error(ws, msg, fatal=fatal, turn_id=turn_id)
+
     try:
+        if len(pcm) < FRAME_BYTES * 5:  # < ~100ms — too short
+            release_reason = "audio_too_short"
+            return
         write_wav(wav_path, bytes(pcm))
 
         # --- ASR -------------------------------------------------------
@@ -1056,10 +1610,11 @@ async def handle_utterance(
             ["asr", "--input", str(wav_path)], timeout=ASR_TIMEOUT_SEC
         )
         if interrupt_event.is_set():
+            release_reason = "interrupted_pre_tts"
             return
         if not ok:
             # Per-turn failure, not a dead call: say it again.
-            await send_error(ws, f"asr failed: {payload.get('error') or 'unknown'}")
+            await turn_error(f"asr failed: {payload.get('error') or 'unknown'}")
             return
         transcript = str(payload.get("transcript") or "").strip()
         # Anti ASR hallucination (second line of defense): a single-character
@@ -1071,9 +1626,9 @@ async def handle_utterance(
             if not ch.isspace() and not unicodedata.category(ch).startswith("P")
         )
         if len(core) <= 1 and speech_ms < ASR_SINGLE_CHAR_MIN_MS:
+            release_reason = "asr_ghost_rejected"
             logger.info(
-                "asr: dropped ghost transcript %r speech=%dms (<%dms)",
-                transcript,
+                "asr: dropped ghost transcript speech=%dms (<%dms)",
                 speech_ms,
                 ASR_SINGLE_CHAR_MIN_MS,
             )
@@ -1086,14 +1641,19 @@ async def handle_utterance(
         if core_lower in ASR_HALLUCINATION_BLACKLIST or any(
             marker in transcript_lower for marker in ASR_HALLUCINATION_SUBSTRINGS
         ):
-            logger.info("asr: dropped hallucination blacklist %r", transcript)
+            release_reason = "asr_hallucination_rejected"
+            logger.info("asr: dropped hallucination blacklist")
             return
-        await send_json(ws, {"type": "asr_final", "text": transcript})
+        await send_json(
+            ws, {"type": "asr_final", "text": transcript, "turn_id": turn_id}
+        )
         if not transcript:
+            release_reason = "empty_transcript"
             return
 
         # --- LLM -------------------------------------------------------
         if interrupt_event.is_set():
+            release_reason = "interrupted_pre_tts"
             return
         # The LLM leg is the long one (a Claude Code turn is routinely 30-60s).
         # Keep a `thinking` drip going for clients that asked for it so neither
@@ -1102,7 +1662,7 @@ async def handle_utterance(
             try:
                 mgr = get_ai_manager()
             except Exception as e:
-                await send_error(ws, f"ai_chat init failed: {e}", fatal=True)
+                await turn_error(f"ai_chat init failed: {e}", fatal=True)
                 return
 
             loop = asyncio.get_running_loop()
@@ -1110,13 +1670,14 @@ async def handle_utterance(
                 async with thinking_ticker(ws, capabilities, interrupt_event):
                     result = await loop.run_in_executor(None, mgr.send_message, transcript)
             except Exception as e:
-                await send_error(ws, f"llm failed: {e}")
+                await turn_error(f"llm failed: {e}")
                 return
             if interrupt_event.is_set():
+                release_reason = "interrupted_pre_tts"
                 return
             if not isinstance(result, dict) or not result.get("ok"):
                 err = (result or {}).get("error") if isinstance(result, dict) else "llm error"
-                await send_error(ws, f"llm: {err}")
+                await turn_error(f"llm: {err}")
                 return
             reply_text = str(result.get("reply") or "").strip()
         elif contact_id in {"xiaoke", "kairos"}:
@@ -1126,24 +1687,36 @@ async def handle_utterance(
                         contact_id, transcript, interrupt_event
                     )
             except Exception as e:
-                await send_error(ws, f"live chat: {e}")
+                await turn_error(f"live chat: {e}")
                 return
             if interrupt_event.is_set():
+                release_reason = "interrupted_pre_tts"
                 return
         else:
-            await send_error(
-                ws, f"voice call contact not supported: {contact_id}", fatal=True
+            await turn_error(
+                f"voice call contact not supported: {contact_id}", fatal=True
             )
             return
-        await send_json(ws, {"type": "reply_text", "text": reply_text})
+        await send_json(
+            ws, {"type": "reply_text", "text": reply_text, "turn_id": turn_id}
+        )
         if not reply_text:
+            release_reason = "empty_reply"
             return
 
         # --- TTS (real streaming) --------------------------------------
         if interrupt_event.is_set():
+            release_reason = "interrupted_pre_tts"
             return
         completed, info = await stream_tts_from_helper(
-            ws, reply_text, interrupt_event, timeout=TTS_TIMEOUT_SEC
+            ws,
+            reply_text,
+            interrupt_event,
+            timeout=TTS_FIRST_FRAME_TIMEOUT_SEC,
+            idle_timeout=TTS_FRAME_IDLE_TIMEOUT_SEC,
+            total_timeout=TTS_TOTAL_TIMEOUT_SEC,
+            session_id=session_id,
+            turn_id=turn_id,
         )
         if info.get("started"):
             logger.info(
@@ -1155,15 +1728,41 @@ async def handle_utterance(
                 info.get("source_sample_rate"),
             )
         if completed:
-            await send_json(ws, {"type": "tts_end"})
+            terminal_sent = True
+            await send_tts_terminal_frame(
+                ws,
+                "tts_end",
+                session_id=session_id,
+                turn_id=turn_id,
+                info=info,
+            )
         elif interrupt_event.is_set():
-            await send_json(ws, {"type": "tts_interrupted"})
+            if info.get("started"):
+                terminal_sent = True
+                await send_tts_terminal_frame(
+                    ws,
+                    "tts_interrupted",
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    info=info,
+                )
+            else:
+                # Never send tts_interrupted without a preceding tts_start;
+                # Android intentionally ignores that orphan terminal.
+                release_reason = "interrupted_pre_tts"
         elif info.get("error"):
-            await send_error(ws, f"tts: {info['error']}")
+            await turn_error(f"tts: {info['error']}")
         else:
-            # Started but ws closed mid-stream — nothing to report.
-            pass
+            release_reason = "tts_not_started"
     finally:
+        if not terminal_sent:
+            await send_turn_released(
+                ws,
+                capabilities,
+                session_id=session_id,
+                turn_id=turn_id,
+                reason_code=release_reason,
+            )
         with contextlib.suppress(Exception):
             wav_path.unlink(missing_ok=True)
         if tts_path is not None:
@@ -1181,9 +1780,13 @@ class Session:
         self.interrupt_event = asyncio.Event()
         self.end_event = asyncio.Event()
         self.current_task: Optional[asyncio.Task] = None
+        self.turn_active = False
         self.started = False
         self.close_reason: str = "unknown"
         self.opened_at = time.monotonic()
+        # Random, short-lived correlation only.  It contains no contact,
+        # transcript, account, device or peer information.
+        self.session_id = uuid.uuid4().hex[:12]
         # Negotiated in the `start` frame; empty means "old client, send it
         # nothing it wasn't built for".
         self.capabilities: frozenset = frozenset()
@@ -1208,6 +1811,12 @@ class Session:
         async for message in self.ws:
             if isinstance(message, (bytes, bytearray)):
                 if not self.started:
+                    continue
+                # Once VAD has accepted a turn, thinking + TTS are strictly
+                # half-duplex.  New clients mute on `turn_accepted`; this
+                # server-side guard also prevents late/in-flight frames (and
+                # legacy-client echo) from becoming the next utterance.
+                if self.turn_active:
                     continue
                 data = bytes(message)
                 # Slice into FRAME_BYTES chunks if client sends bigger.
@@ -1311,7 +1920,28 @@ class Session:
                 )
                 continue
 
+            turn_id = uuid.uuid4().hex[:12]
+            self.turn_active = True
+            # Clear any stale interrupt from the previous turn *before* the
+            # accepted frame.  A fresh interrupt racing with that send must
+            # remain set; clearing afterwards used to swallow it.
             self.interrupt_event.clear()
+            # Endpointing is complete here (including VAD_SILENCE_END_MS), so
+            # it is now safe for a negotiated strict-half-duplex client to
+            # close its mic.  Drain frames already queued behind the accepted
+            # endpoint; they belong to this turn's trailing silence.
+            while True:
+                try:
+                    self.audio_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            await send_turn_accepted(
+                self.ws,
+                self.capabilities,
+                session_id=self.session_id,
+                turn_id=turn_id,
+                speech_ms=speech_ms,
+            )
 
             # Run ASR/LLM/TTS as a cancellable task so a fresh `interrupt`
             # arriving mid-stream cleanly aborts the send loop.
@@ -1323,6 +1953,8 @@ class Session:
                     self.contact_id,
                     speech_ms,
                     self.capabilities,
+                    self.session_id,
+                    turn_id,
                 )
             )
             try:
@@ -1331,10 +1963,18 @@ class Session:
                 pass
             except ConnectionClosed:
                 return
+            except TurnTerminalDeliveryError as exc:
+                # The terminal helper has already closed/aborted the socket.
+                # End this pipeline as well; continuing would leave a capable
+                # Android client muted with no matching terminal frame.
+                self.close_reason = str(exc)
+                self.end_event.set()
+                return
             except Exception:
                 logger.exception("utterance handler crashed")
             finally:
                 self.current_task = None
+                self.turn_active = False
 
     async def run(self) -> None:
         recv = asyncio.create_task(self.recv_loop(), name="ws-recv")
@@ -1457,6 +2097,14 @@ async def amain() -> None:
         WS_PING_TIMEOUT,
         WS_CLOSE_TIMEOUT,
         WS_SEND_TIMEOUT_SEC,
+    )
+    logger.info(
+        "tts: pacing_lead=%dms first_frame_timeout=%ss frame_idle_timeout=%ss "
+        "total_timeout=%ss",
+        int(TTS_PACING_LEAD_SEC * 1000),
+        TTS_FIRST_FRAME_TIMEOUT_SEC,
+        TTS_FRAME_IDLE_TIMEOUT_SEC,
+        TTS_TOTAL_TIMEOUT_SEC,
     )
     logger.info(
         "vad: speak_rms=%d silence_rms=%d silence_end=%dms preroll=%dms "

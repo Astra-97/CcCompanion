@@ -153,6 +153,7 @@ check(
 )
 check("app_ping advertised", "app_ping" in V.SERVER_CAPABILITIES)
 check("error_severity advertised", "error_severity" in V.SERVER_CAPABILITIES)
+check("turn_accepted_v1 advertised", "turn_accepted_v1" in V.SERVER_CAPABILITIES)
 
 print()
 if failures:
