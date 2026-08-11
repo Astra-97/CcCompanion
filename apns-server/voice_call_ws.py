@@ -25,6 +25,7 @@ import io
 import json
 import logging
 import os
+import functools
 import struct
 import sys
 import time
@@ -48,6 +49,7 @@ from voice_protocol import (
     VOICE_REPLY_TOKEN_FIELD,
     generate_voice_reply_token,
     load_or_create_voice_internal_token,
+    normalize_voice_mode,
 )
 
 # ---------------------------------------------------------------------------
@@ -108,6 +110,13 @@ ASR_SINGLE_CHAR_MIN_MS = _env_int("CC_VOICE_ASR_SINGLE_CHAR_MIN_MS", 900)
 # or drop the start of every sentence.
 VAD_PREROLL_MS = _env_int("CC_VOICE_VAD_PREROLL_MS", 300)
 VAD_PREROLL_FRAMES = max(0, VAD_PREROLL_MS // FRAME_MS)
+# A human takeover normally terminates autonomous speech within a handful of
+# frames.  Bound the exceptional stalled-terminal case while retaining the
+# full prefix of one maximum-length utterance plus its endpoint silence.
+CONTINUATION_TAKEOVER_MAX_FRAMES = max(
+    VAD_PREROLL_FRAMES + 1,
+    (MAX_UTTERANCE_MS + VAD_SILENCE_END_MS) // FRAME_MS,
+)
 
 # WebSocket keepalive. The previous 10s/10s pair was the single biggest cause of
 # dropped calls: an Android client that is busy with AudioTrack, briefly dozing,
@@ -175,6 +184,7 @@ SERVER_CAPABILITIES = (
     "app_ping",
     "error_severity",
     "turn_accepted_v1",
+    "voice_modes_v1",
 )
 # How often to remind a thinking_frames client that the LLM is still chewing.
 THINKING_TICK_SEC = float(_env_int("CC_VOICE_THINKING_TICK_SEC", 5))
@@ -340,6 +350,8 @@ def _send_live_contact_message(
     contact_id: str,
     text: str,
     voice_reply_token: str = "",
+    voice_mode: str = "conversation",
+    voice_continuation: bool = False,
 ) -> str:
     payload: dict[str, Any] = {
         "text": text,
@@ -348,6 +360,9 @@ def _send_live_contact_message(
     internal_voice = contact_id == "xiaoke" and bool(voice_reply_token)
     if internal_voice:
         payload[VOICE_REPLY_TOKEN_FIELD] = voice_reply_token
+        payload["voice_mode"] = normalize_voice_mode(voice_mode)
+        if voice_continuation:
+            payload["voice_continuation"] = True
     body = _request_json(
         "/chat/send",
         method="POST",
@@ -465,6 +480,9 @@ async def send_live_contact_and_wait_reply(
     contact_id: str,
     text: str,
     interrupt_event: asyncio.Event | None = None,
+    *,
+    voice_mode: str = "conversation",
+    voice_continuation: bool = False,
 ) -> str:
     """Send a transcript to a live CC Companion contact and wait for its next
     token-bound formal channel reply.
@@ -495,9 +513,19 @@ async def send_live_contact_and_wait_reply(
             _schedule_voice_cancel(voice_reply_token)
 
     try:
-        send_future = loop.run_in_executor(
-            None, _send_live_contact_message, contact_id, text, voice_reply_token
-        )
+        send_call: Any = _send_live_contact_message
+        send_args: tuple[Any, ...] = (contact_id, text, voice_reply_token)
+        if normalize_voice_mode(voice_mode) != "conversation" or voice_continuation:
+            send_call = functools.partial(
+                _send_live_contact_message,
+                contact_id,
+                text,
+                voice_reply_token,
+                voice_mode=voice_mode,
+                voice_continuation=voice_continuation,
+            )
+            send_args = ()
+        send_future = loop.run_in_executor(None, send_call, *send_args)
         interrupted, user_ts = await _await_future_or_interrupt(
             send_future,
             interrupt_event,
@@ -1123,6 +1151,8 @@ async def send_turn_accepted(
     session_id: str,
     turn_id: str,
     speech_ms: int,
+    continuation: bool = False,
+    generation: int = 0,
 ) -> bool:
     """Tell a capable client that endpointing is complete and it may mute.
 
@@ -1132,14 +1162,18 @@ async def send_turn_accepted(
     """
     if "turn_accepted_v1" not in capabilities:
         return False
-    await send_json(
-        ws,
-        {
-            "type": "turn_accepted",
-            "turn_id": turn_id,
-            "speech_ms": max(0, int(speech_ms)),
-        },
-    )
+    payload: dict[str, Any] = {
+        "type": "turn_accepted",
+        "turn_id": turn_id,
+        "speech_ms": max(0, int(speech_ms)),
+    }
+    # Synthetic turns deliberately leave the microphone open for human
+    # takeover.  Bind that exception to the already-validated continue ticket;
+    # ordinary VAD turns retain their historical wire shape (absence=false).
+    if continuation:
+        payload["continuation"] = True
+        payload["generation"] = int(generation)
+    await send_json(ws, payload)
     logger.info(
         "voice_turn_event=%s",
         json.dumps(
@@ -1148,6 +1182,11 @@ async def send_turn_accepted(
                 "session_id": session_id or "-",
                 "turn_id": turn_id or "-",
                 "speech_ms": max(0, int(speech_ms)),
+                **(
+                    {"continuation": True, "generation": int(generation)}
+                    if continuation
+                    else {}
+                ),
             },
             ensure_ascii=True,
             separators=(",", ":"),
@@ -1584,6 +1623,8 @@ async def handle_utterance(
     capabilities: frozenset = frozenset(),
     session_id: str = "-",
     turn_id: str = "-",
+    voice_mode: str = "conversation",
+    continuation: bool = False,
 ) -> None:
     """ASR -> LLM -> TTS for a single utterance. Caller has already cleared
     interrupt_event."""
@@ -1600,56 +1641,60 @@ async def handle_utterance(
         await send_error(ws, msg, fatal=fatal, turn_id=turn_id)
 
     try:
-        if len(pcm) < FRAME_BYTES * 5:  # < ~100ms — too short
+        if not continuation and len(pcm) < FRAME_BYTES * 5:  # < ~100ms — too short
             release_reason = "audio_too_short"
             return
-        write_wav(wav_path, bytes(pcm))
+        if not continuation:
+            write_wav(wav_path, bytes(pcm))
 
         # --- ASR -------------------------------------------------------
-        ok, payload = await run_stackchan(
-            ["asr", "--input", str(wav_path)], timeout=ASR_TIMEOUT_SEC
-        )
-        if interrupt_event.is_set():
-            release_reason = "interrupted_pre_tts"
-            return
-        if not ok:
-            # Per-turn failure, not a dead call: say it again.
-            await turn_error(f"asr failed: {payload.get('error') or 'unknown'}")
-            return
-        transcript = str(payload.get("transcript") or "").strip()
-        # Anti ASR hallucination (second line of defense): a single-character
-        # transcript from a very short burst is almost always a ghost word
-        # ("好" etc.) hallucinated from breath/reverb noise.
-        core = "".join(
-            ch
-            for ch in transcript
-            if not ch.isspace() and not unicodedata.category(ch).startswith("P")
-        )
-        if len(core) <= 1 and speech_ms < ASR_SINGLE_CHAR_MIN_MS:
-            release_reason = "asr_ghost_rejected"
-            logger.info(
-                "asr: dropped ghost transcript speech=%dms (<%dms)",
-                speech_ms,
-                ASR_SINGLE_CHAR_MIN_MS,
+        if continuation:
+            transcript = ""
+        else:
+            ok, payload = await run_stackchan(
+                ["asr", "--input", str(wav_path)], timeout=ASR_TIMEOUT_SEC
             )
-            return
-        # Anti ASR hallucination (third line of defense): well-known Whisper
-        # hallucination phrases ("谢谢大家", subtitle credits, ...) produced
-        # from silence/noise regardless of speech duration.
-        core_lower = core.lower()
-        transcript_lower = transcript.lower()
-        if core_lower in ASR_HALLUCINATION_BLACKLIST or any(
-            marker in transcript_lower for marker in ASR_HALLUCINATION_SUBSTRINGS
-        ):
-            release_reason = "asr_hallucination_rejected"
-            logger.info("asr: dropped hallucination blacklist")
-            return
-        await send_json(
-            ws, {"type": "asr_final", "text": transcript, "turn_id": turn_id}
-        )
-        if not transcript:
-            release_reason = "empty_transcript"
-            return
+            if interrupt_event.is_set():
+                release_reason = "interrupted_pre_tts"
+                return
+            if not ok:
+                # Per-turn failure, not a dead call: say it again.
+                await turn_error(f"asr failed: {payload.get('error') or 'unknown'}")
+                return
+            transcript = str(payload.get("transcript") or "").strip()
+            # Anti ASR hallucination (second line of defense): a single-character
+            # transcript from a very short burst is almost always a ghost word
+            # ("好" etc.) hallucinated from breath/reverb noise.
+            core = "".join(
+                ch
+                for ch in transcript
+                if not ch.isspace() and not unicodedata.category(ch).startswith("P")
+            )
+            if len(core) <= 1 and speech_ms < ASR_SINGLE_CHAR_MIN_MS:
+                release_reason = "asr_ghost_rejected"
+                logger.info(
+                    "asr: dropped ghost transcript speech=%dms (<%dms)",
+                    speech_ms,
+                    ASR_SINGLE_CHAR_MIN_MS,
+                )
+                return
+            # Anti ASR hallucination (third line of defense): well-known Whisper
+            # hallucination phrases ("谢谢大家", subtitle credits, ...) produced
+            # from silence/noise regardless of speech duration.
+            core_lower = core.lower()
+            transcript_lower = transcript.lower()
+            if core_lower in ASR_HALLUCINATION_BLACKLIST or any(
+                marker in transcript_lower for marker in ASR_HALLUCINATION_SUBSTRINGS
+            ):
+                release_reason = "asr_hallucination_rejected"
+                logger.info("asr: dropped hallucination blacklist")
+                return
+            await send_json(
+                ws, {"type": "asr_final", "text": transcript, "turn_id": turn_id}
+            )
+            if not transcript:
+                release_reason = "empty_transcript"
+                return
 
         # --- LLM -------------------------------------------------------
         if interrupt_event.is_set():
@@ -1684,7 +1729,11 @@ async def handle_utterance(
             try:
                 async with thinking_ticker(ws, capabilities, interrupt_event):
                     reply_text = await send_live_contact_and_wait_reply(
-                        contact_id, transcript, interrupt_event
+                        contact_id,
+                        transcript,
+                        interrupt_event,
+                        voice_mode=voice_mode,
+                        voice_continuation=continuation,
                     )
             except Exception as e:
                 await turn_error(f"live chat: {e}")
@@ -1780,6 +1829,17 @@ class Session:
         self.interrupt_event = asyncio.Event()
         self.end_event = asyncio.Event()
         self.current_task: Optional[asyncio.Task] = None
+        self.continuation_task: Optional[asyncio.Task] = None
+        # Set before awaiting turn_accepted delivery.  Socket receive and the
+        # continuation task are independent, so task existence is not a safe
+        # authority during that await window.
+        self.continuation_turn_active = False
+        self.continuation_speech_detected = False
+        self.continuation_preroll: collections.deque[bytes] = collections.deque(
+            maxlen=VAD_PREROLL_FRAMES or 1
+        )
+        self.continuation_takeover_frames: list[bytes] = []
+        self.discard_continuation_audio = False
         self.turn_active = False
         self.started = False
         self.close_reason: str = "unknown"
@@ -1792,6 +1852,208 @@ class Session:
         self.capabilities: frozenset = frozenset()
         self.client_name: str = ""
         self.client_version: str = ""
+        self.voice_mode = "conversation"
+        self.mode_epoch = 0
+        self.last_continue_generation = 0
+
+    def _continuation_is_active(self) -> bool:
+        return self.continuation_turn_active
+
+    def _enqueue_audio_frame(self, frame: bytes) -> None:
+        try:
+            self.audio_q.put_nowait(frame)
+        except asyncio.QueueFull:
+            # Match the normal mic path: retain the newest audio under pressure.
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self.audio_q.get_nowait()
+            with contextlib.suppress(asyncio.QueueFull):
+                self.audio_q.put_nowait(frame)
+
+    def _capture_continuation_frame(self, frame: bytes) -> None:
+        """Keep silence as bounded pre-roll; real speech takes over the turn."""
+
+        if not self.continuation_turn_active:
+            self._enqueue_audio_frame(frame)
+            return
+        if not self.continuation_speech_detected:
+            if frame_rms(frame) < VAD_RMS_SPEAK:
+                if VAD_PREROLL_FRAMES:
+                    self.continuation_preroll.append(frame)
+                return
+            self.continuation_speech_detected = True
+            self.interrupt_event.set()
+            self.continuation_takeover_frames.extend(self.continuation_preroll)
+            self.continuation_preroll.clear()
+        if len(self.continuation_takeover_frames) < CONTINUATION_TAKEOVER_MAX_FRAMES:
+            self.continuation_takeover_frames.append(frame)
+
+    def _ingest_audio_bytes(self, data: bytes) -> None:
+        for i in range(0, len(data), FRAME_BYTES):
+            frame = data[i : i + FRAME_BYTES]
+            if len(frame) != FRAME_BYTES:
+                continue
+            if self.continuation_turn_active:
+                self._capture_continuation_frame(frame)
+            else:
+                self._enqueue_audio_frame(frame)
+
+    def _finish_continuation_audio(self, *, discard: bool = False) -> None:
+        """Atomically leave synthetic mode, then replay a human takeover."""
+
+        captured = (
+            list(self.continuation_takeover_frames)
+            if self.continuation_speech_detected
+            and not discard
+            and not self.discard_continuation_audio
+            else []
+        )
+        # No await in this method: recv_loop can never observe a half-cleared
+        # state or enqueue newer frames ahead of the captured speech prefix.
+        self.continuation_turn_active = False
+        self.continuation_speech_detected = False
+        self.continuation_preroll.clear()
+        self.continuation_takeover_frames.clear()
+        self.discard_continuation_audio = False
+        for frame in captured:
+            self._enqueue_audio_frame(frame)
+
+    @staticmethod
+    def _continue_generation(value: object) -> int:
+        if isinstance(value, bool):
+            return 0
+        try:
+            parsed = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0
+        return parsed if 0 < parsed <= (2**63 - 1) else 0
+
+    def _raise_generation_floor(self, value: object) -> None:
+        generation = self._continue_generation(value)
+        if generation > self.last_continue_generation:
+            self.last_continue_generation = generation
+
+    async def _reject_continuation(self, reason: str, generation: int) -> None:
+        await send_json(
+            self.ws,
+            {
+                "type": "continue_rejected",
+                "reason": reason,
+                "generation": generation,
+            },
+        )
+
+    async def _run_continuation(
+        self,
+        *,
+        mode: str,
+        epoch: int,
+        generation: int,
+        turn_id: str,
+    ) -> None:
+        try:
+            await handle_utterance(
+                self.ws,
+                b"",
+                self.interrupt_event,
+                self.contact_id,
+                0,
+                self.capabilities,
+                self.session_id,
+                turn_id,
+                voice_mode=mode,
+                continuation=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except ConnectionClosed:
+            self.end_event.set()
+        except TurnTerminalDeliveryError as exc:
+            self.close_reason = str(exc)
+            self.end_event.set()
+        except Exception:
+            logger.exception(
+                "voice continuation crashed generation=%d mode=%s",
+                generation,
+                mode,
+            )
+        finally:
+            # Clear the synthetic authority before replaying captured speech;
+            # subsequent mic frames then append behind it in normal FIFO order.
+            self._finish_continuation_audio()
+            if self.continuation_task is asyncio.current_task():
+                self.continuation_task = None
+            self.turn_active = False
+
+    async def _start_continuation(self, msg: dict[str, Any]) -> None:
+        generation = self._continue_generation(msg.get("generation"))
+        requested_mode = normalize_voice_mode(msg.get("mode"))
+        if "voice_modes_v1" not in self.capabilities:
+            return
+        if self.contact_id != "xiaoke":
+            await self._reject_continuation("unsupported_contact", generation)
+            return
+        if requested_mode != self.voice_mode or self.voice_mode == "conversation":
+            await self._reject_continuation("mode_inactive", generation)
+            return
+        if generation <= self.last_continue_generation or generation <= 0:
+            await self._reject_continuation("stale_generation", generation)
+            return
+        if self.turn_active or self.current_task is not None or self._continuation_is_active():
+            await self._reject_continuation("turn_active", generation)
+            return
+        # The phone starts its three-second clock only after AudioTrack drain and
+        # mic reopen.  Still fail closed if speech is already visible server-side
+        # or is waiting in the queue; a late continue must never talk over Astra.
+        queued: list[bytes] = []
+        while True:
+            try:
+                frame = self.audio_q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if frame is not None:
+                queued.append(frame)
+        speech_waiting = self.utterance.has_spoken or any(
+            frame_rms(frame) >= VAD_RMS_SPEAK for frame in queued
+        )
+        if speech_waiting:
+            for frame in queued:
+                with contextlib.suppress(asyncio.QueueFull):
+                    self.audio_q.put_nowait(frame)
+            await self._reject_continuation("speech_active", generation)
+            return
+        self.utterance.reset()
+        self.last_continue_generation = generation
+        self.turn_active = True
+        self.continuation_turn_active = True
+        self.continuation_speech_detected = False
+        self.continuation_preroll.clear()
+        self.continuation_takeover_frames.clear()
+        self.discard_continuation_audio = False
+        self.interrupt_event.clear()
+        turn_id = uuid.uuid4().hex[:12]
+        try:
+            await send_turn_accepted(
+                self.ws,
+                self.capabilities,
+                session_id=self.session_id,
+                turn_id=turn_id,
+                speech_ms=0,
+                continuation=True,
+                generation=generation,
+            )
+        except BaseException:
+            self._finish_continuation_audio(discard=True)
+            self.turn_active = False
+            raise
+        self.continuation_task = asyncio.create_task(
+            self._run_continuation(
+                mode=self.voice_mode,
+                epoch=self.mode_epoch,
+                generation=generation,
+                turn_id=turn_id,
+            ),
+            name=f"voice-continuation-{generation}",
+        )
 
     async def recv_loop(self) -> None:
         try:
@@ -1805,12 +2067,19 @@ class Session:
             self.close_reason = (
                 f"{type(e).__name__} code={rcvd} reason={getattr(self.ws, 'close_reason', '')!r}"
             )
+            self.discard_continuation_audio = True
             self.end_event.set()
 
     async def _recv_loop_inner(self) -> None:
         async for message in self.ws:
             if isinstance(message, (bytes, bytearray)):
                 if not self.started:
+                    continue
+                if self.continuation_turn_active:
+                    # Quiet microphone traffic is normal and only refreshes a
+                    # bounded pre-roll.  The first real-speech frame cancels
+                    # autonomous speech and is retained for the next VAD turn.
+                    self._ingest_audio_bytes(bytes(message))
                     continue
                 # Once VAD has accepted a turn, thinking + TTS are strictly
                 # half-duplex.  New clients mute on `turn_accepted`; this
@@ -1820,17 +2089,7 @@ class Session:
                     continue
                 data = bytes(message)
                 # Slice into FRAME_BYTES chunks if client sends bigger.
-                for i in range(0, len(data), FRAME_BYTES):
-                    frame = data[i : i + FRAME_BYTES]
-                    if len(frame) == FRAME_BYTES:
-                        try:
-                            self.audio_q.put_nowait(frame)
-                        except asyncio.QueueFull:
-                            # Drop oldest to avoid runaway memory.
-                            with contextlib.suppress(asyncio.QueueEmpty):
-                                self.audio_q.get_nowait()
-                            with contextlib.suppress(asyncio.QueueFull):
-                                self.audio_q.put_nowait(frame)
+                self._ingest_audio_bytes(data)
                 continue
 
             # text frame
@@ -1856,6 +2115,18 @@ class Session:
                     )
                 self.client_name = str(msg.get("client") or "")[:32]
                 self.client_version = str(msg.get("client_version") or "")[:32]
+                requested_mode = normalize_voice_mode(msg.get("mode"))
+                self.voice_mode = (
+                    requested_mode
+                    if "voice_modes_v1" in self.capabilities
+                    else "conversation"
+                )
+                self.mode_epoch += 1
+                if "voice_modes_v1" in self.capabilities:
+                    # Client contract: start/mode_change carry an already-bumped
+                    # generation floor; arming the next three-second window
+                    # bumps once more, so every valid continue is strictly newer.
+                    self._raise_generation_floor(msg.get("generation"))
                 self.started = True
                 logger.info(
                     "ws session start contact=%s sample_rate=%d client=%s/%s caps=%s "
@@ -1870,7 +2141,18 @@ class Session:
                 )
                 await send_json(
                     self.ws,
-                    {"type": "ready", "capabilities": list(SERVER_CAPABILITIES)},
+                    {
+                        "type": "ready",
+                        "capabilities": list(SERVER_CAPABILITIES),
+                        **(
+                            {
+                                "mode": self.voice_mode,
+                                "generation_floor": self.last_continue_generation,
+                            }
+                            if "voice_modes_v1" in self.capabilities
+                            else {}
+                        ),
+                    },
                 )
             elif mtype == "ping":
                 # Application-level heartbeat. The protocol-level ping/pong is
@@ -1883,7 +2165,28 @@ class Session:
                 )
             elif mtype == "interrupt":
                 self.interrupt_event.set()
+            elif mtype == "mode_change":
+                if "voice_modes_v1" not in self.capabilities:
+                    continue
+                self.voice_mode = normalize_voice_mode(msg.get("mode"))
+                self.mode_epoch += 1
+                self._raise_generation_floor(msg.get("generation"))
+                if self._continuation_is_active():
+                    self.discard_continuation_audio = True
+                    self.interrupt_event.set()
+                await send_json(
+                    self.ws,
+                    {
+                        "type": "mode_changed",
+                        "mode": self.voice_mode,
+                        "generation_floor": self.last_continue_generation,
+                    },
+                )
+            elif mtype == "continue":
+                await self._start_continuation(msg)
             elif mtype == "end":
+                self.discard_continuation_audio = True
+                self.interrupt_event.set()
                 self.end_event.set()
                 return
             else:
@@ -1955,6 +2258,7 @@ class Session:
                     self.capabilities,
                     self.session_id,
                     turn_id,
+                    voice_mode=self.voice_mode,
                 )
             )
             try:
@@ -2001,8 +2305,14 @@ class Session:
 
         # Tear down.
         self.end_event.set()
+        self.discard_continuation_audio = True
         if self.current_task is not None:
             self.current_task.cancel()
+        if self.continuation_task is not None:
+            self.continuation_task.cancel()
+            with contextlib.suppress(BaseException):
+                await self.continuation_task
+        self._finish_continuation_audio(discard=True)
         for t in pending:
             t.cancel()
         for t in pending:

@@ -372,6 +372,8 @@ class TtsPacingAndProtocolTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sent)
         self.assertEqual(new_ws.sent[0]["type"], "turn_accepted")
         self.assertEqual(new_ws.sent[0]["turn_id"], "turn456")
+        self.assertNotIn("continuation", new_ws.sent[0])
+        self.assertNotIn("generation", new_ws.sent[0])
         self.assertNotIn("text", new_ws.sent[0])
         self.assertIn('"event":"turn_accepted_sent"', captured.output[0])
 

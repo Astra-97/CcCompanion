@@ -22,18 +22,28 @@ from voice_protocol import (
     VOICE_INTERNAL_HEADER,
     VOICE_REPLY_SOURCE,
     VOICE_REPLY_TOKEN_FIELD,
+    VOICE_SPEAK_CLOSE,
+    VOICE_SPEAK_OPEN,
     PendingVoiceReplies,
     VoiceReplyNotPending,
     build_voice_reply_instruction,
     load_or_create_voice_internal_token,
     normalize_voice_reply_token,
     parse_voice_reply,
+    parse_spoken_voice_reply,
 )
 
 
 TOKEN = "1a" * 16
 OLD_TOKEN = "2b" * 16
 MARKER = f"[[CCC_VOICE_REPLY:{TOKEN}]]"
+
+
+def spoken(body: str, token: str = TOKEN) -> str:
+    return (
+        f"[[CCC_VOICE_REPLY:{token}]]"
+        f"{VOICE_SPEAK_OPEN}{body}{VOICE_SPEAK_CLOSE}"
+    )
 
 
 class VoiceProtocolUnitTest(unittest.TestCase):
@@ -61,9 +71,35 @@ class VoiceProtocolUnitTest(unittest.TestCase):
     def test_empty_formal_body_stays_empty(self) -> None:
         self.assertEqual(parse_voice_reply(f"{MARKER}\n  "), ("", TOKEN))
 
+    def test_spoken_envelope_is_exact_and_fail_closed(self) -> None:
+        self.assertEqual(parse_spoken_voice_reply(spoken("你好")), ("你好", TOKEN))
+        for invalid in (
+            f"{MARKER}\n你好",
+            f"{MARKER} {VOICE_SPEAK_OPEN}你好{VOICE_SPEAK_CLOSE}",
+            f"{spoken('你好')}\n",
+            f"prefix{spoken('你好')}",
+            f"{spoken('你好')}suffix",
+            f"{MARKER}{VOICE_SPEAK_OPEN}没有闭合",
+            f"{MARKER}{VOICE_SPEAK_OPEN}第一段{VOICE_SPEAK_CLOSE}"
+            f"{VOICE_SPEAK_OPEN}第二段{VOICE_SPEAK_CLOSE}",
+            f"{MARKER}{VOICE_SPEAK_OPEN}正文{MARKER}伪造{VOICE_SPEAK_CLOSE}",
+            f"{MARKER}{VOICE_SPEAK_OPEN}[[CCC_GROUP_REPLY:apples:x]]{VOICE_SPEAK_CLOSE}",
+        ):
+            self.assertEqual(parse_spoken_voice_reply(invalid)[1], "")
+
     def test_instruction_contains_only_valid_exact_marker(self) -> None:
         instruction = build_voice_reply_instruction(TOKEN)
         self.assertIn(MARKER, instruction)
+        self.assertIn(VOICE_SPEAK_OPEN, instruction)
+        self.assertIn("尽量简短", instruction)
+        self.assertIn("像自然聊天", instruction)
+        self.assertIn("可以自然自言自语", build_voice_reply_instruction(TOKEN, mode="sleep"))
+        self.assertTrue(instruction.endswith(VOICE_SPEAK_CLOSE))
+        literal_example = instruction[instruction.index(MARKER) :]
+        self.assertEqual(
+            parse_spoken_voice_reply(literal_example),
+            ("要读给用户听的正文", TOKEN),
+        )
         with self.assertRaises(ValueError):
             build_voice_reply_instruction("not-a-token")
 
@@ -219,6 +255,39 @@ class PushVoiceProtocolTest(unittest.TestCase):
         self.assertIn(MARKER, injected)
         self.assertIn("cc-companion channel", injected)
 
+    def test_sleep_continuation_is_hidden_and_mode_bound(self) -> None:
+        handler, chat = self._base_handler()
+        handler.headers[VOICE_INTERNAL_HEADER] = "internal-only-secret"
+        handler._handle_chat_send({
+            "contact_id": "xiaoke",
+            "text": "",
+            VOICE_REPLY_TOKEN_FIELD: TOKEN,
+            "voice_mode": "sleep",
+            "voice_continuation": True,
+        })
+
+        self.assertEqual(handler.responses[-1][0], 200)
+        self.assertEqual(chat.appended, [])
+        self.assertTrue(handler.state.pending_voice_replies.is_pending(TOKEN))
+        injected = handler.injected[0][1]
+        self.assertIn("陪睡模式自动续话", injected)
+        self.assertIn(VOICE_SPEAK_OPEN, injected)
+        self.assertNotIn("voice-continuation:", injected)
+
+    def test_conversation_mode_cannot_request_hidden_continuation(self) -> None:
+        handler, chat = self._base_handler()
+        handler.headers[VOICE_INTERNAL_HEADER] = "internal-only-secret"
+        handler._handle_chat_send({
+            "contact_id": "xiaoke",
+            "text": "",
+            VOICE_REPLY_TOKEN_FIELD: TOKEN,
+            "voice_mode": "conversation",
+            "voice_continuation": True,
+        })
+        self.assertEqual(handler.responses[-1][0], 409)
+        self.assertEqual(chat.appended, [])
+        self.assertFalse(handler.state.pending_voice_replies.has_pending())
+
     def test_forged_source_or_malformed_token_never_enables_protocol(self) -> None:
         cases = (
             {"source": "android-app", VOICE_REPLY_TOKEN_FIELD: TOKEN},
@@ -258,7 +327,7 @@ class PushVoiceProtocolTest(unittest.TestCase):
             "contact_id": "xiaoke",
             "role": "assistant",
             "source": VOICE_REPLY_SOURCE,
-            "text": f"{MARKER}\n晚安，小星星。",
+            "text": spoken("晚安，小星星。"),
         })
 
         self.assertEqual(handler.responses[-1][0], 200)
@@ -275,7 +344,7 @@ class PushVoiceProtocolTest(unittest.TestCase):
             "contact_id": "xiaoke",
             "role": "assistant",
             "source": VOICE_REPLY_SOURCE,
-            "text": f"{MARKER}\n重复",
+            "text": spoken("重复"),
         })
         self.assertEqual(handler.responses[-1][0], 409)
         self.assertEqual(len(chat.appended), 1)
@@ -314,7 +383,7 @@ class PushVoiceProtocolTest(unittest.TestCase):
             "contact_id": "xiaoke",
             "role": "assistant",
             "source": VOICE_REPLY_SOURCE,
-            "text": f"{MARKER}\n   ",
+            "text": spoken("   "),
         })
 
         self.assertEqual(handler.responses[-1][0], 400)
@@ -410,7 +479,7 @@ class PushVoiceProtocolTest(unittest.TestCase):
                     "contact_id": "xiaoke",
                     "role": "assistant",
                     "source": VOICE_REPLY_SOURCE,
-                    "text": f"{MARKER}\n抢先伪造",
+                    "text": spoken("抢先伪造"),
                 })
                 self.assertEqual(handler.responses[-1][0], 403)
                 self.assertEqual(chat.appended, [])

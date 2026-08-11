@@ -29,9 +29,16 @@ VOICE_REPLY_RESERVED_METADATA = frozenset(
     {"voice_reply_token", "voice_reply_v", "voice_reply_text"}
 )
 VOICE_REPLY_PENDING_TTL_SEC = 300.0
+VOICE_SPEAK_OPEN = "[[CCC_SPEAK]]"
+VOICE_SPEAK_CLOSE = "[[/CCC_SPEAK]]"
+VOICE_MODES = frozenset({"conversation", "sleep", "commute"})
 
 _TOKEN_RE = re.compile(r"[0-9a-f]{32}\Z")
 _REPLY_MARKER_RE = re.compile(r"\A\[\[CCC_VOICE_REPLY:([0-9a-f]{32})\]\]")
+_SPEAK_ENVELOPE_RE = re.compile(
+    rf"\A{re.escape(VOICE_SPEAK_OPEN)}(?P<body>[\s\S]*?)"
+    rf"{re.escape(VOICE_SPEAK_CLOSE)}\Z"
+)
 _INTERNAL_TOKEN_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 _T = TypeVar("_T")
@@ -222,19 +229,35 @@ class PendingVoiceReplies:
             return suppress
 
 
-def build_voice_reply_instruction(token: str) -> str:
+def normalize_voice_mode(value: object) -> str:
+    """Return a wire-safe voice mode, defaulting unknown values to conversation."""
+
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in VOICE_MODES else "conversation"
+
+
+def build_voice_reply_instruction(token: str, *, mode: str = "conversation") -> str:
     """Build the private terminal-only instruction for a validated token."""
 
     valid = normalize_voice_reply_token(token)
     if not valid:
         raise ValueError("invalid voice reply token")
     marker = f"[[CCC_VOICE_REPLY:{valid}]]"
+    voice_mode = normalize_voice_mode(mode)
+    mode_hint = {
+        "conversation": "这是普通通话模式。除非用户明确要求展开，否则回复尽量简短、口语化，像自然聊天。",
+        "sleep": "这是陪睡模式。语气轻柔、短句、适合闭眼听；可以自然自言自语，不要求用户每次回应。",
+        "commute": "这是通勤模式。语气自然、有陪伴感、短句；可以主动延续话题，不要求用户每次回应。",
+    }[voice_mode]
     return (
-        "[CCC 通话正式回复协议：这是一轮语音通话。终端里的思考、工具过程和自言自语"
-        "都不是给用户的语音回复，不要让 stop hook 代替正式答复。请只通过 "
+        f"[CCC 通话正式回复协议：{mode_hint}终端里的思考、工具过程和协议外文字"
+        "都不是给用户的语音回复，也绝不能触发 TTS。不要让 stop hook 代替正式答复。请只通过 "
         "cc-companion channel 的非流式单次 reply 发送最终要对用户说的正文，"
-        "不要发送 reply_chunk；并且必须把 "
-        f"{marker} 放在正式回复的第一个字符；marker 后再写正文。]"
+        "不要发送 reply_chunk。只有 CCC_SPEAK 标签内的正文会被接受并触发 TTS；"
+        "思考、说明、工具过程均留在通道之外。正式回复必须严格复制下面的结构，"
+        "把占位正文替换成真正要读出的内容；marker 前、marker 与开标签之间、闭标签后"
+        "都不得有空格、换行、标点或任何其他字符。下面是独立的字面格式样例：]\n"
+        f"{marker}{VOICE_SPEAK_OPEN}要读给用户听的正文{VOICE_SPEAK_CLOSE}"
     )
 
 
@@ -257,3 +280,25 @@ def parse_voice_reply(text: object) -> tuple[str, str]:
     elif remainder.startswith(("\r", "\n")):
         remainder = remainder[1:]
     return remainder.strip(), match.group(1)
+
+
+def parse_spoken_voice_reply(text: object) -> tuple[str, str]:
+    """Extract only a complete, marker-bound ``CCC_SPEAK`` envelope.
+
+    This is intentionally fail-closed: leading/trailing prose, a missing close
+    tag, or a marker anywhere except character zero yields no token and thus can
+    never enter TTS.
+    """
+
+    if not isinstance(text, str):
+        return "", ""
+    match = _REPLY_MARKER_RE.match(text)
+    if match is None:
+        return text, ""
+    envelope = _SPEAK_ENVELOPE_RE.fullmatch(text[match.end() :])
+    if envelope is None:
+        return text, ""
+    body = envelope.group("body")
+    if "[[CCC_" in body or "[[/CCC_" in body:
+        return text, ""
+    return body.strip(), match.group(1)

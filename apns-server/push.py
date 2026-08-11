@@ -117,8 +117,10 @@ from voice_protocol import (
     VoiceReplyNotPending,
     build_voice_reply_instruction,
     load_or_create_voice_internal_token,
+    normalize_voice_mode,
     normalize_voice_reply_token,
     parse_voice_reply,
+    parse_spoken_voice_reply,
     sanitize_voice_metadata,
 )
 from health_records import (
@@ -8659,14 +8661,24 @@ class PushHandler(BaseHTTPRequestHandler):
         )
         source = self._source_for_request("card" if is_card_action else "")
         voice_reply_token = ""
+        voice_mode = "conversation"
+        voice_continuation = False
         if self._voice_internal_auth_matches():
             voice_reply_token = normalize_voice_reply_token(
                 body.get(VOICE_REPLY_TOKEN_FIELD)
             )
             if voice_reply_token:
                 source = VOICE_CALL_SOURCE
+                voice_mode = normalize_voice_mode(body.get("voice_mode"))
+                voice_continuation = body.get("voice_continuation") is True
+        if voice_continuation and voice_mode == "conversation":
+            self._send_json(409, {
+                "ok": False,
+                "error": "voice_continuation_mode_inactive",
+            })
+            return
         voice_reply_instruction = (
-            build_voice_reply_instruction(voice_reply_token)
+            build_voice_reply_instruction(voice_reply_token, mode=voice_mode)
             if voice_reply_token
             else ""
         )
@@ -8674,7 +8686,7 @@ class PushHandler(BaseHTTPRequestHandler):
         # {"via": "card", ...}; 普通 App 发消息不带 metadata, 行为不变。
         metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else None
         staged_attachments = list(body.get("_pwa_staged_attachments") or [])
-        if not text and not location and not staged_attachments:
+        if not text and not location and not staged_attachments and not voice_continuation:
             self._send_json(400, {"error": "text or location required"})
             return
         link_bundle = self._enrich_user_links(text)
@@ -8745,26 +8757,36 @@ class PushHandler(BaseHTTPRequestHandler):
                 ),
             )
             return
-        # 写 user 历史
+        # Write a real user's utterance to history.  A negotiated sleep/commute
+        # continuation is different: it is a private control turn injected into
+        # the terminal, never a fake user message shown in chat history.
         chat = self._chat_for_contact(contact_id)
         primary_attachment = staged_attachments[0] if staged_attachments else {}
-        try:
-            rec = chat.append(
-                role="user",
-                text=text,
-                source=source,
-                quoted_ts=quoted_ts,
-                location=location,
-                metadata=metadata,
-                attachment_url=primary_attachment.get("attachment_url") or None,
-                attachment_type=primary_attachment.get("type") or None,
-                attachment_filename=primary_attachment.get("filename") or None,
-            )
-        except Exception as exc:
-            self._release_xiaoke_send_reservation(turn_token)
-            logger.exception("xiaoke history append failed")
-            self._send_json(500, {"ok": False, "error": f"history append failed: {exc}"})
-            return
+        if voice_continuation:
+            rec = {
+                "ts": f"voice-continuation:{voice_reply_token}",
+                "role": "control",
+                "text": "",
+                "source": VOICE_CALL_SOURCE,
+            }
+        else:
+            try:
+                rec = chat.append(
+                    role="user",
+                    text=text,
+                    source=source,
+                    quoted_ts=quoted_ts,
+                    location=location,
+                    metadata=metadata,
+                    attachment_url=primary_attachment.get("attachment_url") or None,
+                    attachment_type=primary_attachment.get("type") or None,
+                    attachment_filename=primary_attachment.get("filename") or None,
+                )
+            except Exception as exc:
+                self._release_xiaoke_send_reservation(turn_token)
+                logger.exception("xiaoke history append failed")
+                self._send_json(500, {"ok": False, "error": f"history append failed: {exc}"})
+                return
         if voice_reply_token:
             self.state.pending_voice_replies.register(
                 voice_reply_token,
@@ -8782,7 +8804,20 @@ class PushHandler(BaseHTTPRequestHandler):
         tts_hint = ""
         if self.state.settings.get("tts_enabled"):
             tts_hint = "[语音模式 这一条带标点回复]\n"
-        injected = f"{turn_marker}\n{ts_prefix} {tts_hint}{text}"
+        if voice_continuation:
+            continuation_hint = {
+                "sleep": (
+                    "[CCC 陪睡模式自动续话：用户在播放真正结束后安静了约3秒。"
+                    "请不要要求用户回答，轻声、简短、自然地接着说，可以自言自语。]"
+                ),
+                "commute": (
+                    "[CCC 通勤模式自动续话：用户在播放真正结束后安静了约3秒。"
+                    "请不要要求用户回答，简短、自然地延续话题或分享当下想说的话。]"
+                ),
+            }[voice_mode]
+            injected = f"{turn_marker}\n{ts_prefix} {continuation_hint}"
+        else:
+            injected = f"{turn_marker}\n{ts_prefix} {tts_hint}{text}"
         if rec.get("location"):
             loc = rec["location"]
             label = loc.get("label", "")
@@ -12965,7 +13000,7 @@ class PushHandler(BaseHTTPRequestHandler):
             # only come from the formal channel and atomically claim the one
             # current server-side pending token; reject all stale/unknown/
             # misplaced forms without echoing their marker into a response.
-            marker_text, marker_token = parse_voice_reply(raw_text)
+            _marker_text, marker_token = parse_voice_reply(raw_text)
             if marker_token:
                 if not self._voice_internal_auth_matches():
                     self._send_json(403, {
@@ -12982,7 +13017,14 @@ class PushHandler(BaseHTTPRequestHandler):
                         "error": "voice_reply_not_pending",
                     })
                     return
-                text = marker_text
+                spoken_text, spoken_token = parse_spoken_voice_reply(raw_text)
+                if spoken_token != marker_token:
+                    self._send_json(409, {
+                        "ok": False,
+                        "error": "voice_reply_format_required",
+                    })
+                    return
+                text = spoken_text
                 formal_voice_token = marker_token
                 marker_metadata = dict(body.get("metadata") or {})
                 marker_metadata[VOICE_REPLY_TOKEN_FIELD] = marker_token
