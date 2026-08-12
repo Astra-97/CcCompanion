@@ -2532,8 +2532,11 @@ class LinkPreviewService:
         # www.xiachufang.com frequently presents a slider wall to server UAs.
         # The official mobile detail URL exposes the same public recipe JSON-LD.
         mobile_url = self._xiachufang_mobile_recipe_url(url)
-        header_variants = (
-            {
+        # The share/source query is a public, fixed mobile-site variant rather
+        # than a user-supplied query.  It improves cache routing without ever
+        # forwarding an original share token or tracking value.
+        attempts = (
+            (mobile_url, {
                 "User-Agent": (
                     "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) "
                     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 "
@@ -2542,8 +2545,8 @@ class LinkPreviewService:
                 "Accept-Language": "zh-CN,zh;q=0.9",
                 "Accept-Encoding": "gzip",
                 "Referer": "https://m.xiachufang.com/",
-            },
-            {
+            }),
+            (mobile_url + "?from=singlemessage&utm_source=weixin", {
                 "User-Agent": (
                     "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
@@ -2551,15 +2554,15 @@ class LinkPreviewService:
                 "Accept-Language": "zh-CN,zh;q=0.9",
                 "Accept-Encoding": "gzip",
                 "Referer": "https://m.xiachufang.com/",
-            },
+            }),
         )
         last_error: LinkPreviewError | None = None
-        for headers in header_variants:
+        for attempt_url, headers in attempts:
             if time.monotonic() >= deadline:
                 break
             try:
                 payload = self.fetcher.request(
-                    mobile_url,
+                    attempt_url,
                     deadline=deadline,
                     headers=headers,
                     max_bytes=self.max_download_bytes,

@@ -2841,6 +2841,8 @@ class LinkPreviewTests(unittest.TestCase):
             headers = fetcher.calls[0][1]["headers"]
             self.assertIn("Mozilla/5.0", headers["User-Agent"])
             self.assertEqual(headers["Referer"], "https://m.xiachufang.com/")
+            self.assertEqual(headers["Accept-Encoding"], "gzip")
+            self.assertTrue(fetcher.calls[0][1]["allow_compression"])
             self.assertEqual(preview["url"], "https://www.xiachufang.com/recipe/104126605/")
             self.assertEqual(preview["final_url"], "https://m.xiachufang.com/recipe/104126605/")
 
@@ -2861,13 +2863,20 @@ class LinkPreviewTests(unittest.TestCase):
             fetcher = QueueFetcher([link_preview.LinkPreviewError("temporary"), good])
             service = link_preview.LinkPreviewService(td, fetcher=fetcher, lease_seconds=1000)
             page = service._fetch_xiachufang_page(
-                "https://www.xiachufang.com/recipe/104126605/", time.monotonic() + 2
+                "https://www.xiachufang.com/recipe/104126605/?token=user-secret&from=unsafe", time.monotonic() + 2
             )
         self.assertEqual(page.title, "重试菜谱")
         self.assertEqual(len(fetcher.calls), 2)
         first_headers = fetcher.calls[0][1]["headers"]
         second_headers = fetcher.calls[1][1]["headers"]
         self.assertNotEqual(first_headers["User-Agent"], second_headers["User-Agent"])
+        self.assertEqual(fetcher.calls[0][0], "https://m.xiachufang.com/recipe/104126605/")
+        self.assertEqual(
+            fetcher.calls[1][0],
+            "https://m.xiachufang.com/recipe/104126605/?from=singlemessage&utm_source=weixin",
+        )
+        self.assertNotIn("user-secret", fetcher.calls[1][0])
+        self.assertNotIn("from=unsafe", fetcher.calls[1][0])
         for _url, kwargs in fetcher.calls:
             self.assertEqual(kwargs["headers"]["Accept-Encoding"], "gzip")
             self.assertTrue(kwargs["allow_compression"])
