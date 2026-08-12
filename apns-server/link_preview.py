@@ -39,6 +39,7 @@ from urllib.parse import (
     urlsplit,
     urlunsplit,
 )
+import zlib
 
 
 URL_RE = re.compile(
@@ -55,12 +56,20 @@ XHS_HOSTS = {
     "www.xhslink.cn",
 }
 WECHAT_HOSTS = {"mp.weixin.qq.com"}
+XIACHUFANG_HOSTS = {
+    "xiachufang.com",
+    "www.xiachufang.com",
+    "m.xiachufang.com",
+}
 MAX_TITLE = 300
 MAX_DESCRIPTION = 800
 MAX_PAGE_IMAGES = 6
 GENERIC_CACHE_SCHEMA_VERSION = 3
 XHS_CACHE_SCHEMA_VERSION = 7
 WECHAT_CACHE_SCHEMA_VERSION = 1
+# Recipe extraction deliberately has its own schema: unlike generic previews,
+# its body is constructed only from a trusted Recipe JSON-LD node.
+XIACHUFANG_CACHE_SCHEMA_VERSION = 1
 DNS_WORKERS = 4
 DNS_QUEUE_SIZE = 8
 
@@ -75,6 +84,40 @@ class UnsafeAddressError(LinkPreviewError):
 
 class ResponseTooLargeError(LinkPreviewError):
     """A response exceeded its configured byte budget."""
+
+
+def _decompress_bounded(chunks: list[bytes], encoding: str, limit: int) -> bytes:
+    """Decode one small gzip/deflate stream without allocating a zip bomb."""
+    try:
+        decoder = zlib.decompressobj(
+            16 + zlib.MAX_WBITS if encoding == "gzip" else zlib.MAX_WBITS
+        )
+        output = bytearray()
+        for chunk in chunks:
+            pending = chunk
+            while pending:
+                remaining = limit - len(output)
+                if remaining <= 0:
+                    raise ResponseTooLargeError("decompressed response too large")
+                decoded = decoder.decompress(pending, remaining + 1)
+                if len(decoded) > remaining:
+                    raise ResponseTooLargeError("decompressed response too large")
+                output.extend(decoded)
+                pending = decoder.unconsumed_tail
+        remaining = limit - len(output)
+        if remaining < 0:
+            raise ResponseTooLargeError("decompressed response too large")
+        final = decoder.flush(remaining + 1)
+        if len(final) > remaining:
+            raise ResponseTooLargeError("decompressed response too large")
+        output.extend(final)
+        if not decoder.eof:
+            raise LinkPreviewError("compressed response was truncated")
+        return bytes(output)
+    except ResponseTooLargeError:
+        raise
+    except (OSError, zlib.error, EOFError) as exc:
+        raise LinkPreviewError("invalid compressed response") from exc
 
 
 @dataclass(frozen=True)
@@ -495,12 +538,29 @@ class SafeHTTPFetcher:
         max_bytes: int | None = None,
         allow_redirects: bool = True,
         truncate_at_limit: bool = False,
+        allowed_hosts: set[str] | None = None,
+        allowed_schemes: set[str] | None = None,
+        allow_compression: bool = False,
     ) -> HTTPPayload:
         current = str(url)
         method = method.upper()
         request_body = body
         extra_headers = dict(headers or {})
         limit = min(self.max_download_bytes, max_bytes or self.max_download_bytes)
+        allowed = (
+            {
+                str(item or "").strip().lower().rstrip(".")
+                for item in allowed_hosts
+                if str(item or "").strip()
+            }
+            if allowed_hosts is not None
+            else None
+        )
+        schemes = (
+            {str(item or "").strip().lower() for item in allowed_schemes if str(item or "").strip()}
+            if allowed_schemes is not None
+            else None
+        )
         visited: set[str] = set()
         for hop in range(self.max_redirects + 1):
             if time.monotonic() >= deadline:
@@ -509,6 +569,10 @@ class SafeHTTPFetcher:
                 raise LinkPreviewError("redirect loop")
             visited.add(current)
             scheme, host, port, path = self._validate_url(current)
+            if schemes is not None and scheme not in schemes:
+                raise LinkPreviewError("redirected outside allowed schemes")
+            if allowed is not None and host not in allowed:
+                raise LinkPreviewError("redirected outside allowed hosts")
             conn = self._connect(scheme, host, port, deadline)
             try:
                 remaining = deadline - time.monotonic()
@@ -555,7 +619,8 @@ class SafeHTTPFetcher:
                     except ValueError:
                         pass
                 encoding = response_headers.get("content-encoding", "").strip().lower()
-                if encoding not in {"", "identity"}:
+                compressed = encoding in {"gzip", "deflate"}
+                if encoding not in {"", "identity"} and not (allow_compression and compressed):
                     raise LinkPreviewError("compressed responses are not accepted")
                 chunks: list[bytes] = []
                 total = 0
@@ -566,10 +631,17 @@ class SafeHTTPFetcher:
                         raise LinkPreviewError("total timeout exceeded")
                     if conn.sock is not None:
                         conn.sock.settimeout(min(self.read_timeout, remaining))
-                    if truncate_at_limit and total >= limit:
+                    # A truncated compressed stream cannot be safely decoded;
+                    # preserve the ordinary HTML truncation behavior only for
+                    # identity responses.
+                    if truncate_at_limit and not compressed and total >= limit:
                         truncated = True
                         break
-                    read_limit = limit - total if truncate_at_limit else limit - total + 1
+                    read_limit = (
+                        limit - total
+                        if truncate_at_limit and not compressed
+                        else limit - total + 1
+                    )
                     chunk = response.read(min(65_536, read_limit))
                     if not chunk:
                         break
@@ -579,7 +651,12 @@ class SafeHTTPFetcher:
                     chunks.append(chunk)
                 if truncated:
                     response_headers["x-cc-preview-truncated"] = "1"
-                return HTTPPayload(current, response.status, response_headers, b"".join(chunks))
+                decoded_body = (
+                    _decompress_bounded(chunks, encoding, limit)
+                    if compressed
+                    else b"".join(chunks)
+                )
+                return HTTPPayload(current, response.status, response_headers, decoded_body)
             except (LinkPreviewError, UnsafeAddressError, ResponseTooLargeError):
                 raise
             except (OSError, ssl.SSLError, http.client.HTTPException, socket.timeout) as exc:
@@ -788,6 +865,254 @@ def _json_ld_article_images(parser: _HTMLTextExtractor, base_url: str) -> tuple[
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
     return _dedupe_image_values(values, base_url, xhs_only=True)
+
+
+def _json_ld_recipe_nodes(parser: _HTMLTextExtractor) -> tuple[dict[str, Any], ...]:
+    """Return bounded schema.org Recipe nodes, including list/@graph wrappers."""
+    recipes: list[dict[str, Any]] = []
+
+    def is_recipe(value: dict[str, Any]) -> bool:
+        kinds = value.get("@type")
+        if isinstance(kinds, str):
+            kinds = [kinds]
+        return isinstance(kinds, list) and any(
+            isinstance(kind, str)
+            and (kind.strip().lower() == "recipe" or kind.rstrip("/").lower().endswith("/recipe"))
+            for kind in kinds[:20]
+        )
+
+    def visit(value: Any, depth: int = 0) -> None:
+        if depth > 8 or len(recipes) >= 8:
+            return
+        if isinstance(value, list):
+            for item in value[:100]:
+                visit(item, depth + 1)
+            return
+        if not isinstance(value, dict):
+            return
+        if is_recipe(value):
+            recipes.append(value)
+        graph = value.get("@graph")
+        if isinstance(graph, list):
+            for item in graph[:100]:
+                visit(item, depth + 1)
+
+    for script_type, script in parser.structured_scripts[:20]:
+        if script_type != "application/ld+json" or len(script) > 2_000_000:
+            continue
+        try:
+            visit(json.loads(script))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return tuple(recipes)
+
+
+def _xiachufang_recipe_id_from_path(path: Any) -> str:
+    match = re.fullmatch(r"/recipe/([0-9]+)/?", str(path or ""))
+    return match.group(1) if match else ""
+
+
+def _xiachufang_recipe_id_from_url(value: Any, *, allow_relative: bool) -> str:
+    if not isinstance(value, str) or len(value) > 4_096:
+        return ""
+    try:
+        parts = urlsplit(value.strip())
+        host = (parts.hostname or "").lower().rstrip(".")
+    except ValueError:
+        return ""
+    if parts.username is not None or parts.password is not None:
+        return ""
+    if host:
+        if (
+            parts.scheme.lower() != "https"
+            or parts.port not in (None, 443)
+            or host not in XIACHUFANG_HOSTS
+        ):
+            return ""
+    elif not allow_relative:
+        return ""
+    return _xiachufang_recipe_id_from_path(parts.path)
+
+
+def _xiachufang_recipe_candidate_ids(recipe: dict[str, Any]) -> set[str]:
+    """Read only standard Recipe identity fields; never fuzzy-match a URL."""
+    values: list[Any] = [recipe.get("@id"), recipe.get("url")]
+    main = recipe.get("mainEntityOfPage")
+    if isinstance(main, dict):
+        values.extend((main.get("@id"), main.get("url")))
+    else:
+        values.append(main)
+    return {
+        recipe_id
+        for value in values
+        if (recipe_id := _xiachufang_recipe_id_from_url(value, allow_relative=True))
+    }
+
+
+def _select_xiachufang_recipe(
+    parser: _HTMLTextExtractor,
+    requested_url: str,
+    final_url: str,
+) -> dict[str, Any]:
+    candidates = _json_ld_recipe_nodes(parser)
+    if not candidates:
+        raise LinkPreviewError("Xiachufang Recipe JSON-LD was not available")
+    target_id = _xiachufang_recipe_id_from_url(requested_url, allow_relative=False)
+    final_id = _xiachufang_recipe_id_from_url(final_url, allow_relative=False)
+    if not target_id or final_id != target_id:
+        raise LinkPreviewError("Xiachufang recipe redirected to a different recipe")
+    matching = [
+        recipe for recipe in candidates
+        if target_id and target_id in _xiachufang_recipe_candidate_ids(recipe)
+    ]
+    if len(matching) == 1:
+        return matching[0]
+    if matching:
+        raise LinkPreviewError("Xiachufang Recipe JSON-LD was ambiguous")
+    if len(candidates) == 1:
+        return candidates[0]
+    raise LinkPreviewError("Xiachufang Recipe JSON-LD had no exact target")
+
+
+def _recipe_string(value: Any, limit: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    return _metadata_text(unescape(value), limit)
+
+
+def _recipe_author(value: Any) -> str:
+    if isinstance(value, dict):
+        value = value.get("name") or ""
+    elif isinstance(value, list):
+        values = [_recipe_author(item) for item in value[:4]]
+        return "、".join(item for item in values if item)[:160]
+    return _recipe_string(value, 160)
+
+
+def _recipe_lines(value: Any, *, limit: int = 80, item_limit: int = 500) -> list[str]:
+    values = value if isinstance(value, list) else [value]
+    lines: list[str] = []
+    for item in values[:limit]:
+        text = _recipe_string(item, item_limit)
+        if text and text not in lines:
+            lines.append(text)
+    return lines
+
+
+def _recipe_instruction_lines(value: Any, *, limit: int = 80) -> list[str]:
+    """Flatten schema.org HowToStep/HowToSection without trusting page chrome."""
+    lines: list[str] = []
+
+    def split_numbered_string(raw: str) -> list[str]:
+        # 下厨房's JSON-LD sometimes puts every step in one string such as
+        # ``0.鸡腿洗净，1.碗里加生抽，2.加水炖``.  Only accept a zero-based,
+        # strictly consecutive sequence; requiring the dot not be followed by
+        # a digit keeps decimals (0.5, 1.5) out of this path.
+        markers = list(re.finditer(r"(?:^|[，,\n])\s*(\d{1,2})[.．、](?!\d)", raw))
+        if len(markers) < 2:
+            return []
+        try:
+            indexes = [int(match.group(1)) for match in markers]
+        except ValueError:
+            return []
+        if indexes[0] != 0 or indexes != list(range(len(indexes))):
+            return []
+        output: list[str] = []
+        for index, marker in enumerate(markers[:limit]):
+            end = markers[index + 1].start() if index + 1 < len(markers) else len(raw)
+            step = _recipe_string(raw[marker.end() : end].strip(), 1_000)
+            if step:
+                output.append(step)
+        return output
+
+    def add(raw: Any) -> None:
+        if not isinstance(raw, str):
+            return
+        values = split_numbered_string(raw) or [_recipe_string(raw, 1_000)]
+        for text in values:
+            if text and text not in lines and len(lines) < limit:
+                lines.append(text)
+
+    def visit(item: Any, depth: int = 0) -> None:
+        if depth > 8 or len(lines) >= limit:
+            return
+        if isinstance(item, str):
+            add(item)
+            return
+        if isinstance(item, list):
+            for child in item[:limit]:
+                visit(child, depth + 1)
+            return
+        if not isinstance(item, dict):
+            return
+        kinds = item.get("@type")
+        if isinstance(kinds, str):
+            kinds = [kinds]
+        is_section = isinstance(kinds, list) and any(
+            isinstance(kind, str) and kind.lower().endswith("howtosection") for kind in kinds[:10]
+        )
+        children = item.get("itemListElement") or item.get("recipeInstructions") or item.get("steps")
+        if is_section:
+            # Section headings offer useful structure, but never replace steps.
+            name = _recipe_string(item.get("name"), 240)
+            if name:
+                add(name)
+            visit(children, depth + 1)
+            return
+        text = item.get("text") or item.get("description") or item.get("name")
+        if text:
+            add(text)
+        elif children:
+            visit(children, depth + 1)
+
+    visit(value)
+    return lines
+
+
+def _xiachufang_recipe_page(
+    requested_url: str,
+    payload: HTTPPayload,
+    parser: _HTMLTextExtractor,
+    *,
+    max_text_chars: int,
+) -> ExtractedPage:
+    """Build a recipe preview exclusively from the exact Recipe JSON-LD node."""
+    if _is_xiachufang_challenge_payload(payload, parser.text_parts):
+        raise LinkPreviewError("Xiachufang verification challenge")
+    recipe = _select_xiachufang_recipe(parser, requested_url, payload.url)
+    if not _recipe_string(recipe.get("name"), MAX_TITLE):
+        raise LinkPreviewError("Xiachufang Recipe JSON-LD had no title")
+    title = _recipe_string(recipe.get("name"), MAX_TITLE)
+    description = _recipe_string(recipe.get("description"), MAX_DESCRIPTION)
+    author = _recipe_author(recipe.get("author"))
+    ingredients = _recipe_lines(recipe.get("recipeIngredient"))
+    instructions = _recipe_instruction_lines(recipe.get("recipeInstructions"))
+    image_values = recipe.get("image")
+    image_urls = _dedupe_image_values(
+        image_values if isinstance(image_values, list) else [image_values], payload.url, xhs_only=False
+    )
+    body_sections: list[str] = []
+    if author:
+        body_sections.append(f"作者：{author}")
+    if ingredients:
+        body_sections.append("食材：\n" + "\n".join(f"- {item}" for item in ingredients))
+    if instructions:
+        body_sections.append("步骤：\n" + "\n".join(
+            f"{index}. {item}" for index, item in enumerate(instructions, 1)
+        ))
+    body_text = "\n\n".join(body_sections)[:max_text_chars]
+    if not body_text and not description:
+        raise LinkPreviewError("Xiachufang Recipe had no extractable fields")
+    return ExtractedPage(
+        requested_url=requested_url,
+        final_url=payload.url,
+        title=title,
+        description=description,
+        site_name="下厨房",
+        image_url=image_urls[0] if image_urls else "",
+        body_text=body_text,
+        image_urls=image_urls,
+    )
 
 
 def _replace_js_undefined(source: str) -> str:
@@ -1309,6 +1634,24 @@ def _is_wechat_challenge_payload(
     )
 
 
+def _is_xiachufang_challenge_payload(
+    payload: HTTPPayload,
+    visible_parts: list[str] | None = None,
+) -> bool:
+    """Recognize the site's slider/verification shell, never preview it."""
+    try:
+        path = urlsplit(payload.url).path.lower()
+    except ValueError:
+        path = ""
+    if "captcha" in path or "verify" in path:
+        return True
+    compact = re.sub(r"\s+", "", unescape(" ".join(visible_parts or ())))
+    return (
+        ("滑动验证" in compact or "拖动滑块" in compact)
+        and any(marker in compact for marker in ("请完成", "安全验证", "访问验证", "验证后"))
+    )
+
+
 def _decode_html(payload: HTTPPayload) -> str:
     content_type = payload.headers.get("content-type", "")
     charset_match = re.search(r"charset\s*=\s*['\"]?([^;'\"\s]+)", content_type, re.I)
@@ -1336,6 +1679,14 @@ def extract_html_page(requested_url: str, payload: HTTPPayload, *, max_text_char
         parser.feed(_decode_html(payload))
     except Exception as exc:
         raise LinkPreviewError("HTML parsing failed") from exc
+    is_xiachufang_recipe = (
+        LinkPreviewService._is_xiachufang_recipe(requested_url)
+        or LinkPreviewService._is_xiachufang_recipe(payload.url)
+    )
+    if is_xiachufang_recipe:
+        return _xiachufang_recipe_page(
+            requested_url, payload, parser, max_text_chars=max_text_chars
+        )
     meta = parser.meta
     trusted_wechat_article = bool(
         str(meta.get("og:title") or "").strip() and parser.wechat_content_seen
@@ -1858,6 +2209,11 @@ class LinkPreviewService:
                 return None
             if self._is_wechat(url) and meta.get("schema_version") != WECHAT_CACHE_SCHEMA_VERSION:
                 return None
+            if (
+                self._is_xiachufang_recipe(url)
+                and meta.get("schema_version") != XIACHUFANG_CACHE_SCHEMA_VERSION
+            ):
+                return None
             if not self._cached_image_paths_are_valid(meta):
                 return None
             # Renew before exposing the path.  The atomic sidecar replacement is
@@ -2127,6 +2483,98 @@ class LinkPreviewService:
             return False
         return host in WECHAT_HOSTS
 
+    @staticmethod
+    def _is_xiachufang_recipe(url: str) -> bool:
+        """Accept only public recipe detail URLs, never credentials or lookalikes."""
+        try:
+            parts = urlsplit(url)
+            host = (parts.hostname or "").lower().rstrip(".")
+            port = parts.port
+        except ValueError:
+            return False
+        return bool(
+            parts.scheme.lower() == "https"
+            and parts.username is None
+            and parts.password is None
+            and host in XIACHUFANG_HOSTS
+            and port in (None, 443)
+            and _xiachufang_recipe_id_from_path(parts.path)
+        )
+
+    @staticmethod
+    def _xiachufang_mobile_recipe_url(url: str) -> str:
+        """Canonical mobile URL, intentionally dropping share-query secrets."""
+        if not LinkPreviewService._is_xiachufang_recipe(url):
+            raise LinkPreviewError("invalid Xiachufang recipe URL")
+        try:
+            recipe_id = re.fullmatch(r"/recipe/([0-9]+)/?", urlsplit(url).path).group(1)
+        except (AttributeError, ValueError):
+            raise LinkPreviewError("invalid Xiachufang recipe URL") from None
+        return f"https://m.xiachufang.com/recipe/{recipe_id}/"
+
+    @staticmethod
+    def _is_xiachufang_final_url(url: str) -> bool:
+        try:
+            parts = urlsplit(url)
+            host = (parts.hostname or "").lower().rstrip(".")
+            port = parts.port
+        except ValueError:
+            return False
+        return bool(
+            parts.scheme.lower() == "https"
+            and parts.username is None
+            and parts.password is None
+            and host in XIACHUFANG_HOSTS
+            and port in (None, 443)
+        )
+
+    def _fetch_xiachufang_page(self, url: str, deadline: float) -> ExtractedPage:
+        # www.xiachufang.com frequently presents a slider wall to server UAs.
+        # The official mobile detail URL exposes the same public recipe JSON-LD.
+        mobile_url = self._xiachufang_mobile_recipe_url(url)
+        header_variants = (
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 "
+                    "Mobile/15E148 Safari/604.1"
+                ),
+                "Accept-Language": "zh-CN,zh;q=0.9",
+                "Accept-Encoding": "gzip",
+                "Referer": "https://m.xiachufang.com/",
+            },
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+                ),
+                "Accept-Language": "zh-CN,zh;q=0.9",
+                "Accept-Encoding": "gzip",
+                "Referer": "https://m.xiachufang.com/",
+            },
+        )
+        last_error: LinkPreviewError | None = None
+        for headers in header_variants:
+            if time.monotonic() >= deadline:
+                break
+            try:
+                payload = self.fetcher.request(
+                    mobile_url,
+                    deadline=deadline,
+                    headers=headers,
+                    max_bytes=self.max_download_bytes,
+                    truncate_at_limit=True,
+                    allowed_hosts=XIACHUFANG_HOSTS,
+                    allowed_schemes={"https"},
+                    allow_compression=True,
+                )
+                if not self._is_xiachufang_final_url(payload.url):
+                    raise LinkPreviewError("Xiachufang recipe redirected off origin")
+                return extract_html_page(url, payload, max_text_chars=self.max_text_chars)
+            except LinkPreviewError as exc:
+                last_error = exc
+        raise last_error or LinkPreviewError("Xiachufang recipe fetch failed")
+
     def _fetch_wechat_page(self, url: str, deadline: float) -> ExtractedPage:
         # The ordinary bot-like UA is redirected to a verification wall, while
         # the public article is served to normal phone browsers.  Try two
@@ -2171,6 +2619,21 @@ class LinkPreviewService:
         raise last_error or LinkPreviewError("WeChat article fetch failed")
 
     def _fetch_page(self, url: str, deadline: float) -> ExtractedPage:
+        try:
+            xiachufang_recipe_path = (
+                (urlsplit(url).hostname or "").lower().rstrip(".") in XIACHUFANG_HOSTS
+                and bool(_xiachufang_recipe_id_from_path(urlsplit(url).path))
+            )
+        except ValueError:
+            xiachufang_recipe_path = False
+        if xiachufang_recipe_path and not self._is_xiachufang_recipe(url):
+            # Do not let an HTTP or credential-bearing share URL fall through
+            # to generic extraction and become a downgradeable card target.
+            raise LinkPreviewError("invalid Xiachufang recipe URL")
+        if self._is_xiachufang_recipe(url):
+            # A recipe link is intentionally fail-open: no generic extractor
+            # may turn a slider wall or recommendation shell into a card.
+            return self._fetch_xiachufang_page(url, deadline)
         if self._is_wechat(url):
             # Never send a verification wall through the generic renderer or
             # persist it as article content.  A failed mobile fetch simply
@@ -2310,6 +2773,7 @@ class LinkPreviewService:
         key = self._url_key(url)
         is_xhs = self._is_xhs(url) or self._is_xhs(page.final_url)
         is_wechat = self._is_wechat(url) or self._is_wechat(page.final_url)
+        is_xiachufang_recipe = self._is_xiachufang_recipe(url) or self._is_xiachufang_recipe(page.final_url)
         remote_image_urls = list(page.image_urls or ((page.image_url,) if page.image_url else ()))[:MAX_PAGE_IMAGES]
         source_urls = (url, page.final_url, *remote_image_urls)
         safe_requested_url = _redact_url_echoes(_metadata_url(url), *source_urls)
@@ -2375,6 +2839,8 @@ class LinkPreviewService:
                 if is_xhs
                 else WECHAT_CACHE_SCHEMA_VERSION
                 if is_wechat
+                else XIACHUFANG_CACHE_SCHEMA_VERSION
+                if is_xiachufang_recipe
                 else GENERIC_CACHE_SCHEMA_VERSION
             ),
             "url": safe_requested_url,

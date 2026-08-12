@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import io
 import os
+import gzip
 from pathlib import Path
 import socket
 import sys
@@ -179,6 +180,74 @@ class LinkPreviewTests(unittest.TestCase):
         fetcher._connect = connect
         with self.assertRaises(link_preview.UnsafeAddressError):
             fetcher.request("https://public.example/a", deadline=time.monotonic() + 1)
+
+    def test_allowed_hosts_blocks_cross_origin_redirect_before_connecting(self):
+        fetcher = link_preview.SafeHTTPFetcher()
+        first = FakeConnection(FakeResponse(302, {"Location": "https://evil.example/recipe"}))
+        calls = []
+
+        def connect(scheme, host, port, deadline):
+            calls.append(host)
+            return first
+
+        fetcher._connect = connect
+        with self.assertRaises(link_preview.LinkPreviewError):
+            fetcher.request(
+                "https://m.xiachufang.com/recipe/1/",
+                deadline=time.monotonic() + 1,
+                allowed_hosts=link_preview.XIACHUFANG_HOSTS,
+            )
+        self.assertEqual(calls, ["m.xiachufang.com"])
+
+    def test_allowed_schemes_blocks_https_downgrade_before_connecting(self):
+        fetcher = link_preview.SafeHTTPFetcher()
+        first = FakeConnection(FakeResponse(302, {"Location": "http://m.xiachufang.com/recipe/1/"}))
+        calls = []
+
+        def connect(scheme, host, port, deadline):
+            calls.append((scheme, host))
+            return first
+
+        fetcher._connect = connect
+        with self.assertRaises(link_preview.LinkPreviewError):
+            fetcher.request(
+                "https://m.xiachufang.com/recipe/1/",
+                deadline=time.monotonic() + 1,
+                allowed_hosts=link_preview.XIACHUFANG_HOSTS,
+                allowed_schemes={"https"},
+            )
+        self.assertEqual(calls, [("https", "m.xiachufang.com")])
+
+    def test_compression_is_opt_in_and_bounded(self):
+        source = b"<html><body>safe compressed response</body></html>"
+        compressed = gzip.compress(source)
+        fetcher = link_preview.SafeHTTPFetcher(max_download_bytes=1_024)
+        fetcher._connect = lambda *args: FakeConnection(FakeResponse(
+            200, {"Content-Type": "text/html", "Content-Encoding": "gzip"}, compressed
+        ))
+        with self.assertRaises(link_preview.LinkPreviewError):
+            fetcher.request("https://example.com", deadline=time.monotonic() + 1)
+        payload = fetcher.request(
+            "https://example.com", deadline=time.monotonic() + 1, allow_compression=True
+        )
+        self.assertEqual(payload.body, source)
+
+        oversized = gzip.compress(b"x" * 1_025)
+        fetcher._connect = lambda *args: FakeConnection(FakeResponse(
+            200, {"Content-Encoding": "gzip"}, oversized
+        ))
+        with self.assertRaises(link_preview.ResponseTooLargeError):
+            fetcher.request(
+                "https://example.com", deadline=time.monotonic() + 1, allow_compression=True
+            )
+        for invalid in (compressed[:-4], b"not-gzip"):
+            fetcher._connect = lambda *args, body=invalid: FakeConnection(FakeResponse(
+                200, {"Content-Encoding": "gzip"}, body
+            ))
+            with self.subTest(invalid=invalid), self.assertRaises(link_preview.LinkPreviewError):
+                fetcher.request(
+                    "https://example.com", deadline=time.monotonic() + 1, allow_compression=True
+                )
 
     def test_cross_origin_redirect_drops_adapter_authorization(self):
         fetcher = link_preview.SafeHTTPFetcher()
@@ -2571,6 +2640,255 @@ class LinkPreviewTests(unittest.TestCase):
             }))
             self.assertIsNone(service._load_cache(url, time.monotonic() + 1))
         self.assertEqual(link_preview.XHS_CACHE_SCHEMA_VERSION, 7)
+
+    def test_xiachufang_recipe_url_validation_and_mobile_rewrite(self):
+        allowed = (
+            "https://xiachufang.com/recipe/104126605/",
+            "https://www.xiachufang.com/recipe/104126605?from=share",
+        )
+        for url in allowed:
+            with self.subTest(url=url):
+                self.assertTrue(link_preview.LinkPreviewService._is_xiachufang_recipe(url))
+                self.assertEqual(
+                    link_preview.LinkPreviewService._xiachufang_mobile_recipe_url(url),
+                    "https://m.xiachufang.com/recipe/104126605/",
+                )
+        rejected = (
+            "https://evilxiachufang.com/recipe/104126605/",
+            "https://www.xiachufang.com/recipe/not-a-number/",
+            "http://m.xiachufang.com/recipe/104126605/",
+            "https://user:pass@m.xiachufang.com/recipe/104126605/",
+            "https://m.xiachufang.com/not-recipe/104126605/",
+        )
+        for url in rejected:
+            with self.subTest(url=url):
+                self.assertFalse(link_preview.LinkPreviewService._is_xiachufang_recipe(url))
+                with self.assertRaises(link_preview.LinkPreviewError):
+                    link_preview.LinkPreviewService._xiachufang_mobile_recipe_url(url)
+
+    def test_xiachufang_recipe_jsonld_extracts_only_recipe_fields(self):
+        recipe = {
+            "@context": "https://schema.org",
+            "@type": "Recipe",
+            "name": "番茄炖牛腩",
+            "description": "酸甜下饭。",
+            "author": {"@type": "Person", "name": "Astra"},
+            "image": ["https://img.example.test/cover.jpg"],
+            "recipeIngredient": ["牛腩 500g", "番茄 3 个"],
+            "recipeInstructions": [
+                {"@type": "HowToStep", "text": "牛腩焯水。"},
+                {
+                    "@type": "HowToSection",
+                    "name": "炖煮",
+                    "itemListElement": [
+                        {"@type": "HowToStep", "text": "加番茄小火炖一小时。"},
+                    ],
+                },
+            ],
+        }
+        shell = {"@graph": [{"@type": "WebPage", "name": "推荐菜谱"}, recipe]}
+        html = f"""<html><head><script type='application/ld+json'>{json.dumps(shell, ensure_ascii=False)}</script>
+        </head><body>滑到最后看推荐菜谱 页面壳</body></html>""".encode()
+        payload = link_preview.HTTPPayload(
+            "https://m.xiachufang.com/recipe/104126605/", 200,
+            {"content-type": "text/html; charset=utf-8"}, html,
+        )
+        page = link_preview.extract_html_page(
+            "https://www.xiachufang.com/recipe/104126605/", payload, max_text_chars=4_000
+        )
+        self.assertEqual(page.title, "番茄炖牛腩")
+        self.assertEqual(page.description, "酸甜下饭。")
+        self.assertEqual(page.site_name, "下厨房")
+        self.assertEqual(page.image_url, "https://img.example.test/cover.jpg")
+        self.assertIn("作者：Astra", page.body_text)
+        self.assertIn("- 牛腩 500g", page.body_text)
+        self.assertIn("1. 牛腩焯水。", page.body_text)
+        self.assertIn("2. 炖煮", page.body_text)
+        self.assertIn("3. 加番茄小火炖一小时。", page.body_text)
+        self.assertNotIn("推荐菜谱", page.body_text)
+        self.assertNotIn("页面壳", page.body_text)
+
+    def test_xiachufang_zero_based_instruction_string_is_split_without_decimal_false_positive(self):
+        recipe = {
+            "@type": "Recipe",
+            "name": "真实形态步骤",
+            "recipeInstructions": "0.鸡腿洗净，1.碗里加一勺生抽,2.加水后炖 20 分钟。",
+        }
+        html = f"<script type='application/ld+json'>{json.dumps(recipe, ensure_ascii=False)}</script>".encode()
+        payload = link_preview.HTTPPayload(
+            "https://m.xiachufang.com/recipe/104126605/", 200, {"content-type": "text/html"}, html
+        )
+        page = link_preview.extract_html_page(
+            "https://www.xiachufang.com/recipe/104126605/", payload, max_text_chars=4_000
+        )
+        self.assertIn("1. 鸡腿洗净", page.body_text)
+        self.assertIn("2. 碗里加一勺生抽", page.body_text)
+        self.assertIn("3. 加水后炖 20 分钟。", page.body_text)
+        self.assertNotIn("0.鸡腿", page.body_text)
+
+        decimal_recipe = {
+            "@type": "Recipe",
+            "name": "小数不拆",
+            "recipeInstructions": "0.5 千克鸡腿，加入 1.5 勺盐，静置 2.0 小时。",
+        }
+        decimal_html = f"<script type='application/ld+json'>{json.dumps(decimal_recipe, ensure_ascii=False)}</script>".encode()
+        decimal_payload = link_preview.HTTPPayload(
+            "https://m.xiachufang.com/recipe/104126605/", 200,
+            {"content-type": "text/html"}, decimal_html,
+        )
+        decimal_page = link_preview.extract_html_page(
+            "https://www.xiachufang.com/recipe/104126605/", decimal_payload, max_text_chars=4_000
+        )
+        self.assertIn("1. 0.5 千克鸡腿，加入 1.5 勺盐，静置 2.0 小时。", decimal_page.body_text)
+
+    def test_xiachufang_recipe_selects_unique_exact_identity_over_recommendation(self):
+        recommended = {"@type": "Recipe", "@id": "/recipe/999999/", "name": "推荐菜"}
+        target = {
+            "@type": "Recipe",
+            "mainEntityOfPage": {"@id": "https://m.xiachufang.com/recipe/104126605/"},
+            "name": "目标菜谱",
+            "recipeInstructions": "目标步骤。",
+        }
+        html = f"<script type='application/ld+json'>{json.dumps({'@graph': [recommended, target]}, ensure_ascii=False)}</script>".encode()
+        payload = link_preview.HTTPPayload(
+            "https://m.xiachufang.com/recipe/104126605/", 200, {"content-type": "text/html"}, html
+        )
+        page = link_preview.extract_html_page(
+            "https://www.xiachufang.com/recipe/104126605/", payload, max_text_chars=1_000
+        )
+        self.assertEqual(page.title, "目标菜谱")
+
+    def test_xiachufang_multiple_unidentified_recipes_fail_closed(self):
+        recipes = {"@graph": [
+            {"@type": "Recipe", "name": "推荐菜"},
+            {"@type": "Recipe", "name": "另一个推荐菜"},
+        ]}
+        payload = link_preview.HTTPPayload(
+            "https://m.xiachufang.com/recipe/104126605/", 200, {"content-type": "text/html"},
+            f"<script type='application/ld+json'>{json.dumps(recipes, ensure_ascii=False)}</script>".encode(),
+        )
+        with self.assertRaises(link_preview.LinkPreviewError):
+            link_preview.extract_html_page(
+                "https://www.xiachufang.com/recipe/104126605/", payload, max_text_chars=1_000
+            )
+
+    def test_xiachufang_similar_identity_path_does_not_match_target(self):
+        similar = {"@type": "Recipe", "@id": "/recipe/104126605/evil", "name": "相似恶意路径"}
+        target = {
+            "@type": "Recipe", "@id": "/recipe/104126605/", "name": "精确目标",
+            "recipeInstructions": "目标步骤。",
+        }
+        payload = link_preview.HTTPPayload(
+            "https://m.xiachufang.com/recipe/104126605/", 200, {"content-type": "text/html"},
+            f"<script type='application/ld+json'>{json.dumps([similar, target], ensure_ascii=False)}</script>".encode(),
+        )
+        page = link_preview.extract_html_page(
+            "https://www.xiachufang.com/recipe/104126605/", payload, max_text_chars=1_000
+        )
+        self.assertEqual(page.title, "精确目标")
+
+    def test_xiachufang_final_recipe_id_must_match_requested_target(self):
+        recipe = {
+            "@type": "Recipe", "@id": "https://m.xiachufang.com/recipe/999999/",
+            "name": "错误重定向目标", "recipeInstructions": "不应采用。",
+        }
+        payload = link_preview.HTTPPayload(
+            "https://m.xiachufang.com/recipe/999999/", 200, {"content-type": "text/html"},
+            f"<script type='application/ld+json'>{json.dumps(recipe, ensure_ascii=False)}</script>".encode(),
+        )
+        with self.assertRaises(link_preview.LinkPreviewError):
+            link_preview.extract_html_page(
+                "https://www.xiachufang.com/recipe/104126605/", payload, max_text_chars=1_000
+            )
+
+    def test_xiachufang_absolute_recipe_identity_requires_https_official_default_port(self):
+        invalid = (
+            "http://m.xiachufang.com/recipe/104126605/",
+            "https://m.xiachufang.com:444/recipe/104126605/",
+            "https://evil.example/recipe/104126605/",
+        )
+        for identity in invalid:
+            with self.subTest(identity=identity):
+                recipe = {"@type": "Recipe", "@id": identity, "name": "不能匹配"}
+                self.assertEqual(link_preview._xiachufang_recipe_candidate_ids(recipe), set())
+
+    def test_xiachufang_challenge_or_missing_recipe_fails_open(self):
+        challenge = "<html><body>请完成安全验证，拖动滑块进行滑动验证</body></html>".encode()
+        no_recipe = "<html><body>普通页面壳和推荐菜谱</body></html>".encode()
+        for body in (challenge, no_recipe):
+            with self.subTest(body=body):
+                payload = link_preview.HTTPPayload(
+                    "https://m.xiachufang.com/recipe/104126605/", 200,
+                    {"content-type": "text/html"}, body,
+                )
+                with self.assertRaises(link_preview.LinkPreviewError):
+                    link_preview.extract_html_page(
+                        "https://www.xiachufang.com/recipe/104126605/", payload, max_text_chars=1_000
+                    )
+
+    def test_xiachufang_mobile_fetch_headers_and_final_host_boundary(self):
+        recipe = {"@type": "Recipe", "name": "小炒肉", "recipeInstructions": "炒熟即可。"}
+        good = link_preview.HTTPPayload(
+            "https://m.xiachufang.com/recipe/104126605/", 200, {"content-type": "text/html"},
+            f"<script type='application/ld+json'>{json.dumps(recipe, ensure_ascii=False)}</script>".encode(),
+        )
+        original = "https://www.xiachufang.com/recipe/104126605/?share=ordinary"
+        with tempfile.TemporaryDirectory() as td:
+            fetcher = QueueFetcher([good])
+            service = link_preview.LinkPreviewService(td, fetcher=fetcher, lease_seconds=1000)
+            preview = service.enrich(original).previews[0]
+            self.assertEqual(fetcher.calls[0][0], "https://m.xiachufang.com/recipe/104126605/")
+            headers = fetcher.calls[0][1]["headers"]
+            self.assertIn("Mozilla/5.0", headers["User-Agent"])
+            self.assertEqual(headers["Referer"], "https://m.xiachufang.com/")
+            self.assertEqual(preview["url"], "https://www.xiachufang.com/recipe/104126605/")
+            self.assertEqual(preview["final_url"], "https://m.xiachufang.com/recipe/104126605/")
+
+        off_origin = link_preview.HTTPPayload(
+            "https://public-evil.example/recipe/104126605/", 200, {"content-type": "text/html"}, b"<html></html>"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(td, fetcher=QueueFetcher([off_origin]))
+            self.assertEqual(service.enrich(original).previews, ())
+
+    def test_xiachufang_mobile_retries_with_compressed_https_contract(self):
+        recipe = {"@type": "Recipe", "name": "重试菜谱", "recipeInstructions": "完成。"}
+        good = link_preview.HTTPPayload(
+            "https://m.xiachufang.com/recipe/104126605/", 200, {"content-type": "text/html"},
+            f"<script type='application/ld+json'>{json.dumps(recipe, ensure_ascii=False)}</script>".encode(),
+        )
+        with tempfile.TemporaryDirectory() as td:
+            fetcher = QueueFetcher([link_preview.LinkPreviewError("temporary"), good])
+            service = link_preview.LinkPreviewService(td, fetcher=fetcher, lease_seconds=1000)
+            page = service._fetch_xiachufang_page(
+                "https://www.xiachufang.com/recipe/104126605/", time.monotonic() + 2
+            )
+        self.assertEqual(page.title, "重试菜谱")
+        self.assertEqual(len(fetcher.calls), 2)
+        first_headers = fetcher.calls[0][1]["headers"]
+        second_headers = fetcher.calls[1][1]["headers"]
+        self.assertNotEqual(first_headers["User-Agent"], second_headers["User-Agent"])
+        for _url, kwargs in fetcher.calls:
+            self.assertEqual(kwargs["headers"]["Accept-Encoding"], "gzip")
+            self.assertTrue(kwargs["allow_compression"])
+            self.assertEqual(kwargs["allowed_hosts"], link_preview.XIACHUFANG_HOSTS)
+            self.assertEqual(kwargs["allowed_schemes"], {"https"})
+
+    def test_xiachufang_cache_schema_upgrade_invalidates_previous_sidecar(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(td, cache_ttl_seconds=60)
+            url = "https://www.xiachufang.com/recipe/104126605/"
+            text_path, meta_path = service._paths(url)
+            text_path.write_text("old")
+            meta_path.write_text(json.dumps({
+                "schema_version": 0,
+                "cache_key": service._url_key(url),
+                "lease_until": int(time.time() + 60),
+                "image_paths": [],
+                "image_cache_urls": [],
+            }))
+            self.assertIsNone(service._load_cache(url, time.monotonic() + 1))
+        self.assertEqual(link_preview.XIACHUFANG_CACHE_SCHEMA_VERSION, 1)
 
 
 if __name__ == "__main__":
