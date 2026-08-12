@@ -491,6 +491,50 @@ class MemoryProxyTest(unittest.TestCase):
         self.assertEqual(captured["method"], "GET")
         self.assertIsNone(captured["data"])
 
+    def test_selected_date_sync_forwards_only_a_calendar_date_to_the_fixed_upstream(self):
+        captured = {}
+
+        def fake_open(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["method"] = req.get_method()
+            captured["data"] = req.data
+            return _FakeResponse(202, _sync_payload(scope="date", date="2026-08-12", matched=3))
+
+        handler = self.handler("/memory/sync/notion/date")
+        with patch.object(PushHandler, "_memory_token", classmethod(lambda cls: "tok-abc")), \
+                patch.object(PushHandler, "_memory_sync_open", side_effect=fake_open):
+            handler._handle_memory_date_sync_post({"date": "2026-08-12"})
+
+        self.assertEqual(handler.responses[0][0], 202)
+        self.assertEqual(handler.responses[0][1]["date"], "2026-08-12")
+        self.assertEqual(handler.responses[0][1]["matched"], 3)
+        self.assertEqual(captured["url"], "https://memory.xiaonancaleb.xyz/api/sync/notion/date")
+        self.assertEqual(captured["data"], b'{"date":"2026-08-12"}')
+
+    def test_selected_date_sync_poll_is_fixed_and_rejects_malformed_or_extra_input(self):
+        captured = {}
+
+        def fake_open(req, timeout=None):
+            captured["url"] = req.full_url
+            self.assertIsNone(req.data)
+            return _FakeResponse(200, _sync_payload(status="completed", scope="date", date="2026-08-12"))
+
+        handler = self.handler("/memory/sync/notion/date?date=2026-08-12")
+        with patch.object(PushHandler, "_memory_token", classmethod(lambda cls: "tok-abc")), \
+                patch.object(PushHandler, "_memory_sync_open", side_effect=fake_open):
+            handler._handle_memory_date_sync_get()
+        self.assertEqual(captured["url"], "https://memory.xiaonancaleb.xyz/api/sync/notion/date?date=2026-08-12")
+        self.assertEqual(handler.responses[0][1]["scope"], "date")
+
+        invalid = self.handler("/memory/sync/notion/date?date=2026-02-30")
+        invalid._handle_memory_date_sync_get()
+        self.assertEqual(invalid.responses[0][0], 400)
+        bad_body = self.handler("/memory/sync/notion/date")
+        with patch.object(PushHandler, "_memory_sync_request") as upstream:
+            bad_body._handle_memory_date_sync_post({"date": "2026-08-12", "url": "https://evil.example"})
+        upstream.assert_not_called()
+        self.assertEqual(bad_body.responses[0][0], 400)
+
     def test_notion_sync_post_route_reads_only_a_small_json_object(self):
         handler = self.handler("/memory/sync/notion")
         handler.command = "POST"

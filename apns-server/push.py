@@ -47,7 +47,7 @@ import signal
 import secrets
 import stat
 import subprocess
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import sys
 import threading
 import time
@@ -4970,11 +4970,14 @@ class PushHandler(BaseHTTPRequestHandler):
         request_path = urlparse(self.path).path
         if not self._is_public_get() and not self._check_ip_allowed():
             return
-        if request_path == self._MEMORY_SYNC_PATH:
+        if request_path in {self._MEMORY_SYNC_PATH, self._MEMORY_DATE_SYNC_PATH}:
             if not self._memory_sync_auth_matches():
                 self._send_json(401, {"ok": False, "error": "unauthorized"})
                 return
-            self._handle_memory_sync_get()
+            if request_path == self._MEMORY_DATE_SYNC_PATH:
+                self._handle_memory_date_sync_get()
+            else:
+                self._handle_memory_sync_get()
             return
         # PWA bootstrap has to answer without an X-Auth-Token header.  It
         # validates only the HttpOnly session cookie itself and never emits a
@@ -5589,7 +5592,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 return
             self._handle_login(body)
             return
-        if request_path == self._MEMORY_SYNC_PATH:
+        if request_path in {self._MEMORY_SYNC_PATH, self._MEMORY_DATE_SYNC_PATH}:
             if not self._memory_sync_auth_matches():
                 self.close_connection = True
                 self._send_json(401, {"ok": False, "error": "unauthorized"})
@@ -5614,7 +5617,10 @@ class PushHandler(BaseHTTPRequestHandler):
             except Exception as error:
                 self._send_json(400, {"ok": False, "error": f"bad json: {error}"})
                 return
-            self._handle_memory_sync_post(body)
+            if request_path == self._MEMORY_DATE_SYNC_PATH:
+                self._handle_memory_date_sync_post(body)
+            else:
+                self._handle_memory_sync_post(body)
             return
         if not self._require_write_auth():
             return
@@ -14409,6 +14415,8 @@ class PushHandler(BaseHTTPRequestHandler):
     )
     _MEMORY_SYNC_PATH = "/memory/sync/notion"
     _MEMORY_SYNC_UPSTREAM_PATH = "/api/sync/notion"
+    _MEMORY_DATE_SYNC_PATH = "/memory/sync/notion/date"
+    _MEMORY_DATE_SYNC_UPSTREAM_PATH = "/api/sync/notion/date"
     _MEMORY_SYNC_REQUEST_LIMIT = 4 * 1024
     _MEMORY_SYNC_RESPONSE_LIMIT = 64 * 1024
     _MEMORY_SYNC_TIMEOUT_SEC = 15
@@ -14635,7 +14643,7 @@ class PushHandler(BaseHTTPRequestHandler):
         }
         for key in (
             "created", "updated", "skipped", "failed", "module_count",
-            "ambiguous", "orphaned",
+            "ambiguous", "orphaned", "matched",
         ):
             value = payload.get(key, 0)
             if isinstance(value, bool) or not isinstance(value, int):
@@ -14684,7 +14692,10 @@ class PushHandler(BaseHTTPRequestHandler):
             return None
         # The app only needs the failed count. Notion page/debug text in an
         # upstream error must never cross this privilege boundary.
-        public["error_count"] = len(errors)
+        supplied_error_count = payload.get("error_count", len(errors))
+        if isinstance(supplied_error_count, bool) or not isinstance(supplied_error_count, int):
+            return None
+        public["error_count"] = max(len(errors), min(supplied_error_count, 50))
         ambiguities = payload.get("ambiguities")
         if not isinstance(ambiguities, list) or len(ambiguities) > 20:
             return None
@@ -14692,6 +14703,13 @@ class PushHandler(BaseHTTPRequestHandler):
         # are sufficient for the App's actionable warning.
         if isinstance(payload.get("interrupted"), bool):
             public["interrupted"] = payload["interrupted"]
+        scope = payload.get("scope")
+        date = payload.get("date")
+        if scope is not None or date is not None:
+            if scope != "date" or not isinstance(date, str) or not re.fullmatch(r"\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])", date):
+                return None
+            public["scope"] = "date"
+            public["date"] = date
         return public
 
     @staticmethod
@@ -14706,15 +14724,24 @@ class PushHandler(BaseHTTPRequestHandler):
         return urllib.request.build_opener(NoRedirect()).open(request, timeout=timeout)
 
     @classmethod
-    def _memory_sync_request(cls, token: str, *, method: str = "POST") -> tuple[int, Any]:
+    def _memory_sync_request(
+        cls,
+        token: str,
+        *,
+        method: str = "POST",
+        upstream_path: str | None = None,
+        payload: dict[str, Any] | None = None,
+        query: str = "",
+    ) -> tuple[int, Any]:
         """Trigger one bounded Notion diary sync without exposing either credential."""
         import urllib.error
         import urllib.request
 
-        url = cls._MEMORY_UPSTREAM_BASE + cls._MEMORY_SYNC_UPSTREAM_PATH
+        url = cls._MEMORY_UPSTREAM_BASE + (upstream_path or cls._MEMORY_SYNC_UPSTREAM_PATH) + query
+        encoded_payload = json.dumps(payload if payload is not None else {}, separators=(",", ":")).encode("utf-8")
         req = urllib.request.Request(
             url,
-            data=b"{}" if method == "POST" else None,
+            data=encoded_payload if method == "POST" else None,
             headers={
                 "Authorization": f"Bearer {token}",
                 "User-Agent": "curl/7.81.0",
@@ -14786,6 +14813,53 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(502, {"ok": False, "error": "memory token not configured"})
             return
         status, payload = self._memory_sync_request(token, method="GET")
+        self._send_json(status, payload)
+
+    @staticmethod
+    def _memory_date_sync_value(value: Any) -> str | None:
+        if not isinstance(value, str) or not re.fullmatch(r"\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])", value):
+            return None
+        try:
+            return value if date.fromisoformat(value).isoformat() == value else None
+        except ValueError:
+            return None
+
+    def _handle_memory_date_sync_post(self, body: dict[str, Any]) -> None:
+        """POST one fixed diary day; clients cannot choose an upstream target."""
+        date = self._memory_date_sync_value(body.get("date")) if set(body) == {"date"} else None
+        if not date:
+            self._send_json(400, {"ok": False, "error": "date must use YYYY-MM-DD"})
+            return
+        token = self._memory_token()
+        if not token:
+            self._send_json(502, {"ok": False, "error": "memory token not configured"})
+            return
+        status, payload = self._memory_sync_request(
+            token,
+            upstream_path=self._MEMORY_DATE_SYNC_UPSTREAM_PATH,
+            payload={"date": date},
+        )
+        self._send_json(status, payload)
+
+    def _handle_memory_date_sync_get(self) -> None:
+        from urllib.parse import parse_qs, urlencode, urlparse
+
+        query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+        values = query.get("date", [])
+        date = self._memory_date_sync_value(values[0]) if len(query) == 1 and len(values) == 1 else None
+        if not date:
+            self._send_json(400, {"ok": False, "error": "date must use YYYY-MM-DD"})
+            return
+        token = self._memory_token()
+        if not token:
+            self._send_json(502, {"ok": False, "error": "memory token not configured"})
+            return
+        status, payload = self._memory_sync_request(
+            token,
+            method="GET",
+            upstream_path=self._MEMORY_DATE_SYNC_UPSTREAM_PATH,
+            query="?" + urlencode({"date": date}),
+        )
         self._send_json(status, payload)
 
     # ------------------------------------------------------------------
