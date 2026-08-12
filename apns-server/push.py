@@ -3349,6 +3349,17 @@ class PushHandler(BaseHTTPRequestHandler):
         except UnicodeError:
             return False
 
+    def _memory_sync_auth_matches(self) -> bool:
+        """Fail closed for the Notion-to-memory mutation and its job status."""
+        expected = str(getattr(self.state, "shared_secret", "") or "")
+        supplied = str(self.headers.get("X-Auth-Token", "") or "")
+        if not expected or not supplied:
+            return False
+        try:
+            return hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+        except UnicodeError:
+            return False
+
     def _trusted_proxy_header_ip(self, name: str) -> tuple[bool, str | None]:
         """Return (present, validated IP) for one non-list proxy header."""
         get_all = getattr(self.headers, "get_all", None)
@@ -4959,6 +4970,12 @@ class PushHandler(BaseHTTPRequestHandler):
         request_path = urlparse(self.path).path
         if not self._is_public_get() and not self._check_ip_allowed():
             return
+        if request_path == self._MEMORY_SYNC_PATH:
+            if not self._memory_sync_auth_matches():
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            self._handle_memory_sync_get()
+            return
         # PWA bootstrap has to answer without an X-Auth-Token header.  It
         # validates only the HttpOnly session cookie itself and never emits a
         # server or memory credential.
@@ -5571,6 +5588,33 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"ok": False, "error": f"bad json: {e}"})
                 return
             self._handle_login(body)
+            return
+        if request_path == self._MEMORY_SYNC_PATH:
+            if not self._memory_sync_auth_matches():
+                self.close_connection = True
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            if self.headers.get("Transfer-Encoding"):
+                self.close_connection = True
+                self._send_json(400, {"ok": False, "error": "chunked request not supported"})
+                return
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+            except (TypeError, ValueError):
+                content_length = -1
+            if content_length < 0 or content_length > self._MEMORY_SYNC_REQUEST_LIMIT:
+                self.close_connection = True
+                self._send_json(413, {"ok": False, "error": "request_too_large"})
+                return
+            try:
+                raw = self.rfile.read(content_length) if content_length else b""
+                body = json.loads(raw) if raw else {}
+                if not isinstance(body, dict):
+                    raise ValueError("JSON object required")
+            except Exception as error:
+                self._send_json(400, {"ok": False, "error": f"bad json: {error}"})
+                return
+            self._handle_memory_sync_post(body)
             return
         if not self._require_write_auth():
             return
@@ -14362,6 +14406,11 @@ class PushHandler(BaseHTTPRequestHandler):
         "sort_order",
         "cursor",
     )
+    _MEMORY_SYNC_PATH = "/memory/sync/notion"
+    _MEMORY_SYNC_UPSTREAM_PATH = "/api/sync/notion"
+    _MEMORY_SYNC_REQUEST_LIMIT = 4 * 1024
+    _MEMORY_SYNC_RESPONSE_LIMIT = 64 * 1024
+    _MEMORY_SYNC_TIMEOUT_SEC = 15
     _memory_token_cache: str | None = None
 
     @classmethod
@@ -14527,6 +14576,199 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception:
             logger.warning("memory proxy upstream unreachable for %s", url.split("?")[0])
             return 502, {"error": "memory upstream unreachable"}
+
+    @staticmethod
+    def _memory_safe_payload(payload: Any, token: str) -> Any:
+        """Remove a bearer token even if an upstream error accidentally echoes it."""
+        if isinstance(payload, dict):
+            return {
+                (str(key).replace(token, "[redacted]") if token else str(key)):
+                    PushHandler._memory_safe_payload(value, token)
+                for key, value in payload.items()
+            }
+        if isinstance(payload, list):
+            return [PushHandler._memory_safe_payload(value, token) for value in payload]
+        if isinstance(payload, str) and token:
+            return payload.replace(token, "[redacted]")
+        return payload
+
+    @staticmethod
+    def _memory_sync_public_payload(payload: Any) -> dict[str, Any] | None:
+        """Validate and minimize the upstream job schema before returning it."""
+        if not isinstance(payload, dict):
+            return None
+        required = {
+            "ok", "status", "created", "updated", "skipped", "failed",
+            "last_sync", "modules", "module_count", "started_at",
+            "finished_at", "errors", "ambiguous", "orphaned", "ambiguities",
+        }
+        if not required.issubset(payload):
+            return None
+        status = payload.get("status")
+        if status not in {"idle", "running", "completed", "failed"}:
+            return None
+
+        ok = payload.get("ok")
+        if not isinstance(ok, bool):
+            return None
+        public: dict[str, Any] = {
+            "ok": ok,
+            "status": status,
+        }
+        for key in (
+            "created", "updated", "skipped", "failed", "module_count",
+            "ambiguous", "orphaned",
+        ):
+            value = payload.get(key, 0)
+            if isinstance(value, bool) or not isinstance(value, int):
+                return None
+            public[key] = max(0, min(value, 1_000_000))
+        if status == "failed":
+            if ok or public["failed"] < 1:
+                return None
+        elif not ok:
+            return None
+
+        for key in ("last_sync", "started_at", "finished_at"):
+            value = payload.get(key)
+            if value is None:
+                public[key] = None
+            elif isinstance(value, str) and len(value) <= 80:
+                public[key] = value
+            else:
+                return None
+
+        modules = payload.get("modules", [])
+        if not isinstance(modules, list) or len(modules) > 200:
+            return None
+        public_modules: list[dict[str, str]] = []
+        for module in modules:
+            if not isinstance(module, dict):
+                return None
+            key = module.get("key")
+            label = module.get("label")
+            if (
+                not isinstance(key, str)
+                or not isinstance(label, str)
+                or not key.strip()
+                or not label.strip()
+                or len(key) > 160
+                or len(label) > 160
+            ):
+                return None
+            public_modules.append({"key": key.strip(), "label": label.strip()})
+        public["modules"] = public_modules
+        if public["module_count"] != len(public_modules):
+            return None
+
+        errors = payload.get("errors", [])
+        if not isinstance(errors, list) or len(errors) > 50:
+            return None
+        # The app only needs the failed count. Notion page/debug text in an
+        # upstream error must never cross this privilege boundary.
+        public["error_count"] = len(errors)
+        ambiguities = payload.get("ambiguities")
+        if not isinstance(ambiguities, list) or len(ambiguities) > 20:
+            return None
+        # Titles and page ids stay upstream; the two aggregate counts above
+        # are sufficient for the App's actionable warning.
+        if isinstance(payload.get("interrupted"), bool):
+            public["interrupted"] = payload["interrupted"]
+        return public
+
+    @staticmethod
+    def _memory_sync_open(request: Any, timeout: int):
+        """Open without redirects so Authorization never crosses origins."""
+        import urllib.request
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        return urllib.request.build_opener(NoRedirect()).open(request, timeout=timeout)
+
+    @classmethod
+    def _memory_sync_request(cls, token: str, *, method: str = "POST") -> tuple[int, Any]:
+        """Trigger one bounded Notion diary sync without exposing either credential."""
+        import urllib.error
+        import urllib.request
+
+        url = cls._MEMORY_UPSTREAM_BASE + cls._MEMORY_SYNC_UPSTREAM_PATH
+        req = urllib.request.Request(
+            url,
+            data=b"{}" if method == "POST" else None,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "curl/7.81.0",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            method=method,
+        )
+
+        def decode(raw: bytes) -> tuple[bool, Any]:
+            if not raw:
+                return True, {}
+            try:
+                return True, json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return False, {"error": "memory upstream returned invalid json"}
+
+        try:
+            with cls._memory_sync_open(req, cls._MEMORY_SYNC_TIMEOUT_SEC) as resp:
+                raw = resp.read(cls._MEMORY_SYNC_RESPONSE_LIMIT + 1)
+                if len(raw) > cls._MEMORY_SYNC_RESPONSE_LIMIT:
+                    return 502, {"error": "memory upstream response too large"}
+                valid, payload = decode(raw)
+                if not valid:
+                    return 502, payload
+                public = cls._memory_sync_public_payload(payload)
+                if public is None:
+                    return 502, {"ok": False, "error": "memory upstream contract invalid"}
+                return resp.status, cls._memory_safe_payload(public, token)
+        except urllib.error.HTTPError as error:
+            if 300 <= error.code < 400:
+                logger.warning("memory sync upstream redirect rejected status=%s", error.code)
+                return 502, {"ok": False, "error": "memory upstream redirect rejected"}
+            raw = error.read(cls._MEMORY_SYNC_RESPONSE_LIMIT + 1)
+            if len(raw) > cls._MEMORY_SYNC_RESPONSE_LIMIT:
+                payload: Any = {"error": "memory upstream response too large"}
+            else:
+                valid, decoded = decode(raw)
+                public = cls._memory_sync_public_payload(decoded) if valid else None
+                if public is not None:
+                    payload = public
+                else:
+                    payload = {
+                        "ok": False,
+                        "error": f"memory upstream http {error.code}",
+                    }
+            logger.warning("memory sync upstream http %s", error.code)
+            return error.code, cls._memory_safe_payload(payload, token)
+        except Exception:
+            logger.warning("memory sync upstream unreachable")
+            return 502, {"error": "memory upstream unreachable"}
+
+    def _handle_memory_sync_post(self, body: dict[str, Any]) -> None:
+        """POST /memory/sync/notion — single-flight, fixed-target sync trigger."""
+        if body:
+            self._send_json(400, {"ok": False, "error": "request body must be empty"})
+            return
+        token = self._memory_token()
+        if not token:
+            self._send_json(502, {"ok": False, "error": "memory token not configured"})
+            return
+        status, payload = self._memory_sync_request(token)
+        self._send_json(status, payload)
+
+    def _handle_memory_sync_get(self) -> None:
+        """GET /memory/sync/notion — return one bounded snapshot of the async job."""
+        token = self._memory_token()
+        if not token:
+            self._send_json(502, {"ok": False, "error": "memory token not configured"})
+            return
+        status, payload = self._memory_sync_request(token, method="GET")
+        self._send_json(status, payload)
 
     # ------------------------------------------------------------------
     # Appearance Settings Sync API (Android cloud backup)

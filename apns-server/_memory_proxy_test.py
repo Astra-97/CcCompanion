@@ -43,13 +43,39 @@ _TAXONOMY = {
 }
 
 
+def _sync_payload(status="running", **overrides):
+    payload = {
+        "ok": status != "failed",
+        "status": status,
+        "created": 0,
+        "updated": 0,
+        "skipped": 0,
+        "failed": 0,
+        "last_sync": None,
+        "modules": [
+            {"key": "diary.general", "label": "日记"},
+            {"key": "diary.worklog", "label": "牛马日志"},
+            {"key": "diary.health", "label": "运动健康"},
+        ],
+        "module_count": 3,
+        "started_at": "2026-08-12T00:00:00Z",
+        "finished_at": None,
+        "errors": [],
+        "ambiguous": 0,
+        "orphaned": 0,
+        "ambiguities": [],
+    }
+    payload.update(overrides)
+    return payload
+
+
 class _FakeResponse:
     def __init__(self, status: int, payload):
         self.status = status
         self._raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
-    def read(self) -> bytes:
-        return self._raw
+    def read(self, size: int = -1) -> bytes:
+        return self._raw if size < 0 else self._raw[:size]
 
     def __enter__(self):
         return self
@@ -380,6 +406,224 @@ class MemoryProxyTest(unittest.TestCase):
         status, payload = handler.responses[0]
         self.assertEqual(status, 502)
         self.assertEqual(payload, {"error": "memory upstream unreachable"})
+
+    # ---------- Notion sync trigger ----------
+
+    def test_notion_sync_forwards_fixed_empty_post_with_bounded_timeout(self):
+        captured = {}
+
+        def fake_open(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["method"] = req.get_method()
+            captured["data"] = req.data
+            captured["headers"] = dict(req.headers)
+            captured["timeout"] = timeout
+            return _FakeResponse(202, _sync_payload())
+
+        with patch.object(PushHandler, "_memory_sync_open", side_effect=fake_open):
+            status, payload = PushHandler._memory_sync_request("tok-abc")
+
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["status"], "running")
+        self.assertEqual(captured["url"], "https://memory.xiaonancaleb.xyz/api/sync/notion")
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["data"], b"{}")
+        self.assertEqual(captured["timeout"], 15)
+        self.assertEqual(captured["headers"].get("Authorization"), "Bearer tok-abc")
+
+    def test_notion_sync_get_polls_same_fixed_path_without_a_body(self):
+        captured = {}
+
+        def fake_open(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["method"] = req.get_method()
+            captured["data"] = req.data
+            return _FakeResponse(200, _sync_payload(
+                status="completed", created=2, updated=1, skipped=206,
+                finished_at="2026-08-12T00:01:00Z",
+            ))
+
+        with patch.object(PushHandler, "_memory_sync_open", side_effect=fake_open):
+            status, payload = PushHandler._memory_sync_request("tok-abc", method="GET")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["created"], 2)
+        self.assertEqual(captured["method"], "GET")
+        self.assertIsNone(captured["data"])
+
+    def test_notion_sync_post_route_reads_only_a_small_json_object(self):
+        handler = self.handler("/memory/sync/notion")
+        handler.command = "POST"
+        handler.state = types.SimpleNamespace(shared_secret="app-secret", strict_auth=False)
+        handler.headers = {"Content-Length": "2", "X-Auth-Token": "app-secret"}
+        handler.rfile = io.BytesIO(b"{}")
+        handler._check_ip_allowed = lambda: True
+        handler._require_write_auth = lambda: True
+        received = []
+        handler._handle_memory_sync_post = lambda body: received.append(body)
+
+        handler.do_POST()
+
+        self.assertEqual(received, [{}])
+        self.assertEqual(handler.responses, [])
+
+    def test_notion_sync_post_rejects_oversize_or_chunked_body(self):
+        for headers in (
+            {"Content-Length": str(PushHandler._MEMORY_SYNC_REQUEST_LIMIT + 1)},
+            {"Content-Length": "2", "Transfer-Encoding": "chunked"},
+        ):
+            handler = self.handler("/memory/sync/notion")
+            handler.command = "POST"
+            handler.state = types.SimpleNamespace(shared_secret="app-secret", strict_auth=False)
+            handler.headers = {**headers, "X-Auth-Token": "app-secret"}
+            handler.rfile = io.BytesIO(b"{}")
+            handler._check_ip_allowed = lambda: True
+            handler._require_write_auth = lambda: True
+            with patch.object(PushHandler, "_handle_memory_sync_post") as sync:
+                handler.do_POST()
+            sync.assert_not_called()
+            self.assertTrue(handler.close_connection)
+            self.assertIn(handler.responses[0][0], (400, 413))
+
+    def test_notion_sync_rejects_client_parameters_and_does_not_call_upstream(self):
+        handler = self.handler("/memory/sync/notion")
+        with patch.object(PushHandler, "_memory_sync_request") as request:
+            handler._handle_memory_sync_post({"database_id": "attacker-controlled"})
+        request.assert_not_called()
+        self.assertEqual(handler.responses[0][0], 400)
+
+    def test_notion_sync_http_error_does_not_forward_upstream_text_or_token(self):
+        import urllib.error
+
+        error = urllib.error.HTTPError(
+            "https://memory.xiaonancaleb.xyz/api/sync/notion",
+            422,
+            "invalid",
+            {},
+            io.BytesIO(b'{"ok":false,"error":"bad tok-abc"}'),
+        )
+        with patch.object(PushHandler, "_memory_sync_open", side_effect=error):
+            status, payload = PushHandler._memory_sync_request("tok-abc")
+        self.assertEqual(status, 422)
+        self.assertEqual(payload, {"ok": False, "error": "memory upstream http 422"})
+        self.assertNotIn("tok-abc", json.dumps(payload))
+
+    def test_notion_sync_response_size_is_bounded(self):
+        class OversizedResponse(_FakeResponse):
+            def __init__(self):
+                self.status = 200
+                self._raw = b"x" * (PushHandler._MEMORY_SYNC_RESPONSE_LIMIT + 1)
+
+        with patch.object(PushHandler, "_memory_sync_open", return_value=OversizedResponse()):
+            status, payload = PushHandler._memory_sync_request("tok-abc")
+        self.assertEqual(status, 502)
+        self.assertEqual(payload, {"error": "memory upstream response too large"})
+
+    def test_notion_sync_success_with_invalid_json_is_not_reported_as_success(self):
+        response = _FakeResponse(200, {})
+        response._raw = b"not-json"
+        with patch.object(PushHandler, "_memory_sync_open", return_value=response):
+            status, payload = PushHandler._memory_sync_request("tok-abc")
+        self.assertEqual(status, 502)
+        self.assertEqual(payload, {"error": "memory upstream returned invalid json"})
+
+    def test_notion_sync_whitelists_contract_and_rejects_missing_status(self):
+        payload = _sync_payload(status="completed", debug={"notion_token": "secret"})
+        public = PushHandler._memory_sync_public_payload(payload)
+        self.assertIsNotNone(public)
+        self.assertNotIn("debug", public)
+        self.assertEqual(public["modules"][0], {"key": "diary.general", "label": "日记"})
+        self.assertEqual(public["ambiguous"], 0)
+        self.assertEqual(public["orphaned"], 0)
+        self.assertNotIn("ambiguities", public)
+        self.assertIsNone(PushHandler._memory_sync_public_payload({"ok": True}))
+        missing_count = _sync_payload()
+        missing_count.pop("created")
+        self.assertIsNone(PushHandler._memory_sync_public_payload(missing_count))
+        self.assertIsNone(PushHandler._memory_sync_public_payload(_sync_payload(created="1")))
+        self.assertIsNone(PushHandler._memory_sync_public_payload(_sync_payload(ambiguous=True)))
+        self.assertIsNone(PushHandler._memory_sync_public_payload(_sync_payload(orphaned="1")))
+        self.assertIsNone(PushHandler._memory_sync_public_payload(_sync_payload(ambiguities=[{}] * 21)))
+
+        failed = PushHandler._memory_sync_public_payload(_sync_payload(
+            status="failed", ok=False, failed=1,
+            errors=[{"page_id": "private-page", "error": "private Notion debug details"}],
+        ))
+        self.assertEqual(failed["error_count"], 1)
+        self.assertNotIn("errors", failed)
+        self.assertNotIn("private Notion", json.dumps(failed))
+
+    def test_notion_sync_redirect_is_rejected_without_following_location(self):
+        import urllib.error
+
+        redirect = urllib.error.HTTPError(
+            "https://memory.xiaonancaleb.xyz/api/sync/notion",
+            301,
+            "moved",
+            {"Location": "https://evil.example/steal"},
+            io.BytesIO(b""),
+        )
+        with patch.object(PushHandler, "_memory_sync_open", side_effect=redirect) as opened:
+            status, payload = PushHandler._memory_sync_request("tok-abc")
+        self.assertEqual(opened.call_count, 1)
+        self.assertEqual(status, 502)
+        self.assertEqual(payload, {"ok": False, "error": "memory upstream redirect rejected"})
+        self.assertNotIn("Location", json.dumps(payload))
+
+    def test_memory_sync_transport_installs_a_no_redirect_handler(self):
+        sentinel = object()
+
+        class FakeOpener:
+            def open(self, request, timeout=None):
+                self.request = request
+                self.timeout = timeout
+                return sentinel
+
+        opener = FakeOpener()
+
+        def fake_build(handler):
+            self.assertIsNone(
+                handler.redirect_request(None, None, 301, "moved", {}, "https://evil.example")
+            )
+            return opener
+
+        with patch("urllib.request.build_opener", side_effect=fake_build):
+            result = PushHandler._memory_sync_open("request", 15)
+        self.assertIs(result, sentinel)
+        self.assertEqual(opener.request, "request")
+        self.assertEqual(opener.timeout, 15)
+
+    def test_memory_sync_routes_fail_closed_even_when_legacy_strict_auth_is_off(self):
+        for method, secret, supplied in (
+            ("POST", "app-secret", ""),
+            ("POST", "", ""),
+            ("GET", "app-secret", "wrong"),
+            ("GET", "", ""),
+        ):
+            handler = self.handler("/memory/sync/notion")
+            handler.command = method
+            handler.client_address = ("127.0.0.1", 1234)
+            handler.state = types.SimpleNamespace(shared_secret=secret, strict_auth=False)
+            handler.headers = {
+                "Content-Length": "2",
+                "X-Auth-Token": supplied,
+            }
+            handler.rfile = io.BytesIO(b"{}")
+            handler._check_ip_allowed = lambda: True
+            with patch.object(PushHandler, "_memory_sync_request") as upstream:
+                if method == "POST":
+                    handler.do_POST()
+                else:
+                    handler.do_GET()
+            upstream.assert_not_called()
+            self.assertEqual(handler.responses[0][0], 401)
+
+    def test_memory_sync_does_not_accept_legacy_x_auth_alias(self):
+        handler = self.handler("/memory/sync/notion")
+        handler.state = types.SimpleNamespace(shared_secret="app-secret", strict_auth=False)
+        handler.headers = {"X-Auth": "app-secret"}
+        self.assertFalse(handler._memory_sync_auth_matches())
 
 
 if __name__ == "__main__":
