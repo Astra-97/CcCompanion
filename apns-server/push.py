@@ -14393,6 +14393,7 @@ class PushHandler(BaseHTTPRequestHandler):
         "/memory/list": "/api/memories",
         "/memory/semantic-search": "/api/semantic-search",
         "/memory/board": "/api/board",
+        "/memory/calendar": "/api/calendar",
     }
     _MEMORY_ALLOWED_PARAMS = (
         "query",
@@ -14411,6 +14412,7 @@ class PushHandler(BaseHTTPRequestHandler):
     _MEMORY_SYNC_REQUEST_LIMIT = 4 * 1024
     _MEMORY_SYNC_RESPONSE_LIMIT = 64 * 1024
     _MEMORY_SYNC_TIMEOUT_SEC = 15
+    _MEMORY_RESPONSE_LIMIT = 8 * 1024 * 1024
     _memory_token_cache: str | None = None
 
     @classmethod
@@ -14445,6 +14447,15 @@ class PushHandler(BaseHTTPRequestHandler):
 
         # Whitelist-filter query params (anti SSRF / abuse).
         qs = parse_qs(parsed.query, keep_blank_values=True)
+        if upstream_path == "/api/calendar":
+            month_values = qs.get("month", [])
+            if (
+                len(qs) != 1
+                or len(month_values) != 1
+                or not re.fullmatch(r"\d{4}-(?:0[1-9]|1[0-2])", str(month_values[0]))
+            ):
+                self._send_json(400, {"error": "month must use YYYY-MM"})
+                return
         subcategory_values = qs.get("subcategory")
         if subcategory_values is not None:
             if len(subcategory_values) != 1:
@@ -14512,6 +14523,8 @@ class PushHandler(BaseHTTPRequestHandler):
                     continue
                 value = raw_value
             params.append((key, value))
+        if upstream_path == "/api/calendar":
+            params.append(("month", str(qs["month"][0])))
 
         url = self._MEMORY_UPSTREAM_BASE + upstream_path
         if params:
@@ -14568,8 +14581,13 @@ class PushHandler(BaseHTTPRequestHandler):
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
-                raw = resp.read()
-                return resp.status, json.loads(raw) if raw else {}
+                raw = resp.read(PushHandler._MEMORY_RESPONSE_LIMIT + 1)
+                if len(raw) > PushHandler._MEMORY_RESPONSE_LIMIT:
+                    return 502, {"error": "memory upstream response too large"}
+                try:
+                    return resp.status, json.loads(raw) if raw else {}
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    return 502, {"error": "memory upstream returned invalid json"}
         except urllib.error.HTTPError as e:
             logger.warning("memory proxy upstream http %s for %s", e.code, url.split("?")[0])
             return 502, {"error": f"memory upstream http {e.code}"}

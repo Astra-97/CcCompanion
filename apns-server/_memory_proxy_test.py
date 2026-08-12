@@ -129,7 +129,7 @@ class MemoryProxyTest(unittest.TestCase):
 
     # ---------- route whitelist ----------
 
-    def test_all_six_routes_mapped(self):
+    def test_all_read_routes_mapped(self):
         self.assertEqual(
             PushHandler._MEMORY_ROUTES,
             {
@@ -139,6 +139,7 @@ class MemoryProxyTest(unittest.TestCase):
                 "/memory/list": "/api/memories",
                 "/memory/semantic-search": "/api/semantic-search",
                 "/memory/board": "/api/board",
+                "/memory/calendar": "/api/calendar",
             },
         )
 
@@ -184,6 +185,44 @@ class MemoryProxyTest(unittest.TestCase):
         self.assertEqual(captured["headers"].get("Authorization"), "Bearer tok-abc")
         self.assertEqual(captured["headers"].get("User-agent"), "curl/7.81.0")
         self.assertEqual(handler.responses[0], (200, {"total": 549}))
+
+    def test_calendar_requires_one_strict_month_and_forwards_only_it(self):
+        payload = {"2026-08-12": {"entries": [], "mood": None}}
+        handler, captured = self.run_forward("/memory/calendar?month=2026-08", payload)
+        self.assertEqual(captured["url"], "https://memory.xiaonancaleb.xyz/api/calendar?month=2026-08")
+        self.assertEqual(handler.responses[0], (200, payload))
+
+        for path in (
+            "/memory/calendar",
+            "/memory/calendar?month=2026-8",
+            "/memory/calendar?month=2026-13",
+            "/memory/calendar?month=2026-08&month=2026-09",
+            "/memory/calendar?month=2026-08&category=diary",
+        ):
+            rejected = self.handler(path)
+            with patch("urllib.request.urlopen") as urlopen:
+                rejected._handle_memory_get()
+            urlopen.assert_not_called()
+            self.assertEqual(rejected.responses[0][0], 400)
+
+    def test_memory_get_rejects_oversized_or_invalid_json_response(self):
+        oversized = self.handler("/memory/stats")
+        invalid = self.handler("/memory/stats")
+
+        with patch.object(PushHandler, "_memory_token", classmethod(lambda cls: "tok-abc")), \
+                patch("urllib.request.urlopen", return_value=_FakeResponse(200, "x" * (PushHandler._MEMORY_RESPONSE_LIMIT + 1))):
+            oversized._handle_memory_get()
+        self.assertEqual(oversized.responses[0], (502, {"error": "memory upstream response too large"}))
+
+        class InvalidResponse(_FakeResponse):
+            def __init__(self):
+                self.status = 200
+                self._raw = b"not-json"
+
+        with patch.object(PushHandler, "_memory_token", classmethod(lambda cls: "tok-abc")), \
+                patch("urllib.request.urlopen", return_value=InvalidResponse()):
+            invalid._handle_memory_get()
+        self.assertEqual(invalid.responses[0], (502, {"error": "memory upstream returned invalid json"}))
 
     def test_list_passes_whitelisted_params_only(self):
         handler, captured = self.run_forward(
