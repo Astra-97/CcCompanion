@@ -26,7 +26,9 @@ from typing import Any
 
 
 MCP_TEST_TIMEOUT_SECONDS = 8
-MCP_TEST_RESPONSE_LIMIT = 64 * 1024
+# McDonald's currently returns roughly 85 KiB for tools/list.  Keep the read
+# bounded, but leave enough headroom for the official catalog to grow.
+MCP_TEST_RESPONSE_LIMIT = 256 * 1024
 XIA_HEALTH_TIMEOUT_SECONDS = 0.5
 XIA_HEALTH_HEADER_LIMIT = 8 * 1024
 XIA_HEALTH_BODY_LIMIT = 16 * 1024

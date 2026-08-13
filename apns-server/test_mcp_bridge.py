@@ -38,6 +38,40 @@ class McpBridgeTest(unittest.TestCase):
             self.assertEqual(captured["url"], "https://gwmcp.lkcoffee.com/order/user/mcp")
             self.assertEqual(captured["auth"], "Bearer first-token")
 
+    def test_large_official_catalog_is_forwarded_but_true_oversize_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token_path = Path(directory) / "token"
+            token_path.write_text("token\n", encoding="utf-8")
+            large_catalog = (
+                b'{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"tool","description":"'
+                + (b"x" * (85 * 1024))
+                + b'"}]}}'
+            )
+
+            class Response:
+                headers = {"Content-Type": "application/json"}
+                def __init__(self, body): self.body = body
+                def read(self, size): return self.body[:size]
+                def __enter__(self): return self
+                def __exit__(self, *args): return False
+
+            class Opener:
+                def __init__(self, body): self.body = body
+                def open(self, request, timeout): return Response(self.body)
+
+            with patch.dict(os.environ, {"MCDONALDS_MCP_TOKEN_PATH": str(token_path)}), patch(
+                "mcp_bridge.urllib.request.build_opener", return_value=Opener(large_catalog)
+            ):
+                answer = mcp_bridge.forward("mcdonalds", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+            self.assertEqual(len(answer["result"]["tools"]), 1)
+
+            oversized = b"x" * (mcp_bridge.MCP_TEST_RESPONSE_LIMIT + 1)
+            with patch.dict(os.environ, {"MCDONALDS_MCP_TOKEN_PATH": str(token_path)}), patch(
+                "mcp_bridge.urllib.request.build_opener", return_value=Opener(oversized)
+            ):
+                answer = mcp_bridge.forward("mcdonalds", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+            self.assertEqual(answer["error"]["code"], -32001)
+
     def test_missing_token_is_safe_jsonrpc_error(self):
         with patch.dict(os.environ, {"MCDONALDS_MCP_TOKEN_PATH": "/does/not/exist"}):
             answer = mcp_bridge.forward("mcdonalds", {"jsonrpc": "2.0", "id": "a", "method": "tools/list"})

@@ -17,7 +17,9 @@ from typing import Any
 
 MAX_STDIN_LINE = 256 * 1024
 MCP_TEST_TIMEOUT_SECONDS = 8
-MCP_TEST_RESPONSE_LIMIT = 64 * 1024
+# McDonald's currently returns roughly 85 KiB for tools/list.  Keep the read
+# bounded, but leave enough headroom for the official catalog to grow.
+MCP_TEST_RESPONSE_LIMIT = 256 * 1024
 PROVIDERS = {
     "luckin": {
         "endpoint": "https://gwmcp.lkcoffee.com/order/user/mcp",

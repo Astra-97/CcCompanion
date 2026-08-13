@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mcp_services import McpServiceError, McpServiceStore, PROVIDERS
+from mcp_services import MCP_TEST_RESPONSE_LIMIT, McpServiceError, McpServiceStore, PROVIDERS
 from push import PushHandler
 from provision_mcp_runtime import _append_codex_config, _install_xia_runtime_templates
 
@@ -109,6 +109,28 @@ class McpServiceStoreTest(unittest.TestCase):
         self.assertEqual(captured["url"], "https://gwmcp.lkcoffee.com/order/user/mcp")
         self.assertEqual(captured["auth"], "Bearer test-value")
         self.assertEqual(captured["protocol"], "2025-03-26")
+
+    def test_connection_check_accepts_large_official_catalog_but_rejects_true_oversize(self):
+        large_catalog = json.dumps({
+            "result": {"tools": [{"name": "tool", "description": "x" * (85 * 1024)}]},
+        }).encode("utf-8")
+
+        class Response:
+            headers = {"Content-Type": "application/json"}
+            def __init__(self, body): self.body = body
+            def read(self, size): return self.body[:size]
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+
+        class Opener:
+            def __init__(self, body): self.body = body
+            def open(self, request, timeout): return Response(self.body)
+
+        with patch("mcp_services.urllib.request.build_opener", return_value=Opener(large_catalog)):
+            self.assertEqual(self.store._test_provider("mcdonalds", "test-value")[0], "connected")
+        oversized = b"x" * (MCP_TEST_RESPONSE_LIMIT + 1)
+        with patch("mcp_services.urllib.request.build_opener", return_value=Opener(oversized)):
+            self.assertEqual(self.store._test_provider("mcdonalds", "test-value"), ("failed", "服务响应过大"))
 
     def test_xiaoke_runtime_ready_requires_authenticated_live_health(self):
         channel_token = self.root / "channel.token"
