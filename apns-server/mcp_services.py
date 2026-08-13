@@ -12,6 +12,8 @@ import tempfile
 import threading
 import stat
 import pwd
+import select
+import socket
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover
@@ -25,6 +27,9 @@ from typing import Any
 
 MCP_TEST_TIMEOUT_SECONDS = 8
 MCP_TEST_RESPONSE_LIMIT = 64 * 1024
+XIA_HEALTH_TIMEOUT_SECONDS = 0.5
+XIA_HEALTH_HEADER_LIMIT = 8 * 1024
+XIA_HEALTH_BODY_LIMIT = 16 * 1024
 
 PROVIDERS: dict[str, dict[str, str]] = {
     "luckin": {
@@ -268,6 +273,105 @@ class McpServiceStore:
         except (OSError, ValueError, TypeError):
             return False
 
+    @staticmethod
+    def _xiaoke_channel_ready() -> bool:
+        """Require the private Xia channel to be live, not merely configured."""
+        token_path = Path(
+            os.environ.get(
+                "CC_XIA_CHANNEL_TOKEN_PATH",
+                "/var/lib/cc-xia-relay/channel-state/channel.token",
+            )
+        )
+        token = McpServiceStore._read_token(token_path)
+        if not token or len(token) > 4096 or any(ord(char) < 32 or ord(char) == 127 for char in token):
+            return False
+        try:
+            raw = McpServiceStore._read_xiaoke_health(token)
+            payload = json.loads(raw.decode("utf-8"))
+            return isinstance(payload, dict) and payload.get("ready") is True
+        except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
+            return False
+
+    @staticmethod
+    def _read_xiaoke_health(token: str) -> bytes:
+        """Read one fixed loopback response within a hard wall-clock deadline."""
+        deadline = time.monotonic() + XIA_HEALTH_TIMEOUT_SECONDS
+        request = (
+            "GET /health HTTP/1.1\r\n"
+            "Host: 127.0.0.1:8821\r\n"
+            f"X-Auth-Token: {token}\r\n"
+            "Accept: application/json\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setblocking(False)
+        try:
+            result = sock.connect_ex(("127.0.0.1", 8821))
+            if result not in (0, getattr(os, "EINPROGRESS", 115), getattr(os, "EWOULDBLOCK", 11)):
+                raise OSError(result, "Xia health connection failed")
+
+            sent = 0
+            while sent < len(request):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Xia health request timed out")
+                _, writable, exceptional = select.select([], [sock], [sock], remaining)
+                if exceptional or not writable:
+                    raise TimeoutError("Xia health request timed out")
+                error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                if error:
+                    raise OSError(error, "Xia health connection failed")
+                sent += sock.send(request[sent:])
+
+            response = bytearray()
+            limit = XIA_HEALTH_HEADER_LIMIT + XIA_HEALTH_BODY_LIMIT + 4
+            while len(response) <= limit:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Xia health response timed out")
+                readable, _, exceptional = select.select([sock], [], [sock], remaining)
+                if exceptional or not readable:
+                    raise TimeoutError("Xia health response timed out")
+                chunk = sock.recv(min(4096, limit + 1 - len(response)))
+                if not chunk:
+                    break
+                response.extend(chunk)
+            else:
+                raise ValueError("Xia health response too large")
+        finally:
+            sock.close()
+        return McpServiceStore._parse_xiaoke_health_http(bytes(response))
+
+    @staticmethod
+    def _parse_xiaoke_health_http(response: bytes) -> bytes:
+        marker = response.find(b"\r\n\r\n")
+        if marker < 0 or marker > XIA_HEALTH_HEADER_LIMIT:
+            raise ValueError("invalid Xia health response headers")
+        header_block = response[:marker].decode("ascii")
+        lines = header_block.split("\r\n")
+        parts = lines[0].split(" ", 2)
+        if len(parts) < 2 or parts[0] not in {"HTTP/1.0", "HTTP/1.1"} or parts[1] != "200":
+            raise ValueError("Xia health response was not successful")
+        headers: dict[str, str] = {}
+        for line in lines[1:]:
+            if not line or line[:1].isspace() or ":" not in line:
+                raise ValueError("invalid Xia health response header")
+            name, value = line.split(":", 1)
+            key = name.strip().lower()
+            if key in headers:
+                raise ValueError("duplicate Xia health response header")
+            headers[key] = value.strip()
+        if "transfer-encoding" in headers:
+            raise ValueError("unsupported Xia health transfer encoding")
+        body = response[marker + 4:]
+        if "content-length" in headers:
+            length = int(headers["content-length"])
+            if length < 0 or length > XIA_HEALTH_BODY_LIMIT or len(body) != length:
+                raise ValueError("invalid Xia health response length")
+        elif len(body) > XIA_HEALTH_BODY_LIMIT:
+            raise ValueError("Xia health response too large")
+        return body
+
     def _runtime_status(self) -> dict[str, Any]:
         """Truthful discovery only; installation/reload is an explicit op."""
         bridge = Path(os.environ.get("CC_MCP_BRIDGE_PATH", "/usr/local/libexec/cc-companion-mcp-bridge"))
@@ -315,6 +419,7 @@ class McpServiceStore:
             except OSError:
                 return False
         xiaoke_can_read_configured_tokens = shared_token_root_ready and all(relay_can_read(path) for path in configured_canonical)
+        xiaoke_channel_ready = self._xiaoke_channel_ready()
         return {
             "bridge_installed": bridge_installed,
             "codex_registered": codex_registered,
@@ -324,7 +429,8 @@ class McpServiceStore:
             # file per JSON-RPC request; discovery changes require a new turn.
             "shared_token_root_ready": shared_token_root_ready,
             "xiaoke_can_read_configured_tokens": xiaoke_can_read_configured_tokens,
-            "activation": "ready" if bridge_installed and codex_registered and xia_active_registered and shared_token_root_ready and xiaoke_can_read_configured_tokens else "pending_activation",
+            "xiaoke_channel_ready": xiaoke_channel_ready,
+            "activation": "ready" if bridge_installed and codex_registered and xia_active_registered and shared_token_root_ready and xiaoke_can_read_configured_tokens and xiaoke_channel_ready else "pending_activation",
             "migration_pending": any(
                 not self._read_token(self._token_path(provider_id))
                 and bool(self._legacy_token_path(provider_id))
