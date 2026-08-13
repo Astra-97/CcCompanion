@@ -122,6 +122,23 @@ class StickerCatalogTests(unittest.TestCase):
             self.assertEqual("brother-bear", catalog["stickers"][0]["category_id"])
             self.assertNotIn("category_id", catalog["stickers"][1])
 
+    def test_aggregate_manifest_uses_only_declared_matching_categories(self):
+        with TemporaryDirectory() as tmp:
+            manifest = self._manifest(Path(tmp), {
+                "categories": [{"id": "cats", "name": "猫猫"}],
+                "stickers": [
+                    {"name": "团团", "file": "团团.png", "category_id": "cats"},
+                    {"name": "无类", "file": "无类.png", "category_id": "unknown"},
+                ],
+            })
+            service = StickerCatalogService({"enabled": True, "sources": [{
+                "manifest_path": str(manifest), "public_base_url": "https://assets.example/user-stickers",
+            }]})
+            catalog = service.snapshot()
+            self.assertEqual([{"id": "cats", "name": "猫猫"}], catalog["categories"])
+            self.assertEqual("cats", catalog["stickers"][0]["category_id"])
+            self.assertNotIn("category_id", catalog["stickers"][1])
+
     def test_invalid_config_category_cannot_fall_back_to_manifest_metadata(self):
         with TemporaryDirectory() as tmp:
             manifest = self._manifest(Path(tmp), {
@@ -291,6 +308,18 @@ class StickerCatalogTests(unittest.TestCase):
             ]})
             after = StickerCatalogService(config).snapshot()["version"]
             self.assertNotEqual(before, after)
+
+    def test_invalidate_rebuilds_even_when_monotonic_is_below_cache_ttl(self):
+        with TemporaryDirectory() as tmp:
+            manifest = self._manifest(Path(tmp), {"stickers": [{"name": "旧", "file": "旧.png"}]})
+            service = StickerCatalogService({"enabled": True, "cache_seconds": 300, "sources": [{
+                "manifest_path": str(manifest), "public_base_url": "https://assets.example/stickers",
+            }]})
+            with patch("sticker_catalog.time.monotonic", return_value=100.0):
+                self.assertEqual(["旧"], [item["name"] for item in service.snapshot()["stickers"]])
+                self._manifest(Path(tmp), {"stickers": [{"name": "新", "file": "新.png"}]})
+                service.invalidate()
+                self.assertEqual(["新"], [item["name"] for item in service.snapshot()["stickers"]])
 
     def test_remote_manifest_uses_fixed_non_secret_user_agent(self):
         response = MagicMock()

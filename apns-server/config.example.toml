@@ -259,6 +259,8 @@ server_url = "https://companion-vps2.xiaonancaleb.xyz"
 enabled = false
 cache_seconds = 300
 max_items = 512
+# Fixed SG importer argv for POST /stickers/upload; request data goes via stdin.
+# upload_command = ["ssh", "memory-sg", "/home/ubuntu/static-assets/import_uploaded_sticker.py"]
 # [[stickers.sources]]
 # manifest_url = "https://test.xiaonancaleb.xyz/stickers/catalog.json"
 # public_base_url = "https://test.xiaonancaleb.xyz/stickers/"
@@ -269,6 +271,9 @@ max_items = 512
 # public_base_url = "https://test.xiaonancaleb.xyz/xiaodou/"
 # category_id = "xiaodou"
 # category_name = "小黄豆"
+# [[stickers.sources]]
+# manifest_url = "https://test.xiaonancaleb.xyz/user-stickers/catalog.json"
+# public_base_url = "https://test.xiaonancaleb.xyz/user-stickers"
 
 [xhs_login]
 # Android 专用 WebView 登录能力；nonce 最长十分钟且只可使用一次。

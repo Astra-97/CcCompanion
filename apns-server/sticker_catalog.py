@@ -172,7 +172,7 @@ class StickerCatalogService:
             self.max_items = _MAX_STICKERS
         self.sources = self._parse_sources(cfg)
         self._lock = threading.Lock()
-        self._cached_at = 0.0
+        self._cached_at = float("-inf")
         self._cached: dict[str, Any] = {
             "ok": True,
             "version": "disabled",
@@ -264,11 +264,26 @@ class StickerCatalogService:
             category = source.category
             if category is None and not source.category_configured and isinstance(raw_manifest, dict):
                 category = _safe_category(raw_manifest.get("category"))
-            category_id = category["id"] if category is not None else None
+            # The user-upload aggregate has multiple categories in one safe
+            # manifest.  Those category IDs are still merely metadata: each
+            # sticker has to point at an exact, validated entry below.
+            manifest_categories: dict[str, dict[str, str]] = {}
+            if category is None and not source.category_configured and isinstance(raw_manifest, dict):
+                raw_categories = raw_manifest.get("categories")
+                if isinstance(raw_categories, list):
+                    for raw_category in raw_categories:
+                        candidate = _safe_category(raw_category)
+                        if candidate is not None and candidate["id"] not in manifest_categories:
+                            manifest_categories[candidate["id"]] = candidate
             for raw_item in raw_items:
                 entry = _safe_catalog_entry(raw_item, source.public_base_url)
                 if entry is None or entry["name"] in seen_names:
                     continue
+                item_category = category
+                if item_category is None and manifest_categories and isinstance(raw_item, dict):
+                    requested_id = raw_item.get("category_id")
+                    item_category = manifest_categories.get(requested_id) if isinstance(requested_id, str) else None
+                category_id = item_category["id"] if item_category is not None else None
                 if category_id is not None:
                     # Return only categories that have a visible sticker.
                     # Equal ID/name pairs merge across sources.  An ID reused
@@ -277,10 +292,10 @@ class StickerCatalogService:
                     # is never silently placed in the first source's group.
                     registered_category = categories_by_id.get(category_id)
                     if registered_category is None:
-                        categories_by_id[category_id] = category
-                        categories.append(category)
+                        categories_by_id[category_id] = item_category
+                        categories.append(item_category)
                         entry["category_id"] = category_id
-                    elif registered_category["name"] == category["name"]:
+                    elif registered_category["name"] == item_category["name"]:
                         entry["category_id"] = category_id
                 seen_names.add(entry["name"])
                 stickers.append(entry)
@@ -305,3 +320,8 @@ class StickerCatalogService:
             self._cached = self._build_catalog()
             self._cached_at = now
             return dict(self._cached)
+
+    def invalidate(self) -> None:
+        """Force the next request to fetch configured manifests again."""
+        with self._lock:
+            self._cached_at = float("-inf")

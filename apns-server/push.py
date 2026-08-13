@@ -42,11 +42,13 @@ import json
 import logging
 import os
 import re
+import selectors
 import shutil
 import signal
 import secrets
 import stat
 import subprocess
+import tempfile
 from datetime import date, datetime, timedelta, timezone
 import sys
 import threading
@@ -71,7 +73,7 @@ from token_store import TokenStore
 from device_token_store import DeviceTokenStore
 from task_queue import TaskQueue
 from chat_history import ChatHistory, ChatStreamBus, EphemeralTaskBuffer
-from sticker_catalog import StickerCatalogService
+from sticker_catalog import StickerCatalogService, is_valid_category_id, is_valid_sticker_name
 from diary_stream import DiaryStream
 from group_chat import GroupChatStore
 from calendar_store import CalendarStore, CATEGORIES, CATEGORY_LABELS
@@ -2495,6 +2497,14 @@ class ServerState:
         # from chat payloads: clients receive only operator-derived static
         # asset URLs and never interpret a model-provided URL as a sticker.
         self.sticker_catalog = StickerCatalogService(config.get("stickers", {}))
+        sticker_cfg = config.get("stickers", {})
+        raw_sticker_upload_command = sticker_cfg.get("upload_command") if isinstance(sticker_cfg, dict) else None
+        self.sticker_upload_command: list[str] | None = (
+            [str(part) for part in raw_sticker_upload_command]
+            if isinstance(raw_sticker_upload_command, list) and raw_sticker_upload_command
+            and all(isinstance(part, str) and part for part in raw_sticker_upload_command)
+            else None
+        )
         self.kairos_terminal = KairosTerminalBridge()
         self.channel_transport_enabled: bool = bool(server_cfg.get("channel_transport_enabled", False))
         self.channel_transport_url: str = str(
@@ -5632,6 +5642,9 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._handle_memory_date_sync_post(body)
             else:
                 self._handle_memory_sync_post(body)
+            return
+        if request_path == "/stickers/upload":
+            self._handle_sticker_upload()
             return
         if not self._require_write_auth():
             return
@@ -12691,6 +12704,230 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "version": "disabled", "categories": [], "stickers": []})
             return
         self._send_json(200, snapshot(), extra_headers={"Cache-Control": "no-store"})
+
+    _STICKER_UPLOAD_LIMIT = 8 * 1024 * 1024
+    _STICKER_UPLOAD_CONTENT_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+    _STICKER_UPLOAD_HELPER_OUTPUT_LIMIT = 16 * 1024
+    _STICKER_UPLOAD_READ_TIMEOUT_SECONDS = 5.0
+    _STICKER_UPLOAD_READ_DEADLINE_SECONDS = 30.0
+
+    def _run_sticker_import_bounded(self, command: list[str], frame: bytes) -> tuple[int, bytes]:
+        """Run fixed argv while draining both output pipes under hard limits."""
+        limit = self._STICKER_UPLOAD_HELPER_OUTPUT_LIMIT
+        with tempfile.TemporaryFile() as input_file:
+            input_file.write(frame)
+            input_file.flush()
+            input_file.seek(0)
+            process = subprocess.Popen(
+                command,
+                stdin=input_file,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+            assert process.stdout is not None and process.stderr is not None
+            selector = selectors.DefaultSelector()
+            buffers = {process.stdout: bytearray(), process.stderr: bytearray()}
+            deadline = time.monotonic() + 30.0
+            try:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                selector.register(process.stderr, selectors.EVENT_READ)
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, 30.0)
+                    for key, _events in selector.select(min(0.25, remaining)):
+                        stream = key.fileobj
+                        chunk = os.read(stream.fileno(), 4096)
+                        if not chunk:
+                            selector.unregister(stream)
+                            continue
+                        buffer = buffers[stream]
+                        buffer.extend(chunk)
+                        if len(buffer) > limit:
+                            raise ValueError("sticker helper output limit exceeded")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, 30.0)
+                return process.wait(timeout=remaining), bytes(buffers[process.stdout])
+            except Exception:
+                if process.poll() is None:
+                    process.kill()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                raise
+            finally:
+                selector.close()
+                process.stdout.close()
+                process.stderr.close()
+
+    def _sticker_upload_query(self) -> dict[str, str] | None:
+        """Strict UTF-8 query parser: no ambiguous/duplicate upload fields."""
+        from urllib.parse import parse_qsl, urlsplit
+        parsed = urlsplit(self.path)
+        try:
+            pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True,
+                              encoding="utf-8", errors="strict")
+        except (UnicodeDecodeError, ValueError):
+            return None
+        if any(key not in {"name", "filename", "category_id", "new_category_name"} for key, _ in pairs):
+            return None
+        result: dict[str, str] = {}
+        for key, value in pairs:
+            if key in result:
+                return None
+            result[key] = value
+        if set(result) not in ({"name", "filename", "category_id"}, {"name", "filename", "new_category_name"}):
+            return None
+        return result
+
+    def _handle_sticker_upload(self) -> None:
+        """POST one native image through a fixed, stdin-framed SG importer."""
+        # This intentionally bypasses generic write auth: a browser/PWA cookie
+        # must never gain the ability to publish permanent static assets.
+        supplied = self.headers.get("X-Auth-Token", "") or ""
+        expected = str(getattr(self.state, "shared_secret", "") or "")
+        if not supplied or not expected or not hmac.compare_digest(supplied, expected):
+            self.close_connection = True
+            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            self._send_json(400, {"ok": False, "error": "chunked_request_not_supported"})
+            return
+        query = self._sticker_upload_query()
+        if query is None or not is_valid_sticker_name(query.get("name")):
+            self.close_connection = True
+            self._send_json(400, {"ok": False, "error": "invalid_upload_parameters"})
+            return
+        filename = query["filename"]
+        suffix = Path(filename).suffix.lower()
+        try:
+            filename_bytes = filename.encode("utf-8")
+        except UnicodeEncodeError:
+            filename_bytes = b""
+        if (not filename or filename != unicodedata.normalize("NFC", filename) or filename != filename.strip()
+                or "/" in filename or "\\" in filename or filename.startswith(".")
+                or len(filename_bytes) > 240 or any(unicodedata.category(char)[0] == "C" or ord(char) == 0x7f for char in filename)
+                or suffix not in {".png", ".jpg", ".jpeg", ".gif", ".webp"}):
+            self.close_connection = True
+            self._send_json(400, {"ok": False, "error": "invalid_upload_parameters"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except (TypeError, ValueError):
+            length = -1
+        if not 1 <= length <= self._STICKER_UPLOAD_LIMIT:
+            self.close_connection = True
+            self._send_json(413, {"ok": False, "error": "request_too_large"})
+            return
+        content_type = (self.headers.get("Content-Type", "") or "").split(";", 1)[0].strip().lower()
+        if content_type not in self._STICKER_UPLOAD_CONTENT_TYPES:
+            self.close_connection = True
+            self._send_json(415, {"ok": False, "error": "unsupported_media_type"})
+            return
+        catalog = getattr(self.state, "sticker_catalog", None)
+        snapshot = getattr(catalog, "snapshot", None)
+        current = snapshot() if callable(snapshot) else {"categories": []}
+        if any(isinstance(item, dict) and item.get("name") == query["name"] for item in current.get("stickers", []) if isinstance(current, dict)):
+            self.close_connection = True
+            self._send_json(409, {"ok": False, "error": "duplicate_sticker"})
+            return
+        category: dict[str, str] | None = None
+        if "category_id" in query:
+            candidate_id = query["category_id"]
+            for item in current.get("categories", []) if isinstance(current, dict) else []:
+                if isinstance(item, dict) and item.get("id") == candidate_id and is_valid_category_id(candidate_id):
+                    candidate_name = item.get("name")
+                    if is_valid_sticker_name(candidate_name):
+                        category = {"id": candidate_id, "name": candidate_name}
+                        break
+        else:
+            candidate_name = query["new_category_name"]
+            if is_valid_sticker_name(candidate_name):
+                if any(isinstance(item, dict) and item.get("name") == candidate_name for item in current.get("categories", []) if isinstance(current, dict)):
+                    self.close_connection = True
+                    self._send_json(409, {"ok": False, "error": "category_exists"})
+                    return
+                # Stable collision-resistant safe ID; its name remains the
+                # authority and later same-ID/different-name manifests fail closed.
+                category = {"id": "user-" + hashlib.sha256(candidate_name.encode("utf-8")).hexdigest()[:20], "name": candidate_name}
+        if category is None:
+            self.close_connection = True
+            self._send_json(400, {"ok": False, "error": "invalid_category"})
+            return
+        command = getattr(self.state, "sticker_upload_command", None)
+        if not isinstance(command, list) or not command:
+            self.close_connection = True
+            self._send_json(503, {"ok": False, "error": "sticker_upload_unavailable"})
+            return
+        remaining = length
+        chunks: list[bytes] = []
+        connection = getattr(self, "connection", None)
+        old_timeout = None
+        try:
+            if connection is not None:
+                old_timeout = connection.gettimeout()
+            deadline = time.monotonic() + self._STICKER_UPLOAD_READ_DEADLINE_SECONDS
+            while remaining:
+                deadline_remaining = deadline - time.monotonic()
+                if deadline_remaining <= 0:
+                    raise TimeoutError("sticker body deadline exceeded")
+                if connection is not None:
+                    connection.settimeout(min(self._STICKER_UPLOAD_READ_TIMEOUT_SECONDS, deadline_remaining))
+                read_once = getattr(self.rfile, "read1", None)
+                piece = (read_once if callable(read_once) else self.rfile.read)(min(64 * 1024, remaining))
+                if not piece:
+                    self.close_connection = True
+                    self._send_json(400, {"ok": False, "error": "truncated_image"})
+                    return
+                chunks.append(piece)
+                remaining -= len(piece)
+        except (OSError, TimeoutError):
+            self.close_connection = True
+            self._send_json(408, {"ok": False, "error": "request_timeout"})
+            return
+        finally:
+            if connection is not None:
+                try:
+                    connection.settimeout(old_timeout)
+                except OSError:
+                    pass
+        image = b"".join(chunks)
+        frame = json.dumps({"name": query["name"], "filename": filename, "category": category,
+                            "content_length": length}, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n" + image
+        try:
+            returncode, helper_stdout = self._run_sticker_import_bounded(command, frame)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            self._send_json(502, {"ok": False, "error": "sticker_import_failed"})
+            return
+        try:
+            imported = json.loads(helper_stdout.decode("utf-8"))
+            if not isinstance(imported, dict) or not imported.get("ok"):
+                if isinstance(imported, dict) and imported.get("error") == "sticker already exists":
+                    self._send_json(409, {"ok": False, "error": "duplicate_sticker"})
+                    return
+                raise ValueError("bad import response")
+        except (UnicodeDecodeError, ValueError):
+            self._send_json(400 if returncode else 502, {"ok": False, "error": "sticker_import_rejected" if returncode else "sticker_import_failed"})
+            return
+        if returncode != 0:
+            self._send_json(400, {"ok": False, "error": "sticker_import_rejected"})
+            return
+        invalidate = getattr(catalog, "invalidate", None)
+        if callable(invalidate):
+            invalidate()
+        refreshed = snapshot() if callable(snapshot) else {"stickers": []}
+        published = next((entry for entry in refreshed.get("stickers", [])
+                          if isinstance(entry, dict) and entry.get("name") == query["name"]
+                          and entry.get("category_id") == category["id"]), None)
+        if not isinstance(published, dict):
+            self._send_json(502, {"ok": False, "error": "sticker_catalog_not_published"})
+            return
+        self._send_json(200, {"ok": True, "category": category, "sticker": published})
 
     def _handle_pet_activity_post(self, body: dict[str, Any]):
         """POST /pet/activity — chain hook 推 streaming terminal display 行.
