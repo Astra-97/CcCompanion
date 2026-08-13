@@ -340,7 +340,10 @@ class XiaRuntimeStateTest(unittest.TestCase):
                 "command": "@INSTALL_DIR@/server.mjs", "env": {
                     "state": "@STATE_DIR@", "token": "@TOKEN_FILE@", "generation": "@GENERATION@",
                     "session": "@SESSION_ID@", "model": "@MODEL@", "bootstrap": "@BOOTSTRAP_TOKEN@",
-                }}}}))
+                }},
+                "luckin": {"command": "/usr/local/libexec/cc-companion-mcp-bridge", "args": ["luckin"]},
+                "mcdonalds": {"command": "/usr/local/libexec/cc-companion-mcp-bridge", "args": ["mcdonalds"]},
+            }}))
             (install / "settings.json").write_text('{"permissions":{"allow":[]}}\n')
             state = root / "state"; state.mkdir(mode=0o700)
             workspace = root / "workspace"; workspace.mkdir(); (workspace / "CLAUDE.md").write_text("persona")
@@ -364,6 +367,9 @@ class XiaRuntimeStateTest(unittest.TestCase):
             self.assertEqual(config["env"]["session"], "00000000-0000-4000-8000-000000000002")
             self.assertEqual(config["env"]["model"], "sonnet")
             self.assertEqual(config["env"]["bootstrap"], "bootstrap-2")
+            published_mcp = json.loads((second / ".mcp.json").read_text())["mcpServers"]
+            self.assertEqual(published_mcp["luckin"]["args"], ["luckin"])
+            self.assertEqual(published_mcp["mcdonalds"]["args"], ["mcdonalds"])
             self.assertEqual((second / "CLAUDE.md").resolve(), (workspace / "CLAUDE.md").resolve())
             self.assertFalse((state / "runtime-2").exists())
 
@@ -378,7 +384,7 @@ class XiaRuntimeStateTest(unittest.TestCase):
 
     def _tmux_socket(self, root):
         path = Path(root) / "tmux.sock"
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); listener.bind(str(path))
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); listener.bind(str(path)); listener.listen()
         return listener, path
 
     def test_kill_session_failure_never_calls_runtime_prepare(self):
@@ -421,6 +427,21 @@ class XiaRuntimeStateTest(unittest.TestCase):
                 prepare.assert_not_called()
             finally:
                 listener.close()
+
+    def test_unlistened_stale_socket_is_retired_and_allows_prepare(self):
+        with tempfile.TemporaryDirectory() as temp:
+            listener, path = self._tmux_socket(temp)
+            listener.close()  # leaves a socket inode with a proven absent listener
+            prepare = mock.Mock(return_value=Path(temp) / "runtime")
+            def runner(args, **_kwargs):
+                return subprocess.CompletedProcess(args, 1, "", "connection refused")
+            result = self.runtime.prepare_after_stop(
+                lambda: self.runtime.stop_dedicated_tui(path, "xia-claude", runner=runner, port_probe=lambda *_: False),
+                prepare,
+            )
+            self.assertEqual(result, Path(temp) / "runtime")
+            self.assertFalse(path.exists())
+            prepare.assert_called_once()
 
     def test_session_disappears_but_old_process_and_health_delay_prepare(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Durable, Xia-home-only native session state helpers for launcher.sh."""
 from __future__ import annotations
-import json, os, re, secrets, shutil, socket, stat, subprocess, sys, time, uuid
+import errno, json, os, re, secrets, shutil, socket, stat, subprocess, sys, time, uuid
 from pathlib import Path
 from typing import Callable
 
@@ -182,6 +182,41 @@ def _validate_socket_parent(path: Path) -> None:
 def _run_tmux(socket_path: Path, *args: str, runner=subprocess.run) -> subprocess.CompletedProcess:
     return runner([TMUX, "-S", str(socket_path), *args], capture_output=True, text=True, timeout=2)
 
+def _socket_listener_is_proven_absent(path: Path) -> bool:
+    """Only ECONNREFUSED/ENOENT prove a private Unix socket has no server."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.15)
+            probe.connect(str(path))
+    except OSError as error:
+        return error.errno in {errno.ECONNREFUSED, errno.ENOENT}
+    return False
+
+def _retire_proven_stale_socket(path: Path) -> bool:
+    """Unlink a trusted, unlistened stale socket; hard-fail all other cases."""
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return True
+    if not stat.S_ISSOCK(before.st_mode) or before.st_uid != os.geteuid():
+        raise RuntimeError("dedicated tmux socket changed while checking stale state")
+    if not _socket_listener_is_proven_absent(path):
+        return False
+    try:
+        after = path.lstat()
+    except FileNotFoundError:
+        return True
+    if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+        raise RuntimeError("dedicated tmux socket changed while checking stale state")
+    # The parent is already checked private/owned by _validate_socket_parent;
+    # re-probe immediately before unlinking rather than interpreting an opaque
+    # tmux client error as absence.
+    if not _socket_listener_is_proven_absent(path):
+        return False
+    path.unlink()
+    _fsync_dir(path.parent)
+    return True
+
 def _query_session_pids(socket_path: Path, session: str, *, runner=subprocess.run) -> list[int] | None:
     if not _socket_present(socket_path):
         return None
@@ -207,6 +242,11 @@ def _query_session_pids(socket_path: Path, session: str, *, runner=subprocess.ru
     listing = _run_tmux(socket_path, "list-sessions", "-F", "#{session_name}", runner=runner)
     if listing.returncode != 0:
         if not _socket_present(socket_path):
+            return None
+        # A stale Unix socket is common after a service/process crash.  Do not
+        # infer this from stderr: retire it only after AF_UNIX connect proves
+        # there is no listener, with stable inode/owner checks.
+        if _retire_proven_stale_socket(socket_path):
             return None
         error = _tmux_query_error(probe, listing)
         raise error("dedicated tmux session query failed")
