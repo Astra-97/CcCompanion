@@ -7,9 +7,13 @@ Wants=network-online.target
 Type=simple
 User=cc-xia-relay
 Group=cc-xia-relay
+Environment=XIA_CHANNEL_CLAUDE_BIN=/usr/local/libexec/cc-xia-claude
 ExecStart=/opt/cc-xia-claude-channel/launcher.sh
 Restart=on-failure
 RestartSec=5
+# A missing/permission-inaccessible trusted CLI is a deployment preflight
+# failure, not a transient channel crash.  Do not spin a restart loop.
+RestartPreventExitStatus=78
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

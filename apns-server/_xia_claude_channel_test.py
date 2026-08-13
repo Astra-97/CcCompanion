@@ -373,6 +373,17 @@ class XiaRuntimeStateTest(unittest.TestCase):
             self.assertEqual((second / "CLAUDE.md").resolve(), (workspace / "CLAUDE.md").resolve())
             self.assertFalse((state / "runtime-2").exists())
 
+    def test_launcher_fails_closed_with_a_clear_cli_access_preflight_and_uses_direct_mcp_entries(self):
+        launcher = (Path(__file__).parent / "xia_claude_channel" / "launcher.sh").read_text(encoding="utf-8")
+        unit = (Path(__file__).parent / "deploy" / "cc-xia-claude-channel.service").read_text(encoding="utf-8")
+        template = json.loads((Path(__file__).parent / "xia_claude_channel" / ".mcp.json.in").read_text(encoding="utf-8"))
+        self.assertIn('XIA_CHANNEL_CLAUDE_BIN:=/usr/bin/claude', launcher)
+        self.assertIn('test -x "$XIA_CHANNEL_CLAUDE_BIN"', launcher)
+        self.assertIn('Environment=XIA_CHANNEL_CLAUDE_BIN=/usr/local/libexec/cc-xia-claude', unit)
+        self.assertIn('RestartPreventExitStatus=78', unit)
+        self.assertEqual(template["mcpServers"]["luckin"]["command"], "/usr/local/libexec/cc-companion-mcp-bridge")
+        self.assertEqual(template["mcpServers"]["mcdonalds"]["command"], "/usr/local/libexec/cc-companion-mcp-bridge")
+
     def test_unsafe_legacy_runtime_symlink_is_not_cleaned_or_followed(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); state = root / "state"; state.mkdir(mode=0o700)

@@ -7,6 +7,7 @@ set -euo pipefail
 : "${XIA_CHANNEL_STATE_DIR:=/var/lib/cc-xia-relay/channel-state}"
 : "${XIA_CHANNEL_WORKSPACE:=/var/lib/cc-xia-relay/workspace}"
 : "${XIA_CHANNEL_INSTALL_DIR:=/opt/cc-xia-claude-channel}"
+: "${XIA_CHANNEL_CLAUDE_BIN:=/usr/bin/claude}"
 : "${XIA_CHANNEL_TMUX_SOCKET:=cc-xia-claude}"
 : "${XIA_CHANNEL_TMUX_SESSION:=xia-claude}"
 : "${XIA_CHANNEL_TMUX_TMPDIR:=$XIA_CHANNEL_STATE_DIR/tmux}"
@@ -22,6 +23,10 @@ test -r "$XIA_CHANNEL_STATE_DIR/channel.token" || { echo "missing private channe
 test -r "$XIA_CHANNEL_HOME/.claude/.credentials.json" || { echo "missing isolated Claude credential snapshot" >&2; exit 78; }
 test -r "$XIA_CHANNEL_HOME/.claude/.claude.json" || { echo "missing isolated Claude onboarding state" >&2; exit 78; }
 test -r "$XIA_CHANNEL_WORKSPACE/CLAUDE.md" || { echo "missing read-only Xia persona workspace" >&2; exit 78; }
+test -x "$XIA_CHANNEL_CLAUDE_BIN" || {
+  echo "Claude CLI is not executable by cc-xia-relay; fix trusted CLI path traversal permissions before starting" >&2
+  exit 78
+}
 tmux_uid="$(id -u)"
 tmux_socket_path="$XIA_CHANNEL_TMUX_TMPDIR/tmux-$tmux_uid/$XIA_CHANNEL_TMUX_SOCKET"
 test -d "$XIA_CHANNEL_TMUX_TMPDIR/tmux-$tmux_uid" || { echo "missing private tmux socket directory" >&2; exit 78; }
@@ -51,7 +56,7 @@ while :; do
 
   resume=0
   [[ "$(/usr/bin/python3 "$XIA_CHANNEL_INSTALL_DIR/runtime_state.py" mode "$XIA_CHANNEL_HOME" "$session_id")" == "resume" ]] && resume=1
-  cmd=(/usr/bin/claude --setting-sources project,local --strict-mcp-config
+  cmd=("$XIA_CHANNEL_CLAUDE_BIN" --setting-sources project,local --strict-mcp-config
     --mcp-config "$runtime/.mcp.json" --disable-slash-commands --tools ""
     --dangerously-load-development-channels server:xia-companion)
   if (( resume )); then
