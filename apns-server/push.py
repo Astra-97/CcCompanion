@@ -136,6 +136,7 @@ from health_records import (
     HealthRecordValidationError,
 )
 from xhs_login import XhsLoginError, XhsLoginManager
+from mcp_services import McpServiceError, McpServiceStore
 from kimi_acp import (
     DEFAULT_KIMI_CWD,
     KimiACPAuthRequired,
@@ -162,6 +163,7 @@ DEFAULT_CONFIG = HERE / "config.toml"
 CLIENT_LOG_PATH = HERE / "client_logs.jsonl"
 CLIENT_LOG_MAX_FIELD = 20_000
 WINDOWS_PWA_ROOT = HERE.parent / "windows-pwa"
+MCP_SERVICES = McpServiceStore(HERE / "state" / "mcp_services.json")
 
 
 # The installed web/PWA client is deliberately a same-origin client.  It must
@@ -4987,6 +4989,12 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         if not self._is_public_get() and not self._require_auth():
             return
+        # MCP credentials are higher-impact than legacy read endpoints: unlike
+        # optional legacy auth, this control surface is always fail-closed.
+        if request_path == "/mcp-services":
+            if not self._native_pairing_auth_matches():
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return
         if self.path == "/task/list":
             self._send_json(200, self.state.tasks.snapshot())
             return
@@ -5026,6 +5034,9 @@ class PushHandler(BaseHTTPRequestHandler):
                     "top_memory": [],
                     "health": {"ok": False},
                 })
+            return
+        if self.path == "/mcp-services" or self.path.startswith("/mcp-services?"):
+            self._handle_mcp_services_get()
             return
         if self.path.startswith("/chat/list-preview"):
             self._handle_chat_list_preview()
@@ -5624,6 +5635,9 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         if not self._require_write_auth():
             return
+        if request_path == "/mcp-services" and not self._native_pairing_auth_matches():
+            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return
         if request_path == "/chat/upload/cancel":
             try:
                 body = self._read_body()
@@ -5656,6 +5670,17 @@ class PushHandler(BaseHTTPRequestHandler):
             "/xhs-login/start": 4 * 1024,
             "/xhs-login/import": 32 * 1024,
         }
+        if request_path == "/mcp-services":
+            # Tokens are sensitive; reject oversized requests before reading
+            # them and never let generic request logging see the JSON body.
+            try:
+                mcp_length = int(self.headers.get("Content-Length", "0"))
+            except (TypeError, ValueError):
+                mcp_length = -1
+            if mcp_length <= 0 or mcp_length > 12 * 1024:
+                self.close_connection = True
+                self._send_json(413, {"ok": False, "error": "request_too_large"})
+                return
         if self.path in xhs_body_limits:
             try:
                 xhs_length = int(self.headers.get("Content-Length", "0"))
@@ -5708,6 +5733,9 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         elif self.path == "/codex/preferences":
             self._handle_codex_preferences_post(body)
+            return
+        elif request_path == "/mcp-services":
+            self._handle_mcp_services_post(body)
             return
         elif self.path == "/codex/abort":
             self._handle_codex_abort(body)
@@ -5955,6 +5983,28 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     # ---------- handlers ----------
+
+    def _handle_mcp_services_get(self) -> None:
+        """Expose only server-owned MCP status; credentials never leave disk."""
+        self._send_json(
+            200,
+            MCP_SERVICES.status(),
+            extra_headers={"Cache-Control": "no-store"},
+        )
+
+    def _handle_mcp_services_post(self, body: dict[str, Any]) -> None:
+        try:
+            # mcp_services deliberately validates a closed schema and fixed
+            # endpoints.  Do not log its body: it may contain a bearer token.
+            result = MCP_SERVICES.update(body)
+        except McpServiceError as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)}, extra_headers={"Cache-Control": "no-store"})
+            return
+        except Exception:
+            logger.exception("mcp service configuration update failed")
+            self._send_json(500, {"ok": False, "error": "无法保存 MCP 服务配置"}, extra_headers={"Cache-Control": "no-store"})
+            return
+        self._send_json(200, result, extra_headers={"Cache-Control": "no-store"})
 
     def _handle_xhs_login_start(self, body: dict[str, Any]):
         if self._source_for_request() != "android-app":

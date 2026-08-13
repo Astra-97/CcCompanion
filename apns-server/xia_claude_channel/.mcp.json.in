@@ -13,6 +13,14 @@
         "XIA_CHANNEL_MODEL": "@MODEL@",
         "XIA_CHANNEL_BOOTSTRAP_TOKEN": "@BOOTSTRAP_TOKEN@"
       }
+    },
+    "luckin": {
+      "command": "/usr/local/libexec/cc-companion-mcp-bridge",
+      "args": ["luckin"]
+    },
+    "mcdonalds": {
+      "command": "/usr/local/libexec/cc-companion-mcp-bridge",
+      "args": ["mcdonalds"]
     }
   }
 }

@@ -20,6 +20,10 @@ safety, or user instructions in an active Codex session.
 - Do not build Android APKs locally on the VPS. Push Android client changes to
   GitHub and use GitHub Actions / GitHub Releases for build artifacts unless
   Astra explicitly overrides this for a one-off emergency.
+- When a release tag points to a main-branch commit whose signed APK has already
+  passed the full workflow, prefer promoting that exact verified artifact after
+  checking its commit/SHA provenance instead of compiling the same commit again.
+  This avoids charging Actions minutes twice for one release.
 
 ## Workflow
 
