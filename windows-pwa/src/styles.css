@@ -46,3 +46,12 @@ body[data-appearance='reading']{--sans:ui-rounded,'Noto Sans SC',system-ui,sans-
    after responsive layout rules so their old console fills cannot win. */
 @media (max-width:1199px){.workers-open::after{background:var(--scrim)}}
 @media (max-width:720px){.rail{background:rgba(255,252,247,.94)}}
+
+.typing-bubble{opacity:0;transform:translateY(5px);animation:typing-bubble-in .22s ease-out forwards}
+.typing-bubble-body{display:flex;align-items:center;min-height:1.78em;color:var(--muted)}
+.typing-dots{display:inline-flex;gap:4px;align-items:center;height:1em}
+.typing-dots i{display:block;width:5px;height:5px;border-radius:50%;background:var(--brass);animation:typing-dot 1.3s ease-in-out infinite}
+.typing-dots i:nth-child(2){animation-delay:.18s}.typing-dots i:nth-child(3){animation-delay:.36s}
+@keyframes typing-bubble-in{to{opacity:1;transform:translateY(0)}}
+@keyframes typing-dot{0%,31%,100%{opacity:.42;transform:translateY(0)}15%{opacity:1;transform:translateY(-6px)}}
+@media (prefers-reduced-motion:reduce){.typing-bubble{animation:none;opacity:1;transform:none}.typing-dots i{animation:none;opacity:.7}}

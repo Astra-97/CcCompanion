@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { createHttpAdapter, createMockAdapter, normalizeLiveState, normalizeRecord } from '../src/api.js';
 import { createPwaBootstrap, isExplicitMockMode } from '../src/bootstrap.js';
 import { createComposerState } from '../src/composer-state.js';
 import { PAIRING_ALPHABET, formatPairingCode, normalizePairingCode } from '../src/pairing-code.js';
-import { composeLiveMessages, reconcileSnapshotStream, reduceStreamDraft } from '../src/live-messages.js';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from '../src/live-messages.js';
 
 function hexToken(css, token) {
   const match = css.match(new RegExp(`--${token}:(#[0-9a-fA-F]{6})`));
@@ -32,6 +33,15 @@ test('normalizes bounded worker activity without relying on server naming', () =
     stopRequest: { supported: true, body: { contact_id: 'kairos', user_ts: 'turn-1' } },
     workers: [{ id: 'layout', name: 'windows_pwa_shell', state: 'running', count: 3 }],
   });
+});
+
+test('typing status uses a stable live region and filters empty streaming placeholders', () => {
+  const index = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  const app = readFileSync(new URL('../src/app.js', import.meta.url), 'utf8');
+  assert.match(index, /id="typing-status"[^>]*role="status"[^>]*aria-live="polite"/);
+  assert.match(app, /typingStatus\.dataset\.active/);
+  assert.match(app, /message\.streaming && !String\(message\.body \|\| ''\)\.trim\(\)/);
+  assert.match(app, /typing-bubble.*aria-hidden/);
 });
 
 test('HTTP adapter reads server records and derives contacts from the manifest', async () => {
@@ -180,6 +190,15 @@ test('Kairos draft is one transient row, SSE cannot duplicate it, and final hist
   }
 });
 
+test('typing bubble is busy-only and yields to visible live draft text', () => {
+  const history = [{ id: 'old', role: 'assistant', body: 'earlier', time: '10:00' }, { id: 'prompt', role: 'user', body: '继续', time: '10:01' }];
+  assert.equal(shouldShowTypingBubble(history, { busy: true, replyState: 'generating', draft: '' }, { contactId: 'kairos' }), true);
+  assert.equal(shouldShowTypingBubble(history, { busy: true, replyState: 'generating', draft: 'partial' }, { contactId: 'kairos' }), false);
+  assert.equal(shouldShowTypingBubble(history, { busy: false, replyState: 'completed', draft: '' }, { contactId: 'kairos' }), false);
+  assert.equal(shouldShowTypingBubble(history, { busy: true, replyState: 'generating', draft: '' }, { contactId: 'xiaoke' }), true);
+  assert.equal(shouldShowTypingBubble([...history, { id: 'final', role: 'assistant', body: '已完成回复', streaming: false }], { busy: true, replyState: 'generating', draft: '' }, { contactId: 'kairos' }), false);
+});
+
 test('stages raw attachment bytes then sends only returned attachment IDs with memory-only CSRF', async () => {
   const calls = []; const uploads = [];
   const adapter = createHttpAdapter({
@@ -319,9 +338,9 @@ test('PWA shell declares installability and has no secret persistence', async ()
   assert.match(manifest, /icon-192\.png/);
   assert.match(manifest, /icon-512\.png/);
   assert.match(serviceWorker, /addEventListener\('fetch'/);
-  assert.match(serviceWorker, /cccompanion-desk-v6/);
-  assert.match(serviceWorker, /src\/styles\.css\?v=6/);
-  assert.match(serviceWorker, /src\/app\.js\?v=6/);
+  assert.match(serviceWorker, /cccompanion-desk-v7/);
+  assert.match(serviceWorker, /src\/styles\.css\?v=7/);
+  assert.match(serviceWorker, /src\/app\.js\?v=7/);
   assert.match(serviceWorker, /src\/live-messages\.js/);
   assert.match(serviceWorker, /src\/pairing-code\.js/);
   assert.doesNotMatch(source, /shared_secret|localStorage\.setItem|sessionStorage\.setItem|credentials:\s*'include'/);
@@ -338,8 +357,8 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   ]);
   assert.match(html, /id="latest-button"/);
   assert.match(html, /id="pairing-code"/);
-  assert.match(html, /href="\.\/src\/styles\.css\?v=6"/);
-  assert.match(html, /src="\.\/src\/app\.js\?v=6"/);
+  assert.match(html, /href="\.\/src\/styles\.css\?v=7"/);
+  assert.match(html, /src="\.\/src\/app\.js\?v=7"/);
   assert.match(html, /autocomplete="one-time-code"/);
   assert.match(html, /id="pairing-form"/);
   assert.match(html, /<details class="password-fallback">/);

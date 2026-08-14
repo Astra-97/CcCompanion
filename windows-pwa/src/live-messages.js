@@ -98,6 +98,16 @@ export function composeLiveMessages(history = [], live = {}, { contactId = '', s
   return persisted;
 }
 
+/** Show the lightweight assistant status row only while busy text is not yet visible. */
+export function shouldShowTypingBubble(history = [], live = {}, options = {}) {
+  const rendered = composeLiveMessages(history, live, options);
+  const active = Boolean(live?.busy || ['queued', 'generating'].includes(live?.replyState));
+  const hasVisibleLiveDraft = rendered.some((message) => message.transient && message.role === 'assistant' && String(message.body || '').trim());
+  const latest = Array.isArray(history) ? history.at(-1) : null;
+  const hasPersistedFinal = latest?.role === 'assistant' && !latest.streaming && String(latest.body || '').trim();
+  return active && !hasVisibleLiveDraft && !hasPersistedFinal;
+}
+
 /** Authoritative status snapshots terminate an SSE draft even if lifecycle was lost. */
 export function reconcileSnapshotStream(stream, live = {}) {
   if (!stream || stream.terminal) return stream || null;

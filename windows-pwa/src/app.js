@@ -1,8 +1,8 @@
-import { createPwaBootstrap } from './bootstrap.js?v=6';
-import { createComposerState } from './composer-state.js?v=6';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=6';
-import { composeLiveMessages, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=6';
-import { normalizeLiveState } from './api.js?v=6';
+import { createPwaBootstrap } from './bootstrap.js?v=7';
+import { createComposerState } from './composer-state.js?v=7';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=7';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=7';
+import { normalizeLiveState } from './api.js?v=7';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -74,14 +74,33 @@ function updateLatestControl() { const follow = state.followLatest[state.activeC
 function scrollLatest() { const scroll = $('#conversation-scroll'); scroll.scrollTop = scroll.scrollHeight; state.followLatest[state.activeContactId] = true; updateLatestControl(); }
 function renderMessages({ forceLatest = false } = {}) {
   const shouldFollow = forceLatest || (state.followLatest[state.activeContactId] !== false && nearBottom());
-  const history = composeLiveMessages(state.histories[state.activeContactId] || [], state.live[state.activeContactId], { contactId: state.activeContactId, stream: state.streams[state.activeContactId] }); messages.replaceChildren(...history.map((message) => {
+  const history = composeLiveMessages(state.histories[state.activeContactId] || [], state.live[state.activeContactId], { contactId: state.activeContactId, stream: state.streams[state.activeContactId] });
+  const showTyping = shouldShowTypingBubble(state.histories[state.activeContactId] || [], state.live[state.activeContactId], { contactId: state.activeContactId, stream: state.streams[state.activeContactId] });
+  const typingStatus = $('#typing-status');
+  const wasTyping = typingStatus.dataset.active === 'true';
+  if (showTyping !== wasTyping) {
+    typingStatus.dataset.active = String(showTyping);
+    typingStatus.setAttribute('aria-hidden', String(!showTyping));
+    typingStatus.textContent = showTyping ? '正在输入…' : '';
+  }
+  const existingTyping = messages.querySelector(`.typing-bubble[data-contact-id="${state.activeContactId}"]`);
+  const typingBubble = showTyping ? (existingTyping || createTypingBubble()) : null;
+  messages.replaceChildren(...history.filter((message) => !(message.role === 'assistant' && message.streaming && !String(message.body || '').trim())).map((message) => {
     const item = el('li', { class: `message ${message.role === 'user' ? 'from-user' : 'from-assistant'}` });
     const meta = el('div', { class: 'message-meta' }, [el('span', { text: message.role === 'user' ? 'ASTRA' : contact().name.toUpperCase() }), el('time', { text: message.time || '刚刚' })]);
     const body = el('p', { class: 'message-body', text: message.body || '…' }); if (message.streaming) body.classList.add('is-streaming'); item.append(meta, body);
     if (message.attachments?.length) item.append(el('div', { class: 'message-files', role: 'list', 'aria-label': '消息附件' }, message.attachments.map(renderAttachment)));
     return item;
-  }));
+  }), ...(typingBubble ? [typingBubble] : []));
   requestAnimationFrame(() => { if (shouldFollow) scrollLatest(); else updateLatestControl(); });
+}
+function createTypingBubble() {
+  const item = el('li', { class: 'message from-assistant typing-bubble', 'data-contact-id': state.activeContactId, 'aria-hidden': 'true' });
+  const meta = el('div', { class: 'message-meta' }, [el('span', { text: contact().name.toUpperCase() }), el('time', { text: '现在' })]);
+  const body = el('p', { class: 'message-body typing-bubble-body' });
+  body.append(el('span', { class: 'typing-dots', 'aria-hidden': 'true' }, [el('i'), el('i'), el('i')]));
+  item.append(meta, body);
+  return item;
 }
 function renderAttachment(file) {
   const label = `打开${file.type === 'image' ? '图片' : '文件'}：${file.name}`;
