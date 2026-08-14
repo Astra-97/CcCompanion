@@ -1,9 +1,9 @@
-import { createPwaBootstrap } from './bootstrap.js?v=9';
-import { createComposerState } from './composer-state.js?v=9';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=9';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=9';
-import { normalizeLiveState } from './api.js?v=9';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=9';
+import { createPwaBootstrap } from './bootstrap.js?v=10';
+import { createComposerState } from './composer-state.js?v=10';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=10';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=10';
+import { normalizeLiveState } from './api.js?v=10';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=10';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -68,21 +68,21 @@ function renderHeader() {
 function formatTokens(value) { return value >= 1_000_000 ? `${(value / 1_000_000).toFixed(1)}M` : value >= 1_000 ? `${(value / 1_000).toFixed(1)}k` : String(value); }
 function renderInstrument() {
   const live = state.live[state.activeContactId] || {}; const instrument = live.instrument;
-  const isKairos = state.activeContactId === 'kairos';
-  $('#instrument-contact').textContent = `${contact().name} / ${contact().channel === 'CODEX APP' ? 'Kairos' : 'CC'}`;
+  const supportsInstrument = ['kairos', 'xiaoke'].includes(state.activeContactId);
+  $('#instrument-contact').textContent = instrument?.provider || `${contact().name} / ${contact().channel === 'CODEX APP' ? 'Kairos' : 'CC'}`;
   $('#instrument-status').textContent = live.statusText || '待命';
-  const model = isKairos && instrument?.model ? instrument.model : '不可用';
-  const effort = isKairos && instrument?.effort ? instrument.effort : '—';
+  const model = supportsInstrument && instrument?.model ? instrument.model : '不可用';
+  const effort = supportsInstrument && instrument?.effort ? instrument.effort : '—';
   $('#instrument-model').textContent = model; $('#instrument-effort').textContent = effort;
-  const context = isKairos ? instrument?.context : null;
+  const context = supportsInstrument ? instrument?.context : null;
   const contextDetail = $('#instrument-context-detail'); const contextBar = $('#instrument-context-bar');
-  if (context?.available) { const percent = context.usedPercent; contextDetail.textContent = `${percent}% · ${formatTokens(context.usedTokens)} / ${formatTokens(context.windowTokens)}`; contextBar.value = percent; contextBar.hidden = false; }
+  if (context?.available) { const percent = context.usedPercent; contextDetail.textContent = context.usedTokens !== null && context.windowTokens !== null ? `${percent}% · ${formatTokens(context.usedTokens)} / ${formatTokens(context.windowTokens)}` : `${percent}% 已用`; contextBar.value = percent; contextBar.hidden = false; }
   else { contextDetail.textContent = '暂无 token 记录'; contextBar.hidden = true; }
   const quotas = $('#instrument-quota'); quotas.replaceChildren();
-  const windows = isKairos ? (instrument?.quota?.windows || []) : [];
-  if (!windows.length) { quotas.append(el('p', { class: 'instrument-empty', text: isKairos ? '额度信息暂不可用' : '此联系人没有工作仪表' })); return; }
+  const windows = supportsInstrument ? (instrument?.quota?.windows || []) : [];
+  if (!windows.length) { quotas.append(el('p', { class: 'instrument-empty', text: supportsInstrument ? '额度信息暂不可用' : '此联系人没有工作仪表' })); return; }
   const plan = instrument?.quota?.plan; if (plan) quotas.append(el('p', { class: 'quota-plan', text: plan }));
-  quotas.append(...windows.map((window) => el('div', { class: 'quota-window' }, [el('span', { text: window.label }), el('strong', { text: `${window.remainingPercent}%` }), el('small', { text: window.resetLabel })])));
+  quotas.append(...windows.map((window) => el('div', { class: 'quota-window' }, [el('span', { text: window.label }), el('strong', { text: `${window.mode === 'used' ? '已用' : '剩余'} ${window.percent}%` }), el('small', { text: window.resetLabel })])));
 }
 
 function observerEventKey(event, occurrence) { return `${event.elapsedSeconds}:${event.label}:${occurrence}`; }

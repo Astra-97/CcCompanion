@@ -32,7 +32,7 @@ test('normalizes bounded worker activity without relying on server naming', () =
     busy: true, replyState: 'generating', turnId: '', revision: '', updatedAt: '', statusText: '生成中', draft: 'partial', activityText: '', activityCount: 2,
     stopRequest: { supported: true, body: { contact_id: 'kairos', user_ts: 'turn-1' } },
     workers: [{ id: 'layout', name: 'windows_pwa_shell', state: 'running', count: 3 }],
-    instrument: { available: false, model: '', effort: '', context: { available: false, usedPercent: null, usedTokens: null, windowTokens: null }, quota: { plan: '', windows: [] } },
+    instrument: { available: false, provider: '', model: '', effort: '', context: { available: false, usedPercent: null, usedTokens: null, windowTokens: null }, quota: { plan: '', windows: [] } },
     terminal: { available: false, busy: false, phase: 'unavailable', events: [] },
   });
 });
@@ -42,9 +42,9 @@ test('instrument and terminal projections reject raw diagnostics and bound obser
     available: true, model: 'gpt-5.5', effort: 'high', context: { available: true, used_tokens: 1200, window_tokens: 10000 },
     quota: { plan: 'Plus', windows: [{ label: '5h', remaining_percent: 40, reset_label: '2 小时后' }, { label: 'weekly', remaining_percent: 80, reset_label: '周一' }, { label: 'third', remaining_percent: 1, reset_label: 'never' }] },
   });
-  assert.equal(instrument.context.usedPercent, 12); assert.equal(instrument.quota.windows.length, 2);
+  assert.equal(instrument.context.usedPercent, 12); assert.equal(instrument.quota.windows.length, 3);
   assert.deepEqual(normalizeInstrument({ available: true, model: 'gpt-5.5\nSECRET', effort: 'ultra', context: { available: true, used_tokens: 2, window_tokens: 1 }, quota: { plan: 'a@b.test', windows: [] } }), {
-    available: false, model: '', effort: '', context: { available: false, usedPercent: null, usedTokens: null, windowTokens: null }, quota: { plan: '', windows: [] },
+    available: false, provider: '', model: '', effort: '', context: { available: false, usedPercent: null, usedTokens: null, windowTokens: null }, quota: { plan: '', windows: [] },
   });
   const terminal = normalizeTerminal({ available: true, busy: true, phase: '正在处理', events: Array.from({ length: 45 }, (_, index) => ({ elapsed_seconds: index, label: index === 44 ? '运行命令（参数与输出已隐藏）' : 'raw secret command' })) });
   assert.equal(terminal.events.length, 1); assert.equal(terminal.events[0].label, '运行命令（参数与输出已隐藏）');
@@ -61,6 +61,15 @@ test('re-normalizing a live snapshot after a draft merge preserves safe instrume
   assert.deepEqual(merged.instrument, first.instrument);
   assert.deepEqual(merged.terminal, first.terminal);
   assert.equal(merged.draft, 'after');
+});
+
+test('Xiaoke Fable instrument keeps three bounded used-quota rows without accepting raw provider text', () => {
+  const result = normalizeInstrument({ available: true, provider: 'Claude Code', model: 'Fable 5', context: { available: true, used_percentage: 12.5 }, quota: { plan: 'Fable', windows: [
+    { label: 'Claude 5h', used_percent: 14.5, mode: 'used', reset_label: '08-14 08:00' }, { label: 'Claude 7d', used_percent: 31, mode: 'used', reset_label: '08-18 08:00' }, { label: 'Fable weekly', used_percent: 81.2, mode: 'used', reset_label: '08-14 18:59' }, { label: 'too many', used_percent: 1, mode: 'used', reset_label: 'soon' },
+  ] } });
+  assert.equal(result.context.usedPercent, 12.5); assert.deepEqual(result.quota.windows.map(({ label, mode, percent }) => ({ label, mode, percent })), [{ label: 'Claude 5h', mode: 'used', percent: 14.5 }, { label: 'Claude 7d', mode: 'used', percent: 31 }, { label: 'Fable weekly', mode: 'used', percent: 81.2 }]);
+  assert.deepEqual(normalizeInstrument(result), result, 'the client-safe projection stays intact across a draft merge');
+  assert.equal(normalizeInstrument({ available: true, provider: 'SECRET provider', model: 'Fable 5', quota: {} }).provider, '');
 });
 
 test('typing status uses a stable live region and filters empty streaming placeholders', () => {
@@ -390,10 +399,10 @@ test('PWA shell declares installability and has no secret persistence', async ()
   assert.match(manifest, /icon-192\.png/);
   assert.match(manifest, /icon-512\.png/);
   assert.match(serviceWorker, /addEventListener\('fetch'/);
-  assert.match(serviceWorker, /cccompanion-desk-v9/);
-  assert.match(serviceWorker, /src\/styles\.css\?v=9/);
-  assert.match(serviceWorker, /src\/app\.js\?v=9/);
-  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=9/);
+  assert.match(serviceWorker, /cccompanion-desk-v10/);
+  assert.match(serviceWorker, /src\/styles\.css\?v=10/);
+  assert.match(serviceWorker, /src\/app\.js\?v=10/);
+  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=10/);
   assert.match(serviceWorker, /src\/live-messages\.js/);
   assert.match(serviceWorker, /src\/pairing-code\.js/);
   assert.doesNotMatch(source, /shared_secret|localStorage\.setItem|sessionStorage\.setItem|credentials:\s*'include'/);
@@ -410,8 +419,8 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   ]);
   assert.match(html, /id="latest-button"/);
   assert.match(html, /id="pairing-code"/);
-  assert.match(html, /href="\.\/src\/styles\.css\?v=9"/);
-  assert.match(html, /src="\.\/src\/app\.js\?v=9"/);
+  assert.match(html, /href="\.\/src\/styles\.css\?v=10"/);
+  assert.match(html, /src="\.\/src\/app\.js\?v=10"/);
   assert.match(html, /autocomplete="one-time-code"/);
   assert.match(html, /id="pairing-form"/);
   assert.match(html, /<details class="password-fallback">/);

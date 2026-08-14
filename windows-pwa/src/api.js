@@ -1,5 +1,5 @@
-import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY } from './data.js?v=9';
-import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=9';
+import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY } from './data.js?v=10';
+import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=10';
 
 const clone = (value) => structuredClone(value);
 const now = () => new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
@@ -50,13 +50,15 @@ const SAFE_OBSERVER_LABELS = new Set([
   '整理会话上下文（内容已隐藏）', '等待外部步骤完成',
 ]);
 const safeCount = (value, maximum = 2_000_000_000) => Number.isInteger(value) && value >= 0 && value <= maximum ? value : null;
+const safePercent = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100 ? Math.round(value * 10) / 10 : null;
 const safeDisplay = (value, maximum = 48) => typeof value === 'string' && value.length > 0 && value.length <= maximum && !value.includes('@') && /^[A-Za-z0-9\u4e00-\u9fff .:_+\-/()]+$/.test(value) ? value : '';
 
 /** Defense-in-depth projection for the optional, read-only Kairos instrument. */
 export function normalizeInstrument(raw) {
-  const empty = { available: false, model: '', effort: '', context: { available: false, usedPercent: null, usedTokens: null, windowTokens: null }, quota: { plan: '', windows: [] } };
+  const empty = { available: false, provider: '', model: '', effort: '', context: { available: false, usedPercent: null, usedTokens: null, windowTokens: null }, quota: { plan: '', windows: [] } };
   if (!raw || typeof raw !== 'object') return empty;
-  const model = typeof raw.model === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(raw.model) ? raw.model : '';
+  const provider = new Set(['Codex', 'Claude Code']).has(raw.provider) ? raw.provider : '';
+  const model = typeof raw.model === 'string' && (/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(raw.model) || raw.model === 'Fable 5') ? raw.model : '';
   const effort = SAFE_EFFORTS.has(raw.effort) ? raw.effort : '';
   const sourceContext = raw.context && typeof raw.context === 'object' ? raw.context : {};
   // The stream reducer can re-normalize an existing client snapshot after a
@@ -64,15 +66,17 @@ export function normalizeInstrument(raw) {
   // spelling; this is not a generic aliasing layer.
   const usedTokens = safeCount(sourceContext.used_tokens ?? sourceContext.usedTokens);
   const windowTokens = safeCount(sourceContext.window_tokens ?? sourceContext.windowTokens);
-  const contextAvailable = sourceContext.available === true && usedTokens !== null && windowTokens !== null && windowTokens > 0 && usedTokens <= windowTokens;
-  const context = { available: contextAvailable, usedPercent: contextAvailable ? Math.round(Math.min(100, Math.max(0, (usedTokens / windowTokens) * 100)) * 10) / 10 : null, usedTokens: contextAvailable ? usedTokens : null, windowTokens: contextAvailable ? windowTokens : null };
+  const suppliedPercent = safePercent(sourceContext.used_percentage ?? sourceContext.usedPercent);
+  const countsAvailable = usedTokens !== null && windowTokens !== null && windowTokens > 0 && usedTokens <= windowTokens;
+  const contextAvailable = sourceContext.available === true && (countsAvailable || suppliedPercent !== null);
+  const context = { available: contextAvailable, usedPercent: contextAvailable ? (countsAvailable ? Math.round(Math.min(100, Math.max(0, (usedTokens / windowTokens) * 100)) * 10) / 10 : suppliedPercent) : null, usedTokens: countsAvailable ? usedTokens : null, windowTokens: countsAvailable ? windowTokens : null };
   const sourceQuota = raw.quota && typeof raw.quota === 'object' ? raw.quota : {};
-  const windows = Array.isArray(sourceQuota.windows) ? sourceQuota.windows.slice(0, 2).map((item) => {
+  const windows = Array.isArray(sourceQuota.windows) ? sourceQuota.windows.slice(0, 3).map((item) => {
     if (!item || typeof item !== 'object') return null;
-    const remainingPercent = safeCount(item.remaining_percent ?? item.remainingPercent, 100); const label = safeDisplay(item.label, 32); const resetLabel = safeDisplay(item.reset_label ?? item.resetLabel, 48);
-    return remainingPercent === null || !label || !resetLabel ? null : { label, remainingPercent, resetLabel };
+    const mode = item.mode === 'used' ? 'used' : 'remaining'; const percent = safePercent(mode === 'used' ? (item.used_percent ?? item.usedPercent ?? item.percent) : (item.remaining_percent ?? item.remainingPercent ?? item.percent)); const label = safeDisplay(item.label, 32); const resetLabel = safeDisplay(item.reset_label ?? item.resetLabel, 48);
+    return percent === null || !label || !resetLabel ? null : { label, percent, mode, resetLabel };
   }).filter(Boolean) : [];
-  return { available: raw.available === true && Boolean(model || effort || context.available || windows.length), model, effort, context, quota: { plan: safeDisplay(sourceQuota.plan, 40), windows } };
+  return { available: raw.available === true && Boolean(provider || model || effort || context.available || windows.length), provider, model, effort, context, quota: { plan: safeDisplay(sourceQuota.plan, 40), windows } };
 }
 
 /** The terminal is observer labels only: never accept upstream text as a line. */

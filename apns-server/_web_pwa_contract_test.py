@@ -8,9 +8,11 @@ contact contract for XiaoKe (Claude Code) and Kairos (Codex app-server).
 from __future__ import annotations
 
 import io
+import os
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from http.client import parse_headers
@@ -492,6 +494,101 @@ class WebPwaContractTest(unittest.TestCase):
         encoded = str(payload)
         for forbidden in ("private@example.test", "SECRET runtime", "/private/path", "session", "cwd", "email"):
             self.assertNotIn(forbidden, encoded)
+
+    def test_xiaoke_fable_instrument_projects_three_used_windows_without_raw_status_text(self):
+        handler = self.handler()
+        handler._pwa_claude_status_cached = lambda: ({
+            "model": {"id": "fable", "display_name": "SECRET MODEL"},
+            "context_window": {"used_percentage": 12.5},
+            "rate_limits": {
+                "five_hour": {"used_percentage": 14.5, "resets_at": 1780000000},
+                "seven_day": {"used_percentage": 31, "resets_at": 1780100000},
+            },
+            "cwd": "/private/path", "email": "private@example.test",
+        }, (81.2, "08-14 18:59"))
+        payload = handler._pwa_xiaoke_instrument_snapshot()
+        self.assertEqual(payload["provider"], "Claude Code")
+        self.assertEqual(payload["model"], "Fable 5")
+        self.assertEqual(payload["context"]["used_percent"], 12.5)
+        self.assertEqual([(row["label"], row["mode"], row["used_percent"]) for row in payload["quota"]["windows"]], [("Claude 5h", "used", 14.5), ("Claude 7d", "used", 31.0), ("Fable weekly", "used", 81.2)])
+        self.assertNotIn("SECRET MODEL", str(payload))
+        self.assertNotIn("private@example.test", str(payload))
+        self.assertNotIn("/private/path", str(payload))
+
+    def test_xiaoke_instrument_skips_only_quota_row_with_extreme_reset_epoch(self):
+        handler = self.handler()
+        handler._pwa_claude_status_cached = lambda: ({"rate_limits": {
+            "five_hour": {"used_percentage": 12, "resets_at": 10**100},
+            "seven_day": {"used_percentage": 33, "resets_at": 1780100000},
+        }}, None)
+        rows = handler._pwa_xiaoke_instrument_snapshot()["quota"]["windows"]
+        self.assertEqual([(row["label"], row["used_percent"]) for row in rows], [("Claude 7d", 33.0)])
+
+    def test_pwa_claude_status_partial_writer_times_out_and_is_reaped(self):
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b'{"partial"')
+        class FakeProcess:
+            def __init__(self):
+                self.stdout = os.fdopen(read_fd, "rb", buffering=0)
+                self.returncode = None; self.killed = False; self.waited = 0
+            def poll(self): return self.returncode
+            def kill(self): self.killed = True; self.returncode = -9; os.close(write_fd)
+            def wait(self, timeout=None): self.waited += 1; return self.returncode
+        class EmptySelector:
+            def register(self, *_args): pass
+            def select(self, _timeout): return []
+            def close(self): pass
+        proc = FakeProcess()
+        handler = self.handler()
+        with patch("push.subprocess.Popen", return_value=proc), patch("push.selectors.DefaultSelector", return_value=EmptySelector()):
+            self.assertEqual(handler._pwa_read_claude_status_option(), {})
+        self.assertTrue(proc.killed)
+        self.assertGreaterEqual(proc.waited, 1)
+        proc.stdout.close()
+
+    def test_pwa_claude_status_cache_refresh_is_single_flight(self):
+        handler = self.handler()
+        calls = []
+        def read_status():
+            calls.append("probe")
+            time.sleep(0.02)
+            return {"model": {"id": "fable"}}
+        with patch.dict("push.PWA_CLAUDE_STATUS_CACHE", {"ts": 0.0, "status": None, "fable_week": None}, clear=True), patch.object(handler, "_pwa_read_claude_status_option", side_effect=read_status), patch.object(handler, "_pwa_read_fable_week_cache", return_value=None):
+            threads = [threading.Thread(target=handler._pwa_claude_status_cached) for _ in range(8)]
+            for thread in threads: thread.start()
+            for thread in threads: thread.join(1)
+        self.assertEqual(calls, ["probe"])
+
+    def test_pwa_fable_week_cache_reads_only_bounded_regular_decimal_file(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            source = root / "fable-usage.txt"
+            source.write_text("81.2%@08-14 18:59", encoding="utf-8")
+            with patch("push.PWA_CLAUDE_FABLE_USAGE_PATH", source):
+                self.assertEqual(PushHandler._pwa_read_fable_week_cache(), (81.2, "08-14 18:59"))
+            source.write_text("101%@08-14 18:59", encoding="utf-8")
+            with patch("push.PWA_CLAUDE_FABLE_USAGE_PATH", source):
+                self.assertIsNone(PushHandler._pwa_read_fable_week_cache())
+            target = root / "target.txt"
+            target.write_text("81%@08-14 18:59", encoding="utf-8")
+            link = root / "usage-link.txt"
+            link.symlink_to(target)
+            with patch("push.PWA_CLAUDE_FABLE_USAGE_PATH", link):
+                self.assertIsNone(PushHandler._pwa_read_fable_week_cache())
+
+    def test_chat_status_keeps_xiaoke_and_kairos_instruments_contact_scoped(self):
+        handler = self.handler("/chat/status?contact_id=xiaoke")
+        handler._contact_id_from_query = lambda: "xiaoke"
+        handler._typing_for_contact = lambda _contact: {"is_typing": False, "since": None}
+        handler._chat_draft_snapshot = lambda _contact: {"is_active": False, "reply_state": "idle", "text": ""}
+        handler._contact_stop_request = lambda *_args, **_kwargs: {"supported": False, "body": None}
+        handler._chat_for_contact = lambda _contact: types.SimpleNamespace(tail=lambda _limit: [])
+        handler._pwa_xiaoke_instrument_snapshot = lambda: {"available": True, "provider": "Claude Code", "model": "Fable 5", "effort": "", "context": {"available": False, "used_percent": None, "used_tokens": None, "window_tokens": None}, "quota": {"plan": "Fable", "windows": []}}
+        handler._pwa_kairos_instrument_snapshot = lambda: (_ for _ in ()).throw(AssertionError("Kairos data leaked"))
+        handler._handle_chat_status()
+        payload = handler.responses[-1][1]
+        self.assertEqual(payload["instrument"]["provider"], "Claude Code")
+        self.assertEqual(payload["terminal"], {"available": False, "busy": False, "phase": "unavailable", "events": []})
 
     def test_pwa_instrument_context_import_path_is_idempotent_across_polls(self):
         handler = self.handler()

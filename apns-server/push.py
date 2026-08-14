@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict, deque
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 import gzip as _gzip_mod
 import hmac
@@ -1622,6 +1622,10 @@ VPS_STATUS_CACHE: dict[str, Any] = {"ts": 0.0, "data": None}
 CODEX_QUOTA_CACHE_TTL = 60.0
 CODEX_QUOTA_CACHE_LOCK = threading.Lock()
 CODEX_QUOTA_CACHE: dict[str, Any] = {"ts": 0.0, "lines": None}
+PWA_CLAUDE_STATUS_CACHE_TTL = 10.0
+PWA_CLAUDE_STATUS_CACHE_LOCK = threading.Lock()
+PWA_CLAUDE_STATUS_CACHE: dict[str, Any] = {"ts": 0.0, "status": None, "fable_week": None}
+PWA_CLAUDE_FABLE_USAGE_PATH = Path("/run/claude-fable-usage.txt")
 
 
 def _run_status_cmd(args: list[str], timeout: float = 1.5) -> str:
@@ -6493,6 +6497,12 @@ class PushHandler(BaseHTTPRequestHandler):
                 # /codex/status or /tmux/capture diagnostics.
                 instrument = self._pwa_kairos_instrument_snapshot()
                 terminal = self._pwa_kairos_terminal_snapshot()
+            elif contact_id == "xiaoke":
+                # Xiaoke shares the same narrow instrument schema, populated
+                # only from the existing status-bar cache.  It has no safe
+                # observer equivalent, so its terminal is explicitly absent.
+                instrument = self._pwa_xiaoke_instrument_snapshot()
+                terminal = self._pwa_unavailable_terminal_snapshot()
             busy = typing or bool(draft.get("is_active")) or provider_busy
             stop_request = self._contact_stop_request(
                 contact_id,
@@ -9931,6 +9941,136 @@ class PushHandler(BaseHTTPRequestHandler):
             return None
         return number if 0 <= number <= maximum else None
 
+    @staticmethod
+    def _pwa_bounded_percent(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return round(number, 1) if 0.0 <= number <= 100.0 else None
+
+    def _pwa_claude_status_cached(self) -> tuple[dict[str, Any], tuple[float, str] | None]:
+        """Use only the existing bounded Claude status-bar sources for PWA."""
+        now = time.time()
+        with PWA_CLAUDE_STATUS_CACHE_LOCK:
+            cached = PWA_CLAUDE_STATUS_CACHE.get("status")
+            if isinstance(cached, dict) and now - float(PWA_CLAUDE_STATUS_CACHE.get("ts") or 0) < PWA_CLAUDE_STATUS_CACHE_TTL:
+                week = PWA_CLAUDE_STATUS_CACHE.get("fable_week")
+                return dict(cached), week if isinstance(week, tuple) else None
+            # Hold the dedicated refresh lock through the short local probe.
+            # Every waiter rechecks this cache before becoming the refresher.
+            status = self._pwa_read_claude_status_option()
+            fable_week = self._pwa_read_fable_week_cache()
+            PWA_CLAUDE_STATUS_CACHE.update({"ts": now, "status": dict(status), "fable_week": fable_week})
+            return status, fable_week
+
+    @staticmethod
+    def _pwa_read_claude_status_option() -> dict[str, Any]:
+        """Bounded tmux option read with a hard deadline and child reaping."""
+        status: dict[str, Any] = {}
+        proc: Any = None
+        selector: Any = None
+        try:
+            proc = subprocess.Popen(["tmux", "show-option", "-gqv", "@claude-code-status-json"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            if proc.stdout is None:
+                return status
+            selector = selectors.DefaultSelector()
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            deadline = time.monotonic() + 2.0
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Claude status option timed out")
+                if not selector.select(remaining):
+                    raise TimeoutError("Claude status option timed out")
+                chunk = os.read(proc.stdout.fileno(), min(16 * 1024 + 1 - total, 4096))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > 16 * 1024:
+                    raise ValueError("Claude status option exceeds limit")
+            proc.wait(timeout=max(0.01, deadline - time.monotonic()))
+            raw_bytes = b"".join(chunks)
+            raw = raw_bytes.decode("utf-8", "replace").strip() if proc.returncode == 0 else ""
+            if raw:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    status = parsed
+        except Exception:
+            logger.debug("PWA Claude status-bar unavailable", exc_info=True)
+        finally:
+            if selector is not None:
+                with suppress(Exception):
+                    selector.close()
+            if proc is not None and proc.poll() is None:
+                with suppress(Exception):
+                    proc.kill()
+            if proc is not None:
+                with suppress(Exception):
+                    proc.wait(timeout=1)
+        return status
+
+    @staticmethod
+    def _pwa_read_fable_week_cache() -> tuple[float, str] | None:
+        fable_week: tuple[float, str] | None = None
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(PWA_CLAUDE_FABLE_USAGE_PATH, flags)
+            try:
+                metadata = os.fstat(fd)
+                raw_week = os.read(fd, 129) if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 128 else b""
+            finally:
+                os.close(fd)
+            if raw_week and len(raw_week) <= 128:
+                match = re.fullmatch(r"\s*(\d{1,3}(?:\.\d+)?)%\s*@\s*(\d{2}-\d{2}\s+\d{2}:\d{2})\s*", raw_week.decode("utf-8", "replace"))
+                if match:
+                    percent = PushHandler._pwa_bounded_percent(match.group(1))
+                    reset = PushHandler._pwa_bounded_text(match.group(2), maximum=24)
+                    if percent is not None and reset:
+                        fable_week = (percent, reset)
+        except Exception:
+            logger.debug("PWA Fable cached usage unavailable", exc_info=True)
+        return fable_week
+
+    def _pwa_xiaoke_instrument_snapshot(self) -> dict[str, Any]:
+        """Narrow safe projection of Xiaoke's existing Claude status bar."""
+        empty = {"available": False, "provider": "Claude Code", "model": "", "effort": "", "context": {"available": False, "used_percent": None, "used_tokens": None, "window_tokens": None}, "quota": {"plan": "", "windows": []}}
+        try:
+            status, fable_week = self._pwa_claude_status_cached()
+            model_data = status.get("model") if isinstance(status.get("model"), dict) else {}
+            model_id = str(model_data.get("id") or "").strip().lower()
+            model = "Fable 5" if model_id in {"fable", "claude-fable-5"} else ""
+            context_data = status.get("context_window") if isinstance(status.get("context_window"), dict) else {}
+            context_percent = self._pwa_bounded_percent(context_data.get("used_percentage"))
+            context = {"available": context_percent is not None, "used_percent": context_percent, "used_tokens": None, "window_tokens": None}
+            limits = status.get("rate_limits") if isinstance(status.get("rate_limits"), dict) else {}
+            windows: list[dict[str, Any]] = []
+            for source_key, label in (("five_hour", "Claude 5h"), ("seven_day", "Claude 7d")):
+                limit = limits.get(source_key) if isinstance(limits.get(source_key), dict) else {}
+                used = self._pwa_bounded_percent(limit.get("used_percentage"))
+                try:
+                    reset = self._pwa_bounded_text(_format_reset_beijing(limit.get("resets_at")), maximum=24)
+                except Exception:
+                    reset = ""
+                if used is not None and reset:
+                    windows.append({"label": label, "used_percent": used, "mode": "used", "reset_label": reset})
+            if fable_week is not None:
+                used, reset = fable_week
+                windows.append({"label": "Fable weekly", "used_percent": used, "mode": "used", "reset_label": reset})
+            return {"available": bool(model or context["available"] or windows), "provider": "Claude Code", "model": model, "effort": "", "context": context, "quota": {"plan": "Fable", "windows": windows[:3]}}
+        except Exception:
+            logger.debug("PWA Xiaoke instrument unavailable", exc_info=True)
+            return empty
+
+    @staticmethod
+    def _pwa_unavailable_terminal_snapshot() -> dict[str, Any]:
+        return {"available": False, "busy": False, "phase": "unavailable", "events": []}
+
     def _pwa_kairos_instrument_snapshot(self) -> dict[str, Any]:
         """Return the PWA's narrow, provider-neutral-ish work instrument.
 
@@ -9941,6 +10081,7 @@ class PushHandler(BaseHTTPRequestHandler):
         """
         empty = {
             "available": False,
+            "provider": "Codex",
             "model": "",
             "effort": "",
             "context": {"available": False, "used_percent": None, "used_tokens": None, "window_tokens": None},
@@ -9991,9 +10132,10 @@ class PushHandler(BaseHTTPRequestHandler):
                 reset = self._pwa_bounded_text(item.get("reset_text"), maximum=48)
                 if remaining is None or not label or not reset:
                     continue
-                windows.append({"label": label, "remaining_percent": remaining, "reset_label": reset})
+                windows.append({"label": label, "remaining_percent": remaining, "mode": "remaining", "reset_label": reset})
             return {
                 "available": bool(safe_model or safe_effort or context["available"] or windows),
+                "provider": "Codex",
                 "model": safe_model,
                 "effort": safe_effort,
                 "context": context,
