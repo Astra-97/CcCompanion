@@ -697,7 +697,17 @@ class WebPwaContractTest(unittest.TestCase):
         status, payload, kwargs = handler.responses[-1]
         self.assertEqual(status, 200)
         self.assertEqual("爱", payload["stickers"][0]["name"])
+        self.assertEqual(8 * 1024 * 1024, payload["upload"]["max_file_bytes"])
+        self.assertEqual(["image/gif", "image/jpeg", "image/png", "image/webp"], payload["upload"]["content_types"])
+        self.assertNotIn("shared_secret", repr(payload))
         self.assertEqual("no-store", kwargs["extra_headers"]["Cache-Control"])
+
+    def test_cookie_route_scope_adds_only_exact_sticker_upload_write(self):
+        handler = self.handler("/stickers/upload?name=x", "POST")
+        self.assertTrue(handler._web_session_route_allowed())
+        for path in ("/stickers/upload/delete", "/stickers/import", "/terminal/write"):
+            handler.path = path
+            self.assertFalse(handler._web_session_route_allowed(), path)
 
     def test_contact_manifest_exposes_both_primary_providers_with_common_endpoints(self):
         handler = self.handler()

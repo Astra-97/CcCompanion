@@ -1,5 +1,6 @@
-import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY } from './data.js?v=10';
-import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=10';
+import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY } from './data.js?v=11';
+import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=11';
+import { normalizeStickerCatalog } from './sticker-protocol.js?v=11';
 
 const clone = (value) => structuredClone(value);
 const now = () => new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
@@ -211,6 +212,11 @@ export function createHttpAdapter({ baseUrl = '', request = defaultRequest, uplo
       if (!body || body.contact_id !== contactId) throw new Error('Server did not provide a valid stop request for this turn');
       return call(url('/chat/stop'), { method: 'POST', body });
     },
+    async getStickerCatalog() { return normalizeStickerCatalog(await call(url('/stickers/catalog'))); },
+    async uploadSticker(file, { name, categoryId, newCategoryName, signal, onProgress } = {}) {
+      const query = new URLSearchParams({ name, filename: resolveAttachmentFilename(file, 0) || 'sticker.png', ...(categoryId ? { category_id: categoryId } : { new_category_name: newCategoryName }) });
+      return upload(url(`/stickers/upload?${query}`), { body: file, signal, credentials: 'same-origin', cache: 'no-store', headers: { 'Content-Type': file.type, ...(csrfToken ? { 'X-CC-Web-CSRF': csrfToken } : {}) }, onProgress });
+    },
     async getTaxonomy() { return call(url('/memory/taxonomy')); },
     async listMemories({ category, subcategory }) {
       const query = new URLSearchParams({ category, ...(subcategory ? { subcategory } : {}) });
@@ -386,6 +392,8 @@ export function createMockAdapter() {
       states[contactId] = normalizeLiveState({ reply_state: 'idle', status_text: '已停止' }); emitState(contactId);
     },
     async getTaxonomy() { return clone(MOCK_TAXONOMY); },
+    async getStickerCatalog() { return normalizeStickerCatalog({ version: 'mock', categories: [{ id: 'common', name: '常用' }], stickers: [{ name: '爱', label: '爱', category_id: 'common', url: 'https://test.xiaonancaleb.xyz/stickers/%E7%88%B1.gif' }], upload: { supported: true, max_file_bytes: 8388608, content_types: ['image/png', 'image/jpeg', 'image/gif', 'image/webp'], max_name_chars: 80 } }); },
+    async uploadSticker() { throw new Error('mock upload unavailable'); },
     async listMemories({ category, subcategory }) { return clone(MOCK_MEMORIES[subcategory || category] || [{ title: '暂时没有可展示的条目', body: '此分类已从 taxonomy 读取。', timestamp: '—' }]); },
     async uploadAttachments(_contactId, files, { onProgress } = {}) { return files.map((file, index) => { onProgress?.({ index, totalFiles: files.length, loaded: file.size, total: file.size, file }); return { attachment_id: `mock-${crypto.randomUUID()}`, filename: file.name, type: file.type || 'file', size: file.size }; }); },
     async cancelUploads() { return { ok: true, canceled: 0 }; },

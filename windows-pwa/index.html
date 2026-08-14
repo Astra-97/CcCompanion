@@ -3,12 +3,12 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; connect-src 'self'; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; img-src 'self' data:; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; connect-src 'self'; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; img-src 'self' data: blob: https://test.xiaonancaleb.xyz; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com" />
     <meta name="theme-color" content="#fff6ec" />
     <meta name="description" content="CcCompanion private operations desk" />
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" href="./assets/cc-mark.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="./src/styles.css?v=10" />
+    <link rel="stylesheet" href="./src/styles.css?v=11" />
     <title>CcCompanion · Desk</title>
   </head>
   <body>
@@ -79,6 +79,7 @@
             <span aria-hidden="true">＋</span><span class="sr-only">添加附件</span>
           </label>
           <input id="attachment-input" class="file-input" type="file" multiple tabindex="-1" />
+          <button class="sticker-button" id="sticker-button" type="button" aria-label="打开表情包" aria-haspopup="dialog" aria-controls="sticker-dialog" aria-expanded="false" title="表情包">☺</button>
           <textarea id="message-input" rows="1" placeholder="写给小克…" aria-label="消息内容"></textarea>
           <div class="composer-actions">
             <span class="shortcut-hint">Enter 发送 · ⇧Enter 换行</span>
@@ -128,7 +129,26 @@
       <div class="memory-results" id="memory-results"><p>选择一个分类查看记忆。</p></div>
     </dialog>
 
+    <dialog class="sticker-dialog" id="sticker-dialog" aria-labelledby="sticker-title">
+      <header class="sticker-head"><div><p class="eyebrow">BQB CATALOG</p><h2 id="sticker-title">表情包</h2></div><button class="icon-button" id="sticker-close" type="button" aria-label="关闭表情包">×</button></header>
+      <div class="sticker-tools" id="sticker-tools"><label for="sticker-search">搜索</label><input id="sticker-search" type="search" placeholder="按名称筛选…" autocomplete="off" /><button class="text-button" id="sticker-upload-open" type="button">上传新的</button></div>
+      <div id="sticker-categories" class="sticker-categories" role="tablist" aria-label="表情包分类"></div>
+      <p id="sticker-status" class="sticker-status" aria-live="polite"></p>
+      <div id="sticker-grid" class="sticker-grid" role="tabpanel"></div>
+      <form id="sticker-upload-form" class="sticker-upload-form" hidden>
+        <img id="sticker-upload-preview" alt="待上传表情包预览" hidden />
+        <label>选择图片<input id="sticker-upload-file" type="file" accept="image/png,image/jpeg,image/gif,image/webp" required /></label>
+        <label>表情包名称<input id="sticker-upload-name" maxlength="80" required /></label>
+        <fieldset><legend>分类</legend><label><input type="radio" name="sticker-category-mode" value="existing" checked /> 已有分类</label><label><input type="radio" name="sticker-category-mode" value="new" /> 新分类</label></fieldset>
+        <label id="sticker-existing-wrap">已有分类<select id="sticker-upload-category"></select></label>
+        <label id="sticker-new-wrap" hidden>新分类名称<input id="sticker-upload-new-category" maxlength="80" /></label>
+        <progress id="sticker-upload-progress" max="100" value="0" hidden>0%</progress>
+        <p id="sticker-upload-error" class="login-error" aria-live="polite"></p>
+        <div class="sticker-upload-actions"><button class="text-button" id="sticker-upload-cancel" type="button">返回目录</button><button class="send-button" type="submit">上传</button></div>
+      </form>
+    </dialog>
+
     <template id="svg-defs"><svg class="svg-defs" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><symbol id="cc-mark" viewBox="0 0 24 24"><path d="M3 12 12 3l9 9-9 9-9 9Zm4.2 0L12 7.2l4.8 4.8L12 16.8 7.2 12Z" fill="currentColor"/></symbol></svg></template>
-    <script type="module" src="./src/app.js?v=10"></script>
+    <script type="module" src="./src/app.js?v=11"></script>
   </body>
 </html>

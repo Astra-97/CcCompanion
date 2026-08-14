@@ -1,9 +1,10 @@
-import { createPwaBootstrap } from './bootstrap.js?v=10';
-import { createComposerState } from './composer-state.js?v=10';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=10';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=10';
-import { normalizeLiveState } from './api.js?v=10';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=10';
+import { createPwaBootstrap } from './bootstrap.js?v=11';
+import { createComposerState } from './composer-state.js?v=11';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=11';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=11';
+import { normalizeLiveState } from './api.js?v=11';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=11';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=11';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -23,6 +24,8 @@ const state = {
   contacts: [], activeContactId: '', histories: {}, live: {}, taxonomy: null,
   selectedScope: null, deferredInstall: null, loginBound: false, stopLive: null, streams: {}, epoch: 0,
   composerState: createComposerState(), appearance: 'default', followLatest: {}, scrollTops: {},
+  stickerCatalog: null, stickerLoading: false, stickerLoadId: 0, stickerError: '', stickerCategory: '__all', stickerSearch: '', stickerTargetContactId: '', stickerSelection: { start: 0, end: 0 },
+  stickerUpload: { file: null, previewUrl: '', uploading: false, controller: null },
 };
 const contactList = $('#contact-list'); const messages = $('#message-list'); const input = $('#message-input');
 
@@ -61,6 +64,7 @@ function renderHeader() {
   input.placeholder = `写给${current.name}…`; $('#connection-state').textContent = isBusy() ? (live.statusText || '正在处理') : '已连接';
   $('#signal-dot').classList.toggle('is-busy', isBusy()); $('#stop-button').hidden = !(isBusy() && live.stopRequest?.supported);
   input.disabled = sending; $('#attachment-input').disabled = sending; $('.attach-button').classList.toggle('is-disabled', sending); $('.attach-button').setAttribute('aria-disabled', String(sending));
+  $('#sticker-button').disabled = sending || !current.id || Boolean(current.readOnly);
   $('#send-button').disabled = sending || !current.id || Boolean(current.readOnly) || (!composer().text.trim() && !composer().attachments.length);
   $('#upload-cancel-button').hidden = !(sending && sendOperation(current.id)?.uploading); $('#upload-cancel-button').disabled = !(sending && sendOperation(current.id)?.uploading);
 }
@@ -113,6 +117,16 @@ function renderActivities() {
 function nearBottom() { const scroll = $('#conversation-scroll'); return scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 88; }
 function updateLatestControl() { const follow = state.followLatest[state.activeContactId] !== false; $('#latest-button').hidden = follow; }
 function scrollLatest() { const scroll = $('#conversation-scroll'); scroll.scrollTop = scroll.scrollHeight; state.followLatest[state.activeContactId] = true; updateLatestControl(); }
+function renderMessageBody(message) {
+  const source = message.body || '…'; const parts = parseStickerParts(source, state.stickerCatalog);
+  const stickers = parts.filter(({ type }) => type === 'sticker'); const standalone = stickers.length > 0 && parts.every((part) => part.type === 'sticker' || !part.value.trim());
+  const body = el(standalone ? 'div' : 'p', { class: `message-body ${standalone ? 'sticker-only-message' : stickers.length ? 'sticker-mixed-message' : ''}` });
+  parts.forEach((part) => {
+    if (part.type === 'text') body.append(document.createTextNode(part.value));
+    else body.append(el('img', { class: standalone ? 'message-sticker-large' : 'message-sticker-inline', src: part.sticker.url, alt: part.sticker.label, loading: 'lazy', decoding: 'async' }));
+  });
+  if (message.streaming) body.classList.add('is-streaming'); return { body, standalone };
+}
 function renderMessages({ forceLatest = false } = {}) {
   const shouldFollow = forceLatest || (state.followLatest[state.activeContactId] !== false && nearBottom());
   const history = composeLiveMessages(state.histories[state.activeContactId] || [], state.live[state.activeContactId], { contactId: state.activeContactId, stream: state.streams[state.activeContactId] });
@@ -129,7 +143,7 @@ function renderMessages({ forceLatest = false } = {}) {
   messages.replaceChildren(...history.filter((message) => !(message.role === 'assistant' && message.streaming && !String(message.body || '').trim())).map((message) => {
     const item = el('li', { class: `message ${message.role === 'user' ? 'from-user' : 'from-assistant'}` });
     const meta = el('div', { class: 'message-meta' }, [el('span', { text: message.role === 'user' ? 'ASTRA' : contact().name.toUpperCase() }), el('time', { text: message.time || '刚刚' })]);
-    const body = el('p', { class: 'message-body', text: message.body || '…' }); if (message.streaming) body.classList.add('is-streaming'); item.append(meta, body);
+    const rendered = renderMessageBody(message); item.classList.toggle('has-sticker-only', rendered.standalone); item.append(meta, rendered.body);
     if (message.attachments?.length) item.append(el('div', { class: 'message-files', role: 'list', 'aria-label': '消息附件' }, message.attachments.map(renderAttachment)));
     return item;
   }), ...(typingBubble ? [typingBubble] : []));
@@ -155,16 +169,23 @@ function renderWorkers() {
   list.replaceChildren(...workers.map((worker) => { const labels = { running: '进行中', completed: '完成', interrupted: '中断', failed: '失败' }; const card = el('article', { class: `worker-card ${worker.state}` }); card.append(el('span', { class: 'worker-status', 'aria-hidden': 'true' }), el('div', { class: 'worker-copy' }, [el('strong', { text: worker.name }), el('small', { text: `${labels[worker.state]} · ${worker.count} 次` })])); return card; }));
 }
 function renderAttachments() {
-  const tray = $('#attachment-tray'); const current = composer(); const operation = sendOperation(); tray.replaceChildren(...current.attachments.map((file, index) => {
+  const tray = $('#attachment-tray'); const current = composer(); const operation = sendOperation(); const chips = current.attachments.map((file, index) => {
     const name = attachmentName(file, index);
     const chip = el('span', { class: 'attachment-chip' }, [el('span', { text: `⌁ ${name} · ${formatSize(file.size)}${operation?.progress ? ` · ${operation.progress}` : ''}` })]);
     const remove = el('button', { type: 'button', 'aria-label': `移除 ${name}`, text: '×', ...(operation ? { disabled: '' } : {}) }); remove.addEventListener('click', () => { if (sendOperation()) return; current.attachments.splice(index, 1); renderAttachments(); renderHeader(); }); chip.append(remove); return chip;
-  }));
+  });
+  stickerTokens(current.text, state.stickerCatalog).forEach((sticker) => {
+    const chip = el('span', { class: 'attachment-chip sticker-chip' }, [el('img', { src: sticker.url, alt: '', loading: 'lazy' }), el('span', { text: sticker.label })]);
+    const remove = el('button', { type: 'button', 'aria-label': `移除表情包 ${sticker.label}`, text: '×', ...(operation ? { disabled: '' } : {}) });
+    remove.addEventListener('click', () => { if (sendOperation()) return; current.text = removeStickerToken(current.text, sticker.index, sticker.token); input.value = current.text; autoResize(); renderAttachments(); renderHeader(); }); chip.append(remove); chips.push(chip);
+  });
+  tray.replaceChildren(...chips);
 }
 function renderAll(options) { renderContacts(); renderHeader(); renderActivities(); renderMessages(options); renderWorkers(); renderInstrument(); renderTerminal(); renderAttachments(); renderDateRule(); }
 
 async function switchContact(id) {
-  if (id === state.activeContactId) return;
+  if (id === state.activeContactId || state.stickerUpload.uploading) return;
+  closeStickerDialog();
   const epoch = ++state.epoch;
   state.scrollTops[state.activeContactId] = $('#conversation-scroll').scrollTop; composer().text = input.value; state.activeContactId = id;
   input.value = composer(id).text; state.followLatest[id] ??= true; autoResize(); syncWorkerPanel(); renderAll({ forceLatest: !Object.hasOwn(state.scrollTops, id) });
@@ -244,8 +265,99 @@ function setWorkers(open, { returnFocus = false } = {}) { if (!workerDrawerQuery
 function closeWorkers() { setWorkers(false, { returnFocus: true }); }
 function cycleAppearance() { const modes = ['default', 'reading', 'compact']; state.appearance = modes[(modes.indexOf(state.appearance) + 1) % modes.length]; document.body.dataset.appearance = state.appearance; const names = { default: '默认', reading: '阅读', compact: '紧凑' }; $('#appearance-button').setAttribute('aria-label', `切换显示模式：${names[state.appearance]}`); $('#appearance-button').title = `显示模式：${names[state.appearance]}`; $('#drawer-appearance-button').textContent = `显示模式：${names[state.appearance]}`; $('#appearance-status').textContent = `显示模式：${names[state.appearance]}`; }
 
+function stickerSearchKey(value) { return String(value || '').normalize('NFC').toLocaleLowerCase('zh-CN'); }
+function clearStickerUploadFile({ clearInput = false } = {}) {
+  if (state.stickerUpload.previewUrl) URL.revokeObjectURL(state.stickerUpload.previewUrl);
+  state.stickerUpload.file = null; state.stickerUpload.previewUrl = ''; const preview = $('#sticker-upload-preview'); preview.hidden = true; preview.removeAttribute('src');
+  if (clearInput) $('#sticker-upload-file').value = '';
+}
+function resetStickerUpload() {
+  clearStickerUploadFile();
+  state.stickerUpload = { file: null, previewUrl: '', uploading: false, controller: null }; $('#sticker-upload-form').reset(); $('#sticker-upload-form').hidden = true; $('#sticker-grid').hidden = false;
+  $('#sticker-tools').hidden = false; $('#sticker-categories').hidden = false; $('#sticker-upload-progress').hidden = true; $('#sticker-upload-error').textContent = ''; renderStickerCategoryFields();
+}
+function closeStickerDialog({ returnFocus = false } = {}) {
+  const dialog = $('#sticker-dialog'); if (state.stickerUpload.uploading) return; const wasOpen = dialog.open;
+  if (wasOpen) dialog.close(); resetStickerUpload(); $('#sticker-button').setAttribute('aria-expanded', 'false'); state.stickerTargetContactId = ''; if (returnFocus && wasOpen) $('#sticker-button').focus();
+}
+async function loadStickerCatalog({ force = false, targetCategory = '' } = {}) {
+  if (state.stickerLoading || (state.stickerCatalog && !force)) return;
+  const epoch = state.epoch; const loadId = ++state.stickerLoadId; state.stickerLoading = true; state.stickerError = ''; renderStickerPicker();
+  try {
+    const catalog = await adapter.getStickerCatalog(); if (epoch !== state.epoch || loadId !== state.stickerLoadId) return; state.stickerCatalog = catalog;
+    const ids = new Set(catalog.categories.map(({ id }) => id)); state.stickerCategory = ids.has(targetCategory) ? targetCategory : (ids.has(state.stickerCategory) ? state.stickerCategory : '__all');
+    renderMessages(); renderAttachments();
+  } catch { if (epoch === state.epoch && loadId === state.stickerLoadId) state.stickerError = '目录暂时读取失败。'; }
+  finally { if (loadId === state.stickerLoadId) { state.stickerLoading = false; if (epoch === state.epoch) renderStickerPicker(); } }
+}
+function renderStickerPicker() {
+  const status = $('#sticker-status'); const categories = $('#sticker-categories'); const grid = $('#sticker-grid'); const catalog = state.stickerCatalog;
+  if (state.stickerLoading) { status.textContent = '正在读取表情包…'; grid.replaceChildren(); return; }
+  if (state.stickerError) {
+    status.textContent = state.stickerError; const retry = el('button', { type: 'button', class: 'text-button', text: '重试目录' }); retry.addEventListener('click', () => loadStickerCatalog({ force: true })); grid.replaceChildren(retry); return;
+  }
+  if (!catalog) { status.textContent = ''; grid.replaceChildren(); return; }
+  const categoryItems = [{ id: '__all', name: '全部' }, ...catalog.categories];
+  categories.replaceChildren(...categoryItems.map((category, index) => {
+    const active = category.id === state.stickerCategory; const button = el('button', { type: 'button', role: 'tab', 'aria-selected': String(active), tabindex: active ? '0' : '-1', 'data-category-id': category.id, text: category.name });
+    button.addEventListener('click', () => { state.stickerCategory = category.id; renderStickerPicker(); });
+    button.addEventListener('keydown', (event) => { if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return; event.preventDefault(); const next = event.key === 'Home' ? 0 : event.key === 'End' ? categoryItems.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + categoryItems.length) % categoryItems.length; const targetId = categoryItems[next].id; state.stickerCategory = targetId; renderStickerPicker(); [...categories.querySelectorAll('[role="tab"]')].find((tab) => tab.dataset.categoryId === targetId)?.focus(); });
+    return button;
+  }));
+  const query = stickerSearchKey(state.stickerSearch); const filtered = catalog.stickers.filter((sticker) => (state.stickerCategory === '__all' || sticker.categoryId === state.stickerCategory) && (!query || stickerSearchKey(`${sticker.label} ${sticker.name}`).includes(query)));
+  status.textContent = filtered.length ? `${filtered.length} 张；点选后加入当前草稿，不会自动发送。` : '没有符合条件的表情包。';
+  grid.replaceChildren(...filtered.map((sticker, index) => {
+    const button = el('button', { type: 'button', class: 'sticker-tile', 'aria-label': `加入表情包 ${sticker.label}`, 'data-sticker-name': sticker.name });
+    button.append(el('img', { src: sticker.url, alt: '', loading: index < 12 ? 'eager' : 'lazy', decoding: 'async' }), el('span', { text: sticker.label }));
+    button.addEventListener('click', () => insertSticker(sticker));
+    button.addEventListener('keydown', (event) => { if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return; event.preventDefault(); const tiles = [...grid.querySelectorAll('.sticker-tile')]; const columns = Math.max(1, Math.round(grid.clientWidth / Math.max(88, tiles[0]?.clientWidth || 88))); const moves = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -columns, ArrowDown: columns }; const next = event.key === 'Home' ? 0 : event.key === 'End' ? tiles.length - 1 : Math.max(0, Math.min(tiles.length - 1, index + moves[event.key])); tiles[next]?.focus(); }); return button;
+  }));
+  $('#sticker-upload-open').disabled = !catalog.upload.supported; $('#sticker-upload-open').title = catalog.upload.supported ? '' : '服务器暂未开放上传'; renderStickerUploadCategories();
+}
+function insertSticker(sticker) {
+  if (state.stickerTargetContactId !== state.activeContactId || sendOperation()) return;
+  const draft = composer(); const selection = state.stickerSelection; const inserted = insertStickerToken(draft.text, selection.start, selection.end, sticker.name);
+  draft.text = inserted.text; input.value = inserted.text; state.stickerSelection = { start: inserted.cursor, end: inserted.cursor }; autoResize(); renderAttachments(); renderHeader();
+  requestAnimationFrame(() => input.setSelectionRange(inserted.cursor, inserted.cursor));
+}
+async function openStickerDialog() {
+  if ($('#sticker-button').disabled) return; state.stickerTargetContactId = state.activeContactId; state.stickerSelection = { start: input.selectionStart ?? input.value.length, end: input.selectionEnd ?? input.value.length };
+  const targetContactId = state.activeContactId; $('#sticker-dialog').showModal(); $('#sticker-button').setAttribute('aria-expanded', 'true'); $('#sticker-search').value = state.stickerSearch; renderStickerPicker(); await loadStickerCatalog(); if ($('#sticker-dialog').open && state.stickerTargetContactId === targetContactId) $('#sticker-search').focus();
+}
+function renderStickerUploadCategories() {
+  const select = $('#sticker-upload-category'); const categories = (state.stickerCatalog?.categories || []).filter(({ id }) => id !== '__uncategorized'); const selected = select.value;
+  select.replaceChildren(...categories.map((category) => el('option', { value: category.id, text: category.name })));
+  if (categories.some(({ id }) => id === selected)) select.value = selected;
+}
+function renderStickerCategoryFields() {
+  const mode = new FormData($('#sticker-upload-form')).get('sticker-category-mode') || 'existing'; $('#sticker-existing-wrap').hidden = mode !== 'existing'; $('#sticker-new-wrap').hidden = mode !== 'new';
+}
+function showStickerUpload() {
+  if (!state.stickerCatalog?.upload.supported) return; renderStickerUploadCategories(); $('#sticker-grid').hidden = true; $('#sticker-tools').hidden = true; $('#sticker-categories').hidden = true; $('#sticker-status').textContent = '上传只在你按下“上传”后执行；失败不会自动重试。'; $('#sticker-upload-form').hidden = false; $('#sticker-upload-file').focus();
+}
+function setStickerUploadFile(file) {
+  const contract = state.stickerCatalog?.upload; const error = $('#sticker-upload-error'); error.textContent = '';
+  clearStickerUploadFile({ clearInput: !file });
+  if (!file) return;
+  if (!contract?.contentTypes.includes(file.type) || file.size <= 0 || file.size > contract.maxFileBytes) { error.textContent = `请选择服务器支持且不超过 ${formatLimit(contract?.maxFileBytes || 8 * 1024 * 1024)} 的图片。`; $('#sticker-upload-file').value = ''; return; }
+  const previewUrl = URL.createObjectURL(file); state.stickerUpload.file = file; state.stickerUpload.previewUrl = previewUrl;
+  const preview = $('#sticker-upload-preview'); preview.src = previewUrl; preview.hidden = false; const proposed = String(file.name || '').replace(/\.[^.]+$/u, '').normalize('NFC').slice(0, 80); if (isSafeStickerName(proposed) && !$('#sticker-upload-name').value) $('#sticker-upload-name').value = proposed;
+}
+async function uploadSticker(event) {
+  event.preventDefault(); if (state.stickerUpload.uploading) return; const file = state.stickerUpload.file; const name = $('#sticker-upload-name').value.normalize('NFC'); const mode = new FormData(event.currentTarget).get('sticker-category-mode'); const categoryId = mode === 'existing' ? $('#sticker-upload-category').value : ''; const newCategoryName = mode === 'new' ? $('#sticker-upload-new-category').value.normalize('NFC') : '';
+  const allowedCategory = (state.stickerCatalog?.categories || []).some(({ id }) => id === categoryId && id !== '__uncategorized'); const error = $('#sticker-upload-error');
+  if (!file || !isSafeStickerName(name) || (mode === 'existing' ? !allowedCategory : !isSafeStickerName(newCategoryName))) { error.textContent = '请填写有效名称、图片和分类。'; return; }
+  state.stickerUpload.uploading = true; state.stickerUpload.controller = new AbortController(); error.textContent = ''; const progress = $('#sticker-upload-progress'); progress.hidden = false; progress.value = 0; [...event.currentTarget.elements].forEach((control) => { control.disabled = true; });
+  try {
+    const result = await adapter.uploadSticker(file, { name, categoryId, newCategoryName, signal: state.stickerUpload.controller.signal, onProgress: (loaded, total) => { progress.value = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0; } });
+    const targetCategory = String(result?.category?.id || categoryId); resetStickerUpload(); await loadStickerCatalog({ force: true, targetCategory });
+    if (state.stickerError) $('#sticker-status').textContent = '上传成功，但目录刷新失败；请只重试目录。';
+  } catch (reason) { error.textContent = reason?.message || '上传失败；表单已保留，可手动重试。'; }
+  finally { state.stickerUpload.uploading = false; [...event.currentTarget.elements].forEach((control) => { control.disabled = false; }); }
+}
+
 $('#composer').addEventListener('submit', send);
-input.addEventListener('input', () => { composer().text = input.value; autoResize(); renderHeader(); });
+input.addEventListener('input', () => { composer().text = input.value; autoResize(); renderAttachments(); renderHeader(); });
 input.addEventListener('paste', (event) => {
   const contactId = state.activeContactId; const current = contact();
   if (!contactId || current.readOnly || sendOperation(contactId)) return;
@@ -261,17 +373,23 @@ input.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !eve
 $('#conversation-scroll').addEventListener('scroll', () => { state.followLatest[state.activeContactId] = nearBottom(); updateLatestControl(); }); $('#latest-button').addEventListener('click', scrollLatest);
 $('#attachment-input').addEventListener('change', (event) => { const draft = composer(); const next = [...draft.attachments, ...event.target.files]; const error = attachmentPreflight(next); event.target.value = ''; if (error) { $('#connection-state').textContent = error; return; } draft.attachments = next; renderAttachments(); renderHeader(); });
 $('.attach-button').addEventListener('keydown', (event) => { if ((event.key === 'Enter' || event.key === ' ') && !$('#attachment-input').disabled) { event.preventDefault(); $('#attachment-input').click(); } });
+$('#sticker-button').addEventListener('click', openStickerDialog); $('#sticker-close').addEventListener('click', () => closeStickerDialog({ returnFocus: true }));
+$('#sticker-dialog').addEventListener('cancel', (event) => { if (state.stickerUpload.uploading) event.preventDefault(); else { event.preventDefault(); closeStickerDialog({ returnFocus: true }); } });
+$('#sticker-dialog').addEventListener('click', (event) => { if (event.target === event.currentTarget) closeStickerDialog({ returnFocus: true }); });
+$('#sticker-search').addEventListener('input', (event) => { state.stickerSearch = event.target.value.normalize('NFC').slice(0, 80); renderStickerPicker(); });
+$('#sticker-upload-open').addEventListener('click', showStickerUpload); $('#sticker-upload-cancel').addEventListener('click', () => { if (!state.stickerUpload.uploading) { resetStickerUpload(); renderStickerPicker(); $('#sticker-search').focus(); } });
+$('#sticker-upload-file').addEventListener('change', (event) => setStickerUploadFile(event.target.files?.[0])); $('#sticker-upload-form').addEventListener('change', (event) => { if (event.target.name === 'sticker-category-mode') renderStickerCategoryFields(); }); $('#sticker-upload-form').addEventListener('submit', uploadSticker);
 $('#upload-cancel-button').addEventListener('click', () => state.composerState.cancel(state.activeContactId)); $('#stop-button').addEventListener('click', () => adapter.stop(state.activeContactId, state.live[state.activeContactId]?.stopRequest).catch(() => { $('#connection-state').textContent = '停止请求失效'; }));
 $('#memory-button').addEventListener('click', openMemory); $('#memory-close').addEventListener('click', () => $('#memory-dialog').close()); $('#worker-toggle').addEventListener('click', () => setWorkers(!document.body.classList.contains('workers-open'))); $('#worker-close').addEventListener('click', closeWorkers);
-async function logout() { state.epoch += 1; state.composerState.cancelAll(); try { await adapter.logout(); } finally { state.stopLive?.(); state.stopLive = null; state.contacts = []; state.histories = {}; state.live = {}; state.streams = {}; state.composerState = createComposerState(); state.activeContactId = ''; renderAll(); if (!bootstrap.mock) showLogin(); } }
+async function logout() { state.epoch += 1; state.stickerLoadId += 1; state.composerState.cancelAll(); state.stickerUpload.controller?.abort(); state.stickerUpload.uploading = false; closeStickerDialog(); state.stickerCatalog = null; state.stickerLoading = false; state.stickerError = ''; state.stickerSearch = ''; state.stickerCategory = '__all'; state.stickerTargetContactId = ''; try { await adapter.logout(); } finally { state.stopLive?.(); state.stopLive = null; state.contacts = []; state.histories = {}; state.live = {}; state.streams = {}; state.composerState = createComposerState(); state.activeContactId = ''; renderAll(); if (!bootstrap.mock) showLogin(); } }
 $('#logout-button').addEventListener('click', logout); $('#drawer-logout-button').addEventListener('click', logout);
 $('#appearance-button').addEventListener('click', cycleAppearance); $('#drawer-appearance-button').addEventListener('click', cycleAppearance);
-window.addEventListener('keydown', (event) => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); input.focus(); } if (event.altKey && /^[1-9]$/.test(event.key)) { const target = state.contacts[Number(event.key) - 1]; if (target) switchContact(target.id); } if (event.key === 'Escape') { if ($('#memory-dialog').open) $('#memory-dialog').close(); if (document.body.classList.contains('workers-open')) closeWorkers(); } });
+window.addEventListener('keydown', (event) => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); input.focus(); } if (event.altKey && /^[1-9]$/.test(event.key)) { const target = state.contacts[Number(event.key) - 1]; if (target) switchContact(target.id); } if (event.key === 'Escape') { if ($('#sticker-dialog').open) closeStickerDialog({ returnFocus: true }); if ($('#memory-dialog').open) $('#memory-dialog').close(); if (document.body.classList.contains('workers-open')) closeWorkers(); } });
 window.addEventListener('beforeinstallprompt', (event) => { event.preventDefault(); state.deferredInstall = event; $('#install-button').hidden = false; }); $('#install-button').addEventListener('click', async () => { await state.deferredInstall?.prompt(); state.deferredInstall = null; $('#install-button').hidden = true; });
 workerDrawerQuery.addEventListener('change', syncWorkerPanel); syncWorkerPanel(); document.body.append($('#svg-defs').content.cloneNode(true)); if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js'));
 async function start() {
   try { await bootstrap.checkSession(); } catch (error) { if (!bootstrap.mock) { showLogin(); return; } }
-  try { state.contacts = await adapter.contacts(); if (!state.contacts.length) throw new Error('没有可用联系人'); state.activeContactId = state.contacts.find(({ id }) => id === 'xiaoke')?.id || state.contacts[0].id; state.contacts.forEach(({ id }) => { state.histories[id] = []; state.live[id] = { replyState: 'idle', statusText: '待命', workers: [] }; composer(id); state.followLatest[id] = true; }); await Promise.all(state.contacts.map(({ id }) => refreshContact(id))); watchLive(state.activeContactId); renderAll({ forceLatest: true }); }
+  try { state.contacts = await adapter.contacts(); if (!state.contacts.length) throw new Error('没有可用联系人'); state.activeContactId = state.contacts.find(({ id }) => id === 'xiaoke')?.id || state.contacts[0].id; state.contacts.forEach(({ id }) => { state.histories[id] = []; state.live[id] = { replyState: 'idle', statusText: '待命', workers: [] }; composer(id); state.followLatest[id] = true; }); await Promise.all(state.contacts.map(({ id }) => refreshContact(id))); watchLive(state.activeContactId); renderAll({ forceLatest: true }); void loadStickerCatalog(); }
   catch (error) { $('#connection-state').textContent = '连接不可用'; console.warn('PWA bootstrap failed', error); }
 }
 function pairingError(error) {

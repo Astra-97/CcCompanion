@@ -3461,6 +3461,7 @@ class PushHandler(BaseHTTPRequestHandler):
         get_prefixes = ("/memory/",)
         post_exact = {
             "/web/session/logout", "/chat/send", "/chat/stop", "/chat/upload", "/chat/upload/cancel",
+            "/stickers/upload",
         }
         if method in {"GET", "HEAD"}:
             return (
@@ -13000,9 +13001,23 @@ class PushHandler(BaseHTTPRequestHandler):
         catalog = getattr(self.state, "sticker_catalog", None)
         snapshot = getattr(catalog, "snapshot", None)
         if not callable(snapshot):
-            self._send_json(200, {"ok": True, "version": "disabled", "categories": [], "stickers": []})
+            self._send_json(200, {"ok": True, "version": "disabled", "categories": [], "stickers": [], "upload": {
+                "supported": False,
+                "max_file_bytes": self._STICKER_UPLOAD_LIMIT,
+                "content_types": sorted(self._STICKER_UPLOAD_CONTENT_TYPES),
+                "max_name_chars": 80,
+            }}, extra_headers={"Cache-Control": "no-store"})
             return
-        self._send_json(200, snapshot(), extra_headers={"Cache-Control": "no-store"})
+        payload = snapshot()
+        if not isinstance(payload, dict):
+            payload = {"ok": True, "version": "unavailable", "categories": [], "stickers": []}
+        payload = {**payload, "upload": {
+            "supported": bool(getattr(self.state, "sticker_upload_command", None)),
+            "max_file_bytes": self._STICKER_UPLOAD_LIMIT,
+            "content_types": sorted(self._STICKER_UPLOAD_CONTENT_TYPES),
+            "max_name_chars": 80,
+        }}
+        self._send_json(200, payload, extra_headers={"Cache-Control": "no-store"})
 
     _STICKER_UPLOAD_LIMIT = 8 * 1024 * 1024
     _STICKER_UPLOAD_CONTENT_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
@@ -13085,13 +13100,21 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _handle_sticker_upload(self) -> None:
         """POST one native image through a fixed, stdin-framed SG importer."""
-        # This intentionally bypasses generic write auth: a browser/PWA cookie
-        # must never gain the ability to publish permanent static assets.
+        # This intentionally bypasses generic write auth.  Accept either the
+        # native shared secret or the narrowly scoped same-origin PWA cookie +
+        # in-memory CSRF token; no other admin privilege is inherited.
         supplied = self.headers.get("X-Auth-Token", "") or ""
         expected = str(getattr(self.state, "shared_secret", "") or "")
-        if not supplied or not expected or not hmac.compare_digest(supplied, expected):
+        native_ok = bool(supplied and expected and hmac.compare_digest(supplied, expected))
+        web_ok = False
+        if not native_ok:
+            try:
+                web_ok = self._web_session_write_matches()
+            except Exception:
+                web_ok = False
+        if not native_ok and not web_ok:
             self.close_connection = True
-            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            self._send_json(403 if self._web_session_token() else 401, {"ok": False, "error": "unauthorized"})
             return
         if self.headers.get("Transfer-Encoding"):
             self.close_connection = True

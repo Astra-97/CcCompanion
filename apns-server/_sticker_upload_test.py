@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
-from push import PushHandler
+from push import PushHandler, WebSessionStore
 
 
 class _Catalog:
@@ -36,6 +36,27 @@ class StickerUploadRouteTests(unittest.TestCase):
         guarded = MagicMock(side_effect=AssertionError("body must not be read")); handler.rfile = guarded
         PushHandler._handle_sticker_upload(handler)
         handler._send_json.assert_called_once_with(401, {"ok": False, "error": "unauthorized"})
+
+    def web_handler(self, *, origin="https://desk.example", csrf="valid", body=b"abc"):
+        handler = self.handler({"Content-Length": str(len(body)), "Content-Type": "image/png"}, body)
+        sessions = WebSessionStore(300); token, _ = sessions.create(); expected_csrf = sessions.csrf_token(token)
+        handler.state.web_session_enabled = True; handler.state.web_sessions = sessions; handler.state.public_server_url = "https://desk.example"
+        handler.command = "POST"; handler.headers.update({"Cookie": f"__Host-cccompanion={token}", "Origin": origin})
+        if csrf is not None:
+            handler.headers["X-CC-Web-CSRF"] = expected_csrf if csrf == "valid" else csrf
+        return handler
+
+    def test_pwa_upload_requires_exact_origin_and_memory_csrf_before_body_read(self):
+        for origin, csrf in (("https://evil.example", "valid"), ("https://desk.example", "wrong"), ("https://desk.example", None)):
+            handler = self.web_handler(origin=origin, csrf=csrf); guarded = MagicMock(); guarded.read.side_effect = AssertionError("body must not be read"); handler.rfile = guarded
+            PushHandler._handle_sticker_upload(handler)
+            self.assertEqual(403, handler._send_json.call_args.args[0]); self.assertTrue(handler.close_connection); guarded.read.assert_not_called()
+
+    def test_valid_pwa_cookie_origin_and_csrf_uploads_under_native_constraints(self):
+        handler = self.web_handler()
+        with patch.object(PushHandler, "_run_sticker_import_bounded", return_value=(0, b'{"ok":true}')) as run:
+            PushHandler._handle_sticker_upload(handler)
+        self.assertEqual(200, handler._send_json.call_args.args[0]); self.assertIn(b"abc", run.call_args.args[1])
 
     def test_chunked_and_oversized_are_rejected_before_reading_body(self):
         for headers, status in (({"X-Auth-Token": "native", "Transfer-Encoding": "chunked"}, 400), ({"X-Auth-Token": "native", "Content-Length": str(8 * 1024 * 1024 + 1)}, 413)):

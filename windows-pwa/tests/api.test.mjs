@@ -7,6 +7,7 @@ import { createPwaBootstrap, isExplicitMockMode } from '../src/bootstrap.js';
 import { createComposerState } from '../src/composer-state.js';
 import { PAIRING_ALPHABET, formatPairingCode, normalizePairingCode } from '../src/pairing-code.js';
 import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from '../src/live-messages.js';
+import { insertStickerToken, normalizeStickerCatalog, parseStickerParts, removeStickerToken, stickerTokens } from '../src/sticker-protocol.js';
 
 function hexToken(css, token) {
   const match = css.match(new RegExp(`--${token}:(#[0-9a-fA-F]{6})`));
@@ -79,6 +80,67 @@ test('typing status uses a stable live region and filters empty streaming placeh
   assert.match(app, /typingStatus\.dataset\.active/);
   assert.match(app, /message\.streaming && !String\(message\.body \|\| ''\)\.trim\(\)/);
   assert.match(app, /typing-bubble.*aria-hidden/);
+});
+
+test('sticker catalog trusts only the exact asset origin and exact known BQB tokens', () => {
+  const catalog = normalizeStickerCatalog({ categories: [{ id: 'common', name: '常用' }], stickers: [
+    { name: '爱', category_id: 'common', url: 'https://test.xiaonancaleb.xyz/stickers/%E7%88%B1.gif' },
+    { name: 'evil-host', category_id: 'common', url: 'https://evil.example/stickers/x.png' },
+    { name: 'evil-js', category_id: 'common', url: 'javascript:alert(1)' },
+    { name: 'evil-data', category_id: 'common', url: 'data:image/png;base64,AA' },
+    { name: 'evil-query', category_id: 'common', url: 'https://test.xiaonancaleb.xyz/stickers/x.png?token=secret' },
+  ] });
+  assert.deepEqual(catalog.stickers.map(({ name }) => name), ['爱']);
+  assert.deepEqual(stickerTokens('[bqb:爱] [bqb:未知]', catalog).map(({ name }) => name), ['爱']);
+  assert.deepEqual(parseStickerParts('[bqb:爱] [bqb:未知]', catalog).map((part) => part.type === 'text' ? part.value : part.sticker.name), ['爱', ' [bqb:未知]']);
+});
+
+test('sticker insertion is exact at the cursor, stays contact scoped, and never sends', () => {
+  const composers = createComposerState(); composers.get('xiaoke').text = '前后'; composers.get('kairos').text = 'Kairos 草稿'; let sends = 0;
+  const inserted = insertStickerToken(composers.get('xiaoke').text, 1, 1, '爱'); composers.get('xiaoke').text = inserted.text;
+  assert.deepEqual(inserted, { text: '前[bqb:爱]后', cursor: 8 }); assert.equal(sends, 0); assert.equal(composers.get('kairos').text, 'Kairos 草稿');
+  const token = stickerTokens(inserted.text, normalizeStickerCatalog({ stickers: [{ name: '爱', url: 'https://test.xiaonancaleb.xyz/stickers/a.gif' }] }))[0];
+  assert.equal(removeStickerToken(inserted.text, token.index, token.token), '前后');
+});
+
+test('sticker upload uses memory-only CSRF once and preserves explicit retry ownership', async () => {
+  const uploads = []; const file = { name: '爱.png', type: 'image/png', size: 4 };
+  const adapter = createHttpAdapter({
+    request: async (path) => path === '/web/session' ? { csrf_token: 'memory-csrf' } : { ok: true },
+    upload: async (path, options) => { uploads.push({ path, options }); throw new Error('offline'); },
+  });
+  await adapter.getWebSession(); await assert.rejects(() => adapter.uploadSticker(file, { name: '爱', categoryId: 'common' }), /offline/);
+  assert.equal(uploads.length, 1); assert.match(uploads[0].path, /^\/stickers\/upload\?name=/); assert.equal(uploads[0].options.body, file); assert.equal(uploads[0].options.headers['X-CC-Web-CSRF'], 'memory-csrf'); assert.equal(uploads[0].options.credentials, 'same-origin');
+});
+
+test('sticker picker clears file/blob state on close, invalid replacement, and contact switch', () => {
+  const app = readFileSync(new URL('../src/app.js', import.meta.url), 'utf8');
+  const closeSource = app.slice(app.indexOf('function closeStickerDialog'), app.indexOf('async function loadStickerCatalog'));
+  const fileSource = app.slice(app.indexOf('function setStickerUploadFile'), app.indexOf('async function uploadSticker'));
+  const switchSource = app.slice(app.indexOf('async function switchContact'), app.indexOf('async function refreshContact'));
+  assert.match(closeSource, /resetStickerUpload\(\)/); assert.match(switchSource, /closeStickerDialog\(\)/);
+  assert.ok(fileSource.indexOf('clearStickerUploadFile') < fileSource.indexOf("if (!file) return"));
+  assert.ok(fileSource.indexOf('clearStickerUploadFile') < fileSource.indexOf('contentTypes.includes'));
+  assert.match(app, /URL\.revokeObjectURL\(state\.stickerUpload\.previewUrl\)/);
+  assert.match(app, /state\.stickerUpload\.file = null; state\.stickerUpload\.previewUrl = ''/);
+});
+
+test('stale sticker catalog loads release loading without overwriting a newer lifecycle', () => {
+  const app = readFileSync(new URL('../src/app.js', import.meta.url), 'utf8');
+  const source = app.slice(app.indexOf('async function loadStickerCatalog'), app.indexOf('function renderStickerPicker'));
+  assert.match(source, /const loadId = \+\+state\.stickerLoadId/);
+  assert.match(source, /epoch !== state\.epoch \|\| loadId !== state\.stickerLoadId/);
+  assert.match(source, /finally \{ if \(loadId === state\.stickerLoadId\) \{ state\.stickerLoading = false/);
+  assert.match(app, /state\.stickerLoadId \+= 1/);
+});
+
+test('category arrow navigation focuses the newly rendered tab instead of a detached node', () => {
+  const app = readFileSync(new URL('../src/app.js', import.meta.url), 'utf8');
+  const source = app.slice(app.indexOf("button.addEventListener('keydown', (event) => { if (!['ArrowLeft'"), app.indexOf('const query = stickerSearchKey'));
+  assert.match(source, /const targetId = categoryItems\[next\]\.id/);
+  assert.ok(source.indexOf('renderStickerPicker()') < source.indexOf("categories.querySelectorAll('[role=\"tab\"]')"));
+  assert.match(source, /find\(\(tab\) => tab\.dataset\.categoryId === targetId\)\?\.focus\(\)/);
+  assert.doesNotMatch(source, /all\[next\]\.focus\(\)/);
 });
 
 test('HTTP adapter reads server records and derives contacts from the manifest', async () => {
@@ -399,10 +461,11 @@ test('PWA shell declares installability and has no secret persistence', async ()
   assert.match(manifest, /icon-192\.png/);
   assert.match(manifest, /icon-512\.png/);
   assert.match(serviceWorker, /addEventListener\('fetch'/);
-  assert.match(serviceWorker, /cccompanion-desk-v10/);
-  assert.match(serviceWorker, /src\/styles\.css\?v=10/);
-  assert.match(serviceWorker, /src\/app\.js\?v=10/);
-  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=10/);
+  assert.match(serviceWorker, /cccompanion-desk-v11/);
+  assert.match(serviceWorker, /src\/styles\.css\?v=11/);
+  assert.match(serviceWorker, /src\/app\.js\?v=11/);
+  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=11/);
+  assert.match(serviceWorker, /src\/sticker-protocol\.js\?v=11/);
   assert.match(serviceWorker, /src\/live-messages\.js/);
   assert.match(serviceWorker, /src\/pairing-code\.js/);
   assert.doesNotMatch(source, /shared_secret|localStorage\.setItem|sessionStorage\.setItem|credentials:\s*'include'/);
@@ -419,8 +482,8 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   ]);
   assert.match(html, /id="latest-button"/);
   assert.match(html, /id="pairing-code"/);
-  assert.match(html, /href="\.\/src\/styles\.css\?v=10"/);
-  assert.match(html, /src="\.\/src\/app\.js\?v=10"/);
+  assert.match(html, /href="\.\/src\/styles\.css\?v=11"/);
+  assert.match(html, /src="\.\/src\/app\.js\?v=11"/);
   assert.match(html, /autocomplete="one-time-code"/);
   assert.match(html, /id="pairing-form"/);
   assert.match(html, /<details class="password-fallback">/);
@@ -432,7 +495,9 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   assert.match(csp[1], /connect-src 'self'/);
   assert.match(csp[1], /worker-src 'self'/);
   assert.match(csp[1], /manifest-src 'self'/);
-  assert.match(csp[1], /img-src 'self' data:/);
+  assert.match(csp[1], /img-src 'self' data: blob:/);
+  assert.match(csp[1], /img-src 'self' data: blob: https:\/\/test\.xiaonancaleb\.xyz/);
+  assert.doesNotMatch(csp[1], /img-src[^;]*https:\s/);
   assert.doesNotMatch(csp[1], /unsafe-(?:inline|eval)|static\.cloudflareinsights\.com/);
   assert.doesNotMatch(html, /style="/);
   assert.match(html, /class="svg-defs"/);
@@ -450,6 +515,18 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   assert.match(app, /const nearEnd = list\.scrollHeight - list\.scrollTop - list\.clientHeight < 28/);
   assert.doesNotMatch(html + app, /xterm|terminal\/key|tmux\/capture/);
   assert.match(app, /adapter\.sendMessage\(contactId,/);
+  assert.match(html, /id="sticker-button"[^>]*aria-label="打开表情包"[^>]*aria-haspopup="dialog"/);
+  assert.match(html, /id="sticker-status"[^>]*aria-live="polite"/);
+  assert.match(app, /insertStickerToken\(draft\.text, selection\.start, selection\.end/);
+  assert.match(app, /adapter\.uploadSticker\(file,/);
+  assert.match(app, /void loadStickerCatalog\(\)/);
+  assert.match(app, /state\.stickerTargetContactId !== state\.activeContactId/);
+  assert.match(app, /input\.addEventListener\('input',[^\n]*renderAttachments\(\)/);
+  assert.match(app, /URL\.revokeObjectURL\(state\.stickerUpload\.previewUrl\)/);
+  assert.match(app, /state\.stickerCatalog = null/);
+  assert.match(app, /state\.stickerLoading = false/);
+  assert.match(app, /state\.stickerSearch = ''/);
+  assert.match(css, /\.sticker-tile\{[^}]*min-width:44px;min-height:106px/);
   assert.match(app, /extractClipboardImageFiles\(event\.clipboardData\)/);
   assert.match(app, /if \(!images\.length\) return/);
   assert.match(app, /event\.preventDefault\(\)/);
