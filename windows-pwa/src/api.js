@@ -1,5 +1,5 @@
-import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY } from './data.js?v=8';
-import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=8';
+import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY } from './data.js?v=9';
+import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=9';
 
 const clone = (value) => structuredClone(value);
 const now = () => new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
@@ -35,7 +35,59 @@ export function normalizeLiveState(raw = {}) {
         count: Math.max(1, Number(item.count || 1)),
       };
     }) : [],
+    instrument: normalizeInstrument(raw.instrument),
+    terminal: normalizeTerminal(raw.terminal),
   };
+}
+
+const SAFE_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+const SAFE_PHASES = new Set(['idle', 'unavailable', '正在准备', '正在启动', '正在处理', '处理完成', '已中断', '处理失败']);
+const SAFE_OBSERVER_LABELS = new Set([
+  '已接收任务，正在准备', '正在启动本轮处理', '开始处理', '正在整理回复（内容已隐藏）',
+  '正在分析（思考内容已隐藏）', '运行命令（参数与输出已隐藏）', '修改文件（路径与内容已隐藏）',
+  '调用工具（名称与参数已隐藏）', '调用协作代理（任务内容已隐藏）', '协作代理处理中（详情已隐藏）',
+  '搜索资料（查询内容已隐藏）', '查看图片（路径已隐藏）', '生成图片（提示词已隐藏）',
+  '整理会话上下文（内容已隐藏）', '等待外部步骤完成',
+]);
+const safeCount = (value, maximum = 2_000_000_000) => Number.isInteger(value) && value >= 0 && value <= maximum ? value : null;
+const safeDisplay = (value, maximum = 48) => typeof value === 'string' && value.length > 0 && value.length <= maximum && !value.includes('@') && /^[A-Za-z0-9\u4e00-\u9fff .:_+\-/()]+$/.test(value) ? value : '';
+
+/** Defense-in-depth projection for the optional, read-only Kairos instrument. */
+export function normalizeInstrument(raw) {
+  const empty = { available: false, model: '', effort: '', context: { available: false, usedPercent: null, usedTokens: null, windowTokens: null }, quota: { plan: '', windows: [] } };
+  if (!raw || typeof raw !== 'object') return empty;
+  const model = typeof raw.model === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(raw.model) ? raw.model : '';
+  const effort = SAFE_EFFORTS.has(raw.effort) ? raw.effort : '';
+  const sourceContext = raw.context && typeof raw.context === 'object' ? raw.context : {};
+  // The stream reducer can re-normalize an existing client snapshot after a
+  // draft event.  Accept only our own camelCase representation as a second
+  // spelling; this is not a generic aliasing layer.
+  const usedTokens = safeCount(sourceContext.used_tokens ?? sourceContext.usedTokens);
+  const windowTokens = safeCount(sourceContext.window_tokens ?? sourceContext.windowTokens);
+  const contextAvailable = sourceContext.available === true && usedTokens !== null && windowTokens !== null && windowTokens > 0 && usedTokens <= windowTokens;
+  const context = { available: contextAvailable, usedPercent: contextAvailable ? Math.round(Math.min(100, Math.max(0, (usedTokens / windowTokens) * 100)) * 10) / 10 : null, usedTokens: contextAvailable ? usedTokens : null, windowTokens: contextAvailable ? windowTokens : null };
+  const sourceQuota = raw.quota && typeof raw.quota === 'object' ? raw.quota : {};
+  const windows = Array.isArray(sourceQuota.windows) ? sourceQuota.windows.slice(0, 2).map((item) => {
+    if (!item || typeof item !== 'object') return null;
+    const remainingPercent = safeCount(item.remaining_percent ?? item.remainingPercent, 100); const label = safeDisplay(item.label, 32); const resetLabel = safeDisplay(item.reset_label ?? item.resetLabel, 48);
+    return remainingPercent === null || !label || !resetLabel ? null : { label, remainingPercent, resetLabel };
+  }).filter(Boolean) : [];
+  return { available: raw.available === true && Boolean(model || effort || context.available || windows.length), model, effort, context, quota: { plan: safeDisplay(sourceQuota.plan, 40), windows } };
+}
+
+/** The terminal is observer labels only: never accept upstream text as a line. */
+export function normalizeTerminal(raw) {
+  const empty = { available: false, busy: false, phase: 'unavailable', events: [] };
+  if (!raw || typeof raw !== 'object') return empty;
+  const available = raw.available === true;
+  const busy = available && raw.busy === true;
+  const phase = SAFE_PHASES.has(raw.phase) ? raw.phase : (available ? 'idle' : 'unavailable');
+  const events = busy && Array.isArray(raw.events) ? raw.events.slice(-40).map((event) => {
+    if (!event || typeof event !== 'object') return null;
+    const elapsedSeconds = safeCount(event.elapsed_seconds ?? event.elapsedSeconds, 604800); const label = event.label;
+    return elapsedSeconds === null || !SAFE_OBSERVER_LABELS.has(label) ? null : { elapsedSeconds, label };
+  }).filter(Boolean) : [];
+  return { available, busy, phase: busy ? phase : (available ? 'idle' : 'unavailable'), events };
 }
 
 export function normalizeRecord(record = {}) {

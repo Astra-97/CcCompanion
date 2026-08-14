@@ -1,5 +1,5 @@
-const CACHE = 'cccompanion-desk-v8';
-const ASSETS = ['./', './index.html', './manifest.webmanifest', './src/styles.css?v=8', './src/api.js?v=8', './src/bootstrap.js?v=8', './src/composer-state.js?v=8', './src/data.js?v=8', './src/pairing-code.js?v=8', './src/live-messages.js?v=8', './src/clipboard-images.js?v=8', './src/app.js?v=8', './assets/cc-mark.svg', './assets/icon-192.png', './assets/icon-512.png'];
+const CACHE = 'cccompanion-desk-v9';
+const ASSETS = ['./', './index.html', './manifest.webmanifest', './src/styles.css?v=9', './src/api.js?v=9', './src/bootstrap.js?v=9', './src/composer-state.js?v=9', './src/data.js?v=9', './src/pairing-code.js?v=9', './src/live-messages.js?v=9', './src/clipboard-images.js?v=9', './src/app.js?v=9', './assets/cc-mark.svg', './assets/icon-192.png', './assets/icon-512.png'];
 self.addEventListener('activate', (event) => event.waitUntil(
   caches.keys()
     .then((keys) => Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key))))

@@ -8,7 +8,7 @@
     <meta name="description" content="CcCompanion private operations desk" />
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" href="./assets/cc-mark.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="./src/styles.css?v=8" />
+    <link rel="stylesheet" href="./src/styles.css?v=9" />
     <title>CcCompanion · Desk</title>
   </head>
   <body>
@@ -93,15 +93,25 @@
         <div class="drawer-head"><p class="eyebrow">LIVE INSTRUMENT</p><button class="icon-button" id="worker-close" type="button" aria-label="关闭协作现场">×</button></div>
         <section class="instrument" aria-labelledby="instrument-title">
           <p class="eyebrow">LIVE INSTRUMENT</p><h2 id="instrument-title">本次工作</h2>
-          <dl class="instrument-grid">
-            <div><dt>通道</dt><dd id="state-channel">小克 / CC</dd></div>
-            <div><dt>状态</dt><dd id="state-status">待命</dd></div>
-            <div><dt>会话</dt><dd id="state-session">独立历史</dd></div>
+          <dl class="instrument-grid instrument-identity">
+            <div><dt>通道</dt><dd id="instrument-contact">小克 / CC</dd></div>
+            <div><dt>状态</dt><dd id="instrument-status">待命</dd></div>
           </dl>
+          <dl class="instrument-grid instrument-work" aria-label="本次工作的只读指标">
+            <div><dt>Model</dt><dd id="instrument-model">不可用</dd></div>
+            <div><dt>Context</dt><dd><progress id="instrument-context-bar" max="100" value="0" aria-label="上下文用量"></progress><span id="instrument-context-detail">暂无 token 记录</span></dd></div>
+            <div><dt>Effort</dt><dd id="instrument-effort">—</dd></div>
+          </dl>
+          <div class="instrument-quota" id="instrument-quota" aria-label="剩余额度"></div>
         </section>
         <section class="workers-panel" aria-labelledby="workers-title">
           <div class="panel-heading"><div><p class="eyebrow">COLLABORATION</p><h2 id="workers-title">协作现场</h2></div><span id="worker-total" class="count-pill">0</span></div>
           <div id="worker-list" class="worker-list" aria-live="polite"></div>
+          <section class="terminal-panel" aria-labelledby="terminal-title">
+            <div class="terminal-heading"><p class="eyebrow">READ-ONLY OBSERVER</p><h3 id="terminal-title">Terminal</h3></div>
+            <p id="terminal-status" class="terminal-status">观察器暂不可用</p>
+            <ol id="terminal-events" class="terminal-events" aria-label="只读终端观察事件"></ol>
+          </section>
         </section>
         <section class="quiet-note"><span aria-hidden="true">✦</span><p>联系人各自保留独立历史、草稿和忙碌状态。</p></section>
         <div class="drawer-tools" aria-label="工作台设置">
@@ -119,6 +129,6 @@
     </dialog>
 
     <template id="svg-defs"><svg class="svg-defs" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><symbol id="cc-mark" viewBox="0 0 24 24"><path d="M3 12 12 3l9 9-9 9-9 9Zm4.2 0L12 7.2l4.8 4.8L12 16.8 7.2 12Z" fill="currentColor"/></symbol></svg></template>
-    <script type="module" src="./src/app.js?v=8"></script>
+    <script type="module" src="./src/app.js?v=9"></script>
   </body>
 </html>

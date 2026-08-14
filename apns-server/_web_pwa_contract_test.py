@@ -8,6 +8,7 @@ contact contract for XiaoKe (Claude Code) and Kairos (Codex app-server).
 from __future__ import annotations
 
 import io
+import sys
 import tempfile
 import threading
 import types
@@ -438,6 +439,116 @@ class WebPwaContractTest(unittest.TestCase):
             handler.path = path
             handler.command = "POST"
             self.assertFalse(handler._web_session_matches(), path)
+
+    def test_kairos_chat_status_has_only_bounded_read_only_panels_when_idle_or_busy(self):
+        handler = self.handler("/chat/status?contact_id=kairos")
+        handler._contact_id_from_query = lambda: "kairos"
+        handler._typing_for_contact = lambda _contact: {"is_typing": False, "since": None}
+        handler._chat_draft_snapshot = lambda _contact: {"is_active": False, "reply_state": "idle", "text": ""}
+        handler._contact_stop_request = lambda *_args, **_kwargs: {"supported": False, "body": None}
+        handler._codex_busy_snapshot = lambda **_kwargs: {"busy": False}
+        handler._pwa_kairos_instrument_snapshot = lambda: {"available": True, "model": "gpt-5.5", "effort": "high", "context": {"available": False, "used_percent": None, "used_tokens": None, "window_tokens": None}, "quota": {"plan": "", "windows": []}}
+        handler._pwa_kairos_terminal_snapshot = lambda: {"available": True, "busy": False, "phase": "idle", "events": []}
+        handler._chat_for_contact = lambda _contact: types.SimpleNamespace(tail=lambda _limit: [])
+        handler._handle_chat_status()
+        idle = handler.responses[-1][1]
+        self.assertFalse(idle["busy"])
+        self.assertEqual(idle["terminal"], {"available": True, "busy": False, "phase": "idle", "events": []})
+        self.assertEqual(idle["instrument"]["model"], "gpt-5.5")
+
+        handler._codex_busy_snapshot = lambda **_kwargs: {"busy": True}
+        handler._handle_chat_status()
+        busy = handler.responses[-1][1]
+        self.assertTrue(busy["busy"])
+        self.assertIn("instrument", busy)
+        self.assertIn("terminal", busy)
+
+        handler._codex_busy_snapshot = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("probe failed"))
+        handler._pwa_kairos_instrument_snapshot = lambda: {"available": False, "model": "", "effort": "", "context": {"available": False, "used_percent": None, "used_tokens": None, "window_tokens": None}, "quota": {"plan": "", "windows": []}}
+        handler._pwa_kairos_terminal_snapshot = lambda: {"available": False, "busy": False, "phase": "unavailable", "events": []}
+        handler._handle_chat_status()
+        self.assertEqual(handler.responses[-1][0], 200)
+        self.assertFalse(handler.responses[-1][1]["busy"])
+
+    def test_pwa_instrument_contract_bounds_and_redacts_runtime_details(self):
+        handler = self.handler()
+        handler.state = types.SimpleNamespace()
+        handler._codex_preference_snapshot = lambda: ("gpt-5.5", "high")
+        handler._load_codex_target = lambda: (None, Path("/not-returned"))
+        handler._codex_context_snapshot = lambda _meta: {
+            "available": True, "input_tokens": 1200, "window_tokens": 10000,
+            "context_text": "SECRET runtime line", "last_turn_text": "/private/path",
+        }
+        handler._codex_quota_lines_cached = lambda: [
+            "额度: Plus / private@example.test",
+            "5h: 剩余 42%（2 小时后）",
+            "weekly: 剩余 88%（周一）",
+            "third: 剩余 1%（never）",
+        ]
+        payload = handler._pwa_kairos_instrument_snapshot()
+        self.assertEqual(payload["model"], "gpt-5.5")
+        self.assertEqual(payload["context"], {"available": True, "used_percent": 12.0, "used_tokens": 1200, "window_tokens": 10000})
+        self.assertEqual(len(payload["quota"]["windows"]), 2)
+        encoded = str(payload)
+        for forbidden in ("private@example.test", "SECRET runtime", "/private/path", "session", "cwd", "email"):
+            self.assertNotIn(forbidden, encoded)
+
+    def test_pwa_instrument_context_import_path_is_idempotent_across_polls(self):
+        handler = self.handler()
+        handler.state = types.SimpleNamespace()
+        handler._codex_preference_snapshot = lambda: ("gpt-5.5", "high")
+        handler._load_codex_target = lambda: ("session-is-never-returned", Path("/not-returned"))
+        handler._codex_quota_lines_cached = lambda: []
+        fake_store = types.SimpleNamespace(find_by_id=lambda _session_id: None)
+        fake_common = types.SimpleNamespace(SessionStore=lambda _root: fake_store)
+        fake_service = types.SimpleNamespace(_latest_context_usage=lambda _meta: None)
+        fake_tg = types.SimpleNamespace(TgCodexService=fake_service)
+        with patch("push.sys.path", []), patch.dict("sys.modules", {
+            "codex_common": fake_common,
+            "tg_codex_bot": fake_tg,
+        }):
+            handler._pwa_kairos_instrument_snapshot()
+            handler._pwa_kairos_instrument_snapshot()
+            self.assertEqual([entry for entry in sys.path if entry == "/root/Windows-Codex-TG"], ["/root/Windows-Codex-TG"])
+
+    def test_expired_pwa_quota_cache_import_path_is_idempotent_without_real_quota_probe(self):
+        handler = self.handler()
+        handler.state = types.SimpleNamespace(codex_home="/not-read")
+        calls = []
+        fake_service = types.SimpleNamespace(_quota_status_lines=lambda root: calls.append(root) or ["额度: Plus"])
+        fake_tg = types.SimpleNamespace(TgCodexService=fake_service)
+        with patch("push.sys.path", []), patch.dict("sys.modules", {"tg_codex_bot": fake_tg}), patch.dict("push.CODEX_QUOTA_CACHE", {"ts": 0.0, "lines": []}, clear=True):
+            self.assertEqual(handler._codex_quota_lines_cached(), ["额度: Plus"])
+            # Force a second expired-cache read; the fake service confirms no
+            # filesystem/network quota provider ran during this contract test.
+            import push
+            push.CODEX_QUOTA_CACHE["ts"] = 0.0
+            self.assertEqual(handler._codex_quota_lines_cached(), ["额度: Plus"])
+            self.assertEqual(len(calls), 2)
+            self.assertEqual([entry for entry in sys.path if entry == "/root/Windows-Codex-TG"], ["/root/Windows-Codex-TG"])
+
+    def test_pwa_terminal_uses_observer_precedence_fallback_and_safe_labels_only(self):
+        raw = {"busy": True, "phase": "raw phase", "events": [
+            {"elapsed_seconds": 4, "label": "运行命令（参数与输出已隐藏）"},
+            {"elapsed_seconds": 5, "label": "SUPER SECRET --token"},
+            {"elapsed_seconds": -1, "label": "开始处理"},
+        ]}
+        bridge = types.SimpleNamespace(observer_snapshot=lambda: raw)
+        fallback = types.SimpleNamespace(observer_snapshot=lambda: {"busy": True, "phase": "处理完成", "events": []})
+        handler = self.handler()
+        handler.state = types.SimpleNamespace(codex_app_bridge=bridge)
+        with patch("push.CODEX_RUNS", fallback):
+            payload = handler._pwa_kairos_terminal_snapshot()
+        self.assertEqual(payload["phase"], "正在处理")
+        self.assertEqual(payload["events"], [{"elapsed_seconds": 4, "label": "运行命令（参数与输出已隐藏）"}])
+        self.assertNotIn("SUPER SECRET", str(payload))
+
+        handler.state = types.SimpleNamespace(codex_app_bridge=types.SimpleNamespace(observer_snapshot=lambda: {"busy": False, "phase": None, "events": []}))
+        with patch("push.CODEX_RUNS", fallback):
+            self.assertEqual(handler._pwa_kairos_terminal_snapshot()["phase"], "处理完成")
+        handler.state = types.SimpleNamespace(codex_app_bridge=types.SimpleNamespace(observer_snapshot=lambda: (_ for _ in ()).throw(RuntimeError("nope"))))
+        with patch("push.CODEX_RUNS", types.SimpleNamespace(observer_snapshot=lambda: (_ for _ in ()).throw(RuntimeError("nope")))):
+            self.assertEqual(handler._pwa_kairos_terminal_snapshot(), {"available": False, "busy": False, "phase": "unavailable", "events": []})
 
     def test_cookie_write_needs_exact_origin_and_memory_only_csrf(self):
         store = WebSessionStore(300)

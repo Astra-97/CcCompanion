@@ -1,9 +1,9 @@
-import { createPwaBootstrap } from './bootstrap.js?v=8';
-import { createComposerState } from './composer-state.js?v=8';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=8';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=8';
-import { normalizeLiveState } from './api.js?v=8';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=8';
+import { createPwaBootstrap } from './bootstrap.js?v=9';
+import { createComposerState } from './composer-state.js?v=9';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=9';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=9';
+import { normalizeLiveState } from './api.js?v=9';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=9';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -58,12 +58,51 @@ function renderHeader() {
   const current = contact(); const live = state.live[current.id] || { replyState: 'idle', statusText: '待命', workers: [] };
   const sending = Boolean(sendOperation(current.id));
   $('#contact-name').textContent = current.name; $('#contact-mode').textContent = current.channel;
-  input.placeholder = `写给${current.name}…`; $('#state-channel').textContent = `${current.name} / ${current.channel === 'CODEX APP' ? 'Kairos' : 'CC'}`;
-  $('#state-status').textContent = live.statusText || '待命'; $('#connection-state').textContent = isBusy() ? (live.statusText || '正在处理') : '已连接';
+  input.placeholder = `写给${current.name}…`; $('#connection-state').textContent = isBusy() ? (live.statusText || '正在处理') : '已连接';
   $('#signal-dot').classList.toggle('is-busy', isBusy()); $('#stop-button').hidden = !(isBusy() && live.stopRequest?.supported);
   input.disabled = sending; $('#attachment-input').disabled = sending; $('.attach-button').classList.toggle('is-disabled', sending); $('.attach-button').setAttribute('aria-disabled', String(sending));
   $('#send-button').disabled = sending || !current.id || Boolean(current.readOnly) || (!composer().text.trim() && !composer().attachments.length);
   $('#upload-cancel-button').hidden = !(sending && sendOperation(current.id)?.uploading); $('#upload-cancel-button').disabled = !(sending && sendOperation(current.id)?.uploading);
+}
+
+function formatTokens(value) { return value >= 1_000_000 ? `${(value / 1_000_000).toFixed(1)}M` : value >= 1_000 ? `${(value / 1_000).toFixed(1)}k` : String(value); }
+function renderInstrument() {
+  const live = state.live[state.activeContactId] || {}; const instrument = live.instrument;
+  const isKairos = state.activeContactId === 'kairos';
+  $('#instrument-contact').textContent = `${contact().name} / ${contact().channel === 'CODEX APP' ? 'Kairos' : 'CC'}`;
+  $('#instrument-status').textContent = live.statusText || '待命';
+  const model = isKairos && instrument?.model ? instrument.model : '不可用';
+  const effort = isKairos && instrument?.effort ? instrument.effort : '—';
+  $('#instrument-model').textContent = model; $('#instrument-effort').textContent = effort;
+  const context = isKairos ? instrument?.context : null;
+  const contextDetail = $('#instrument-context-detail'); const contextBar = $('#instrument-context-bar');
+  if (context?.available) { const percent = context.usedPercent; contextDetail.textContent = `${percent}% · ${formatTokens(context.usedTokens)} / ${formatTokens(context.windowTokens)}`; contextBar.value = percent; contextBar.hidden = false; }
+  else { contextDetail.textContent = '暂无 token 记录'; contextBar.hidden = true; }
+  const quotas = $('#instrument-quota'); quotas.replaceChildren();
+  const windows = isKairos ? (instrument?.quota?.windows || []) : [];
+  if (!windows.length) { quotas.append(el('p', { class: 'instrument-empty', text: isKairos ? '额度信息暂不可用' : '此联系人没有工作仪表' })); return; }
+  const plan = instrument?.quota?.plan; if (plan) quotas.append(el('p', { class: 'quota-plan', text: plan }));
+  quotas.append(...windows.map((window) => el('div', { class: 'quota-window' }, [el('span', { text: window.label }), el('strong', { text: `${window.remainingPercent}%` }), el('small', { text: window.resetLabel })])));
+}
+
+function observerEventKey(event, occurrence) { return `${event.elapsedSeconds}:${event.label}:${occurrence}`; }
+function renderTerminal() {
+  const terminal = state.live[state.activeContactId]?.terminal || { available: false, busy: false, phase: 'unavailable', events: [] };
+  const status = $('#terminal-status'); const list = $('#terminal-events');
+  status.textContent = !terminal.available ? '观察器暂不可用' : terminal.busy ? terminal.phase : '空闲 · 没有正在运行的安全事件';
+  const nearEnd = list.scrollHeight - list.scrollTop - list.clientHeight < 28;
+  const seen = new Map(); const desired = [];
+  terminal.events.forEach((event) => { const base = `${event.elapsedSeconds}:${event.label}`; const count = seen.get(base) || 0; seen.set(base, count + 1); desired.push({ key: observerEventKey(event, count), event }); });
+  const existing = new Map([...list.children].map((node) => [node.dataset.key, node]));
+  const nodes = desired.map(({ key, event }) => {
+    let node = existing.get(key);
+    if (!node) { node = el('li', { 'data-key': key }); node.append(el('time'), el('span')); }
+    node.querySelector('time').textContent = `${String(Math.floor(event.elapsedSeconds / 60)).padStart(2, '0')}:${String(event.elapsedSeconds % 60).padStart(2, '0')}`;
+    node.querySelector('span').textContent = event.label;
+    return node;
+  });
+  list.replaceChildren(...nodes);
+  if (nearEnd) requestAnimationFrame(() => { list.scrollTop = list.scrollHeight; });
 }
 function renderActivities() {
   const live = state.live[state.activeContactId] || { replyState: 'idle' }; const strip = $('#activity-strip'); strip.replaceChildren();
@@ -122,7 +161,7 @@ function renderAttachments() {
     const remove = el('button', { type: 'button', 'aria-label': `移除 ${name}`, text: '×', ...(operation ? { disabled: '' } : {}) }); remove.addEventListener('click', () => { if (sendOperation()) return; current.attachments.splice(index, 1); renderAttachments(); renderHeader(); }); chip.append(remove); return chip;
   }));
 }
-function renderAll(options) { renderContacts(); renderHeader(); renderActivities(); renderMessages(options); renderWorkers(); renderAttachments(); renderDateRule(); }
+function renderAll(options) { renderContacts(); renderHeader(); renderActivities(); renderMessages(options); renderWorkers(); renderInstrument(); renderTerminal(); renderAttachments(); renderDateRule(); }
 
 async function switchContact(id) {
   if (id === state.activeContactId) return;

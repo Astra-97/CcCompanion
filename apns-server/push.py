@@ -6475,11 +6475,24 @@ class PushHandler(BaseHTTPRequestHandler):
             draft = self._chat_draft_snapshot(contact_id)
             reply_state = str(draft.get("reply_state") or "idle")
             provider_busy = False
+            instrument: dict[str, Any] | None = None
+            terminal: dict[str, Any] | None = None
             if contact_id == "kairos":
                 # Codex can be active before its first draft delta; retain the
                 # bridge's busy observation so a web client never offers an
                 # unsafe second send just because draft text is still empty.
-                provider_busy = bool(self._codex_busy_snapshot().get("busy"))
+                try:
+                    provider_busy = bool(self._codex_busy_snapshot(include_runtime=False).get("busy"))
+                except Exception:
+                    # The status route is a UI poller.  A transient process or
+                    # target-state probe must not turn it into a 500 response.
+                    logger.debug("PWA Kairos busy probe unavailable", exc_info=True)
+                    provider_busy = False
+                # These are deliberately separate, bounded projections for
+                # the low-privilege PWA cookie.  They never expose the richer
+                # /codex/status or /tmux/capture diagnostics.
+                instrument = self._pwa_kairos_instrument_snapshot()
+                terminal = self._pwa_kairos_terminal_snapshot()
             busy = typing or bool(draft.get("is_active")) or provider_busy
             stop_request = self._contact_stop_request(
                 contact_id,
@@ -6487,7 +6500,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 draft=draft,
             )
             if busy:
-                self._send_json(200, {
+                payload = {
                     "ok": True,
                     "contact_id": contact_id,
                     "status": "typing",
@@ -6497,7 +6510,11 @@ class PushHandler(BaseHTTPRequestHandler):
                     "reply_state": reply_state if reply_state != "idle" else "generating",
                     "draft": draft,
                     "stop_request": stop_request,
-                })
+                }
+                if instrument is not None and terminal is not None:
+                    payload["instrument"] = instrument
+                    payload["terminal"] = terminal
+                self._send_json(200, payload)
                 return
             last_records = self._chat_for_contact(contact_id).tail(20)
             last_ts = None
@@ -6514,7 +6531,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         status = "online"
                 except Exception:
                     pass
-            self._send_json(200, {
+            payload = {
                 "ok": True,
                 "contact_id": contact_id,
                 "status": status,
@@ -6524,7 +6541,11 @@ class PushHandler(BaseHTTPRequestHandler):
                 "last_turn": last_ts,
                 "draft": draft,
                 "stop_request": stop_request,
-            })
+            }
+            if instrument is not None and terminal is not None:
+                payload["instrument"] = instrument
+                payload["terminal"] = terminal
+            self._send_json(200, payload)
         except Exception as e:
             logger.exception("chat status fail")
             self._send_json(500, {"error": str(e)})
@@ -9847,7 +9868,7 @@ class PushHandler(BaseHTTPRequestHandler):
             str(getattr(self.state, "codex_reasoning_effort", "")),
         )
 
-    def _codex_busy_snapshot(self) -> dict[str, Any]:
+    def _codex_busy_snapshot(self, *, include_runtime: bool = True) -> dict[str, Any]:
         session_id, cwd = self._load_codex_target()
         cwd = self._codex_allowed_cwd(cwd)
         selected_model, selected_effort = self._codex_preference_snapshot()
@@ -9881,8 +9902,140 @@ class PushHandler(BaseHTTPRequestHandler):
                 bridge.get("started_at") if bridge_busy else None
             ),
         }
-        payload.update(self._codex_runtime_detail(session_id, cwd))
+        if include_runtime:
+            payload.update(self._codex_runtime_detail(session_id, cwd))
         return payload
+
+    @staticmethod
+    def _pwa_bounded_text(value: Any, *, maximum: int = 48) -> str:
+        """Allow only short display labels; never pass arbitrary status text."""
+        if not isinstance(value, str):
+            return ""
+        text = value.strip()
+        if not text or len(text) > maximum or "@" in text:
+            return ""
+        # These fields are labels, not a free-form message channel.  Keep the
+        # permitted character set intentionally small while allowing Chinese
+        # reset labels emitted by the locally configured Codex status helper.
+        if not re.fullmatch(r"[A-Za-z0-9\u4e00-\u9fff .:_+\-/()]{1," + str(maximum) + r"}", text):
+            return ""
+        return text
+
+    @staticmethod
+    def _pwa_bounded_count(value: Any, *, maximum: int = 2_000_000_000) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            number = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if 0 <= number <= maximum else None
+
+    def _pwa_kairos_instrument_snapshot(self) -> dict[str, Any]:
+        """Return the PWA's narrow, provider-neutral-ish work instrument.
+
+        No raw session id, account, path, prompt, runtime line, or quota text
+        is allowed through this boundary.  This intentionally does not reuse
+        ``_codex_runtime_detail`` because that admin-facing helper carries
+        exactly those diagnostics.
+        """
+        empty = {
+            "available": False,
+            "model": "",
+            "effort": "",
+            "context": {"available": False, "used_percent": None, "used_tokens": None, "window_tokens": None},
+            "quota": {"plan": "", "windows": []},
+        }
+        try:
+            model, effort = self._codex_preference_snapshot()
+            safe_model = str(model or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", safe_model):
+                safe_model = ""
+            safe_effort = str(effort or "").strip()
+            if safe_effort not in TOOLBOT_EFFORT_LEVELS:
+                safe_effort = ""
+
+            # Session metadata is read only to calculate the already-existing
+            # token summary.  It is never returned, even when malformed.
+            session_id, _cwd = self._load_codex_target()
+            meta = None
+            if session_id:
+                try:
+                    codex_library = "/root/Windows-Codex-TG"
+                    if codex_library not in sys.path:
+                        sys.path.insert(0, codex_library)
+                    from codex_common import SessionStore
+                    root = Path(os.environ.get("CODEX_SESSION_ROOT", "~/.codex/sessions")).expanduser()
+                    meta = SessionStore(root).find_by_id(session_id)
+                except Exception:
+                    meta = None
+            source_context = self._codex_context_snapshot(meta)
+            used = self._pwa_bounded_count(source_context.get("input_tokens"))
+            window = self._pwa_bounded_count(source_context.get("window_tokens"))
+            context = {"available": False, "used_percent": None, "used_tokens": None, "window_tokens": None}
+            if bool(source_context.get("available")) and used is not None and window and used <= window:
+                context = {
+                    "available": True,
+                    "used_percent": round(min(100.0, max(0.0, used / window * 100.0)), 1),
+                    "used_tokens": used,
+                    "window_tokens": window,
+                }
+
+            parsed_quota = self._parse_quota_lines(self._codex_quota_lines_cached())
+            windows: list[dict[str, Any]] = []
+            for item in parsed_quota.get("windows", [])[:2]:
+                if not isinstance(item, dict):
+                    continue
+                remaining = self._pwa_bounded_count(item.get("remaining_percent"), maximum=100)
+                label = self._pwa_bounded_text(item.get("label"), maximum=32)
+                reset = self._pwa_bounded_text(item.get("reset_text"), maximum=48)
+                if remaining is None or not label or not reset:
+                    continue
+                windows.append({"label": label, "remaining_percent": remaining, "reset_label": reset})
+            return {
+                "available": bool(safe_model or safe_effort or context["available"] or windows),
+                "model": safe_model,
+                "effort": safe_effort,
+                "context": context,
+                "quota": {"plan": self._pwa_bounded_text(parsed_quota.get("plan"), maximum=40), "windows": windows},
+            }
+        except Exception:
+            logger.debug("PWA Kairos instrument unavailable", exc_info=True)
+            return empty
+
+    def _pwa_kairos_terminal_snapshot(self) -> dict[str, Any]:
+        """Project the pre-redacted observer to a read-only PWA terminal."""
+        provider_seen = False
+        snapshot: dict[str, Any] | None = None
+        providers = (getattr(self.state, "codex_app_bridge", None), CODEX_RUNS)
+        for provider in providers:
+            observer = getattr(provider, "observer_snapshot", None)
+            if not callable(observer):
+                continue
+            try:
+                candidate = observer()
+                provider_seen = True
+            except Exception:
+                logger.debug("PWA Kairos observer unavailable", exc_info=True)
+                continue
+            if isinstance(candidate, dict) and candidate.get("busy") is True:
+                snapshot = candidate
+                break
+        if snapshot is None:
+            return {"available": provider_seen, "busy": False, "phase": "idle" if provider_seen else "unavailable", "events": []}
+        phase = snapshot.get("phase")
+        safe_phase = phase if isinstance(phase, str) and phase in OBSERVER_PHASES else "正在处理"
+        events: list[dict[str, Any]] = []
+        raw_events = snapshot.get("events")
+        if isinstance(raw_events, list):
+            for event in raw_events[-40:]:
+                if not isinstance(event, dict):
+                    continue
+                elapsed = event.get("elapsed_seconds")
+                label = event.get("label")
+                if isinstance(elapsed, int) and not isinstance(elapsed, bool) and 0 <= elapsed <= 604800 and label in OBSERVER_EVENT_LABELS:
+                    events.append({"elapsed_seconds": elapsed, "label": label})
+        return {"available": True, "busy": True, "phase": safe_phase, "events": events[-40:]}
 
     @staticmethod
     def _parse_quota_lines(lines: list[str]) -> dict[str, Any]:
@@ -9940,7 +10093,9 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _codex_context_snapshot(self, meta: Any) -> dict[str, Any]:
         try:
-            sys.path.insert(0, "/root/Windows-Codex-TG")
+            codex_library = "/root/Windows-Codex-TG"
+            if codex_library not in sys.path:
+                sys.path.insert(0, codex_library)
             from tg_codex_bot import TgCodexService
 
             usage = TgCodexService._latest_context_usage(meta)
@@ -9999,7 +10154,9 @@ class PushHandler(BaseHTTPRequestHandler):
             if isinstance(cached, list) and now - float(CODEX_QUOTA_CACHE.get("ts") or 0) < CODEX_QUOTA_CACHE_TTL:
                 return [str(line) for line in cached]
         try:
-            sys.path.insert(0, "/root/Windows-Codex-TG")
+            codex_library = "/root/Windows-Codex-TG"
+            if codex_library not in sys.path:
+                sys.path.insert(0, codex_library)
             from tg_codex_bot import TgCodexService
 
             lines = TgCodexService._quota_status_lines(Path(self.state.codex_home).expanduser())
