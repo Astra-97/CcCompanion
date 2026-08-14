@@ -1,4 +1,5 @@
-import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY } from './data.js?v=7';
+import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY } from './data.js?v=8';
+import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=8';
 
 const clone = (value) => structuredClone(value);
 const now = () => new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
@@ -168,8 +169,9 @@ export function createHttpAdapter({ baseUrl = '', request = defaultRequest, uplo
       try {
         for (let index = 0; index < files.length; index += 1) {
           const file = files[index];
-          if (!file?.name || file.size <= 0 || file.size > uploadLimits.max_file_bytes) throw new Error(`${file?.name || '文件'} 超出 ${formatBytes(uploadLimits.max_file_bytes)} 限制或为空`);
-          const query = new URLSearchParams({ contact_id: contactId, filename: file.name, role: 'user' });
+          const filename = resolveAttachmentFilename(file, index);
+          if (!file || file.size <= 0 || file.size > uploadLimits.max_file_bytes || (!filename && !isImageFile(file))) throw new Error(`${filename || '文件'} 超出 ${formatBytes(uploadLimits.max_file_bytes)} 限制或为空`);
+          const query = new URLSearchParams({ contact_id: contactId, filename, role: 'user' });
           const result = await upload(url(`/chat/upload?${query}`), {
             body: file,
             signal,

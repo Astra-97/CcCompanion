@@ -214,6 +214,30 @@ test('stages raw attachment bytes then sends only returned attachment IDs with m
   assert.deepEqual(calls.at(-1), { path: '/chat/send', options: { method: 'POST', body: { contact_id: 'kairos', text: 'with attachment', attachment_ids: ['att-1'] }, headers: { 'X-CC-Web-CSRF': 'csrf-memory-only' } } });
 });
 
+test('uploads an unnamed image with a display-only filename fallback without rewriting the File', async () => {
+  const uploads = []; const file = { type: 'image/png', size: 4 };
+  const adapter = createHttpAdapter({
+    request: async (path) => path === '/web/session' ? { csrf_token: 'csrf' } : { ok: true },
+    upload: async (path, options) => { uploads.push({ path, options }); return { attachments: [{ attachment_id: 'image-1' }] }; },
+  });
+  await adapter.getWebSession(); await adapter.uploadAttachments('kairos', [file]);
+  assert.equal(uploads[0].path, '/chat/upload?contact_id=kairos&filename=pasted-image-1.png&role=user');
+  assert.equal(uploads[0].options.body, file);
+  assert.equal(file.type, 'image/png');
+});
+
+test('keeps ordinary selected filenames and rejects an unnamed non-image as before', async () => {
+  const uploads = [];
+  const adapter = createHttpAdapter({
+    request: async (path) => path === '/web/session' ? { csrf_token: 'csrf' } : { ok: true },
+    upload: async (path, options) => { uploads.push({ path, options }); return { attachments: [{ attachment_id: 'file-1' }] }; },
+  });
+  await adapter.getWebSession();
+  await adapter.uploadAttachments('kairos', [{ name: 'notes.pdf', type: 'application/pdf', size: 4 }]);
+  assert.match(uploads[0].path, /filename=notes\.pdf/);
+  await assert.rejects(() => adapter.uploadAttachments('kairos', [{ type: 'application/pdf', size: 4 }]), /文件/);
+});
+
 test('uses the server-advertised pending total-byte and file-count limits', async () => {
   let uploads = 0;
   const adapter = createHttpAdapter({
@@ -338,9 +362,10 @@ test('PWA shell declares installability and has no secret persistence', async ()
   assert.match(manifest, /icon-192\.png/);
   assert.match(manifest, /icon-512\.png/);
   assert.match(serviceWorker, /addEventListener\('fetch'/);
-  assert.match(serviceWorker, /cccompanion-desk-v7/);
-  assert.match(serviceWorker, /src\/styles\.css\?v=7/);
-  assert.match(serviceWorker, /src\/app\.js\?v=7/);
+  assert.match(serviceWorker, /cccompanion-desk-v8/);
+  assert.match(serviceWorker, /src\/styles\.css\?v=8/);
+  assert.match(serviceWorker, /src\/app\.js\?v=8/);
+  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=8/);
   assert.match(serviceWorker, /src\/live-messages\.js/);
   assert.match(serviceWorker, /src\/pairing-code\.js/);
   assert.doesNotMatch(source, /shared_secret|localStorage\.setItem|sessionStorage\.setItem|credentials:\s*'include'/);
@@ -357,8 +382,8 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   ]);
   assert.match(html, /id="latest-button"/);
   assert.match(html, /id="pairing-code"/);
-  assert.match(html, /href="\.\/src\/styles\.css\?v=7"/);
-  assert.match(html, /src="\.\/src\/app\.js\?v=7"/);
+  assert.match(html, /href="\.\/src\/styles\.css\?v=8"/);
+  assert.match(html, /src="\.\/src\/app\.js\?v=8"/);
   assert.match(html, /autocomplete="one-time-code"/);
   assert.match(html, /id="pairing-form"/);
   assert.match(html, /<details class="password-fallback">/);
@@ -384,6 +409,9 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   assert.match(html, /23456789ABCDEFGHJKLMNPQRSTUVWXYZ/);
   assert.match(app, /adapter\.uploadAttachments\(contactId, queued/);
   assert.match(app, /adapter\.sendMessage\(contactId,/);
+  assert.match(app, /extractClipboardImageFiles\(event\.clipboardData\)/);
+  assert.match(app, /if \(!images\.length\) return/);
+  assert.match(app, /event\.preventDefault\(\)/);
   assert.match(app, /createComposerState/);
   assert.match(app, /state\.composerState\.begin\(contactId\)/);
   assert.match(app, /state\.composerState\.isCurrent\(contactId, operation\)/);

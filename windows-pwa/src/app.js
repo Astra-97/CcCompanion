@@ -1,8 +1,9 @@
-import { createPwaBootstrap } from './bootstrap.js?v=7';
-import { createComposerState } from './composer-state.js?v=7';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=7';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=7';
-import { normalizeLiveState } from './api.js?v=7';
+import { createPwaBootstrap } from './bootstrap.js?v=8';
+import { createComposerState } from './composer-state.js?v=8';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=8';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=8';
+import { normalizeLiveState } from './api.js?v=8';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=8';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -30,6 +31,7 @@ function isBusy(id = state.activeContactId) { const live = state.live[id]; retur
 function composer(id = state.activeContactId) { return state.composerState.get(id); }
 function sendOperation(id = state.activeContactId) { return state.composerState.current(id); }
 function formatSize(size) { return size > 1_000_000 ? `${(size / 1_000_000).toFixed(1)} MB` : `${Math.max(1, Math.round(size / 1000))} KB`; }
+function attachmentName(file, index = 0) { return resolveAttachmentFilename(file, index) || '附件'; }
 function formatLimit(size) { return `${Math.max(1, Math.round(size / (1024 * 1024)))} MiB`; }
 function attachmentPreflight(files) {
   const limits = adapter.getUploadLimits?.() || { max_file_bytes: 50 * 1024 * 1024, max_pending_files: 10, max_pending_bytes: 64 * 1024 * 1024 };
@@ -37,7 +39,7 @@ function attachmentPreflight(files) {
   const total = files.reduce((sum, file) => sum + Number(file.size || 0), 0);
   if (total > limits.max_pending_bytes) return `附件合计不能超过 ${formatLimit(limits.max_pending_bytes)}`;
   const tooLarge = files.find((file) => !file.size || file.size > limits.max_file_bytes);
-  return tooLarge ? `${tooLarge.name} 为空或超过 ${formatLimit(limits.max_file_bytes)}` : '';
+  return tooLarge ? `${attachmentName(tooLarge)} 为空或超过 ${formatLimit(limits.max_file_bytes)}` : '';
 }
 function renderDateRule() {
   const now = new Date(); const label = new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric', weekday: 'short' }).format(now);
@@ -115,8 +117,9 @@ function renderWorkers() {
 }
 function renderAttachments() {
   const tray = $('#attachment-tray'); const current = composer(); const operation = sendOperation(); tray.replaceChildren(...current.attachments.map((file, index) => {
-    const chip = el('span', { class: 'attachment-chip' }, [el('span', { text: `⌁ ${file.name} · ${formatSize(file.size)}${operation?.progress ? ` · ${operation.progress}` : ''}` })]);
-    const remove = el('button', { type: 'button', 'aria-label': `移除 ${file.name}`, text: '×', ...(operation ? { disabled: '' } : {}) }); remove.addEventListener('click', () => { if (sendOperation()) return; current.attachments.splice(index, 1); renderAttachments(); renderHeader(); }); chip.append(remove); return chip;
+    const name = attachmentName(file, index);
+    const chip = el('span', { class: 'attachment-chip' }, [el('span', { text: `⌁ ${name} · ${formatSize(file.size)}${operation?.progress ? ` · ${operation.progress}` : ''}` })]);
+    const remove = el('button', { type: 'button', 'aria-label': `移除 ${name}`, text: '×', ...(operation ? { disabled: '' } : {}) }); remove.addEventListener('click', () => { if (sendOperation()) return; current.attachments.splice(index, 1); renderAttachments(); renderHeader(); }); chip.append(remove); return chip;
   }));
 }
 function renderAll(options) { renderContacts(); renderHeader(); renderActivities(); renderMessages(options); renderWorkers(); renderAttachments(); renderDateRule(); }
@@ -204,6 +207,17 @@ function cycleAppearance() { const modes = ['default', 'reading', 'compact']; st
 
 $('#composer').addEventListener('submit', send);
 input.addEventListener('input', () => { composer().text = input.value; autoResize(); renderHeader(); });
+input.addEventListener('paste', (event) => {
+  const contactId = state.activeContactId; const current = contact();
+  if (!contactId || current.readOnly || sendOperation(contactId)) return;
+  const images = extractClipboardImageFiles(event.clipboardData);
+  if (!images.length) return;
+  event.preventDefault();
+  const draft = composer(contactId); const next = [...draft.attachments, ...images]; const error = attachmentPreflight(next);
+  if (error) { $('#connection-state').textContent = error; return; }
+  draft.attachments = next; renderAttachments(); renderHeader();
+  $('#connection-state').textContent = `${images.length} 张图片已添加`;
+});
 input.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); $('#composer').requestSubmit(); } });
 $('#conversation-scroll').addEventListener('scroll', () => { state.followLatest[state.activeContactId] = nearBottom(); updateLatestControl(); }); $('#latest-button').addEventListener('click', scrollLatest);
 $('#attachment-input').addEventListener('change', (event) => { const draft = composer(); const next = [...draft.attachments, ...event.target.files]; const error = attachmentPreflight(next); event.target.value = ''; if (error) { $('#connection-state').textContent = error; return; } draft.attachments = next; renderAttachments(); renderHeader(); });
