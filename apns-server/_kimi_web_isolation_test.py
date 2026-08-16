@@ -96,7 +96,22 @@ class KimiWebIsolationTest(unittest.TestCase):
         # the quota helper independently preserves its lazy-start contract.
         self.assertEqual(2, client.start.call_count)
         self.assertEqual(200, handler.responses[-1][0])
-        self.assertEqual({}, handler.responses[-1][1]["quota"])
+        self.assertEqual(
+            {"text": "配额信息暂不可用", "windows": []},
+            handler.responses[-1][1]["quota"],
+        )
+
+    def test_status_exposes_only_bounded_quota_dto(self):
+        web = FakeKimiWeb(quota={"private": {"account": "never expose"}, "remaining": 3})
+        handler = self.handler(web)
+
+        handler._handle_kimi_status()
+
+        payload = handler.responses[-1][1]
+        self.assertIn("quota", payload)
+        self.assertNotIn("quota_raw", payload)
+        self.assertNotIn("quota_windows", payload)
+        self.assertNotIn("private", str(payload["quota"]))
 
     def test_real_client_normalizes_network_os_errors_only(self):
         client = KimiWebClient(command="/unused/kimi", start_timeout=5)

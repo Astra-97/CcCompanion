@@ -106,8 +106,13 @@ allowed_ips = []
 # kimi_bin = "/root/.kimi-code/bin/kimi"
 # Keep Kimi/卡拉米 in a workspace that does not inherit Kairos's AGENTS.md.
 # kimi_cwd = "/root/Karami-Workspace"
-# The App session pins ACP's per-session model to Kimi's k3-256k model; this
-# does not change Kimi Code's global config.toml.
+# The Android App keeps a private per-contact model/effort preference and
+# pins+reads it back on every ACP prepare/load/new/forge. It never writes Kimi
+# Code's global config.toml. Only the locally configured audited aliases
+# k3-256k, k3, kimi-for-coding and kimi-for-coding-highspeed are selectable.
+# Default: kimi-code/k3-256k with high effort.
+# kimi_config_path = "/root/.kimi-code/config.toml"
+# kimi_semantic_memory_recall_enabled = true
 # kimi_acp_request_timeout_seconds = 30
 # kimi_acp_prompt_timeout_seconds = 900
 # Kimi web server is used only for state queries (quota, context usage).
@@ -278,6 +283,6 @@ max_items = 512
 [xhs_login]
 # Android 专用 WebView 登录能力；nonce 最长十分钟且只可使用一次。
 ttl_seconds = 300
-allowed_contacts = ["kairos", "xiaoke"]
+allowed_contacts = ["kairos", "xiaoke", "kimi"]
 # 固定 argv，cookie JSON 只经 subprocess stdin 传入，不得改成 shell 字符串。
 import_command = ["ssh", "memory-sg", "/home/ubuntu/xhs-login-bridge/import_cookies.py"]

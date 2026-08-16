@@ -3,7 +3,8 @@ import types
 import unittest
 from unittest.mock import patch
 
-from kimi_acp import KimiACPError
+from kimi_acp import KimiACPCancelled, KimiACPError
+from link_preview import LinkPreviewBundle
 from push import PushHandler, _should_generate_chat_append_tts
 
 
@@ -70,6 +71,43 @@ class KimiChatRoutingTest(unittest.TestCase):
         handler._chat_for_contact = lambda contact_id: state.contact_chats[contact_id]
         handler._source_for_request = lambda suffix="": f"android-app:{suffix}"
         return handler, kimi, xiaoke
+
+    @staticmethod
+    def _immediate_thread(target, **_kwargs):
+        class ImmediateThread:
+            def start(self):
+                target()
+
+        return ImmediateThread()
+
+    def _run_kimi_reply(self, handler, *, user_text, assistant_text, bundle, failure=None):
+        """Run the Kimi worker inline and return the prompt it received."""
+        prompts = []
+        handler._kimi_link_bundle = lambda _text: bundle
+
+        def prompt_existing(prompt, *, on_update, **_kwargs):
+            prompts.append(prompt)
+            if assistant_text:
+                on_update(assistant_text)
+            if failure is not None:
+                raise failure
+
+        handler.state.kimi_acp = types.SimpleNamespace(
+            prepare_session=lambda: "session-1",
+            prompt_existing=prompt_existing,
+            cancel=lambda _turn, _session: True,
+            close=lambda: None,
+        )
+        with patch("push.threading.Thread", self._immediate_thread):
+            handler._handle_kimi_chat_send({"text": user_text}, "kimi")
+        return prompts
+
+    @staticmethod
+    def _xhs_login_bundle():
+        return LinkPreviewBundle(
+            previews=({"comments_status": "login_required"},),
+            prompt_context="[链接全文资料]\n小红书登录已失效。",
+        )
 
     def test_kimi_send_uses_only_kimi_history_and_worker(self):
         handler, kimi, xiaoke = self.handler()
@@ -259,6 +297,118 @@ class KimiChatRoutingTest(unittest.TestCase):
         self.assertEqual(1, len(handler.completed))
         self.assertFalse(handler.typing[-1][0][1]["is_typing"])
 
+    def test_kimi_xhs_login_marker_is_stripped_only_for_trusted_login_required_reply(self):
+        handler, kimi, _xiaoke = self.handler()
+        marker = "[[CCC_XHS_LOGIN_CARD:v1]]"
+        prompts = self._run_kimi_reply(
+            handler,
+            user_text="https://www.xiaohongshu.com/explore/example",
+            assistant_text=f"小红书需要重新登录。\n{marker}",
+            bundle=self._xhs_login_bundle(),
+        )
+
+        assistant = [record for record in kimi.records if record["role"] == "assistant"][-1]
+        self.assertEqual("小红书需要重新登录。", assistant["text"])
+        self.assertTrue(assistant["metadata"]["xhs_login_card"])
+        self.assertNotIn(marker, assistant["text"])
+        self.assertIn(marker, prompts[0])
+
+    def test_normal_kimi_final_reply_never_gets_an_xhs_login_card(self):
+        handler, kimi, _xiaoke = self.handler()
+        marker = "[[CCC_XHS_LOGIN_CARD:v1]]"
+        prompts = self._run_kimi_reply(
+            handler,
+            user_text="普通问题",
+            assistant_text="这是正常回复。",
+            bundle=LinkPreviewBundle(),
+        )
+
+        assistant = [record for record in kimi.records if record["role"] == "assistant"][-1]
+        self.assertEqual("这是正常回复。", assistant["text"])
+        self.assertNotIn("xhs_login_card", assistant["metadata"])
+        self.assertNotIn(marker, prompts[0])
+
+    def test_kimi_xhs_marker_is_not_a_client_or_inline_card_trigger(self):
+        marker = "[[CCC_XHS_LOGIN_CARD:v1]]"
+        with self.subTest("user-marker-cannot-create-card"):
+            handler, kimi, _xiaoke = self.handler()
+            self._run_kimi_reply(
+                handler,
+                user_text=marker,
+                assistant_text=marker,
+                bundle=LinkPreviewBundle(),
+            )
+            assistant = [record for record in kimi.records if record["role"] == "assistant"][-1]
+            self.assertEqual(marker, assistant["text"])
+            self.assertNotIn("xhs_login_card", assistant["metadata"])
+
+        with self.subTest("inline-marker-is-ordinary-text"):
+            handler, kimi, _xiaoke = self.handler()
+            inline = f"示例：{marker}"
+            self._run_kimi_reply(
+                handler,
+                user_text="https://www.xiaohongshu.com/explore/example",
+                assistant_text=inline,
+                bundle=self._xhs_login_bundle(),
+            )
+            assistant = [record for record in kimi.records if record["role"] == "assistant"][-1]
+            self.assertEqual(inline, assistant["text"])
+            self.assertNotIn("xhs_login_card", assistant["metadata"])
+
+        with self.subTest("repeated-marker-is-ordinary-text"):
+            handler, kimi, _xiaoke = self.handler()
+            repeated = f"{marker}\n{marker}"
+            self._run_kimi_reply(
+                handler,
+                user_text="https://www.xiaohongshu.com/explore/example",
+                assistant_text=repeated,
+                bundle=self._xhs_login_bundle(),
+            )
+            assistant = [record for record in kimi.records if record["role"] == "assistant"][-1]
+            self.assertEqual(repeated, assistant["text"])
+            self.assertNotIn("xhs_login_card", assistant["metadata"])
+
+        with self.subTest("marker-must-be-last-nonempty-line"):
+            handler, kimi, _xiaoke = self.handler()
+            trailing = f"{marker}\n这句在标记后面"
+            self._run_kimi_reply(
+                handler,
+                user_text="https://www.xiaohongshu.com/explore/example",
+                assistant_text=trailing,
+                bundle=self._xhs_login_bundle(),
+            )
+            assistant = [record for record in kimi.records if record["role"] == "assistant"][-1]
+            self.assertEqual(trailing, assistant["text"])
+            self.assertNotIn("xhs_login_card", assistant["metadata"])
+
+    def test_kimi_xhs_marker_never_survives_as_a_card_on_failure_or_interrupt(self):
+        marker = "[[CCC_XHS_LOGIN_CARD:v1]]"
+        with self.subTest("failure"):
+            handler, kimi, _xiaoke = self.handler()
+            self._run_kimi_reply(
+                handler,
+                user_text="https://www.xiaohongshu.com/explore/example",
+                assistant_text="",
+                bundle=self._xhs_login_bundle(),
+                failure=KimiACPError("transport failed"),
+            )
+            assistant = [record for record in kimi.records if record["role"] == "assistant"][-1]
+            self.assertNotIn("xhs_login_card", assistant["metadata"])
+            self.assertNotIn(marker, assistant["text"])
+
+        with self.subTest("interrupted"):
+            handler, kimi, _xiaoke = self.handler()
+            self._run_kimi_reply(
+                handler,
+                user_text="https://www.xiaohongshu.com/explore/example",
+                assistant_text=marker,
+                bundle=self._xhs_login_bundle(),
+                failure=KimiACPCancelled("stopped"),
+            )
+            assistant = [record for record in kimi.records if record["role"] == "assistant"][-1]
+            self.assertNotIn("xhs_login_card", assistant["metadata"])
+            self.assertIn(marker, assistant["text"])
+
     def test_assistant_history_failure_still_finishes_every_lifecycle_state(self):
         handler, kimi, _xiaoke = self.handler()
         original_append = kimi.append
@@ -314,6 +464,14 @@ class KimiChatRoutingTest(unittest.TestCase):
             "metadata": {"card_title": "Interactive"},
         })
         self.assertEqual(415, handler.responses[-1][0])
+
+        handler._handle_chat_send({
+            "contact_id": "kimi",
+            "text": "not a login card",
+            "metadata": {"xhs_login_card": True},
+        })
+        self.assertEqual(415, handler.responses[-1][0])
+        self.assertEqual("kimi_text_only", handler.responses[-1][1]["error"])
 
         for body in (
             {"contact_id": "kimi", "text": "metadata", "metadata": {}},

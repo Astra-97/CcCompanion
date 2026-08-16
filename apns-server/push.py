@@ -147,6 +147,13 @@ from kimi_acp import (
     KimiACPClient,
     KimiACPError,
 )
+from kimi_preferences import (
+    KIMI_APP_DEFAULT_EFFORT,
+    KIMI_APP_DEFAULT_MODEL,
+    KimiPreferenceError,
+    KimiPreferencePersistenceError,
+    KimiPreferenceStore,
+)
 from kimi_web_client import KimiWebClient, KimiWebError
 import todos as todos_mod
 from studyroom import StudyroomDB
@@ -2565,7 +2572,7 @@ class ServerState:
         import_command = raw_import_command if isinstance(raw_import_command, list) else None
         allowed_contacts = {
             str(item).strip().lower()
-            for item in (xhs_login_cfg.get("allowed_contacts", ["kairos"]) or [])
+            for item in (xhs_login_cfg.get("allowed_contacts", ["kairos", "kimi"]) or [])
             if str(item).strip()
         }
         self.xhs_login = XhsLoginManager(
@@ -2667,6 +2674,20 @@ class ServerState:
         self.kairos_recall_card_lock = threading.Lock()
         self.kairos_recall_index = KairosRecallIndex(
             Path(self.token_store_path).expanduser().parent / "kairos_recall_index.json"
+        )
+        # Kimi may read the same memory service, but its seen/commit ledger,
+        # client instance and locking are deliberately separate from Kairos.
+        # A Kimi turn must never consume (or be suppressed by) a Kairos recall.
+        self.kimi_semantic_memory_recall_enabled: bool = bool(
+            server_cfg.get("kimi_semantic_memory_recall_enabled", True)
+        )
+        self.kimi_semantic_memory_recall_timeout_sec: float = self.kairos_semantic_memory_recall_timeout_sec
+        self.kimi_semantic_memory_recall: Any = None
+        self.kimi_semantic_memory_recall_init_attempted = False
+        self.kimi_semantic_memory_recall_lock = threading.Lock()
+        self.kimi_recall_card_lock = threading.Lock()
+        self.kimi_recall_index = KairosRecallIndex(
+            Path(self.token_store_path).expanduser().parent / "kimi_recall_index.json"
         )
         self.codex_kairos_backend: str = str(
             server_cfg.get("codex_kairos_backend", "app-server") or "app-server"
@@ -2774,6 +2795,10 @@ class ServerState:
         self.kimi_turn_lock = threading.RLock()
         self.kimi_active_turn: dict[str, Any] = {}
         self.kimi_prepare_token = ""
+        self.kimi_preferences = KimiPreferenceStore(
+            contact_history_dir / "kimi_preferences.json",
+            config_path=server_cfg.get("kimi_config_path", "/root/.kimi-code/config.toml"),
+        )
         self.kimi_acp = KimiACPClient(
             command=server_cfg.get("kimi_bin", "/root/.kimi-code/bin/kimi"),
             cwd=server_cfg.get("kimi_cwd", DEFAULT_KIMI_CWD),
@@ -4198,6 +4223,7 @@ class PushHandler(BaseHTTPRequestHandler):
             name = str(raw.get("name") or "").strip()
             valid_fallback = (
                 name == "协作 worker"
+                or name == "Kimi 协作 worker"
                 or (
                     name.startswith("协作 worker-")
                     and len(name) == len("协作 worker-") + 8
@@ -4987,6 +5013,12 @@ class PushHandler(BaseHTTPRequestHandler):
         request_path = urlparse(self.path).path
         if not self._is_public_get() and not self._check_ip_allowed():
             return
+        # Kimi control is native-App control, not a PWA capability.  Keep it
+        # behind the shared secret even when legacy strict_auth is disabled;
+        # importantly, this happens before the generic cookie-aware auth.
+        if request_path.startswith("/kimi/") and not self._native_pairing_auth_matches():
+            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return
         if request_path in {self._MEMORY_SYNC_PATH, self._MEMORY_DATE_SYNC_PATH}:
             if not self._memory_sync_auth_matches():
                 self._send_json(401, {"ok": False, "error": "unauthorized"})
@@ -5218,6 +5250,12 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/kimi/status":
             self._handle_kimi_status()
+            return
+        if self.path == "/kimi/preferences" or self.path.startswith("/kimi/preferences?"):
+            self._handle_kimi_preferences_get()
+            return
+        if self.path == "/kimi/sessions" or self.path.startswith("/kimi/sessions?"):
+            self._handle_kimi_sessions()
             return
         if self.path == "/settings":
             self._send_json(200, {"ok": True, "settings": self.state.settings.snapshot()})
@@ -5610,6 +5648,9 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         if not self._check_ip_allowed():
             return
+        if request_path.startswith("/kimi/") and not self._native_pairing_auth_matches():
+            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return
         if self.path == "/login":
             try:
                 body = self._read_body()
@@ -5767,6 +5808,18 @@ class PushHandler(BaseHTTPRequestHandler):
         elif self.path == "/codex/forge":
             self._handle_codex_forge(body)
             return
+        elif self.path == "/kimi/preferences":
+            self._handle_kimi_preferences_post(body)
+            return
+        elif self.path == "/kimi/new_session":
+            self._handle_kimi_new_session(body)
+            return
+        elif self.path == "/kimi/switch_session":
+            self._handle_kimi_switch_session(body)
+            return
+        elif self.path == "/kimi/forge":
+            self._handle_kimi_forge(body)
+            return
         elif self.path == "/ai-status":
             self._handle_ai_status_post(body)
             return
@@ -5815,11 +5868,10 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         elif self.path == "/chat/stop":
             # XiaoKe Stop emits literal tmux Ctrl-C and remains under the
-            # remote-control gate.  Kairos is a separate app-server request
-            # with its own contact+turn fence; it must not inherit a tmux-only
-            # configuration switch.
+            # remote-control gate. Kairos and Kimi use independent in-process
+            # exact-turn fences, so neither inherits a tmux-only switch.
             requested_stop_contact = str(body.get("contact_id") or "").strip()
-            if requested_stop_contact != "kairos" and not self.state.allow_remote_control:
+            if requested_stop_contact not in {"kairos", "kimi"} and not self.state.allow_remote_control:
                 self._send_json(403, {"error": "remote_control disabled", "hint": "set allow_remote_control=true in config.toml"})
                 return
             self._handle_chat_stop(body)
@@ -8118,7 +8170,10 @@ class PushHandler(BaseHTTPRequestHandler):
                 "display_name": "Kimi",
                 "provider": "kimi-acp",
                 "terminal_target": "",
-                "capabilities": ["chat", "history", "draft", "busy", "stop", "attachments"],
+                "capabilities": [
+                    "chat", "history", "draft", "busy", "stop",
+                    "kimi_model_preferences", "kimi_session_control", "kimi_memory_recall",
+                ],
                 "stop_fields": ["contact_id", "user_ts"],
             },
             {
@@ -8738,6 +8793,17 @@ class PushHandler(BaseHTTPRequestHandler):
         else:
             body["metadata"] = clean_user_metadata
         contact_id = self._contact_id_from_body(body)
+        # Kimi is deliberately a plain-text ACP contact.  Reject attachment,
+        # location, voice and interactive-card shapes before the shared upload
+        # staging code can consume them; link previews are generated later by
+        # the server from the text itself, never accepted from caller metadata.
+        if contact_id == "kimi" and self._kimi_inbound_not_text_only(body):
+            self._send_json(415, {
+                "ok": False,
+                "error": "kimi_text_only",
+                "reason": "Kimi 当前只接受直接发送的文字消息。",
+            })
+            return
         try:
             staged_attachments = self._consume_pwa_staged_attachments(body, contact_id)
         except ValueError as exc:
@@ -9084,13 +9150,254 @@ class PushHandler(BaseHTTPRequestHandler):
             },
         })
 
+    @staticmethod
+    def _kimi_inbound_not_text_only(body: dict[str, Any]) -> bool:
+        forbidden = (
+            "attachment_id", "attachment_ids", "attachments", "attachment_path",
+            "attachment_url", "attachment_type", "attachment_filename",
+            "upload_id", "staged_attachment_ids", "location", "voice_mode",
+            "voice_continuation", VOICE_REPLY_TOKEN_FIELD,
+        )
+        if any(body.get(field) for field in forbidden):
+            return True
+        metadata = body.get("metadata")
+        if not isinstance(metadata, dict):
+            return metadata is not None
+        return (
+            metadata.get("via") == "card"
+            or bool(metadata.get("card"))
+            or bool(metadata.get("card_title"))
+            or any("card" in str(key).lower() and bool(value) for key, value in metadata.items())
+        )
+
+    def _kimi_link_bundle(self, text: str) -> LinkPreviewBundle:
+        """Fail open while keeping Kimi's text ingress on the safe preview path."""
+        try:
+            bundle = self._enrich_user_links(text)
+            return bundle if isinstance(bundle, LinkPreviewBundle) else LinkPreviewBundle()
+        except Exception:
+            logger.warning("Kimi link preview failed", exc_info=True)
+            return LinkPreviewBundle()
+
+    @staticmethod
+    def _kimi_xhs_login_card_allowed(bundle: LinkPreviewBundle) -> bool:
+        """Permit the Kimi login card only from trusted XHS enrichment state.
+
+        This looks solely at the server-created ``LinkPreviewBundle``.  It
+        never inspects client metadata or model text, so a user cannot create
+        a login card by sending a marker or a card-shaped request payload.
+        ``comments_status=login_required`` is emitted by the XHS enrichment
+        path only when its authenticated comment fetch needs login again.
+        """
+        return any(
+            isinstance(item, dict) and item.get("comments_status") == "login_required"
+            for item in bundle.previews
+        )
+
+    @staticmethod
+    def _kimi_extract_xhs_login_card(
+        message: str,
+        *,
+        allowed: bool,
+    ) -> tuple[str, bool]:
+        """Extract exactly one standalone, server-authorized XHS card marker.
+
+        Near matches, inline uses, repeated markers, and a marker that is not
+        the last non-empty line remain ordinary assistant text.  This narrow
+        grammar makes the internal rendering flag impossible to activate from
+        an arbitrary user message or a fuzzy model completion.
+        """
+        raw = str(message or "")
+        if not allowed:
+            return raw, False
+        marker = "[[CCC_XHS_LOGIN_CARD:v1]]"
+        lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        marker_count = sum(line.strip() == marker for line in lines)
+        nonempty = [line.strip() for line in lines if line.strip()]
+        if marker_count != 1 or not nonempty or nonempty[-1] != marker:
+            return raw, False
+        visible = "\n".join(line for line in lines if line.strip() != marker).strip()
+        return visible or "小红书登录已失效，点下方卡片重新登录。", True
+
+    def _kimi_bqb_protocol(self) -> str:
+        """Return bounded, catalog-backed token instructions with no image URLs."""
+        names: list[str] = []
+        try:
+            snapshot = self.state.sticker_catalog.snapshot()
+            entries = snapshot.get("stickers") if isinstance(snapshot, dict) else None
+            if isinstance(entries, list):
+                for item in entries[:128]:
+                    name = item.get("name") if isinstance(item, dict) else None
+                    if is_valid_sticker_name(name):
+                        names.append(str(name))
+        except Exception:
+            pass
+        names = list(dict.fromkeys(names))[:64]
+        catalog = "、".join(names)
+        if len(catalog) > 1400:
+            catalog = catalog[:1400]
+        return (
+            "\n\n[表情协议]\n"
+            "如需表达情绪，可以输出一个或少量完全匹配的 [bqb:名字] 文字 token。"
+            "只能使用下列已验证目录名；绝不把 URL、Markdown 图片、文件路径或模型生成的链接当作表情。"
+            + (f"\n已验证名字：{catalog}" if catalog else "\n当前没有可用表情目录，不要猜测 token。")
+        )
+
+    def _kimi_prompt(
+        self,
+        text: str,
+        *,
+        link_context: str = "",
+        recall_context: str = "",
+        xhs_login_card_allowed: bool = False,
+    ) -> str:
+        sections = [
+            "[消息来源]",
+            "入口: cc_companion_kimi_private",
+            "contact_id: kimi",
+            "",
+            "Astra 正在通过 CcCompanion app 和 Kimi 对话。请直接回复她，不要提到后台路由。",
+            f"对方说：{text}",
+        ]
+        if link_context:
+            sections.extend(["", link_context])
+        if recall_context:
+            # SemanticMemoryRecall supplies explicit untrusted-reference
+            # framing. Preserve it verbatim rather than blending it into user
+            # text or allowing it to look like an instruction.
+            sections.extend(["", recall_context])
+        if xhs_login_card_allowed:
+            sections.extend([
+                "",
+                "[小红书登录卡片]",
+                "本轮服务端已确认小红书评论抓取需要重新登录。请简短提醒 Astra；"
+                "如需展示登录卡片，只能在回复末尾单独一行、且只输出一次"
+                " [[CCC_XHS_LOGIN_CARD:v1]]。其他任何情况都不要输出或复述这个标记。",
+            ])
+        return "\n".join(sections) + self._kimi_bqb_protocol()
+
+    def _kimi_seen_memory_keys(self, session_id: str | None) -> tuple[str, ...]:
+        try:
+            index = getattr(self.state, "kimi_recall_index", None)
+            return tuple(index.keys(session_id)) if index is not None else ()
+        except Exception:
+            return ()
+
+    def _kimi_semantic_recall(self, query: str, *, session_id: str | None) -> Any:
+        if not bool(getattr(self.state, "kimi_semantic_memory_recall_enabled", False)) or not str(query or "").strip():
+            return None
+        try:
+            lock = getattr(self.state, "kimi_semantic_memory_recall_lock", None)
+            if lock is None:
+                return None
+            with lock:
+                client = getattr(self.state, "kimi_semantic_memory_recall", None)
+                attempted = bool(getattr(self.state, "kimi_semantic_memory_recall_init_attempted", False))
+                if client is None and not attempted:
+                    self.state.kimi_semantic_memory_recall_init_attempted = True
+                    module_root = "/root/Windows-Codex-TG"
+                    if module_root not in sys.path:
+                        sys.path.insert(0, module_root)
+                    from semantic_memory_recall import SemanticMemoryRecall, SemanticMemoryRecallConfig
+
+                    client = SemanticMemoryRecall(SemanticMemoryRecallConfig(
+                        enabled=True,
+                        token_file=Path("/root/.codex/config.toml"),
+                        total_timeout_sec=float(getattr(
+                            self.state,
+                            "kimi_semantic_memory_recall_timeout_sec",
+                            2.5,
+                        )),
+                    ))
+                    self.state.kimi_semantic_memory_recall = client
+            if client is None:
+                return None
+            result = client.recall_result(
+                str(query),
+                exclude_memory_keys=self._kimi_seen_memory_keys(session_id),
+            )
+            context = str(getattr(result, "context", "") or "").strip()
+            items = getattr(result, "items", ())
+            return result if context and isinstance(items, (list, tuple)) and items else None
+        except Exception:
+            return None
+
+    def _commit_kimi_recall(self, result: Any, session_id: str | None) -> bool:
+        try:
+            index = getattr(self.state, "kimi_recall_index", None)
+            return bool(index and index.add(session_id, getattr(result, "memory_keys", ())))
+        except Exception:
+            return False
+
+    def _append_kimi_recall_card(
+        self,
+        chat: ChatHistory,
+        result: Any,
+        *,
+        user_ts: str,
+        session_id: str,
+    ) -> bool:
+        """Persist a Kimi-only recall card without sharing Kairos state."""
+        try:
+            if not user_ts or not session_id:
+                return False
+            lock = getattr(self.state, "kimi_recall_card_lock", None)
+            if lock is None:
+                return False
+            with lock:
+                for record in chat.tail(200):
+                    metadata = record.get("metadata")
+                    if (
+                        isinstance(metadata, dict)
+                        and metadata.get("recall_card") is True
+                        and str(metadata.get("kimi_user_ts") or "") == user_ts
+                    ):
+                        return False
+                items: list[dict[str, str]] = []
+                for raw_item in getattr(result, "items", ())[:3]:
+                    if not isinstance(raw_item, dict):
+                        continue
+                    item = {
+                        "date": str(raw_item.get("date") or "")[:10],
+                        "title": str(raw_item.get("title") or "")[:60],
+                        "snippet": str(raw_item.get("snippet") or "")[:80],
+                    }
+                    if any(item.values()):
+                        items.append(item)
+                if not items:
+                    return False
+                keys = [
+                    str(key) for key in getattr(result, "memory_keys", ())[:100]
+                    if re.fullmatch(r"v1:[0-9a-f]{64}", str(key))
+                ]
+                chat.append(
+                    role="assistant",
+                    text=f"💭 浮现了 {len(items)} 条记忆（摘要见卡片）",
+                    source="memory-recall:kimi",
+                    metadata={
+                        "recall_card": True,
+                        "items": items,
+                        "kimi_user_ts": user_ts,
+                        "recall_session_id": session_id,
+                        "recall_memory_keys": keys,
+                    },
+                )
+                return True
+        except Exception:
+            return False
+
     def _handle_kimi_chat_send(self, body: dict[str, Any], contact_id: str) -> None:
-        """Queue one text turn into Kimi's isolated ACP session."""
+        """Queue one plain-text turn into Kimi's isolated ACP session."""
         text = str(body.get("text") or "").strip()
         quoted_ts = body.get("quoted_ts") or None
         if not text:
             self._send_json(400, {"ok": False, "error": "text required"})
             return
+        link_bundle = self._kimi_link_bundle(text)
+        xhs_login_card_allowed = self._kimi_xhs_login_card_allowed(link_bundle)
+        # User-supplied metadata is deliberately discarded. Only the server's
+        # bounded link preview schema is stored alongside the Kimi message.
+        metadata = merge_preview_metadata(None, link_bundle)
         with self.state.kimi_turn_lock:
             if self.state.kimi_active_turn or self.state.kimi_prepare_token:
                 self._send_json(409, {
@@ -9103,54 +9410,37 @@ class PushHandler(BaseHTTPRequestHandler):
             self.state.kimi_prepare_token = prepare_token
 
         try:
-            session_id = self.state.kimi_acp.prepare_session()
+            model, effort = self._kimi_selection()
+            session_id = self._prepare_kimi_selected_session(model, effort)
             try:
-                session_id, _forged = self._maybe_forge_kimi_session(session_id)
+                session_id, _forged = self._maybe_forge_kimi_session(
+                    session_id,
+                    model=model,
+                    reasoning_effort=effort,
+                )
             except Exception as exc:
-                logger.warning("Kimi auto-forge failed, continuing with existing session: %s", exc)
+                logger.warning("Kimi auto-forge failed, continuing with existing session: %s", type(exc).__name__)
         except KimiACPAuthRequired:
-            with self.state.kimi_turn_lock:
-                if self.state.kimi_prepare_token == prepare_token:
-                    self.state.kimi_prepare_token = ""
+            self._release_kimi_control(prepare_token)
             self.state.kimi_acp.close()
-            self._send_json(503, {
-                "ok": False,
-                "error": "kimi_auth_required",
-                "reason": "Kimi 还没有完成登录，请先在 VPS 终端完成登录。",
-            })
+            self._send_json(503, {"ok": False, "error": "kimi_auth_required"})
             return
         except (KimiACPBusy, KimiACPError) as exc:
-            with self.state.kimi_turn_lock:
-                if self.state.kimi_prepare_token == prepare_token:
-                    self.state.kimi_prepare_token = ""
+            self._release_kimi_control(prepare_token)
             logger.warning("Kimi ACP prepare failed: %s", type(exc).__name__)
             self.state.kimi_acp.close()
-            self._send_json(503, {
-                "ok": False,
-                "error": "kimi_unavailable",
-                "reason": "Kimi 暂时无法建立安全会话，请稍后重试。",
-            })
+            self._send_json(503, {"ok": False, "error": "kimi_unavailable"})
             return
         except Exception:
-            with self.state.kimi_turn_lock:
-                if self.state.kimi_prepare_token == prepare_token:
-                    self.state.kimi_prepare_token = ""
+            self._release_kimi_control(prepare_token)
             logger.exception("Kimi ACP prepare crashed")
             self.state.kimi_acp.close()
-            self._send_json(503, {
-                "ok": False,
-                "error": "kimi_unavailable",
-                "reason": "Kimi 暂时无法建立安全会话，请稍后重试。",
-            })
+            self._send_json(503, {"ok": False, "error": "kimi_unavailable"})
             return
 
         with self.state.kimi_turn_lock:
-            if (
-                self.state.kimi_prepare_token != prepare_token
-                or self.state.kimi_active_turn
-            ):
-                if self.state.kimi_prepare_token == prepare_token:
-                    self.state.kimi_prepare_token = ""
+            if self.state.kimi_prepare_token != prepare_token or self.state.kimi_active_turn:
+                self._release_kimi_control(prepare_token)
                 self.state.kimi_acp.close()
                 self._send_json(409, {
                     "ok": False,
@@ -9165,22 +9455,21 @@ class PushHandler(BaseHTTPRequestHandler):
                     text=text,
                     source=self._source_for_request("kimi"),
                     quoted_ts=quoted_ts,
+                    metadata=metadata,
                 )
             except Exception:
                 logger.exception("Kimi history append failed")
-                self.state.kimi_prepare_token = ""
+                self._release_kimi_control(prepare_token)
                 self.state.kimi_acp.close()
-                self._send_json(500, {
-                    "ok": False,
-                    "error": "kimi_history_unavailable",
-                    "reason": "Kimi 消息暂时无法安全保存，请稍后重试。",
-                })
+                self._send_json(500, {"ok": False, "error": "kimi_history_unavailable"})
                 return
             cancel_event = threading.Event()
             self.state.kimi_active_turn = {
                 "user_ts": str(rec.get("ts") or ""),
                 "cancel_event": cancel_event,
                 "session_id": session_id,
+                "model": model,
+                "reasoning_effort": effort,
             }
             self.state.kimi_prepare_token = ""
             self._set_typing_for_contact(contact_id, {
@@ -9193,29 +9482,101 @@ class PushHandler(BaseHTTPRequestHandler):
                 user_ts=rec["ts"],
                 queued_at=rec["ts"],
                 source="cc-app:kimi",
+                session_id=session_id,
             )
+
+        recall_result = self._kimi_semantic_recall(text, session_id=session_id)
+        if recall_result is not None:
+            self._append_kimi_recall_card(
+                chat,
+                recall_result,
+                user_ts=str(rec.get("ts") or ""),
+                session_id=session_id,
+            )
+        recall_context = str(getattr(recall_result, "context", "") or "").strip()
+        prompt = self._kimi_prompt(
+            text,
+            link_context=link_bundle.prompt_context,
+            recall_context=recall_context,
+            xhs_login_card_allowed=xhs_login_card_allowed,
+        )
 
         def worker() -> None:
             chunks: list[str] = []
             last_published = 0.0
             terminalized = False
+            activity_count = 0
+            activity_items: list[str] = []
+            worker_activity_items: list[dict[str, Any]] = []
+            activity_labels_seen: set[str] = set()
 
-            def append_assistant_safely(message: str, source: str) -> str:
+            def terminalize_workers(status: str) -> None:
+                terminalized_workers = self._terminalize_worker_activity_items(worker_activity_items, status)
+                worker_activity_items[:] = terminalized_workers
+
+            def append_worker_history() -> None:
+                for item in self._sanitize_worker_activity_items(worker_activity_items):
+                    status = str(item.get("status") or "running")
+                    status_text = {
+                        "running": "进行中", "completed": "已完成",
+                        "interrupted": "已中断", "failed": "失败",
+                    }.get(status, "进行中")
+                    try:
+                        chat.append(
+                            role="task",
+                            text=f"{item['name']} 忙活了 {max(1, int(item['count']))} 下 · {status_text}",
+                            source="kimi-acp:worker",
+                            metadata={
+                                "worker_activity": True,
+                                "kimi_user_ts": str(rec.get("ts") or ""),
+                                "worker_id": str(item["worker_id"]),
+                                "status": status,
+                                "count": max(0, int(item["count"])),
+                            },
+                        )
+                    except Exception:
+                        logger.exception("Kimi worker activity history append failed")
+
+            def append_assistant_safely(
+                message: str,
+                source: str,
+                *,
+                allow_xhs_login_card: bool = False,
+            ) -> str:
                 try:
+                    visible_message, xhs_login_card = self._kimi_extract_xhs_login_card(
+                        message,
+                        allowed=allow_xhs_login_card,
+                    )
+                    assistant_metadata = {"kimi_user_ts": str(rec.get("ts") or "")}
+                    if xhs_login_card:
+                        assistant_metadata["xhs_login_card"] = True
                     final = chat.append(
                         role="assistant",
-                        text=message,
+                        text=visible_message,
                         source=source,
-                        metadata={"kimi_user_ts": str(rec.get("ts") or "")},
+                        metadata=assistant_metadata,
                     )
                     return str(final.get("ts") or "")
                 except Exception:
                     logger.exception("Kimi assistant history append failed")
                     return ""
 
-            def set_completed(message: str, source: str) -> None:
+            def set_completed(
+                message: str,
+                source: str,
+                *,
+                status: str = "completed",
+                allow_xhs_login_card: bool = False,
+            ) -> None:
                 nonlocal terminalized
-                final_ts = append_assistant_safely(message, source)
+                terminalize_workers(status)
+                append_worker_history()
+                final_ts = append_assistant_safely(
+                    message,
+                    source,
+                    allow_xhs_login_card=allow_xhs_login_card,
+                )
                 self._set_chat_completed(
                     contact_id,
                     user_ts=rec["ts"],
@@ -9234,31 +9595,86 @@ class PushHandler(BaseHTTPRequestHandler):
                         contact_id,
                         "".join(chunks),
                         source="cc-app:kimi",
+                        session_id=session_id,
                         user_ts=rec["ts"],
                         queued_at=rec["ts"],
+                        activity_text=activity_items[-1] if activity_items else "",
+                        activity_count=activity_count,
+                        activity_items=activity_items,
+                        worker_activity_items=worker_activity_items,
                     )
                     last_published = now
 
+            def on_activity(event: dict[str, Any]) -> None:
+                nonlocal activity_count
+                if not isinstance(event, dict):
+                    return
+                if event.get("kind") == "collaboration_worker":
+                    worker_id = str(event.get("worker_id") or "kimi-subagent")
+                    current = next((item for item in worker_activity_items if item.get("worker_id") == worker_id), None)
+                    if current is None:
+                        current = {"worker_id": worker_id, "name": "Kimi 协作 worker", "status": "running", "count": 0}
+                        worker_activity_items.append(current)
+                    status = str(event.get("status") or "running")
+                    if status in {"running", "completed", "failed", "interrupted"}:
+                        current["status"] = status
+                    delta = max(0, int(event.get("count_delta") or 0))
+                    if delta:
+                        current["count"] = max(0, int(current.get("count") or 0) + delta)
+                        activity_count += delta
+                    self._set_chat_activity(
+                        contact_id,
+                        activity_text="Kimi 正在协作",
+                        activity_count=activity_count,
+                        activity_items=activity_items,
+                        worker_activity_items=worker_activity_items,
+                        user_ts=rec["ts"],
+                    )
+                    return
+                label = str(event.get("label") or "")
+                if label not in {"正在思考", "正在使用工具"}:
+                    return
+                # Each already-sanitized ACP thought/tool event is one unit of
+                # work. The visible activity vocabulary may stay de-duplicated
+                # without making several tool calls look like one operation.
+                activity_count += 1
+                if label not in activity_labels_seen:
+                    activity_labels_seen.add(label)
+                    activity_items.append(label)
+                self._set_chat_activity(
+                    contact_id,
+                    activity_text=label,
+                    activity_count=activity_count,
+                    activity_items=activity_items,
+                    worker_activity_items=worker_activity_items,
+                    user_ts=rec["ts"],
+                )
+
             try:
                 self.state.kimi_acp.prompt_existing(
-                    text,
+                    prompt,
                     session_id=session_id,
                     turn_id=str(rec.get("ts") or ""),
                     on_update=on_update,
+                    on_activity=on_activity,
                     cancel_event=cancel_event,
                 )
-                answer = "".join(chunks).strip()
-                if not answer:
-                    answer = "Kimi 没有返回可展示内容。"
-                set_completed(answer, "kimi-acp")
+                if recall_result is not None:
+                    self._commit_kimi_recall(recall_result, session_id)
+                answer = "".join(chunks).strip() or "Kimi 没有返回可展示内容。"
+                set_completed(
+                    answer,
+                    "kimi-acp",
+                    allow_xhs_login_card=xhs_login_card_allowed,
+                )
             except KimiACPCancelled:
+                terminalize_workers("interrupted")
+                append_worker_history()
                 partial = "".join(chunks).strip()
-                final_ts = ""
-                if partial:
-                    final_ts = append_assistant_safely(
-                        partial + "\n\n*[已停止生成]*",
-                        "kimi-acp:interrupted",
-                    )
+                final_ts = append_assistant_safely(
+                    partial + "\n\n*[已停止生成]*" if partial else "已中断当前生成。",
+                    "kimi-acp:interrupted",
+                )
                 self._set_chat_interrupted(
                     contact_id,
                     user_ts=rec["ts"],
@@ -9268,31 +9684,21 @@ class PushHandler(BaseHTTPRequestHandler):
                 )
                 terminalized = True
             except KimiACPAuthRequired:
-                set_completed(
-                    "Kimi 还没有完成登录。请先在 VPS 终端运行 `kimi login`，登录后再发一次。",
-                    "kimi-acp:auth-required",
-                )
+                set_completed("Kimi 还没有完成登录。请先完成登录后再发一次。", "kimi-acp:auth-required", status="failed")
             except (KimiACPBusy, KimiACPError) as exc:
                 logger.warning("Kimi ACP turn failed: %s", type(exc).__name__)
-                set_completed(
-                    "Kimi 这次没有成功回复。请稍后重试；原消息已经保留。",
-                    "kimi-acp:error",
-                )
+                set_completed("Kimi 这次没有成功回复。请稍后重试；原消息已经保留。", "kimi-acp:error", status="failed")
             except Exception:
                 logger.exception("Kimi ACP worker failed")
-                set_completed(
-                    "Kimi 接入进程异常退出。请稍后重试；原消息已经保留。",
-                    "kimi-acp:error",
-                )
+                set_completed("Kimi 接入进程异常退出。请稍后重试；原消息已经保留。", "kimi-acp:error", status="failed")
             finally:
                 if not terminalized:
-                    # History persistence is allowed to fail, but lifecycle
-                    # state must never remain "generating" indefinitely.
                     try:
-                        self._set_chat_completed(
+                        terminalize_workers("failed")
+                        append_worker_history()
+                        self._set_chat_failed(
                             contact_id,
                             user_ts=rec["ts"],
-                            final_ts="",
                             source="kimi-acp:error",
                             session_id=session_id,
                         )
@@ -9337,6 +9743,59 @@ class PushHandler(BaseHTTPRequestHandler):
             return float(tokens) / float(limit)
         return 0.0
 
+    @staticmethod
+    def _kimi_quota_windows(raw: Any) -> list[dict[str, Any]]:
+        """Normalize Kimi's varying quota payload into the Android DTO.
+
+        The original ``quota`` field remains for existing clients. This
+        projection is bounded and never passes provider-specific nested data
+        through to the App.
+        """
+        if not isinstance(raw, dict):
+            return []
+        candidates: Any = raw.get("windows") or raw.get("limits") or raw.get("items")
+        if not isinstance(candidates, list):
+            candidates = [raw] if any(key in raw for key in ("remaining", "total", "limit")) else []
+        windows: list[dict[str, Any]] = []
+        for index, item in enumerate(candidates[:6], start=1):
+            if not isinstance(item, dict):
+                continue
+            label = re.sub(r"[\x00-\x1f\x7f]", "", str(
+                item.get("label") or item.get("name") or item.get("type") or f"配额 {index}"
+            )).strip()[:80] or f"配额 {index}"
+            try:
+                remaining = float(item.get("remaining"))
+            except (TypeError, ValueError):
+                remaining = None
+            try:
+                total = float(item.get("total", item.get("limit")))
+            except (TypeError, ValueError):
+                total = None
+            try:
+                percent = float(item.get("remaining_percent"))
+            except (TypeError, ValueError):
+                percent = None
+            if percent is None and remaining is not None and total is not None and total > 0:
+                percent = remaining / total * 100
+            if percent is None:
+                percent = 0.0
+            percent = max(0.0, min(100.0, percent))
+            reset_text = re.sub(r"[\x00-\x1f\x7f]", "", str(
+                item.get("reset_text") or item.get("reset_at") or item.get("resetsAt") or ""
+            )).strip()[:120]
+            text = (
+                f"剩余 {max(0, int(remaining))}/{max(0, int(total))}"
+                if remaining is not None and total is not None and total >= 0
+                else f"剩余 {round(percent, 1)}%"
+            )
+            windows.append({
+                "label": label,
+                "text": text,
+                "reset_text": reset_text,
+                "remaining_percent": round(percent, 2),
+            })
+        return windows
+
     def _kimi_quota_snapshot(self) -> dict[str, Any]:
         """Return the managed-account quota snapshot, or an empty dict on error."""
         try:
@@ -9350,6 +9809,8 @@ class PushHandler(BaseHTTPRequestHandler):
         self,
         session_id: str,
         *,
+        model: str = KIMI_APP_DEFAULT_MODEL,
+        reasoning_effort: str = KIMI_APP_DEFAULT_EFFORT,
         cancel_event: threading.Event | None = None,
     ) -> tuple[str, bool]:
         """Auto-forge if context usage is above the configured threshold.
@@ -9368,6 +9829,8 @@ class PushHandler(BaseHTTPRequestHandler):
             threshold * 100,
         )
         new_session_id, _summary = self.state.kimi_acp.forge_new_session(
+            model=model,
+            reasoning_effort=reasoning_effort,
             cancel_event=cancel_event,
         )
         logger.info("Kimi forged new session %s", new_session_id)
@@ -10594,6 +11057,252 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.exception("codex/sessions failed")
             self._send_json(500, {"ok": False, "error": str(e)})
 
+    def _kimi_busy(self) -> bool:
+        with self.state.kimi_turn_lock:
+            return bool(
+                self.state.kimi_active_turn
+                or self.state.kimi_prepare_token
+                or bool(getattr(self.state.kimi_acp, "busy", False))
+            )
+
+    def _reserve_kimi_control(self, action: str) -> str | None:
+        """Reserve the ACP lifecycle without holding a lock across I/O."""
+        with self.state.kimi_turn_lock:
+            if (
+                self.state.kimi_active_turn
+                or self.state.kimi_prepare_token
+                or bool(getattr(self.state.kimi_acp, "busy", False))
+            ):
+                self._send_json(409, {
+                    "ok": False,
+                    "error": "kimi_busy",
+                    "reason": "Kimi 正在处理另一项操作，请稍后重试。",
+                })
+                return None
+            token = f"control:{action}:{secrets.token_hex(16)}"
+            self.state.kimi_prepare_token = token
+            return token
+
+    def _release_kimi_control(self, token: str) -> None:
+        with self.state.kimi_turn_lock:
+            if self.state.kimi_prepare_token == token:
+                self.state.kimi_prepare_token = ""
+
+    def _kimi_preferences_payload(self) -> dict[str, Any]:
+        model, effort = self.state.kimi_preferences.snapshot()
+        models = self.state.kimi_preferences.payload_models()
+        return {
+            "ok": True,
+            "provider": "Kimi Code",
+            "models": models,
+            # Keep the simple compatibility list primitive-only. Structured
+            # per-model capabilities remain under ``models``.
+            "available_models": [
+                str(item.get("id") or "")
+                for item in models
+                if isinstance(item, dict) and str(item.get("id") or "")
+            ],
+            "available_reasoning_efforts": ["low", "high", "max"],
+            "available_efforts": ["low", "high", "max"],
+            "selection": {"model": model, "reasoning_effort": effort},
+            "model": model,
+            "reasoning_effort": effort,
+            "busy": self._kimi_busy(),
+            "applies_from": "next_session_prepare",
+        }
+
+    def _handle_kimi_preferences_get(self) -> None:
+        self._send_json(200, self._kimi_preferences_payload())
+
+    def _handle_kimi_preferences_post(self, body: dict[str, Any]) -> None:
+        try:
+            self.state.kimi_preferences.save_validated(
+                str(body.get("model") or ""),
+                str(body.get("reasoning_effort") or ""),
+            )
+        except KimiPreferenceError:
+            self._send_json(400, {
+                "ok": False,
+                "error": "invalid_kimi_selection",
+                "message": "model 必须来自本机 Kimi Code 配置的 App allowlist，effort 仅支持 low/high/max。",
+            })
+            return
+        except KimiPreferencePersistenceError:
+            logger.exception("persist Kimi preferences failed")
+            self._send_json(500, {
+                "ok": False,
+                "error": "kimi_preferences_persistence_failed",
+            })
+            return
+        self._send_json(200, self._kimi_preferences_payload())
+
+    def _kimi_selection(self) -> tuple[str, str]:
+        store = getattr(self.state, "kimi_preferences", None)
+        snapshot = getattr(store, "snapshot", None)
+        if callable(snapshot):
+            return snapshot()
+        # Compatibility for minimal in-process test doubles only. The real
+        # ServerState always constructs KimiPreferenceStore above.
+        return KIMI_APP_DEFAULT_MODEL, KIMI_APP_DEFAULT_EFFORT
+
+    def _prepare_kimi_selected_session(self, model: str, effort: str) -> str:
+        """Pin and read back one selection; ACP itself is the authority."""
+        acp = self.state.kimi_acp
+        try:
+            session_id = acp.prepare_session(model=model, reasoning_effort=effort)
+        except TypeError:
+            # Old narrow fake clients had no keyword parameters. Do not use
+            # this branch for a real KimiACPClient, which always accepts them.
+            if callable(getattr(acp, "prepared_selection", None)):
+                raise
+            session_id = acp.prepare_session()
+        confirmed = getattr(acp, "prepared_selection", None)
+        if callable(confirmed) and confirmed(session_id) != (model, effort):
+            raise KimiACPError("Kimi ACP selection was not read back")
+        return str(session_id or "")
+
+    def _kimi_control_error(self, exc: Exception) -> None:
+        if isinstance(exc, KimiACPAuthRequired):
+            self._send_json(503, {"ok": False, "error": "kimi_auth_required"})
+            return
+        logger.warning("Kimi control action failed: %s", type(exc).__name__)
+        self._send_json(503, {"ok": False, "error": "kimi_unavailable"})
+
+    def _handle_kimi_sessions(self) -> None:
+        try:
+            active_session_id = str(self.state.kimi_acp.load_session_id() or "")
+            records = self.state.kimi_acp.list_local_sessions(limit=48)
+        except Exception:
+            logger.warning("Kimi local session listing failed", exc_info=True)
+            self._send_json(503, {"ok": False, "error": "kimi_sessions_unavailable"})
+            return
+        sessions: list[dict[str, Any]] = []
+        known: set[str] = set()
+        for item in records:
+            session_id = str(item.get("session_id") or "")
+            if not session_id or session_id in known:
+                continue
+            known.add(session_id)
+            try:
+                updated_at = max(0, int(item.get("updated_at") or 0))
+            except (TypeError, ValueError):
+                updated_at = 0
+            mtime_iso = ""
+            if updated_at:
+                try:
+                    mtime_iso = datetime.fromtimestamp(updated_at / 1000, timezone.utc).isoformat()
+                except (OverflowError, OSError, ValueError):
+                    mtime_iso = ""
+            # Do not pass through a raw ACP/web session object: no cwd,
+            # title/prompt, token, agent or implementation metadata leaves.
+            sessions.append({
+                "id": session_id,
+                "session_id": session_id,
+                "updated_at": updated_at,
+                "mtime_iso": mtime_iso,
+                "active": session_id == active_session_id,
+                "is_active": session_id == active_session_id,
+            })
+        self._send_json(200, {
+            "ok": True,
+            "provider": "Kimi Code",
+            "sessions": sessions,
+            "active_session_id": active_session_id or None,
+        })
+
+    def _handle_kimi_new_session(self, _body: dict[str, Any]) -> None:
+        token = self._reserve_kimi_control("new_session")
+        if token is None:
+            return
+        try:
+            model, effort = self._kimi_selection()
+            session_id = self.state.kimi_acp.new_session(model=model, reasoning_effort=effort)
+            confirmed = self.state.kimi_acp.prepared_selection(session_id)
+            if confirmed != (model, effort):
+                raise KimiACPError("Kimi ACP selection was not read back")
+        except Exception as exc:
+            self._kimi_control_error(exc)
+            return
+        finally:
+            self._release_kimi_control(token)
+        self._send_json(200, {
+            "ok": True,
+            "active_session_id": session_id,
+            "model": model,
+            "reasoning_effort": effort,
+        })
+
+    def _handle_kimi_switch_session(self, body: dict[str, Any]) -> None:
+        session_id = str(body.get("session_id") or body.get("sessionId") or "").strip()
+        if not session_id:
+            self._send_json(400, {"ok": False, "error": "session_id required"})
+            return
+        token = self._reserve_kimi_control("switch_session")
+        if token is None:
+            return
+        try:
+            allowed = {
+                str(item.get("session_id") or "")
+                for item in self.state.kimi_acp.list_local_sessions(limit=96)
+            }
+            if session_id not in allowed:
+                self._send_json(404, {"ok": False, "error": "unknown_kimi_session"})
+                return
+            model, effort = self._kimi_selection()
+            loaded_session_id = self.state.kimi_acp.prepare_existing_session(
+                session_id,
+                model=model,
+                reasoning_effort=effort,
+            )
+            if loaded_session_id != session_id:
+                raise KimiACPError("Kimi ACP loaded an unexpected session")
+            if self.state.kimi_acp.prepared_selection(session_id) != (model, effort):
+                raise KimiACPError("Kimi ACP selection was not read back")
+        except Exception as exc:
+            self._kimi_control_error(exc)
+            return
+        finally:
+            self._release_kimi_control(token)
+        self._send_json(200, {
+            "ok": True,
+            "active_session_id": session_id,
+            "model": model,
+            "reasoning_effort": effort,
+        })
+
+    def _handle_kimi_forge(self, _body: dict[str, Any]) -> None:
+        token = self._reserve_kimi_control("forge")
+        if token is None:
+            return
+        old_session_id = str(self.state.kimi_acp.load_session_id() or "")
+        if not old_session_id:
+            self._release_kimi_control(token)
+            self._send_json(400, {"ok": False, "error": "no_active_kimi_session"})
+            return
+        model, effort = self._kimi_selection()
+
+        def worker() -> None:
+            try:
+                new_session_id, _summary = self.state.kimi_acp.forge_new_session(
+                    model=model,
+                    reasoning_effort=effort,
+                )
+                if self.state.kimi_acp.prepared_selection(new_session_id) != (model, effort):
+                    raise KimiACPError("Kimi ACP selection was not read back")
+            except Exception:
+                logger.warning("Kimi forge failed", exc_info=True)
+            finally:
+                self._release_kimi_control(token)
+
+        threading.Thread(target=worker, name="kimi-acp-forge", daemon=True).start()
+        self._send_json(202, {
+            "ok": True,
+            "active_session_id": old_session_id,
+            "model": model,
+            "reasoning_effort": effort,
+            "busy": True,
+        })
+
     def _handle_kimi_status(self):
         """GET /kimi/status — return quota and current session context usage."""
         try:
@@ -10610,6 +11319,11 @@ class PushHandler(BaseHTTPRequestHandler):
             pass
 
         quota = self._kimi_quota_snapshot()
+        quota_windows = self._kimi_quota_windows(quota)
+        quota_text = (
+            " · ".join(str(item.get("text") or "") for item in quota_windows if item.get("text"))
+            or "配额信息暂不可用"
+        )
         context_usage = 0.0
         context_tokens = 0
         max_context_tokens = 0
@@ -10625,15 +11339,54 @@ class PushHandler(BaseHTTPRequestHandler):
                 logger.warning("Kimi status context query failed: %s", exc)
 
         active_turn = dict(self.state.kimi_active_turn)
+        preference_store = getattr(self.state, "kimi_preferences", None)
+        snapshot = getattr(preference_store, "snapshot", None)
+        if callable(snapshot):
+            model, effort = snapshot()
+        else:
+            model, effort = KIMI_APP_DEFAULT_MODEL, KIMI_APP_DEFAULT_EFFORT
+        prepared = getattr(self.state.kimi_acp, "prepared_selection", None)
+        if callable(prepared):
+            confirmed = prepared(session_id)
+            if isinstance(confirmed, tuple) and len(confirmed) == 2 and confirmed[0] and confirmed[1]:
+                model, effort = confirmed
+        context_text = (
+            f"已使用 {round(context_usage * 100, 2)}%"
+            if max_context_tokens else "上下文使用情况暂不可用"
+        )
         self._send_json(200, {
             "ok": True,
             "session_id": session_id,
+            "active_session_id": session_id or None,
+            "provider": "Kimi Code",
+            "model": model,
+            "reasoning_effort": effort,
+            # Android's DTO consumes these boolean controls. Do not overload
+            # this with the chat-contact capability list below.
+            "capabilities": {
+                "new_session": True,
+                "switch_session": True,
+                "forge": True,
+            },
+            "capability_names": [
+                "chat", "history", "draft", "busy", "stop",
+                "kimi_model_preferences", "kimi_session_control", "kimi_memory_recall",
+            ],
+            "context": {
+                "available": bool(session_id and max_context_tokens),
+                "used_percent": round(context_usage * 100, 2),
+                "input_tokens": context_tokens,
+                "window_tokens": max_context_tokens,
+                "text": context_text,
+            },
             "context_usage": round(context_usage, 6),
             "context_tokens": context_tokens,
             "max_context_tokens": max_context_tokens,
             "context_usage_percent": round(context_usage * 100, 2),
-            "quota": quota,
-            "busy": bool(active_turn),
+            # The normalized quota DTO is deliberately bounded; raw provider
+            # payloads can contain account/session metadata and never leave.
+            "quota": {"text": quota_text, "windows": quota_windows},
+            "busy": bool(active_turn or getattr(self.state, "kimi_prepare_token", "") or getattr(self.state.kimi_acp, "busy", False)),
             "auto_forge_threshold": self.state.kimi_auto_forge_context_threshold,
         })
 
@@ -13587,6 +14340,7 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(401, {"error": "auth required"})
             return
         body = dict(body)
+        kimi_had_metadata = "metadata" in body
         clean_append_metadata = sanitize_voice_metadata(body.get("metadata"))
         if clean_append_metadata is None:
             body.pop("metadata", None)
@@ -13613,6 +14367,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 or not isinstance(text_in, str)
                 or not text_in.strip()
                 or has_non_plain_fields
+                or kimi_had_metadata
             ):
                 self._send_json(415, {
                     "ok": False,

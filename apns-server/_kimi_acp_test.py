@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from kimi_acp import (
     DEFAULT_KIMI_CWD,
@@ -472,7 +473,6 @@ class KimiACPProtocolTest(unittest.TestCase):
                 "session/load",
                 "session/set_config_option",
                 "session/new",
-                "session/load",
                 "session/set_config_option",
             ],
             [method for method, _params in calls],
@@ -489,6 +489,247 @@ class KimiACPProtocolTest(unittest.TestCase):
         self.assertEqual("new-session", client._app_model_session_id)
         self.assertEqual("new-session", prompt_calls[1][1])
         self.assertTrue(prompt_calls[1][0].startswith("【上下文继承】"))
+
+    def test_preference_change_on_loaded_session_reloads_options_and_confirms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "workspace"
+            cwd.mkdir()
+            client = KimiACPClient(state_path=root / "session.json", cwd=cwd)
+            client._save_session_id("same-session")
+            client._start = lambda: None
+            client._process_alive = lambda: True
+            client._loaded_session_id = "same-session"
+            client._app_model_session_id = "same-session"
+            client._app_effort_session_id = "same-session"
+            client._prepared_selection["same-session"] = (KIMI_APP_MODEL, "high")
+            options = [
+                {
+                    "id": "model", "currentValue": KIMI_APP_MODEL,
+                    "options": [{"value": KIMI_APP_MODEL}, {"value": "kimi-code/k3"}],
+                },
+                {
+                    "id": "thinking_effort", "currentValue": "high",
+                    "options": [{"value": "low"}, {"value": "high"}],
+                },
+            ]
+            calls = []
+
+            def request(method, params, **_kwargs):
+                calls.append((method, params))
+                if method == "session/load":
+                    return {"sessionId": "same-session", "configOptions": options}
+                if params["configId"] == "model":
+                    return {"configOptions": [
+                        {**options[0], "currentValue": "kimi-code/k3"}, options[1],
+                    ]}
+                if params["configId"] == "thinking_effort":
+                    return {"configOptions": [
+                        {**options[0], "currentValue": "kimi-code/k3"},
+                        {**options[1], "currentValue": "low"},
+                    ]}
+                raise AssertionError(method)
+
+            client._request = request
+            self.assertEqual(
+                "same-session",
+                client.prepare_session(model="kimi-code/k3", reasoning_effort="low"),
+            )
+            self.assertEqual(("kimi-code/k3", "low"), client.prepared_selection("same-session"))
+            self.assertEqual(
+                ["session/load", "session/set_config_option", "session/set_config_option"],
+                [method for method, _params in calls],
+            )
+
+    def test_failed_partial_selection_forces_a_fresh_readback_before_reusing_old_values(self):
+        """A failed effort pin cannot leave a stale model confirmation cached."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "workspace"
+            cwd.mkdir()
+            client = KimiACPClient(state_path=root / "session.json", cwd=cwd)
+            client._save_session_id("same-session")
+            client._start = lambda: None
+            client._process_alive = lambda: True
+            client._loaded_session_id = "same-session"
+            client._app_model_session_id = "same-session"
+            client._app_effort_session_id = "same-session"
+            client._prepared_selection["same-session"] = (KIMI_APP_MODEL, "high")
+            remote = {"model": KIMI_APP_MODEL, "effort": "high"}
+            methods: list[str] = []
+
+            def options():
+                return [
+                    {
+                        "id": "model", "currentValue": remote["model"],
+                        "options": [{"value": KIMI_APP_MODEL}, {"value": "kimi-code/k3"}],
+                    },
+                    {
+                        "id": "thinking_effort", "currentValue": remote["effort"],
+                        "options": [{"value": "low"}, {"value": "high"}],
+                    },
+                ]
+
+            def request(method, params, **_kwargs):
+                methods.append(method)
+                if method == "session/load":
+                    return {"sessionId": "same-session", "configOptions": options()}
+                if method == "session/set_config_option":
+                    if params["configId"] == "model":
+                        remote["model"] = params["value"]
+                    elif params["configId"] == "thinking_effort":
+                        # The remote accepts the model change but fails to
+                        # confirm the new effort, modelling a partial ACP
+                        # mutation before the local operation raises.
+                        self.assertEqual("low", params["value"])
+                    return {"configOptions": options()}
+                raise AssertionError(method)
+
+            client._request = request
+            with self.assertRaises(KimiACPError):
+                client.prepare_session(model="kimi-code/k3", reasoning_effort="low")
+
+            self.assertEqual("kimi-code/k3", remote["model"])
+            self.assertIsNone(client.prepared_selection("same-session"))
+            self.assertEqual("", client._app_model_session_id)
+            self.assertEqual("", client._app_effort_session_id)
+
+            self.assertEqual(
+                "same-session",
+                client.prepare_session(model=KIMI_APP_MODEL, reasoning_effort="high"),
+            )
+            self.assertEqual((KIMI_APP_MODEL, "high"), client.prepared_selection("same-session"))
+            self.assertEqual(2, methods.count("session/load"))
+            self.assertEqual(KIMI_APP_MODEL, remote["model"])
+
+    def test_failed_selection_never_commits_candidate_pointer(self):
+        options_without_app_model = [{
+            "id": "model", "currentValue": "kimi-code/k3",
+            "options": [{"value": "kimi-code/k3"}],
+        }]
+
+        def build_client(root: Path, pointer: str = ""):
+            cwd = root / "workspace"
+            cwd.mkdir()
+            client = KimiACPClient(state_path=root / "session.json", cwd=cwd)
+            if pointer:
+                client._save_session_id(pointer)
+            client._start = lambda: None
+            return client
+
+        with self.subTest(path="new"):
+            with tempfile.TemporaryDirectory() as tmp:
+                client = build_client(Path(tmp))
+                client._request = lambda method, _params, **_kwargs: {
+                    "sessionId": "candidate-new", "configOptions": options_without_app_model,
+                } if method == "session/new" else self.fail(method)
+                with self.assertRaises(KimiACPError):
+                    client.prepare_session()
+                self.assertEqual("", client.load_session_id())
+
+        with self.subTest(path="load"):
+            with tempfile.TemporaryDirectory() as tmp:
+                client = build_client(Path(tmp), "old-session")
+                client._request = lambda method, params, **_kwargs: {
+                    "sessionId": params["sessionId"], "configOptions": options_without_app_model,
+                } if method == "session/load" else self.fail(method)
+                with self.assertRaises(KimiACPError):
+                    client.prepare_session()
+                self.assertEqual("old-session", client.load_session_id())
+
+        with self.subTest(path="switch"):
+            with tempfile.TemporaryDirectory() as tmp:
+                client = build_client(Path(tmp), "old-session")
+                client._request = lambda method, params, **_kwargs: {
+                    "sessionId": params["sessionId"], "configOptions": options_without_app_model,
+                } if method == "session/load" else self.fail(method)
+                with self.assertRaises(KimiACPError):
+                    client.prepare_existing_session(
+                        "candidate-switch", model=KIMI_APP_MODEL, reasoning_effort="high",
+                    )
+                self.assertEqual("old-session", client.load_session_id())
+
+        with self.subTest(path="forge"):
+            with tempfile.TemporaryDirectory() as tmp:
+                client = build_client(Path(tmp), "old-session")
+                client._process_alive = lambda: True
+                old_options = [{
+                    "id": "model", "currentValue": KIMI_APP_MODEL,
+                    "options": [{"value": KIMI_APP_MODEL}],
+                }]
+
+                def request(method, params, **_kwargs):
+                    if method == "session/load":
+                        return {"sessionId": params["sessionId"], "configOptions": old_options}
+                    if method == "session/new":
+                        return {"sessionId": "candidate-forge", "configOptions": options_without_app_model}
+                    raise AssertionError(method)
+
+                client._request = request
+                client._prompt_and_collect_text = lambda *_args, **_kwargs: "summary"
+                with self.assertRaises(KimiACPError):
+                    client.forge_new_session()
+                self.assertEqual("old-session", client.load_session_id())
+
+    def test_invalid_acp_session_ids_are_rejected_before_pointer_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "workspace"
+            cwd.mkdir()
+            client = KimiACPClient(state_path=root / "session.json", cwd=cwd)
+            client._request = lambda method, _params, **_kwargs: {
+                "sessionId": "../../not-a-session", "configOptions": [],
+            } if method == "session/new" else self.fail(method)
+            with self.assertRaises(KimiACPError):
+                client._new_or_load_session()
+            self.assertEqual("", client.load_session_id())
+
+            client._save_session_id("old-session")
+            client._request = lambda method, _params, **_kwargs: {
+                "sessionId": "invalid/id", "configOptions": [],
+            } if method == "session/load" else self.fail(method)
+            with self.assertRaises(KimiACPError):
+                client._new_or_load_session()
+            self.assertEqual("old-session", client.load_session_id())
+
+    def test_list_local_sessions_accepts_legacy_and_workdir_formats_without_leaking_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "workspace"
+            cwd.mkdir()
+            sessions_root = root / ".kimi-code" / "sessions" / "wd_test"
+            legacy = sessions_root / "session_legacy-id" / "state.json"
+            current = sessions_root / "session_current-id" / "state.json"
+            zero = sessions_root / "session_zero-id" / "state.json"
+            foreign = sessions_root / "session_foreign-id" / "state.json"
+            invalid = sessions_root / "session_bad!id" / "state.json"
+            for state_file in (legacy, current, zero, foreign, invalid):
+                state_file.parent.mkdir(parents=True, exist_ok=True)
+            legacy.write_text(json.dumps({
+                "id": "legacy-id", "cwd": str(cwd), "updatedAt": 1_700_000_000_000,
+                "title": "do not expose", "lastPrompt": "do not expose",
+            }), encoding="utf-8")
+            current.write_text(json.dumps({
+                "workDir": str(cwd), "updatedAt": "2026-08-16T01:02:03Z",
+                "agents": ["do not expose"],
+            }), encoding="utf-8")
+            zero.write_text(json.dumps({"workDir": str(cwd), "updatedAt": "not-a-date"}), encoding="utf-8")
+            foreign.write_text(json.dumps({"workDir": str(root / "other"), "updatedAt": "bad"}), encoding="utf-8")
+            invalid.write_text(json.dumps({"workDir": str(cwd), "updatedAt": "bad"}), encoding="utf-8")
+
+            client = KimiACPClient(state_path=root / "pointer.json", cwd=cwd)
+            with patch("kimi_acp.Path.home", return_value=root):
+                records = client.list_local_sessions()
+
+            self.assertEqual(
+                ["current-id", "legacy-id", "zero-id"],
+                [item["session_id"] for item in records],
+            )
+            self.assertGreater(records[0]["updated_at"], records[1]["updated_at"])
+            self.assertEqual(0, records[-1]["updated_at"])
+            self.assertNotIn("title", str(records))
+            self.assertNotIn("lastPrompt", str(records))
+            self.assertNotIn("agents", str(records))
 
     def test_close_clears_app_model_cache_before_same_session_is_prepared_again(self):
         client = KimiACPClient(state_path="/tmp/unused-kimi-test-state")

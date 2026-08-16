@@ -756,6 +756,17 @@ class WebPwaContractTest(unittest.TestCase):
         handler.do_POST()
         self.assertEqual(called, [{"contact_id": "kairos", "user_ts": "turn-1"}])
 
+    def test_do_post_allows_fenced_kimi_stop_without_tmux_switch(self):
+        handler = self.handler("/chat/stop", "POST")
+        handler.state = types.SimpleNamespace(allow_remote_control=False)
+        handler._check_ip_allowed = lambda: True
+        handler._require_write_auth = lambda: True
+        handler._read_body = lambda: {"contact_id": "kimi", "user_ts": "turn-1"}
+        called = []
+        handler._handle_chat_stop = lambda body: called.append(body)
+        handler.do_POST()
+        self.assertEqual(called, [{"contact_id": "kimi", "user_ts": "turn-1"}])
+
     def test_do_post_keeps_xiaoke_stop_behind_remote_control_gate(self):
         handler = self.handler("/chat/stop", "POST")
         handler.state = types.SimpleNamespace(allow_remote_control=False)
