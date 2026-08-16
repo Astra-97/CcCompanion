@@ -106,8 +106,8 @@ allowed_ips = []
 # kimi_bin = "/root/.kimi-code/bin/kimi"
 # Keep Kimi/卡拉米 in a workspace that does not inherit Kairos's AGENTS.md.
 # kimi_cwd = "/root/Karami-Workspace"
-# The App session pins ACP's per-session model to Kimi's coding high-speed
-# model; this does not change Kimi Code's global config.toml.
+# The App session pins ACP's per-session model to Kimi's k3-256k model; this
+# does not change Kimi Code's global config.toml.
 # kimi_acp_request_timeout_seconds = 30
 # kimi_acp_prompt_timeout_seconds = 900
 # Kimi web server is used only for state queries (quota, context usage).

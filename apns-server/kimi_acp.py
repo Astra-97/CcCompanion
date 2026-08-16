@@ -17,7 +17,7 @@ import threading
 import time
 from typing import Any, Callable
 
-KIMI_APP_MODEL = "kimi-code/kimi-for-coding-highspeed"
+KIMI_APP_MODEL = "kimi-code/k3-256k"
 DEFAULT_KIMI_CWD = "/root/Karami-Workspace"
 
 
@@ -81,7 +81,9 @@ class KimiACPClient:
         self._process: subprocess.Popen[str] | None = None
         self._write_lock = threading.Lock()
         self._start_lock = threading.Lock()
-        self._prepare_lock = threading.Lock()
+        # forge_new_session() holds this lock while it calls prepare_session()
+        # for the new session; the nested prepare must be re-entrant.
+        self._prepare_lock = threading.RLock()
         self._turn_lock = threading.Lock()
         self._pending_lock = threading.Lock()
         self._pending: dict[int, tuple[threading.Event, dict[str, Any], int]] = {}
@@ -95,7 +97,7 @@ class KimiACPClient:
         self._stderr_reader: threading.Thread | None = None
         self._initialized = False
         self._loaded_session_id = ""
-        self._highspeed_model_session_id = ""
+        self._app_model_session_id = ""
 
     @property
     def busy(self) -> bool:
@@ -168,7 +170,7 @@ class KimiACPClient:
             generation = self._process_generation
             self._initialized = False
             self._loaded_session_id = ""
-            self._highspeed_model_session_id = ""
+            self._app_model_session_id = ""
             self._reader = threading.Thread(
                 target=self._read_stdout,
                 args=(process, generation),
@@ -388,7 +390,7 @@ class KimiACPClient:
         return values
 
     @classmethod
-    def _model_option_is_highspeed(
+    def _model_option_is_app_model(
         cls,
         options: list[dict[str, Any]],
         *,
@@ -410,14 +412,14 @@ class KimiACPClient:
             or str(model.get("currentValue") or "") == KIMI_APP_MODEL
         )
 
-    def _set_highspeed_model(
+    def _set_app_model(
         self,
         session_id: str,
         config_options: list[dict[str, Any]],
     ) -> None:
-        if self._highspeed_model_session_id == session_id:
+        if self._app_model_session_id == session_id:
             return
-        if not self._model_option_is_highspeed(config_options, require_current=False):
+        if not self._model_option_is_app_model(config_options, require_current=False):
             raise KimiACPError("Kimi ACP session does not support the App model")
         current = next(
             (
@@ -427,7 +429,7 @@ class KimiACPClient:
             {},
         )
         if str(current.get("currentValue") or "") == KIMI_APP_MODEL:
-            self._highspeed_model_session_id = session_id
+            self._app_model_session_id = session_id
             return
         result = self._request(
             "session/set_config_option",
@@ -436,16 +438,16 @@ class KimiACPClient:
         )
         updated = result.get("configOptions")
         updated_options = updated if isinstance(updated, list) else []
-        if not self._model_option_is_highspeed(updated_options, require_current=True):
+        if not self._model_option_is_app_model(updated_options, require_current=True):
             raise KimiACPError("Kimi ACP did not confirm the App model")
-        self._highspeed_model_session_id = session_id
+        self._app_model_session_id = session_id
 
     def prepare_session(self) -> str:
-        """Start/load one session and pin the App-only high-speed model."""
+        """Start/load one session and pin the App model."""
         with self._prepare_lock:
             self._start()
             session_id, config_options = self._new_or_load_session()
-            self._set_highspeed_model(session_id, config_options)
+            self._set_app_model(session_id, config_options)
             self._save_session_id(session_id)
             return session_id
 
@@ -468,7 +470,7 @@ class KimiACPClient:
             if (
                 not self._process_alive()
                 or self._loaded_session_id != session_id
-                or self._highspeed_model_session_id != session_id
+                or self._app_model_session_id != session_id
             ):
                 raise KimiACPError("Kimi ACP session was not prepared")
             with self._active_lock:
@@ -599,7 +601,7 @@ class KimiACPClient:
             self._save_session_id(new_session_id)
             # Force prepare_session() to load the new session next time.
             self._loaded_session_id = ""
-            self._highspeed_model_session_id = ""
+            self._app_model_session_id = ""
 
             # 4. Load the new session and seed it with the summary.
             self.prepare_session()
@@ -645,7 +647,7 @@ class KimiACPClient:
         self._process = None
         self._initialized = False
         self._loaded_session_id = ""
-        self._highspeed_model_session_id = ""
+        self._app_model_session_id = ""
         if process is None or process.poll() is not None:
             return
         try:

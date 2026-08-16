@@ -17,6 +17,9 @@ from kimi_acp import (
 
 
 class KimiACPProtocolTest(unittest.TestCase):
+    def test_app_model_is_k3_256k(self):
+        self.assertEqual("kimi-code/k3-256k", KIMI_APP_MODEL)
+
     def test_only_agent_text_chunks_are_extracted(self):
         self.assertEqual(
             "hello",
@@ -54,7 +57,7 @@ class KimiACPProtocolTest(unittest.TestCase):
             cwd.mkdir()
             client = KimiACPClient(state_path=path, cwd=cwd)
             client._save_session_id("kimi-session-1")
-            self.assertEqual("kimi-session-1", client._load_session_id())
+            self.assertEqual("kimi-session-1", client.load_session_id())
             self.assertEqual(0o600, path.stat().st_mode & 0o777)
             payload = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(2, payload["version"])
@@ -74,7 +77,7 @@ class KimiACPProtocolTest(unittest.TestCase):
                 json.dumps({"version": 1, "session_id": "legacy"}),
                 encoding="utf-8",
             )
-            self.assertEqual("", client._load_session_id())
+            self.assertEqual("", client.load_session_id())
 
             path.write_text(
                 json.dumps(
@@ -86,7 +89,7 @@ class KimiACPProtocolTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            self.assertEqual("", client._load_session_id())
+            self.assertEqual("", client.load_session_id())
 
             path.write_text(
                 json.dumps(
@@ -98,7 +101,7 @@ class KimiACPProtocolTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            self.assertEqual("", client._load_session_id())
+            self.assertEqual("", client.load_session_id())
 
     def test_workspace_mismatch_starts_new_session_instead_of_loading_old(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -228,7 +231,7 @@ class KimiACPProtocolTest(unittest.TestCase):
         client = KimiACPClient(state_path="/tmp/unused-kimi-test-state")
         client._process_alive = lambda: True
         client._loaded_session_id = "s1"
-        client._highspeed_model_session_id = "s1"
+        client._app_model_session_id = "s1"
         cancelled = []
         gate = threading.Event()
         release = threading.Event()
@@ -256,7 +259,7 @@ class KimiACPProtocolTest(unittest.TestCase):
         client = KimiACPClient(state_path="/tmp/unused-kimi-test-state")
         client._process_alive = lambda: True
         client._loaded_session_id = "s1"
-        client._highspeed_model_session_id = "s1"
+        client._app_model_session_id = "s1"
         client.prompt_timeout = 0.0
         cancelled = []
         release = threading.Event()
@@ -295,7 +298,7 @@ class KimiACPProtocolTest(unittest.TestCase):
         client = KimiACPClient(state_path="/tmp/unused-kimi-test-state")
         client._process_alive = lambda: True
         client._loaded_session_id = "s1"
-        client._highspeed_model_session_id = "s1"
+        client._app_model_session_id = "s1"
         client._request = lambda *_args, **_kwargs: self.fail("prompt must not be sent")
         gate = threading.Event()
         gate.set()
@@ -310,7 +313,7 @@ class KimiACPProtocolTest(unittest.TestCase):
 
     def test_persisted_session_load_failure_never_silently_starts_new_context(self):
         client = KimiACPClient(state_path="/tmp/unused-kimi-test-state")
-        client._load_session_id = lambda: "persisted-session"
+        client.load_session_id = lambda: "persisted-session"
         methods = []
 
         def request(method, _params, **_kwargs):
@@ -322,10 +325,10 @@ class KimiACPProtocolTest(unittest.TestCase):
             client._new_or_load_session()
         self.assertEqual(["session/load"], methods)
 
-    def test_prepare_new_session_sets_highspeed_model_once(self):
+    def test_prepare_new_session_sets_app_model_once(self):
         client = KimiACPClient(state_path="/tmp/unused-kimi-test-state")
         client._start = lambda: None
-        client._load_session_id = lambda: ""
+        client.load_session_id = lambda: ""
         client._save_session_id = lambda _sid: None
         calls = []
         options_default = [{
@@ -337,20 +340,20 @@ class KimiACPProtocolTest(unittest.TestCase):
                 {"value": KIMI_APP_MODEL},
             ],
         }]
-        options_highspeed = [{**options_default[0], "currentValue": KIMI_APP_MODEL}]
+        options_app_model = [{**options_default[0], "currentValue": KIMI_APP_MODEL}]
 
         def request(method, params, **_kwargs):
             calls.append((method, params))
             if method == "session/new":
                 return {"sessionId": "s1", "configOptions": options_default}
             if method == "session/set_config_option":
-                return {"configOptions": options_highspeed}
+                return {"configOptions": options_app_model}
             raise AssertionError(method)
 
         client._request = request
         self.assertEqual("s1", client.prepare_session())
         client._process_alive = lambda: True
-        client._load_session_id = lambda: "s1"
+        client.load_session_id = lambda: "s1"
         self.assertEqual("s1", client.prepare_session())
         self.assertEqual(
             ["session/new", "session/set_config_option"],
@@ -361,10 +364,10 @@ class KimiACPProtocolTest(unittest.TestCase):
             calls[1][1],
         )
 
-    def test_prepare_loaded_session_also_sets_highspeed_model(self):
+    def test_prepare_loaded_session_also_sets_app_model(self):
         client = KimiACPClient(state_path="/tmp/unused-kimi-test-state")
         client._start = lambda: None
-        client._load_session_id = lambda: "persisted"
+        client.load_session_id = lambda: "persisted"
         client._save_session_id = lambda _sid: None
         methods = []
         options = [{
@@ -386,10 +389,10 @@ class KimiACPProtocolTest(unittest.TestCase):
         self.assertEqual("persisted", client.prepare_session())
         self.assertEqual(["session/load", "session/set_config_option"], methods)
 
-    def test_prepare_does_not_reset_model_when_highspeed_is_already_current(self):
+    def test_prepare_does_not_reset_model_when_app_model_is_already_current(self):
         client = KimiACPClient(state_path="/tmp/unused-kimi-test-state")
         client._start = lambda: None
-        client._load_session_id = lambda: ""
+        client.load_session_id = lambda: ""
         client._save_session_id = lambda _sid: None
         methods = []
         options = [{
@@ -408,6 +411,124 @@ class KimiACPProtocolTest(unittest.TestCase):
         client._request = request
         self.assertEqual("s1", client.prepare_session())
         self.assertEqual(["session/new"], methods)
+
+    def test_forge_repins_app_model_for_new_session_before_seeding_summary(self):
+        client = KimiACPClient(state_path="/tmp/unused-kimi-test-state")
+        client._start = lambda: None
+        client._process_alive = lambda: True
+        persisted = {"session_id": "old-session"}
+        client.load_session_id = lambda: persisted["session_id"]
+        client._save_session_id = lambda session_id: persisted.update(session_id=session_id)
+        calls = []
+        prompt_calls = []
+        options = [{
+            "id": "model",
+            "type": "select",
+            "currentValue": "kimi-code/k3",
+            "options": [
+                {"value": "kimi-code/k3"},
+                {"value": KIMI_APP_MODEL},
+            ],
+        }]
+        pinned_options = [{**options[0], "currentValue": KIMI_APP_MODEL}]
+
+        def request(method, params, **_kwargs):
+            calls.append((method, params))
+            if method == "session/load":
+                return {"sessionId": params["sessionId"], "configOptions": options}
+            if method == "session/set_config_option":
+                return {"configOptions": pinned_options}
+            if method == "session/new":
+                return {"sessionId": "new-session", "configOptions": options}
+            raise AssertionError(method)
+
+        def prompt_existing(text, *, session_id, turn_id, on_update=None, **_kwargs):
+            prompt_calls.append((text, session_id, turn_id))
+            if len(prompt_calls) == 1:
+                on_update("summary")
+
+        client._request = request
+        client.prompt_existing = prompt_existing
+
+        result = []
+        failure = []
+
+        def run_forge():
+            try:
+                result.append(client.forge_new_session(summarize_prompt="summarize"))
+            except Exception as exc:  # surfaced below without hiding deadlocks
+                failure.append(exc)
+
+        worker = threading.Thread(target=run_forge, daemon=True)
+        worker.start()
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive(), "forge must not deadlock while preparing the new session")
+        if failure:
+            raise failure[0]
+
+        self.assertEqual(("new-session", "summary"), result[0])
+        self.assertEqual(
+            [
+                "session/load",
+                "session/set_config_option",
+                "session/new",
+                "session/load",
+                "session/set_config_option",
+            ],
+            [method for method, _params in calls],
+        )
+        self.assertEqual(
+            ["old-session", "new-session"],
+            [params["sessionId"] for method, params in calls if method == "session/set_config_option"],
+        )
+        self.assertTrue(
+            all(params["value"] == KIMI_APP_MODEL
+                for method, params in calls
+                if method == "session/set_config_option")
+        )
+        self.assertEqual("new-session", client._app_model_session_id)
+        self.assertEqual("new-session", prompt_calls[1][1])
+        self.assertTrue(prompt_calls[1][0].startswith("【上下文继承】"))
+
+    def test_close_clears_app_model_cache_before_same_session_is_prepared_again(self):
+        client = KimiACPClient(state_path="/tmp/unused-kimi-test-state")
+        client._start = lambda: None
+        client._process_alive = lambda: True
+        client._app_model_session_id = "same-session"
+        client._loaded_session_id = "same-session"
+        client.close()
+        self.assertEqual("", client._app_model_session_id)
+
+        client.load_session_id = lambda: "same-session"
+        client._save_session_id = lambda _session_id: None
+        calls = []
+        options = [{
+            "id": "model",
+            "type": "select",
+            "currentValue": "kimi-code/k3",
+            "options": [
+                {"value": "kimi-code/k3"},
+                {"value": KIMI_APP_MODEL},
+            ],
+        }]
+        pinned_options = [{**options[0], "currentValue": KIMI_APP_MODEL}]
+
+        def request(method, params, **_kwargs):
+            calls.append((method, params))
+            if method == "session/load":
+                return {"sessionId": "same-session", "configOptions": options}
+            if method == "session/set_config_option":
+                return {"configOptions": pinned_options}
+            raise AssertionError(method)
+
+        client._request = request
+        self.assertEqual("same-session", client.prepare_session())
+        self.assertEqual(
+            ["session/load", "session/set_config_option"],
+            [method for method, _params in calls],
+        )
+        self.assertEqual(KIMI_APP_MODEL, calls[1][1]["value"])
+        self.assertEqual("same-session", client._app_model_session_id)
 
     def test_prompt_existing_rejects_blank_or_unprepared_session(self):
         client = KimiACPClient(state_path="/tmp/unused-kimi-test-state")
