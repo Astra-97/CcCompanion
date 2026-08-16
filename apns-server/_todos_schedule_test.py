@@ -5,6 +5,7 @@ import json
 import tempfile
 import types
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest import mock
 
@@ -42,11 +43,12 @@ class ScheduleTodosTest(unittest.TestCase):
 
     def test_get_projection_keeps_todo_contract_and_stable_schedule_event_id(self):
         self.write([
+            _event("stale", "旧法棍", "2026-07-20", None),
             _event("late", "晚间复盘", "2026-08-17", "20:00", note="十分钟"),
             _event("all-day", "整理", "2026-08-16", None, done=True),
         ])
 
-        sections = todos.collect_all(self.path)
+        sections = todos.collect_all(self.path, today=date(2026, 8, 16))
 
         self.assertEqual(len(sections), 1)
         section = sections[0]
@@ -55,6 +57,7 @@ class ScheduleTodosTest(unittest.TestCase):
         self.assertEqual(section["count"], 2)
         self.assertEqual(section["pending"], 1)
         self.assertEqual([item["event_id"] for item in section["items"]], ["all-day", "late"])
+        self.assertNotIn("stale", [item["event_id"] for item in section["items"]])
         self.assertEqual(section["items"][1]["text"], "晚间复盘")
         self.assertEqual(section["items"][1]["dueDate"], "2026-08-17")
         self.assertEqual(section["items"][1]["note"], "十分钟")
@@ -99,23 +102,32 @@ class TodosHandlerAuthTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.path = Path(self.temp.name) / "events.json"
-        self.path.write_text(json.dumps([_event("evt1", "私密日程", "2026-08-16", "09:00")]), encoding="utf-8")
+        self.path.write_text(json.dumps([_event("evt1", "私密日程", "2099-08-16", "09:00")]), encoding="utf-8")
 
     def tearDown(self):
         self.temp.cleanup()
 
     def handler(self, token=""):
         handler = object.__new__(PushHandler)
+        handler.history_records = []
+        handler.notifications = []
+
+        class _History:
+            def append(_self, **record):
+                handler.history_records.append(record)
+                return {"ts": "test-turn", **record}
+
         handler.state = types.SimpleNamespace(
             strict_auth=True,
             shared_secret="test-secret",
             todos_schedule_path=str(self.path),
             bus_send_path="/unused",
+            contact_chats={"xiaoke": _History()},
         )
         handler.headers = {"X-Auth-Token": token}
         handler.responses = []
         handler._send_json = lambda status, payload: handler.responses.append((status, payload))
-        handler._notify_chain_todo = lambda _text: None
+        handler._notify_chain_todo = lambda text: handler.notifications.append(text)
         return handler
 
     def test_get_and_toggle_require_authentication(self):
@@ -134,6 +146,55 @@ class TodosHandlerAuthTest(unittest.TestCase):
         handler._handle_todos_toggle({"event_id": "evt1", "expected_done": False})
         self.assertEqual(handler.responses[0][0], 200)
         self.assertTrue(handler.responses[0][1]["new_done"])
+        self.assertEqual(len(handler.history_records), 1)
+        record = handler.history_records[0]
+        self.assertEqual(record["role"], "user")
+        self.assertEqual(record["source"], "todos")
+        self.assertEqual(record["text"], "日程更新\n✅ 已完成：私密日程")
+        self.assertEqual(record["metadata"], {
+            "todo_share": True,
+            "event_id": "evt1",
+            "done": True,
+        })
+        self.assertEqual(handler.notifications, [record["text"]])
+
+        # A replay/race is not a second user utterance or AI notification.
+        handler.responses.clear()
+        handler.history_records.clear()
+        handler.notifications.clear()
+        handler._handle_todos_toggle({"event_id": "evt1", "expected_done": False})
+        self.assertEqual(handler.responses[0][0], 400)
+        self.assertEqual(handler.history_records, [])
+        self.assertEqual(handler.notifications, [])
+
+        handler.responses.clear()
+        handler._handle_todos_toggle({"event_id": "evt1", "expected_done": True})
+        self.assertEqual(handler.responses[0][0], 200)
+        self.assertEqual(handler.history_records[0]["text"], "日程更新\n↩️ 已取消完成：私密日程")
+        self.assertEqual(handler.history_records[0]["metadata"]["done"], False)
+        self.assertEqual(handler.notifications, [handler.history_records[0]["text"]])
+
+    def test_successful_schedule_write_surfaces_history_append_partial_failure(self):
+        handler = self.handler("test-secret")
+
+        class _FailingHistory:
+            def append(_self, **_record):
+                raise OSError("test history unavailable")
+
+        handler.state.contact_chats["xiaoke"] = _FailingHistory()
+        with mock.patch("push.logger.exception") as log_exception:
+            handler._handle_todos_toggle({"event_id": "evt1", "expected_done": False})
+
+        self.assertEqual(handler.responses[0][0], 503)
+        log_exception.assert_called_once()
+        payload = handler.responses[0][1]
+        self.assertFalse(payload["ok"])
+        self.assertTrue(payload["schedule_updated"])
+        self.assertTrue(payload["new_done"])
+        self.assertEqual(payload["partial_failure"], "chat_history_append_failed")
+        self.assertEqual(payload["error"], "schedule_updated_but_chat_history_append_failed")
+        self.assertTrue(json.loads(self.path.read_text(encoding="utf-8"))[0]["done"])
+        self.assertEqual(handler.notifications, [])
 
     def test_add_and_edit_explicitly_reject_schedule_source(self):
         handler = self.handler("test-secret")

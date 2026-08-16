@@ -17418,9 +17418,41 @@ class PushHandler(BaseHTTPRequestHandler):
         )
         if res.get("ok"):
             done = res.get("new_done", False)
-            verb = "勾完成" if done else "取消勾"
-            todo_title = str(body.get("text") or res.get("title") or "")
-            self._notify_chain_todo(f"[用户 {verb}: {todo_title[:60]}]")
+            # The title comes from the just-locked schedule event, never from
+            # an untrusted client echo field.
+            todo_title = str(res.get("title") or "")
+            share_text = (
+                f"日程更新\n{'✅ 已完成' if done else '↩️ 已取消完成'}：{todo_title}"
+            )
+            try:
+                record = self._chat_for_contact("xiaoke").append(
+                    role="user",
+                    text=share_text,
+                    source="todos",
+                    metadata={
+                        "todo_share": True,
+                        "event_id": str(res.get("event_id") or body.get("event_id") or ""),
+                        "done": bool(done),
+                    },
+                )
+            except Exception:
+                # The schedule write is already durable.  Do not roll it back
+                # and do not inject a message the user cannot see in XiaoKe's
+                # history; surface the partial failure explicitly instead.
+                logger.exception("schedule todo chat history append failed")
+                res.update({
+                    "ok": False,
+                    "schedule_updated": True,
+                    "partial_failure": "chat_history_append_failed",
+                    "error": "schedule_updated_but_chat_history_append_failed",
+                })
+                self._send_json(503, res)
+                return
+            # The visible user record and XiaoKe's one chain notification have
+            # the same content.  Keeping the legacy notifier as the only
+            # injection avoids a duplicate AI turn.
+            self._notify_chain_todo(share_text)
+            res["record"] = record
         self._send_json(200 if res.get("ok") else 400, res)
 
     def _handle_todos_list(self):

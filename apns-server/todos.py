@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
 from typing import Any, Iterator
+from zoneinfo import ZoneInfo
 
 VAULT = Path(os.path.expanduser("~/Documents/星原"))
 
@@ -61,11 +62,17 @@ class ScheduleTodoStoreError(RuntimeError):
     """Schedule data cannot be safely read or modified."""
 
 
-def collect_all(schedule_path: str | Path | None = None) -> list[dict]:
-    """Return schedule events in the legacy TodoSection/TodoItem shape."""
+def collect_all(
+    schedule_path: str | Path | None = None,
+    *,
+    today: date | None = None,
+) -> list[dict]:
+    """Return today's and future schedule events in the legacy todo shape."""
     path = _schedule_path(schedule_path)
     with _schedule_lock(path, create_parent=False):
         events = _load_schedule(path)
+    local_today = today or datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    events = [event for event in events if date.fromisoformat(event["date"]) >= local_today]
     items = [_schedule_item(event) for event in sorted(events, key=_schedule_sort_key)]
     return [{
         "section": "日程",
