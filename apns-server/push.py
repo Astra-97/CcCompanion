@@ -2902,6 +2902,13 @@ class ServerState:
         self.token_store_path: str = server_cfg.get(
             "token_store_path", str(HERE / "tokens" / "active.json")
         )
+        # Homepage todos are a direct projection of XiaoKe's schedule.  The
+        # env override is intentionally useful for isolated tests/deployments.
+        self.todos_schedule_path: str = str(
+            os.environ.get("CC_COMPANION_TODOS_SCHEDULE_PATH")
+            or server_cfg.get("todos_schedule_path")
+            or "/root/schedule/events.json"
+        )
         # P0-3: auto-generate secret if not set
         raw_secret = server_cfg.get("shared_secret") or ""
         if not raw_secret:
@@ -5704,10 +5711,7 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "settings": self.state.settings.snapshot()})
             return
         if self.path == "/todos":
-            try:
-                self._send_json(200, {"ok": True, "sections": todos_mod.collect_all()})
-            except Exception as e:
-                self._send_json(500, {"error": str(e)})
+            self._handle_todos_list()
             return
         if self.path == "/drivers/state":
             try:
@@ -17409,16 +17413,34 @@ class PushHandler(BaseHTTPRequestHandler):
             expected_done=body.get("expected_done"),
             file_mtime=body.get("file_mtime"),
             line_index=body.get("line_index"),
+            event_id=body.get("event_id"),
+            schedule_path=self.state.todos_schedule_path,
         )
         if res.get("ok"):
             done = res.get("new_done", False)
             verb = "勾完成" if done else "取消勾"
-            self._notify_chain_todo(f"[用户 {verb}: {body.get('text', '')[:60]}]")
+            todo_title = str(body.get("text") or res.get("title") or "")
+            self._notify_chain_todo(f"[用户 {verb}: {todo_title[:60]}]")
         self._send_json(200 if res.get("ok") else 400, res)
+
+    def _handle_todos_list(self):
+        if not self._check_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        try:
+            self._send_json(200, {
+                "ok": True,
+                "sections": todos_mod.collect_all(self.state.todos_schedule_path),
+            })
+        except todos_mod.ScheduleTodoStoreError:
+            self._send_json(503, {"ok": False, "error": "schedule unavailable"})
 
     def _handle_todos_add(self, body: dict[str, Any]):
         if not self._check_auth():
             self._send_json(401, {"error": "auth required"})
+            return
+        if body.get("event_id") or body.get("source") == "schedule":
+            self._send_json(409, {"ok": False, "error": "schedule_add_unsupported"})
             return
         res = todos_mod.add(
             rel_path=body.get("path", ""),
@@ -17435,6 +17457,9 @@ class PushHandler(BaseHTTPRequestHandler):
     def _handle_todos_edit(self, body: dict[str, Any]):
         if not self._check_auth():
             self._send_json(401, {"error": "auth required"})
+            return
+        if body.get("event_id") or body.get("source") == "schedule":
+            self._send_json(409, {"ok": False, "error": "schedule_edit_unsupported"})
             return
         res = todos_mod.edit(
             rel_path=body.get("path", ""),

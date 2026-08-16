@@ -32,6 +32,10 @@ port = 8795
 # token 持久化路径 (重启后 reload 不丢)
 token_store_path = "~/CcCompanion/apns-server/tokens/active.json"
 
+# Homepage todos are projected directly from this schedule file; no Markdown
+# copy is maintained.  CC_COMPANION_TODOS_SCHEDULE_PATH overrides it for tests.
+todos_schedule_path = "/root/schedule/events.json"
+
 # P0-3: 写接口鉴权 token. 留空则启动时自动生成并写 ~/.ots/secret (mode 0600)。
 # 自动生成的 secret 会 log 到控制台，复制到 OTS app onboarding wizard。
 # 手动填写可覆盖自动生成。不要 commit 真实密钥到 git。

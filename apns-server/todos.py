@@ -4,9 +4,14 @@ from __future__ import annotations
 import os
 import re
 import shutil
-from datetime import datetime
+import fcntl
+import json
+import tempfile
+from datetime import date, datetime
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
+from typing import Any, Iterator
 
 VAULT = Path(os.path.expanduser("~/Documents/星原"))
 
@@ -45,6 +50,30 @@ TAG_RE = re.compile(r'(?<![a-zA-Z])#([a-zA-Z一-鿿][a-zA-Z0-9一-鿿_-]*)(?![a-
 ALLOWED_PATHS = {src["path"].resolve(): src["section"] for src in TODO_SOURCES}
 BACKUP_DIR = Path("~/CcCompanion/apns-server/tokens/todos_backup").expanduser()
 _WRITE_LOCK = Lock()
+
+# The home-screen todo view is a projection of XiaoKe's schedule, not a
+# second Markdown-backed task list.  The default and lock protocol match
+# /root/ccbot-lite/ops/scripts/schedule-ctl and schedule-remind.
+DEFAULT_SCHEDULE_PATH = Path("/root/schedule/events.json")
+
+
+class ScheduleTodoStoreError(RuntimeError):
+    """Schedule data cannot be safely read or modified."""
+
+
+def collect_all(schedule_path: str | Path | None = None) -> list[dict]:
+    """Return schedule events in the legacy TodoSection/TodoItem shape."""
+    path = _schedule_path(schedule_path)
+    with _schedule_lock(path, create_parent=False):
+        events = _load_schedule(path)
+    items = [_schedule_item(event) for event in sorted(events, key=_schedule_sort_key)]
+    return [{
+        "section": "日程",
+        "source": "schedule",
+        "items": items,
+        "count": len(items),
+        "pending": sum(1 for item in items if not item["done"]),
+    }]
 
 
 def parse_file(path: Path) -> list[dict]:
@@ -123,22 +152,6 @@ def parse_file(path: Path) -> list[dict]:
     return items
 
 
-def collect_all() -> list[dict]:
-    out: list[dict] = []
-    for src in TODO_SOURCES:
-        items = parse_file(src["path"])
-        if not items:
-            continue
-        out.append({
-            "section": src["section"],
-            "source": str(src["path"]).replace(os.path.expanduser("~"), "~"),
-            "items": items,
-            "count": len(items),
-            "pending": sum(1 for i in items if not i["done"]),
-        })
-    return out
-
-
 def toggle(
     rel_path: str,
     heading: str,
@@ -146,45 +159,39 @@ def toggle(
     expected_done: bool | None = None,
     file_mtime: float | None = None,
     line_index: int | None = None,
+    *,
+    event_id: str | None = None,
+    schedule_path: str | Path | None = None,
 ) -> dict:
-    abs_path = _resolve_path(rel_path)
-    if abs_path is None:
-        return {"ok": False, "error": "path_not_allowed"}
+    """Toggle one schedule event by its stable id.
 
-    with _WRITE_LOCK:
-        if not abs_path.exists():
-            return {"ok": False, "error": "file_missing"}
-        if _mtime_changed(abs_path, file_mtime):
-            return {"ok": False, "error": "race_detected"}
-
-        lines = abs_path.read_text(encoding="utf-8").splitlines(keepends=False)
-        target_idx = None
-        if line_index is not None and 0 <= line_index < len(lines):
-            candidate = lines[line_index]
-            if TODO_RE.match(candidate):
-                target_idx = line_index
-        if target_idx is None:
-            target_idx = _locate_line(lines, heading, text)
-        if target_idx is None:
-            return {"ok": False, "error": "line_not_found"}
-        if isinstance(target_idx, str):
-            return {"ok": False, "error": target_idx}
-
-        m = TODO_RE.match(lines[target_idx])
-        if not m:
-            return {"ok": False, "error": "regex_fail"}
-        cur_char = m.group(1)
-        cur_done = cur_char.lower() == "x"
-        if expected_done is not None and expected_done != cur_done:
-            return {"ok": False, "error": "race_detected"}
-        if cur_char not in {" ", "x", "X"}:
-            return {"ok": False, "error": "unsupported_status"}
-
-        new_char = " " if cur_done else "x"
-        lines[target_idx] = lines[target_idx].replace(f"[{cur_char}]", f"[{new_char}]", 1)
-        _backup(abs_path)
-        _atomic_write(abs_path, lines)
-        return {"ok": True, "new_done": new_char == "x", "file_mtime": abs_path.stat().st_mtime}
+    The legacy Markdown locator parameters remain in the signature for caller
+    compatibility but are deliberately never used to modify Markdown files.
+    """
+    del rel_path, heading, text, file_mtime, line_index
+    if not isinstance(event_id, str) or not event_id.strip():
+        return {"ok": False, "error": "schedule_event_id_required"}
+    if not isinstance(expected_done, bool):
+        return {"ok": False, "error": "expected_done_required"}
+    path = _schedule_path(schedule_path)
+    try:
+        with _schedule_lock(path, create_parent=False):
+            events = _load_schedule(path)
+            event = next((item for item in events if item["id"] == event_id), None)
+            if event is None:
+                return {"ok": False, "error": "event_not_found"}
+            if event["done"] != expected_done:
+                return {"ok": False, "error": "race_detected"}
+            event["done"] = not expected_done
+            _save_schedule(path, events)
+            return {
+                "ok": True,
+                "new_done": event["done"],
+                "event_id": event_id,
+                "title": event["title"],
+            }
+    except ScheduleTodoStoreError:
+        return {"ok": False, "error": "schedule_unavailable"}
 
 
 def add(
@@ -329,3 +336,140 @@ def _atomic_write(path: Path, lines: list[str]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _schedule_path(override: str | Path | None) -> Path:
+    raw = override or os.environ.get("CC_COMPANION_TODOS_SCHEDULE_PATH") or DEFAULT_SCHEDULE_PATH
+    return Path(raw).expanduser()
+
+
+@contextmanager
+def _schedule_lock(path: Path, *, create_parent: bool) -> Iterator[None]:
+    """Use schedule-ctl's exact ``<schedule dir>/.lock`` protocol."""
+    parent = path.parent
+    if create_parent:
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(parent, 0o700)
+        except OSError as exc:
+            raise ScheduleTodoStoreError("schedule directory unavailable") from exc
+    elif not parent.exists():
+        yield
+        return
+    try:
+        with _WRITE_LOCK:
+            fd = os.open(parent / ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "r+") as lock_file:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX)
+                    try:
+                        yield
+                    finally:
+                        fcntl.flock(lock_file, fcntl.LOCK_UN)
+            except BaseException:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+    except ScheduleTodoStoreError:
+        raise
+    except OSError as exc:
+        raise ScheduleTodoStoreError("schedule lock unavailable") from exc
+
+
+def _load_schedule(path: Path) -> list[dict[str, Any]]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            events = json.load(handle)
+    except FileNotFoundError:
+        return []
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ScheduleTodoStoreError("schedule data unavailable") from exc
+    _validate_schedule(events)
+    return events
+
+
+def _save_schedule(path: Path, events: list[dict[str, Any]]) -> None:
+    _validate_schedule(events)
+    tmp_name: str | None = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(prefix=".events.", suffix=".tmp", dir=path.parent)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(events, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+        dir_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except (OSError, TypeError, ValueError) as exc:
+        raise ScheduleTodoStoreError("schedule write failed") from exc
+    finally:
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+
+
+def _validate_schedule(events: Any) -> None:
+    if not isinstance(events, list):
+        raise ScheduleTodoStoreError("schedule data invalid")
+    seen: set[str] = set()
+    for event in events:
+        if not isinstance(event, dict):
+            raise ScheduleTodoStoreError("schedule data invalid")
+        event_id = event.get("id")
+        if not isinstance(event_id, str) or not event_id or event_id in seen:
+            raise ScheduleTodoStoreError("schedule data invalid")
+        seen.add(event_id)
+        if not isinstance(event.get("title"), str) or not event["title"].strip():
+            raise ScheduleTodoStoreError("schedule data invalid")
+        try:
+            date.fromisoformat(event["date"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ScheduleTodoStoreError("schedule data invalid") from exc
+        event_time = event.get("time", object())
+        if event_time is not None:
+            if not isinstance(event_time, str):
+                raise ScheduleTodoStoreError("schedule data invalid")
+            try:
+                normalized = datetime.strptime(event_time, "%H:%M").strftime("%H:%M")
+            except ValueError as exc:
+                raise ScheduleTodoStoreError("schedule data invalid") from exc
+            if normalized != event_time:
+                raise ScheduleTodoStoreError("schedule data invalid")
+        remind = event.get("remind_minutes_before")
+        if remind is not None and (not isinstance(remind, int) or isinstance(remind, bool) or remind < 0):
+            raise ScheduleTodoStoreError("schedule data invalid")
+        if not isinstance(event.get("done"), bool) or not isinstance(event.get("reminded"), bool):
+            raise ScheduleTodoStoreError("schedule data invalid")
+        if event.get("note") is not None and not isinstance(event.get("note"), str):
+            raise ScheduleTodoStoreError("schedule data invalid")
+
+
+def _schedule_item(event: dict[str, Any]) -> dict:
+    item: dict[str, Any] = {
+        "text": event["title"],
+        "done": event["done"],
+        "unsure": False,
+        "actor": None,
+        "heading": "日程",
+        "rawText": event["title"],
+        "lineIndex": None,
+        "dueDate": event["date"],
+        "event_id": event["id"],
+        "time": event["time"],
+        "note": event.get("note") or "",
+        "remind_minutes_before": event.get("remind_minutes_before"),
+    }
+    return item
+
+
+def _schedule_sort_key(event: dict[str, Any]) -> tuple[str, str]:
+    return str(event["date"]), str(event["time"] or "00:00")
