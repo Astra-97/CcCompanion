@@ -21,6 +21,88 @@ class KimiACPProtocolTest(unittest.TestCase):
     def test_app_model_is_k3_256k(self):
         self.assertEqual("kimi-code/k3-256k", KIMI_APP_MODEL)
 
+    def test_kimi_036_thinking_option_is_read_back_without_mutation(self):
+        client = KimiACPClient(state_path="/tmp/unused-kimi-thinking-readback")
+        client._start = lambda: None
+        client.load_session_id = lambda: ""
+        client._save_session_id = lambda _session: None
+        requests: list[tuple[str, dict]] = []
+
+        def request(method, params, **_kwargs):
+            requests.append((method, params))
+            if method == "session/new":
+                return {
+                    "sessionId": "thinking-session",
+                    "configOptions": [
+                        {
+                            "id": "model",
+                            "currentValue": KIMI_APP_MODEL,
+                            "options": [{"value": KIMI_APP_MODEL}],
+                        },
+                        {
+                            "id": "thinking",
+                            "currentValue": "high",
+                            "options": [
+                                {"value": "low"},
+                                {"value": "high"},
+                                {"value": "max"},
+                            ],
+                        },
+                    ],
+                }
+            raise AssertionError(method)
+
+        client._request = request
+        self.assertEqual(
+            "thinking-session",
+            client.prepare_session(model=KIMI_APP_MODEL, reasoning_effort="high"),
+        )
+        self.assertEqual(
+            (KIMI_APP_MODEL, "high"),
+            client.prepared_selection("thinking-session"),
+        )
+        self.assertEqual(["session/new"], [method for method, _params in requests])
+
+    def test_kimi_036_thinking_change_requires_exact_readback(self):
+        client = KimiACPClient(state_path="/tmp/unused-kimi-thinking-change")
+        client._start = lambda: None
+        client.load_session_id = lambda: ""
+        client._save_session_id = lambda _session: None
+        calls: list[tuple[str, dict]] = []
+        options = [
+            {
+                "id": "model",
+                "currentValue": KIMI_APP_MODEL,
+                "options": [{"value": KIMI_APP_MODEL}],
+            },
+            {
+                "id": "thinking",
+                "currentValue": "high",
+                "options": [{"value": "low"}, {"value": "high"}],
+            },
+        ]
+
+        def request(method, params, **_kwargs):
+            calls.append((method, params))
+            if method == "session/new":
+                return {"sessionId": "thinking-session", "configOptions": options}
+            if method == "session/set_config_option":
+                self.assertEqual("thinking", params["configId"])
+                self.assertEqual("low", params["value"])
+                # A 200 response is not confirmation: the CLI must return the
+                # new value in configOptions or preparation fails closed.
+                return {"configOptions": options}
+            raise AssertionError(method)
+
+        client._request = request
+        with self.assertRaises(KimiACPError):
+            client.prepare_session(model=KIMI_APP_MODEL, reasoning_effort="low")
+        self.assertIsNone(client.prepared_selection("thinking-session"))
+        self.assertEqual(
+            ["session/new", "session/set_config_option"],
+            [method for method, _params in calls],
+        )
+
     def test_only_agent_text_chunks_are_extracted(self):
         self.assertEqual(
             "hello",

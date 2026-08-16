@@ -27,6 +27,19 @@ KIMI_APP_MODELS = frozenset({
     "kimi-code/kimi-for-coding-highspeed",
 })
 KIMI_APP_EFFORTS = frozenset({"low", "high", "max"})
+# Kimi Code 0.36.x renamed the ACP config option to ``thinking``.  Keep the
+# older spellings because durable sessions created by earlier CLI releases may
+# still report them after an upgrade.  Every support/current/set lookup must
+# use this one allowlist so a schema change cannot be accepted on one path and
+# then silently fail read-back on another.
+KIMI_ACP_EFFORT_OPTION_IDS = frozenset({
+    "thinking",
+    "thinking_effort",
+    "thinkingeffort",
+    "reasoning_effort",
+    "reasoningeffort",
+    "effort",
+})
 DEFAULT_KIMI_CWD = "/root/Karami-Workspace"
 
 
@@ -648,7 +661,7 @@ class KimiACPClient:
     ) -> bool:
         return cls._option_is_value(
             options,
-            ids=frozenset({"thinking_effort", "thinkingeffort", "reasoning_effort", "reasoningeffort", "effort"}),
+            ids=KIMI_ACP_EFFORT_OPTION_IDS,
             value=effort,
             require_current=require_current,
         )
@@ -703,8 +716,7 @@ class KimiACPClient:
         self._app_model_session_id = session_id
 
         if reasoning_effort is not None:
-            effort_ids = frozenset({"thinking_effort", "thinkingeffort", "reasoning_effort", "reasoningeffort", "effort"})
-            effort_option = self._option_by_ids(options, effort_ids)
+            effort_option = self._option_by_ids(options, KIMI_ACP_EFFORT_OPTION_IDS)
             if (
                 not isinstance(effort_option, dict)
                 or not self._effort_option_is_app_effort(
