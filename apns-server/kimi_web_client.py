@@ -193,6 +193,15 @@ class KimiWebClient:
         """Return managed-account quota, e.g. weekly/5h limits."""
         return self._request("GET", "/api/v1/oauth/usage")
 
+    def get_userinfo(self) -> dict[str, Any]:
+        """Return Kimi's account payload for server-side allowlist projection.
+
+        Callers must never return this raw object: it can include display name,
+        avatar and account identifiers.  The App status endpoint projects only
+        the public subscription level fields it explicitly understands.
+        """
+        return self._request("GET", "/api/v1/oauth/userinfo")
+
     def list_sessions(self) -> list[dict[str, Any]]:
         data = self._request("GET", "/api/v1/sessions")
         items = data.get("items")

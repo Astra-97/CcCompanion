@@ -97,7 +97,14 @@ class KimiWebIsolationTest(unittest.TestCase):
         self.assertEqual(2, client.start.call_count)
         self.assertEqual(200, handler.responses[-1][0])
         self.assertEqual(
-            {"text": "配额信息暂不可用", "windows": []},
+            {
+                "text": "配额信息暂不可用",
+                "windows": [],
+                "billing": {
+                    "membership": {"available": False, "tier": "", "level": None},
+                    "extra_usage": {"available": False},
+                },
+            },
             handler.responses[-1][1]["quota"],
         )
 

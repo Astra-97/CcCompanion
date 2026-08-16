@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict, deque
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 import gzip as _gzip_mod
 import hmac
@@ -799,6 +799,8 @@ KAIROS_TERMINAL_OWNER_OPTION = "@ccc_kairos_terminal_owner"
 KAIROS_TERMINAL_OWNER_VALUE = "cccompanion:qiaokairos:v1"
 KAIROS_TERMINAL_READY_OPTION = "@ccc_kairos_terminal_ready"
 KAIROS_TERMINAL_READY_VALUE = "cccompanion:qiaokairos:ready:v1"
+KIMI_TERMINAL_OWNER_OPTION = "@ccc_kimi_terminal_owner"
+KIMI_TERMINAL_OWNER_VALUE = "cccompanion:kimi-terminal:v1"
 KAIROS_TERMINAL_COMPAT_LOCK_WAIT_TEXT = (
     "旧版 standalone 客户端占用兼容锁；等待它退出后自动连接…"
 )
@@ -1138,6 +1140,274 @@ class KairosTerminalBridge:
             self._may_be_present = False
             self._checked_existing = True
             return True
+
+
+class KimiTerminalUnavailable(RuntimeError):
+    """Safe failure while opening the dedicated interactive Kimi console."""
+
+
+class KimiTerminalBridge:
+    """Own one Kimi Code TUI pane without touching the chat ACP client.
+
+    The App chat process talks to ``kimi acp`` over its own stdio pipe and
+    persists its selected ACP session separately.  This bridge starts a plain
+    Kimi Code TUI with neither ``--session`` nor ``--continue``; Kimi Code
+    therefore allocates a new terminal-only session in the same configured
+    account, instead of attaching to the ACP chat session.  The console is
+    deliberately kept in ``DEFAULT_KIMI_CWD`` so its tool permissions stay
+    within Karami's existing workspace boundary.
+    """
+
+    def __init__(
+        self,
+        *,
+        command: Path = Path("/root/.kimi-code/bin/kimi"),
+        cwd: Path = Path(DEFAULT_KIMI_CWD),
+        tmux_session: str = "ccc-kimi-terminal",
+        model: str = "kimi-code/k3-256k",
+        idle_seconds: float = 45.0,
+        runner: Any = subprocess.run,
+    ) -> None:
+        self.command = command
+        self.cwd = cwd
+        self.tmux_session = tmux_session
+        self.model = model
+        self.idle_seconds = max(1.0, float(idle_seconds))
+        self._run = runner
+        self._lock = threading.RLock()
+        # Kimi has its own input transaction.  Never use the normal tmux
+        # buffer: a concurrent XiaoKe send must not replace an in-flight Kimi
+        # paste between load-buffer and paste-buffer.
+        self._input_lock = threading.Lock()
+        # Opaque capability for exactly the currently owned terminal pane.
+        # This is intentionally unrelated to the tmux pane/session name and
+        # is returned only to the authenticated App in Kimi capture results.
+        self._lease: str | None = None
+        self._lease_pane: str | None = None
+        self._timer: threading.Timer | None = None
+        self._last_activity = 0.0
+
+    def input_transaction(self):
+        return self._input_lock
+
+    def _run_tmux(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
+        return self._run(argv, capture_output=True, text=True, timeout=5)
+
+    def _has_session_locked(self) -> bool:
+        return self._run_tmux(["tmux", "has-session", "-t", self.tmux_session]).returncode == 0
+
+    def _owns_session_locked(self) -> bool:
+        result = self._run_tmux([
+            "tmux", "show-options", "-v", "-t", self.tmux_session,
+            KIMI_TERMINAL_OWNER_OPTION,
+        ])
+        return result.returncode == 0 and result.stdout.rstrip("\r\n") == KIMI_TERMINAL_OWNER_VALUE
+
+    def _pane_status_locked(self) -> tuple[str, bool]:
+        result = self._run_tmux([
+            "tmux", "display-message", "-p", "-t", self.tmux_session,
+            "#{pane_id}|#{pane_dead}",
+        ])
+        fields = result.stdout.rstrip("\r\n").split("|", 1)
+        if (
+            result.returncode != 0
+            or len(fields) != 2
+            or not re.fullmatch(r"%[0-9]+", fields[0])
+            or fields[1] not in {"0", "1"}
+        ):
+            raise KimiTerminalUnavailable("Kimi 终端 pane 状态异常")
+        return fields[0], fields[1] == "1"
+
+    def _schedule_reaper_locked(self, delay: float | None = None) -> None:
+        if self._timer is not None:
+            return
+        self._timer = threading.Timer(delay or self.idle_seconds, self._reap_if_idle)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _touch_locked(self) -> None:
+        self._last_activity = time.monotonic()
+        self._schedule_reaper_locked()
+
+    def touch(self) -> None:
+        """Record successful Kimi capture/input without exposing pane identity."""
+        with self._lock:
+            if self._lease is not None:
+                self._touch_locked()
+
+    def _kill_exact_pane_locked(self, expected_pane: str) -> bool:
+        """Kill one verified owned pane; never target the reusable session name."""
+        if not re.fullmatch(r"%[0-9]+", expected_pane):
+            raise KimiTerminalUnavailable("Kimi 终端 pane 身份异常")
+        if not self._has_session_locked() or not self._owns_session_locked():
+            return False
+        pane_id, _pane_dead = self._pane_status_locked()
+        if not hmac.compare_digest(pane_id, expected_pane):
+            return False
+        result = self._run_tmux(["tmux", "kill-pane", "-t", expected_pane])
+        if result.returncode != 0:
+            # A replacement that happened after the identity re-check is a
+            # harmless stale release. Never fall back to kill-session.
+            try:
+                current_pane, _dead = self._pane_status_locked()
+            except KimiTerminalUnavailable:
+                return False
+            if not hmac.compare_digest(current_pane, expected_pane):
+                return False
+            raise KimiTerminalUnavailable("Kimi 终端释放失败")
+        return True
+
+    def _ensure_locked(self) -> str:
+        try:
+            exists = self._has_session_locked()
+        except Exception as exc:
+            raise KimiTerminalUnavailable("tmux 状态不可用") from exc
+        if exists:
+            if not self._owns_session_locked():
+                raise KimiTerminalUnavailable("Kimi 终端名称已被其他会话占用")
+            pane_id, pane_dead = self._pane_status_locked()
+            if not pane_dead:
+                # A process restart can find its still-owned pane but has no
+                # in-memory lease; make a fresh opaque generation for it.
+                if self._lease is None:
+                    self._lease = secrets.token_urlsafe(32)
+                    self._lease_pane = pane_id
+                elif self._lease_pane != pane_id:
+                    # An owned pane replacement is a new generation even
+                    # before Android sees it; old leases become stale.
+                    self._lease = secrets.token_urlsafe(32)
+                    self._lease_pane = pane_id
+                self._touch_locked()
+                return pane_id
+            self._kill_exact_pane_locked(pane_id)
+            self._lease = None
+            self._lease_pane = None
+        if not self.command.is_file() or not os.access(self.command, os.X_OK):
+            raise KimiTerminalUnavailable("Kimi Code 终端入口未安装")
+        if not self.cwd.is_dir():
+            raise KimiTerminalUnavailable("Kimi 终端工作区不可用")
+        # Start a harmless staging pane first.  Marking it before respawn
+        # prevents this API from ever owning or killing an arbitrary
+        # pre-existing tmux session with the same user-visible name.
+        result = self._run_tmux([
+            "tmux", "new-session", "-d", "-s", self.tmux_session,
+            "-c", str(self.cwd), "-x", "160", "-y", "48", "/bin/sleep", "30",
+        ])
+        if result.returncode != 0:
+            raise KimiTerminalUnavailable("Kimi 终端启动失败")
+        marked = self._run_tmux([
+            "tmux", "set-option", "-t", self.tmux_session,
+            KIMI_TERMINAL_OWNER_OPTION, KIMI_TERMINAL_OWNER_VALUE,
+        ])
+        if marked.returncode != 0 or not self._owns_session_locked():
+            raise KimiTerminalUnavailable("Kimi 终端归属标记失败")
+        # No --session/--continue: this always creates a fresh TUI session
+        # and cannot resume or drive the ACP session used by chat.
+        launched = self._run_tmux([
+            "tmux", "respawn-pane", "-k", "-t", self.tmux_session,
+            "/usr/bin/env", "CCC_KIMI_TERMINAL_BRIDGE=1", str(self.command),
+            "--model", self.model,
+        ])
+        if launched.returncode != 0:
+            try:
+                staged_pane, _staged_dead = self._pane_status_locked()
+                self._kill_exact_pane_locked(staged_pane)
+            except KimiTerminalUnavailable:
+                pass
+            raise KimiTerminalUnavailable("Kimi 终端启动失败")
+        pane_id, pane_dead = self._pane_status_locked()
+        if pane_dead:
+            raise KimiTerminalUnavailable("Kimi 终端启动后立即退出")
+        self._lease = secrets.token_urlsafe(32)
+        self._lease_pane = pane_id
+        self._touch_locked()
+        return pane_id
+
+    def ensure(self) -> str:
+        with self._lock:
+            return self._ensure_locked()
+
+    def lease_for_pane(self, pane_id: str) -> str:
+        """Return the opaque lease only while ``pane_id`` is still current."""
+        with self._lock:
+            current = self._ensure_locked()
+            if (
+                not hmac.compare_digest(current, str(pane_id))
+                or self._lease is None
+                or self._lease_pane is None
+                or not hmac.compare_digest(current, self._lease_pane)
+            ):
+                raise KimiTerminalUnavailable("Kimi 终端已切换")
+            self._touch_locked()
+            return self._lease
+
+    def release(self, lease: str | None = None) -> bool:
+        """Release only the exact lease that captured the current pane.
+
+        A missing/old lease is a successful no-op.  In particular it cannot
+        kill a newer TUI created by a fast App target switch.
+        """
+        candidate = str(lease or "")
+        with self._lock:
+            try:
+                if (
+                    not self._lease
+                    or not self._lease_pane
+                    or not hmac.compare_digest(candidate, self._lease)
+                ):
+                    return False
+                released = self._kill_exact_pane_locked(self._lease_pane)
+                if released:
+                    self._lease = None
+                    self._lease_pane = None
+                    if self._timer is not None:
+                        self._timer.cancel()
+                        self._timer = None
+                return released
+            except KimiTerminalUnavailable:
+                raise
+            except Exception as exc:
+                raise KimiTerminalUnavailable("Kimi 终端释放失败") from exc
+
+    def release_for_shutdown(self) -> bool:
+        """Server-lifecycle cleanup; HTTP callers must use an exact lease."""
+        with self._lock:
+            try:
+                if not self._lease_pane:
+                    self._lease = None
+                    return False
+                released = self._kill_exact_pane_locked(self._lease_pane)
+                if released:
+                    self._lease = None
+                    self._lease_pane = None
+                if self._timer is not None:
+                    self._timer.cancel()
+                    self._timer = None
+                return released
+            except KimiTerminalUnavailable:
+                raise
+            except Exception as exc:
+                raise KimiTerminalUnavailable("Kimi 终端释放失败") from exc
+
+    def _reap_if_idle(self) -> None:
+        # Lock order matches HTTP operations: input transaction first, then
+        # bridge metadata. This prevents the timer from killing a pane midway
+        # through paste/Enter and avoids an input-lock/bridge-lock deadlock.
+        with self._input_lock:
+            with self._lock:
+                self._timer = None
+                if self._lease is None or self._lease_pane is None:
+                    return
+                remaining = self.idle_seconds - (time.monotonic() - self._last_activity)
+                if remaining > 0:
+                    self._schedule_reaper_locked(remaining)
+                    return
+                try:
+                    self._kill_exact_pane_locked(self._lease_pane)
+                    self._lease = None
+                    self._lease_pane = None
+                except Exception:
+                    logger.exception("failed to reap idle Kimi terminal")
 
 
 def _should_expire_chat_typing(contact_id: str, state: dict[str, Any], age_seconds: float) -> bool:
@@ -2519,6 +2789,13 @@ class ServerState:
             else None
         )
         self.kairos_terminal = KairosTerminalBridge()
+        # This is intentionally a separate TUI process, not a handle to
+        # ``self.kimi_acp``.  The two may use the same configured Kimi account
+        # but never share a prompt pipe or resume each other's session.
+        self.kimi_terminal = KimiTerminalBridge(
+            command=Path(server_cfg.get("kimi_bin", "/root/.kimi-code/bin/kimi")),
+            cwd=Path(server_cfg.get("kimi_cwd", DEFAULT_KIMI_CWD)),
+        )
         self.channel_transport_enabled: bool = bool(server_cfg.get("channel_transport_enabled", False))
         self.channel_transport_url: str = str(
             server_cfg.get("channel_transport_url", "http://127.0.0.1:8810")
@@ -3242,6 +3519,13 @@ class ServerState:
             self.kairos_terminal.release()
         except KairosTerminalUnavailable:
             logger.exception("Kairos terminal did not confirm release during shutdown")
+        kimi_terminal = getattr(self, "kimi_terminal", None)
+        release_kimi_terminal = getattr(kimi_terminal, "release_for_shutdown", None)
+        if callable(release_kimi_terminal):
+            try:
+                release_kimi_terminal()
+            except KimiTerminalUnavailable:
+                logger.exception("Kimi terminal did not confirm release during shutdown")
         try:
             self.kimi_web.close()
         except Exception:
@@ -5014,7 +5298,7 @@ class PushHandler(BaseHTTPRequestHandler):
     # ---------- routes ----------
 
     def do_GET(self):
-        from urllib.parse import urlparse
+        from urllib.parse import parse_qs, urlparse
 
         request_path = urlparse(self.path).path
         if not self._is_public_get() and not self._check_ip_allowed():
@@ -5025,6 +5309,14 @@ class PushHandler(BaseHTTPRequestHandler):
         if request_path.startswith("/kimi/") and not self._native_pairing_auth_matches():
             self._send_json(401, {"ok": False, "error": "unauthorized"})
             return
+        # The Kimi interactive terminal is privileged even on a legacy
+        # strict_auth=false server. Its GET target is visible in the query, so
+        # reject before generic optional auth or bridge construction.
+        if request_path == "/tmux/capture":
+            requested = parse_qs(urlparse(self.path).query).get("session", [""])[0]
+            if str(requested).strip().lower() == KIMI_TERMINAL_ALIAS and not self._native_pairing_auth_matches():
+                self._send_json(401, {"error": "unauthorized"})
+                return
         if request_path in {self._MEMORY_SYNC_PATH, self._MEMORY_DATE_SYNC_PATH}:
             if not self._memory_sync_auth_matches():
                 self._send_json(401, {"ok": False, "error": "unauthorized"})
@@ -5312,14 +5604,6 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(500, {"error": str(e)})
             return
         if self.path.startswith("/tmux/capture"):
-            # ``kimi`` is a virtual observer target, never a tmux target.
-            # Reject it before the generic remote-control gate so clients get
-            # a stable read-only contract rather than an accidental fallback.
-            from urllib.parse import parse_qs
-            requested = parse_qs(urlparse(self.path).query).get("session", [""])[0]
-            if str(requested).strip().lower() == KIMI_TERMINAL_ALIAS:
-                self._handle_tmux_capture()
-                return
             # P0-2: remote control disabled by default
             if not self.state.allow_remote_control:
                 self._send_json(403, {"error": "remote_control disabled", "hint": "set allow_remote_control=true in config.toml"})
@@ -5668,6 +5952,12 @@ class PushHandler(BaseHTTPRequestHandler):
         if request_path.startswith("/kimi/") and not self._native_pairing_auth_matches():
             self._send_json(401, {"ok": False, "error": "unauthorized"})
             return
+        # session/target lives in the JSON body for these routes. Fail closed
+        # for the whole terminal mutation surface before reading it; otherwise
+        # strict_auth=false would let an unauthenticated request reach Kimi.
+        if request_path in {"/terminal/key", "/tmux/send", "/terminal/release"} and not self._native_pairing_auth_matches():
+            self._send_json(401, {"error": "unauthorized"})
+            return
         if self.path == "/login":
             try:
                 body = self._read_body()
@@ -5998,29 +6288,20 @@ class PushHandler(BaseHTTPRequestHandler):
         elif self.path == "/todos/edit":
             self._handle_todos_edit(body)
         elif self.path == "/terminal/release":
-            # Only the reserved Kairos console can be released here. This is
+            # Reserved Kairos/Kimi consoles can be released here. This is
             # intentionally not a generic tmux-kill endpoint.
-            if str(body.get("target") or "").strip().lower() == KIMI_TERMINAL_ALIAS:
-                self._handle_terminal_release(body)
-                return
             if not self.state.allow_remote_control:
                 self._send_json(403, {"error": "remote_control disabled"})
                 return
             self._handle_terminal_release(body)
         elif self.path == "/terminal/key":
             # Virtual keyboard: send a special key (Escape, C-c, Tab, etc.) to tmux
-            if str(body.get("session") or "").strip().lower() == KIMI_TERMINAL_ALIAS:
-                self._handle_terminal_key(body)
-                return
             if not self.state.allow_remote_control:
                 self._send_json(403, {"error": "remote_control disabled"})
                 return
             self._handle_terminal_key(body)
         elif self.path == "/tmux/send":
             # P0-2: direct tmux send-keys — remote control gate
-            if str(body.get("session") or "").strip().lower() == KIMI_TERMINAL_ALIAS:
-                self._handle_tmux_send(body)
-                return
             if not self.state.allow_remote_control:
                 self._send_json(403, {"error": "remote_control disabled"})
                 return
@@ -9822,15 +10103,33 @@ class PushHandler(BaseHTTPRequestHandler):
         """
         if not isinstance(raw, dict):
             return []
-        candidates: Any = raw.get("windows") or raw.get("limits") or raw.get("items")
+        # Kimi Code 0.31's real /oauth/usage response is
+        # ``summary={window,used,limit,reset_at}`` plus ``limits=[...]``.
+        # Put both on the same bounded, account-free public projection.
+        candidates: list[Any] = []
+        summary = raw.get("summary")
+        if isinstance(summary, dict):
+            candidates.append(summary)
+        trailing = raw.get("windows") or raw.get("limits") or raw.get("items")
+        if isinstance(trailing, list):
+            candidates.extend(trailing)
+        elif not candidates and any(key in raw for key in ("remaining", "used", "total", "limit")):
+            candidates.append(raw)
         if not isinstance(candidates, list):
-            candidates = [raw] if any(key in raw for key in ("remaining", "total", "limit")) else []
+            candidates = []
         windows: list[dict[str, Any]] = []
         for index, item in enumerate(candidates[:6], start=1):
             if not isinstance(item, dict):
                 continue
+            raw_window = item.get("window")
+            duration = raw_window.get("duration") if isinstance(raw_window, dict) else None
+            unit = str(raw_window.get("unit") or "") if isinstance(raw_window, dict) else ""
+            unit_text = {"hour": "小时", "day": "天", "week": "天", "month": "个月"}.get(unit, "")
+            if unit == "week" and isinstance(duration, (int, float)):
+                duration = int(duration) * 7
+            window_label = f"{int(duration)} {unit_text} Code" if isinstance(duration, (int, float)) and unit_text else ""
             label = re.sub(r"[\x00-\x1f\x7f]", "", str(
-                item.get("label") or item.get("name") or item.get("type") or f"配额 {index}"
+                item.get("label") or item.get("name") or item.get("type") or window_label or f"配额 {index}"
             )).strip()[:80] or f"配额 {index}"
             try:
                 remaining = float(item.get("remaining"))
@@ -9840,6 +10139,12 @@ class PushHandler(BaseHTTPRequestHandler):
                 total = float(item.get("total", item.get("limit")))
             except (TypeError, ValueError):
                 total = None
+            try:
+                used = float(item.get("used"))
+            except (TypeError, ValueError):
+                used = None
+            if remaining is None and used is not None and total is not None:
+                remaining = max(0.0, total - used)
             try:
                 percent = float(item.get("remaining_percent"))
             except (TypeError, ValueError):
@@ -9853,7 +10158,9 @@ class PushHandler(BaseHTTPRequestHandler):
                 item.get("reset_text") or item.get("reset_at") or item.get("resetsAt") or ""
             )).strip()[:120]
             text = (
-                f"剩余 {max(0, int(remaining))}/{max(0, int(total))}"
+                f"已用 {max(0, int(used))}/{max(0, int(total))} · 剩余 {round(percent, 1)}%"
+                if used is not None and total is not None and total >= 0
+                else f"剩余 {max(0, int(remaining))}/{max(0, int(total))}"
                 if remaining is not None and total is not None and total >= 0
                 else f"剩余 {round(percent, 1)}%"
             )
@@ -9864,6 +10171,48 @@ class PushHandler(BaseHTTPRequestHandler):
                 "remaining_percent": round(percent, 2),
             })
         return windows
+
+    @staticmethod
+    def _kimi_billing_projection(userinfo: Any, usage: Any) -> dict[str, Any]:
+        """Project the two documented Kimi Code REST responses, and nothing else."""
+        tier = ""
+        level: int | None = None
+        if isinstance(userinfo, dict) and str(userinfo.get("kind") or "") == "ok":
+            profile = userinfo.get("userInfo")
+            if isinstance(profile, dict):
+                tier = re.sub(r"[\x00-\x1f\x7f]", "", str(profile.get("userLevelName") or "")).strip()[:80]
+                raw_level = profile.get("userLevel")
+                if isinstance(raw_level, int) and not isinstance(raw_level, bool) and 0 <= raw_level <= 100_000:
+                    level = raw_level
+
+        extra_payload: dict[str, Any] = {"available": False}
+        raw_extra = usage.get("extra_usage") if isinstance(usage, dict) else None
+        if isinstance(raw_extra, dict):
+            def cents(key: str) -> int:
+                value = raw_extra.get(key)
+                return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 10**12 else 0
+
+            currency = re.sub(r"[^A-Za-z]", "", str(raw_extra.get("currency") or ""))[:6].upper()
+            left, total = cents("balance_cents"), cents("total_cents")
+            monthly_limit, monthly_used = cents("monthly_charge_limit_cents"), cents("monthly_used_cents")
+            prefix = f"{currency} " if currency else ""
+            extra_payload = {
+                "available": True,
+                "balance_text": f"{prefix}{left / 100:.2f} / {total / 100:.2f}",
+                "monthly_cap_enabled": bool(raw_extra.get("monthly_charge_limit_enabled", False)),
+                "monthly_cap_text": (
+                    f"{prefix}{monthly_used / 100:.2f} / {monthly_limit / 100:.2f}"
+                    if monthly_limit else ""
+                ),
+            }
+        return {
+            "membership": {
+                "available": bool(tier),
+                "tier": tier,
+                "level": level,
+            },
+            "extra_usage": extra_payload,
+        }
 
     def _kimi_quota_snapshot(self) -> dict[str, Any]:
         """Return the managed-account quota snapshot, or an empty dict on error."""
@@ -11416,6 +11765,13 @@ class PushHandler(BaseHTTPRequestHandler):
 
         quota = self._kimi_quota_snapshot()
         quota_windows = self._kimi_quota_windows(quota)
+        userinfo: dict[str, Any] = {}
+        get_userinfo = getattr(self.state.kimi_web, "get_userinfo", None)
+        if callable(get_userinfo):
+            try:
+                userinfo = get_userinfo()
+            except KimiWebError as exc:
+                logger.warning("Kimi userinfo query failed: %s", exc)
         quota_text = (
             " · ".join(str(item.get("text") or "") for item in quota_windows if item.get("text"))
             or "配额信息暂不可用"
@@ -11481,7 +11837,11 @@ class PushHandler(BaseHTTPRequestHandler):
             "context_usage_percent": round(context_usage * 100, 2),
             # The normalized quota DTO is deliberately bounded; raw provider
             # payloads can contain account/session metadata and never leave.
-            "quota": {"text": quota_text, "windows": quota_windows},
+            "quota": {
+                "text": quota_text,
+                "windows": quota_windows,
+                "billing": self._kimi_billing_projection(userinfo, quota),
+            },
             "busy": bool(active_turn or getattr(self.state, "kimi_prepare_token", "") or getattr(self.state.kimi_acp, "busy", False)),
             "auto_forge_threshold": self.state.kimi_auto_forge_context_threshold,
         })
@@ -17058,6 +17418,13 @@ class PushHandler(BaseHTTPRequestHandler):
             if require_ready:
                 physical = self.state.kairos_terminal.require_ready()
             return physical, KAIROS_TERMINAL_ALIAS, True
+        if requested.strip().lower() == KIMI_TERMINAL_ALIAS:
+            # Do not use kimi_acp here.  This owns an independent Kimi TUI
+            # process whose new CLI session cannot drive the chat ACP pipe.
+            # ``ensure`` returns an exact owned pane id, never the reusable
+            # tmux session name.  This fences all Kimi capture/input against
+            # an unrelated same-named session appearing between requests.
+            return self.state.kimi_terminal.ensure(), KIMI_TERMINAL_ALIAS, False
         # Selecting any regular tmux pane hands the shared Codex lock back to
         # the App before XiaoKe input/capture proceeds.  The release itself
         # participates in the Kairos input transaction so a target switch
@@ -17114,10 +17481,16 @@ class PushHandler(BaseHTTPRequestHandler):
     def _handle_terminal_release(self, body: dict[str, Any]) -> None:
         target = str(body.get("target") or "").strip().lower()
         if target == KIMI_TERMINAL_ALIAS:
-            self._send_json(403, {
-                "error": "Kimi terminal is a read-only observer",
+            with self.state.kimi_terminal.input_transaction():
+                try:
+                    released = self.state.kimi_terminal.release(str(body.get("lease") or ""))
+                except KimiTerminalUnavailable as exc:
+                    self._send_json(503, {"error": str(exc), "target": KIMI_TERMINAL_ALIAS})
+                    return
+            self._send_json(200, {
+                "ok": True,
                 "target": KIMI_TERMINAL_ALIAS,
-                "mode": "read_only",
+                "released": released,
             })
             return
         if target != KAIROS_TERMINAL_ALIAS:
@@ -17150,13 +17523,6 @@ class PushHandler(BaseHTTPRequestHandler):
         from urllib.parse import urlparse, parse_qs
         qs = parse_qs(urlparse(self.path).query)
         requested_session = qs.get("session", [self.state.default_session])[0]
-        if str(requested_session).strip().lower() == KIMI_TERMINAL_ALIAS:
-            self._send_json(403, {
-                "error": "Kimi terminal is a read-only observer",
-                "target": KIMI_TERMINAL_ALIAS,
-                "mode": "read_only",
-            })
-            return
         try:
             lines = int(qs.get("lines", ["120"])[0])
         except Exception:
@@ -17166,6 +17532,14 @@ class PushHandler(BaseHTTPRequestHandler):
         except KairosTerminalUnavailable as exc:
             self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
             return
+        except KimiTerminalUnavailable as exc:
+            self._send_json(503, {"error": str(exc), "target": KIMI_TERMINAL_ALIAS})
+            return
+        kimi_lease = ""
+        capture_transaction = (
+            self.state.kimi_terminal.input_transaction()
+            if public_session == KIMI_TERMINAL_ALIAS else nullcontext()
+        )
         try:
             terminal_state = "ready"
             capture_pane: str | None = None
@@ -17175,10 +17549,17 @@ class PushHandler(BaseHTTPRequestHandler):
                 # state and content belong to one physical console.
                 capture_pane, _state_before_capture = self.state.kairos_terminal.terminal_state()
                 session = capture_pane
-            result = subprocess.run(
-                ["tmux", "capture-pane", "-t", session, "-p", "-S", str(-lines)],
-                capture_output=True, text=True, timeout=3
-            )
+            with capture_transaction:
+                if public_session == KIMI_TERMINAL_ALIAS:
+                    # Lease is opaque and only binds this capture to the exact
+                    # current owned pane; pane/session identifiers never leave.
+                    kimi_lease = self.state.kimi_terminal.lease_for_pane(session)
+                result = subprocess.run(
+                    ["tmux", "capture-pane", "-t", session, "-p", "-S", str(-lines)],
+                    capture_output=True, text=True, timeout=3
+                )
+                if result.returncode == 0 and public_session == KIMI_TERMINAL_ALIAS:
+                    self.state.kimi_terminal.touch()
             if result.returncode != 0:
                 if is_kairos:
                     self._finish_kairos_terminal_failure(
@@ -17231,12 +17612,15 @@ class PushHandler(BaseHTTPRequestHandler):
                         else "Kairos 终端已连接，正在等待终端输出…\n"
                     )
                 )
-            self._send_json(200, {
+            payload = {
                 "ok": True,
                 "session": public_session,
                 "content": content,
                 "state": terminal_state,
-            })
+            }
+            if public_session == KIMI_TERMINAL_ALIAS:
+                payload["lease"] = kimi_lease
+            self._send_json(200, payload)
         except Exception as e:
             if is_kairos:
                 self._finish_kairos_terminal_failure(
@@ -17247,15 +17631,12 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _handle_terminal_key(self, body: dict[str, Any]):
         requested_session = str(body.get("session", "cctg")).strip() or "cctg"
-        if requested_session.lower() == KIMI_TERMINAL_ALIAS:
-            self._send_json(403, {
-                "error": "Kimi terminal is a read-only observer",
-                "target": KIMI_TERMINAL_ALIAS,
-                "mode": "read_only",
-            })
-            return
         if requested_session.lower() == KAIROS_TERMINAL_ALIAS:
             with self.state.kairos_terminal.input_transaction():
+                self._handle_terminal_key_transaction(body)
+            return
+        if requested_session.lower() == KIMI_TERMINAL_ALIAS:
+            with self.state.kimi_terminal.input_transaction():
                 self._handle_terminal_key_transaction(body)
             return
         self._handle_terminal_key_transaction(body)
@@ -17297,6 +17678,9 @@ class PushHandler(BaseHTTPRequestHandler):
         except KairosTerminalUnavailable as exc:
             self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
             return
+        except KimiTerminalUnavailable as exc:
+            self._send_json(503, {"error": str(exc), "target": KIMI_TERMINAL_ALIAS})
+            return
         try:
             result = subprocess.run(
                 ["tmux", "send-keys", "-t", session, key_name],
@@ -17308,6 +17692,8 @@ class PushHandler(BaseHTTPRequestHandler):
                 else:
                     self._send_json(500, {"error": result.stderr.strip() or "send-keys failed"})
                 return
+            if public_session == KIMI_TERMINAL_ALIAS:
+                self.state.kimi_terminal.touch()
             self._send_json(200, {"ok": True, "key": key_name, "session": public_session})
         except Exception as e:
             if is_kairos:
@@ -17317,15 +17703,12 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _handle_tmux_send(self, body: dict[str, Any]):
         requested_session = body.get("session") or self.state.active_session or self.state.default_session
-        if str(requested_session).strip().lower() == KIMI_TERMINAL_ALIAS:
-            self._send_json(403, {
-                "error": "Kimi terminal is a read-only observer",
-                "target": KIMI_TERMINAL_ALIAS,
-                "mode": "read_only",
-            })
-            return
         if str(requested_session).strip().lower() == KAIROS_TERMINAL_ALIAS:
             with self.state.kairos_terminal.input_transaction():
+                self._handle_tmux_send_transaction(body)
+            return
+        if str(requested_session).strip().lower() == KIMI_TERMINAL_ALIAS:
+            with self.state.kimi_terminal.input_transaction():
                 self._handle_tmux_send_transaction(body)
             return
         self._handle_tmux_send_transaction(body)
@@ -17356,6 +17739,9 @@ class PushHandler(BaseHTTPRequestHandler):
             except KairosTerminalUnavailable as exc:
                 self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
                 return
+            except KimiTerminalUnavailable as exc:
+                self._send_json(503, {"error": str(exc), "target": KIMI_TERMINAL_ALIAS})
+                return
             try:
                 result = subprocess.run(
                     ["tmux", "send-keys", "-t", session, special_key],
@@ -17367,6 +17753,8 @@ class PushHandler(BaseHTTPRequestHandler):
                     else:
                         self._send_json(500, {"error": result.stderr.strip() or "send-keys failed"})
                     return
+                if public_session == KIMI_TERMINAL_ALIAS:
+                    self.state.kimi_terminal.touch()
                 self._send_json(200, {"ok": True, "session": public_session, "key": special_key})
             except Exception as e:
                 if is_kairos:
@@ -17388,13 +17776,21 @@ class PushHandler(BaseHTTPRequestHandler):
         except KairosTerminalUnavailable as exc:
             self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
             return
+        except KimiTerminalUnavailable as exc:
+            self._send_json(503, {"error": str(exc), "target": KIMI_TERMINAL_ALIAS})
+            return
         buffer_name: str | None = None
+        is_kimi = public_session == KIMI_TERMINAL_ALIAS
         try:
             if keys:
                 # 用 load-buffer + paste-buffer 安全注入 (避免 - 开头被当 flag)
                 # Kairos uses a request-scoped buffer so concurrent XiaoKe
                 # input can never replace its payload between load and paste.
-                buffer_name = f"ccc-kairos-{secrets.token_hex(8)}" if is_kairos else None
+                buffer_name = (
+                    f"ccc-kairos-{secrets.token_hex(8)}" if is_kairos
+                    else f"ccc-kimi-{secrets.token_hex(8)}" if is_kimi
+                    else None
+                )
                 load_argv = ["tmux", "load-buffer"]
                 if buffer_name:
                     load_argv += ["-b", buffer_name]
@@ -17404,12 +17800,12 @@ class PushHandler(BaseHTTPRequestHandler):
                     stdin=subprocess.PIPE,
                 )
                 try:
-                    p.communicate(input=keys.encode("utf-8"), timeout=3 if is_kairos else None)
+                    p.communicate(input=keys.encode("utf-8"), timeout=3 if (is_kairos or is_kimi) else None)
                 except subprocess.TimeoutExpired:
                     p.kill()
                     p.communicate()
                     raise RuntimeError("tmux load-buffer timed out")
-                if is_kairos and p.returncode != 0:
+                if (is_kairos or is_kimi) and p.returncode != 0:
                     raise RuntimeError("tmux load-buffer failed")
                 paste_argv = ["tmux", "paste-buffer"]
                 if buffer_name:
@@ -17417,7 +17813,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 paste_argv += ["-t", session, "-p"]
                 if buffer_name:
                     paste_argv.append("-d")
-                if is_kairos:
+                if is_kairos or is_kimi:
                     paste = subprocess.run(
                         paste_argv, capture_output=True, text=True, timeout=3,
                     )
@@ -17426,7 +17822,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 else:
                     subprocess.run(paste_argv, check=False)
             if enter:
-                if is_kairos:
+                if is_kairos or is_kimi:
                     submit = subprocess.run(
                         ["tmux", "send-keys", "-t", session, "Enter"],
                         capture_output=True, text=True, timeout=3,
@@ -17435,6 +17831,8 @@ class PushHandler(BaseHTTPRequestHandler):
                         raise RuntimeError("tmux send-keys Enter failed")
                 else:
                     subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=False)
+            if is_kimi:
+                self.state.kimi_terminal.touch()
             self._send_json(200, {"ok": True, "session": public_session})
         except Exception as e:
             if is_kairos:
@@ -17442,6 +17840,16 @@ class PushHandler(BaseHTTPRequestHandler):
                     buffer_name=buffer_name,
                     expected_pane=session,
                 )
+            elif is_kimi:
+                if buffer_name:
+                    try:
+                        subprocess.run(
+                            ["tmux", "delete-buffer", "-b", buffer_name],
+                            capture_output=True, text=True, timeout=3,
+                        )
+                    except Exception:
+                        logger.exception("failed to clear Kimi terminal input buffer")
+                self._send_json(503, {"error": "Kimi 终端操作失败", "target": KIMI_TERMINAL_ALIAS})
             else:
                 self._send_json(500, {"error": str(e)})
 
