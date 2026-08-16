@@ -154,6 +154,7 @@ from kimi_preferences import (
     KimiPreferencePersistenceError,
     KimiPreferenceStore,
 )
+from kimi_terminal_observer import KimiTerminalObserver
 from kimi_web_client import KimiWebClient, KimiWebError
 import todos as todos_mod
 from studyroom import StudyroomDB
@@ -793,6 +794,7 @@ logger = logging.getLogger("cc-apns-server")
 
 XIAOKE_STALE_COMPLETION_GRACE_SECONDS = 120.0
 KAIROS_TERMINAL_ALIAS = "kairos"
+KIMI_TERMINAL_ALIAS = "kimi"
 KAIROS_TERMINAL_OWNER_OPTION = "@ccc_kairos_terminal_owner"
 KAIROS_TERMINAL_OWNER_VALUE = "cccompanion:qiaokairos:v1"
 KAIROS_TERMINAL_READY_OPTION = "@ccc_kairos_terminal_ready"
@@ -2795,6 +2797,10 @@ class ServerState:
         self.kimi_turn_lock = threading.RLock()
         self.kimi_active_turn: dict[str, Any] = {}
         self.kimi_prepare_token = ""
+        # A Kimi ACP process is not a tmux console.  Keep its terminal-shaped
+        # UI as a separate, prompt-free observer rather than ever capturing
+        # ACP stdio or giving it remote terminal input.
+        self.kimi_terminal_observer = KimiTerminalObserver()
         self.kimi_preferences = KimiPreferenceStore(
             contact_history_dir / "kimi_preferences.json",
             config_path=server_cfg.get("kimi_config_path", "/root/.kimi-code/config.toml"),
@@ -5251,6 +5257,9 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path == "/kimi/status":
             self._handle_kimi_status()
             return
+        if self.path == "/kimi/terminal/observer":
+            self._handle_kimi_terminal_observer()
+            return
         if self.path == "/kimi/preferences" or self.path.startswith("/kimi/preferences?"):
             self._handle_kimi_preferences_get()
             return
@@ -5303,6 +5312,14 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(500, {"error": str(e)})
             return
         if self.path.startswith("/tmux/capture"):
+            # ``kimi`` is a virtual observer target, never a tmux target.
+            # Reject it before the generic remote-control gate so clients get
+            # a stable read-only contract rather than an accidental fallback.
+            from urllib.parse import parse_qs
+            requested = parse_qs(urlparse(self.path).query).get("session", [""])[0]
+            if str(requested).strip().lower() == KIMI_TERMINAL_ALIAS:
+                self._handle_tmux_capture()
+                return
             # P0-2: remote control disabled by default
             if not self.state.allow_remote_control:
                 self._send_json(403, {"error": "remote_control disabled", "hint": "set allow_remote_control=true in config.toml"})
@@ -5983,18 +6000,27 @@ class PushHandler(BaseHTTPRequestHandler):
         elif self.path == "/terminal/release":
             # Only the reserved Kairos console can be released here. This is
             # intentionally not a generic tmux-kill endpoint.
+            if str(body.get("target") or "").strip().lower() == KIMI_TERMINAL_ALIAS:
+                self._handle_terminal_release(body)
+                return
             if not self.state.allow_remote_control:
                 self._send_json(403, {"error": "remote_control disabled"})
                 return
             self._handle_terminal_release(body)
         elif self.path == "/terminal/key":
             # Virtual keyboard: send a special key (Escape, C-c, Tab, etc.) to tmux
+            if str(body.get("session") or "").strip().lower() == KIMI_TERMINAL_ALIAS:
+                self._handle_terminal_key(body)
+                return
             if not self.state.allow_remote_control:
                 self._send_json(403, {"error": "remote_control disabled"})
                 return
             self._handle_terminal_key(body)
         elif self.path == "/tmux/send":
             # P0-2: direct tmux send-keys — remote control gate
+            if str(body.get("session") or "").strip().lower() == KIMI_TERMINAL_ALIAS:
+                self._handle_tmux_send(body)
+                return
             if not self.state.allow_remote_control:
                 self._send_json(403, {"error": "remote_control disabled"})
                 return
@@ -9500,15 +9526,41 @@ class PushHandler(BaseHTTPRequestHandler):
             recall_context=recall_context,
             xhs_login_card_allowed=xhs_login_card_allowed,
         )
+        kimi_observer = getattr(self.state, "kimi_terminal_observer", None)
+        observer_begin = getattr(kimi_observer, "begin", None)
+        try:
+            observer_epoch = (
+                observer_begin(session_id, str(rec.get("ts") or ""))
+                if callable(observer_begin) else None
+            )
+        except Exception:
+            # Observer availability must never prevent an actual chat turn.
+            logger.debug("Kimi terminal observer begin failed", exc_info=True)
+            observer_epoch = None
 
         def worker() -> None:
             chunks: list[str] = []
             last_published = 0.0
             terminalized = False
+            observer_finished = False
             activity_count = 0
             activity_items: list[str] = []
             worker_activity_items: list[dict[str, Any]] = []
             activity_labels_seen: set[str] = set()
+
+            def finish_observer(outcome: str) -> None:
+                """Terminalize only this exact private observer epoch once."""
+                nonlocal observer_finished
+                if observer_finished or observer_epoch is None:
+                    return
+                finish = getattr(kimi_observer, "finish", None)
+                if not callable(finish):
+                    return
+                try:
+                    finish(session_id, str(rec.get("ts") or ""), observer_epoch, outcome)
+                    observer_finished = True
+                except Exception:
+                    logger.debug("Kimi terminal observer finish failed", exc_info=True)
 
             def terminalize_workers(status: str) -> None:
                 terminalized_workers = self._terminalize_worker_activity_items(worker_activity_items, status)
@@ -9570,6 +9622,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 allow_xhs_login_card: bool = False,
             ) -> None:
                 nonlocal terminalized
+                finish_observer(status)
                 terminalize_workers(status)
                 append_worker_history()
                 final_ts = append_assistant_safely(
@@ -9609,6 +9662,20 @@ class PushHandler(BaseHTTPRequestHandler):
                 nonlocal activity_count
                 if not isinstance(event, dict):
                     return
+                # kimi_acp already maps ACP notifications without retaining
+                # payload text.  The observer repeats that fixed vocabulary
+                # mapping and fences it to this private turn/epoch.
+                record_activity = getattr(kimi_observer, "record_activity", None)
+                if observer_epoch is not None and callable(record_activity):
+                    try:
+                        record_activity(
+                            session_id,
+                            str(rec.get("ts") or ""),
+                            observer_epoch,
+                            event,
+                        )
+                    except Exception:
+                        logger.debug("Kimi terminal observer activity failed", exc_info=True)
                 if event.get("kind") == "collaboration_worker":
                     worker_id = str(event.get("worker_id") or "kimi-subagent")
                     current = next((item for item in worker_activity_items if item.get("worker_id") == worker_id), None)
@@ -9668,6 +9735,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     allow_xhs_login_card=xhs_login_card_allowed,
                 )
             except KimiACPCancelled:
+                finish_observer("interrupted")
                 terminalize_workers("interrupted")
                 append_worker_history()
                 partial = "".join(chunks).strip()
@@ -9694,6 +9762,7 @@ class PushHandler(BaseHTTPRequestHandler):
             finally:
                 if not terminalized:
                     try:
+                        finish_observer("failed")
                         terminalize_workers("failed")
                         append_worker_history()
                         self._set_chat_failed(
@@ -11302,6 +11371,33 @@ class PushHandler(BaseHTTPRequestHandler):
             "reasoning_effort": effort,
             "busy": True,
         })
+
+    def _handle_kimi_terminal_observer(self) -> None:
+        """Return Kimi's narrow observer DTO, never ACP/stdout diagnostics."""
+        observer = getattr(self.state, "kimi_terminal_observer", None)
+        snapshot = getattr(observer, "snapshot", None)
+        session_id = ""
+        try:
+            session_id = str(self.state.kimi_acp.load_session_id() or "")
+        except Exception:
+            logger.debug("Kimi observer session lookup unavailable", exc_info=True)
+        if not session_id:
+            # A turn can be in the tiny interval after it was accepted but
+            # before ACP persists the pointer.  It stays private in state and
+            # is used only to find observer data, never returned in this DTO.
+            with getattr(self.state, "kimi_turn_lock", threading.RLock()):
+                active = getattr(self.state, "kimi_active_turn", {})
+                if isinstance(active, dict):
+                    session_id = str(active.get("session_id") or "")
+        try:
+            candidate = snapshot(session_id) if callable(snapshot) else None
+        except Exception:
+            logger.debug("Kimi terminal observer unavailable", exc_info=True)
+            candidate = None
+        # Rebuild the strict DTO at the HTTP boundary as well.  Do not trust a
+        # pre-rendered string or an observer implementation's extra fields.
+        payload = KimiTerminalObserver.project_snapshot(candidate)
+        self._send_json(200, payload)
 
     def _handle_kimi_status(self):
         """GET /kimi/status — return quota and current session context usage."""
@@ -17017,6 +17113,13 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _handle_terminal_release(self, body: dict[str, Any]) -> None:
         target = str(body.get("target") or "").strip().lower()
+        if target == KIMI_TERMINAL_ALIAS:
+            self._send_json(403, {
+                "error": "Kimi terminal is a read-only observer",
+                "target": KIMI_TERMINAL_ALIAS,
+                "mode": "read_only",
+            })
+            return
         if target != KAIROS_TERMINAL_ALIAS:
             self._send_json(400, {"error": "target must be kairos"})
             return
@@ -17047,6 +17150,13 @@ class PushHandler(BaseHTTPRequestHandler):
         from urllib.parse import urlparse, parse_qs
         qs = parse_qs(urlparse(self.path).query)
         requested_session = qs.get("session", [self.state.default_session])[0]
+        if str(requested_session).strip().lower() == KIMI_TERMINAL_ALIAS:
+            self._send_json(403, {
+                "error": "Kimi terminal is a read-only observer",
+                "target": KIMI_TERMINAL_ALIAS,
+                "mode": "read_only",
+            })
+            return
         try:
             lines = int(qs.get("lines", ["120"])[0])
         except Exception:
@@ -17137,6 +17247,13 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _handle_terminal_key(self, body: dict[str, Any]):
         requested_session = str(body.get("session", "cctg")).strip() or "cctg"
+        if requested_session.lower() == KIMI_TERMINAL_ALIAS:
+            self._send_json(403, {
+                "error": "Kimi terminal is a read-only observer",
+                "target": KIMI_TERMINAL_ALIAS,
+                "mode": "read_only",
+            })
+            return
         if requested_session.lower() == KAIROS_TERMINAL_ALIAS:
             with self.state.kairos_terminal.input_transaction():
                 self._handle_terminal_key_transaction(body)
@@ -17200,6 +17317,13 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _handle_tmux_send(self, body: dict[str, Any]):
         requested_session = body.get("session") or self.state.active_session or self.state.default_session
+        if str(requested_session).strip().lower() == KIMI_TERMINAL_ALIAS:
+            self._send_json(403, {
+                "error": "Kimi terminal is a read-only observer",
+                "target": KIMI_TERMINAL_ALIAS,
+                "mode": "read_only",
+            })
+            return
         if str(requested_session).strip().lower() == KAIROS_TERMINAL_ALIAS:
             with self.state.kairos_terminal.input_transaction():
                 self._handle_tmux_send_transaction(body)

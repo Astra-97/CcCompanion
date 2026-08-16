@@ -15,6 +15,7 @@ from kimi_preferences import (
     KIMI_APP_DEFAULT_MODEL,
     KimiPreferenceStore,
 )
+from kimi_terminal_observer import KimiTerminalObserver
 from link_preview import LinkPreviewBundle
 from push import KairosRecallIndex, PushHandler
 
@@ -331,6 +332,7 @@ class KimiIsolationAndActivityTest(unittest.TestCase):
             contact_chats={"kimi": chat},
             kimi_turn_lock=threading.RLock(), kimi_active_turn={}, kimi_prepare_token="",
             kimi_acp=ACP(), kimi_preferences=prefs, kimi_auto_forge_context_threshold=0,
+            kimi_terminal_observer=KimiTerminalObserver(),
             kimi_semantic_memory_recall_enabled=False,
             chat_draft_lock=threading.Lock(), chat_drafts={}, chat_reply_states={}, chat_stream_revisions={},
             sticker_catalog=types.SimpleNamespace(snapshot=lambda: {"stickers": []}),
@@ -376,6 +378,15 @@ class KimiIsolationAndActivityTest(unittest.TestCase):
             and update.get("activity_items") == ["正在思考", "正在使用工具"]
             for update in activity_updates
         ))
+        observer_payload = state.kimi_terminal_observer.snapshot("session-k")
+        self.assertEqual("idle", observer_payload["state"])
+        self.assertIn("正在思考（内容已隐藏）", observer_payload["content"])
+        self.assertIn("正在使用工具（名称与参数已隐藏）", observer_payload["content"])
+        self.assertIn("Kimi 协作 worker 已开始", observer_payload["content"])
+        self.assertIn("Kimi 协作 worker 已完成", observer_payload["content"])
+        self.assertIn("本轮已完成", observer_payload["content"])
+        self.assertNotIn("rm -rf", str(observer_payload))
+        self.assertNotIn("secret", str(observer_payload))
 
 
 if __name__ == "__main__":
