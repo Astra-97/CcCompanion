@@ -222,6 +222,21 @@ class KimiACPClient:
             return ""
         return session_id
 
+    def validated_local_session_id(self, value: Any) -> str:
+        """Return ``value`` only when it belongs to this client's workspace.
+
+        Terminal resume and ACP selection share this exact validation path so
+        neither a syntactically valid foreign id nor a session from another
+        working directory can cross the Karami boundary.
+        """
+        clean = self._valid_session_id(value)
+        if not clean:
+            return ""
+        return clean if any(
+            str(item.get("session_id") or "") == clean
+            for item in self.list_local_sessions(limit=96)
+        ) else ""
+
     def _session_cache_snapshot(self) -> tuple[str, str, str, dict[str, tuple[str, str]]]:
         """Snapshot only volatile ACP state; the persisted pointer is committed last."""
         return (

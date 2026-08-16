@@ -21,6 +21,18 @@ class KimiACPProtocolTest(unittest.TestCase):
     def test_app_model_is_k3_256k(self):
         self.assertEqual("kimi-code/k3-256k", KIMI_APP_MODEL)
 
+    def test_terminal_session_validation_requires_syntax_and_local_allowlist(self):
+        client = KimiACPClient(state_path="/tmp/unused-kimi-terminal-validation")
+        client.list_local_sessions = lambda **_kwargs: [
+            {"session_id": "karami-session", "updated_at": 1},
+        ]
+        self.assertEqual(
+            "karami-session",
+            client.validated_local_session_id("karami-session"),
+        )
+        self.assertEqual("", client.validated_local_session_id("foreign-session"))
+        self.assertEqual("", client.validated_local_session_id("../karami-session"))
+
     def test_kimi_036_thinking_option_is_read_back_without_mutation(self):
         client = KimiACPClient(state_path="/tmp/unused-kimi-thinking-readback")
         client._start = lambda: None

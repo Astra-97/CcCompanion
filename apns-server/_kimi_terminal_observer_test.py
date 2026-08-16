@@ -2,6 +2,8 @@ import json
 from contextlib import nullcontext
 from pathlib import Path
 import sys
+import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -201,7 +203,7 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         handler.path = "/tmux/capture?session=kimi"
         lease = "a" * 43
         bridge = types.SimpleNamespace(
-            ensure=lambda: "%42",
+            ensure=lambda session_id: "%42" if session_id == "session-current" else "",
             lease_for_pane=lambda pane: lease if pane == "%42" else "",
             release=lambda candidate: candidate == lease,
             input_transaction=lambda: nullcontext(),
@@ -209,6 +211,12 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         )
         handler.state = types.SimpleNamespace(
             default_session="cctg", active_session="cctg", kimi_terminal=bridge,
+            kimi_turn_lock=threading.RLock(), kimi_active_turn={}, kimi_prepare_token="",
+            kimi_acp=types.SimpleNamespace(
+                busy=False, load_session_id=lambda: "session-current",
+                validated_local_session_id=lambda value: value,
+                close=lambda: None,
+            ),
         )
         handler.responses = []
         handler._send_json = lambda status, payload: handler.responses.append((status, payload))
@@ -226,14 +234,59 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         self.assertEqual(200, handler.responses[-1][0])
         self.assertTrue(handler.responses[-1][1]["released"])
 
-    def test_kimi_bridge_starts_plain_cli_without_acp_resume_flags(self):
+    @mock.patch("push.subprocess.run")
+    def test_capture_holds_one_input_lock_across_acquire_lease_and_tmux_capture(self, run):
+        handler = object.__new__(PushHandler)
+        handler.path = "/tmux/capture?session=kimi"
+        input_lock = threading.Lock()
+        observations = []
+
+        class Bridge:
+            def input_transaction(self): return input_lock
+            def ensure(self, session_id):
+                observations.append(("ensure", input_lock.locked(), session_id))
+                return "%42"
+            def lease_for_pane(self, pane):
+                observations.append(("lease", input_lock.locked(), pane))
+                return "a" * 43
+            def touch(self): pass
+
+        def capture(argv, **_kwargs):
+            observations.append(("capture", input_lock.locked(), argv[3]))
+            return types.SimpleNamespace(returncode=0, stdout="ready\n", stderr="")
+
+        run.side_effect = capture
+        acp = types.SimpleNamespace(
+            busy=False, load_session_id=lambda: "session-current",
+            validated_local_session_id=lambda value: value, close=mock.Mock(),
+        )
+        handler.state = types.SimpleNamespace(
+            default_session="cctg", active_session="cctg",
+            kimi_turn_lock=threading.RLock(), kimi_active_turn={}, kimi_prepare_token="",
+            kimi_acp=acp, kimi_terminal=Bridge(),
+        )
+        handler.responses = []
+        handler._send_json = lambda status, payload: handler.responses.append((status, payload))
+        handler._handle_tmux_capture()
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertEqual(
+            [("ensure", True, "session-current"), ("lease", True, "%42"), ("capture", True, "%42")],
+            observations,
+        )
+        acp.close.assert_called_once_with()
+
+    def test_kimi_bridge_resumes_exact_durable_session_without_ambiguous_flags(self):
         calls = []
+        options = {}
         def runner(argv, **_kwargs):
             calls.append(argv)
             if argv[1:3] == ["has-session", "-t"]:
                 return types.SimpleNamespace(returncode=1, stdout="", stderr="")
             if "show-options" in argv:
-                stdout = KIMI_TERMINAL_OWNER_VALUE
+                stdout = options.get(argv[-1], "")
+            elif "set-option" in argv:
+                options[argv[-2]] = argv[-1]
+                stdout = ""
             elif "display-message" in argv:
                 stdout = "%42|0"
             else:
@@ -242,16 +295,16 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
 
         with mock.patch("push.Path.is_file", return_value=True), mock.patch("push.os.access", return_value=True), mock.patch("push.Path.is_dir", return_value=True):
             bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"), runner=runner)
-            self.assertEqual("%42", bridge.ensure())
+            self.assertEqual("%42", bridge.ensure("session-current"))
         self.assertIsNotNone(bridge._lease)
         self.assertRegex(str(bridge._lease), r"^[A-Za-z0-9_-]{32,128}$")
         self.assertNotIn("%42", str(bridge._lease))
         launch = next(argv for argv in calls if "respawn-pane" in argv)
         self.assertIn("CCC_KIMI_TERMINAL_BRIDGE=1", launch)
         self.assertIn("/fake/kimi", launch)
-        self.assertIn("kimi-code/k3-256k", launch)
-        self.assertNotIn("--session", launch)
+        self.assertEqual(["--session", "session-current"], launch[-2:])
         self.assertNotIn("--continue", launch)
+        self.assertNotIn("--model", launch)
 
     def test_stale_lease_cannot_release_new_kimi_pane(self):
         bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"))
@@ -259,12 +312,12 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         new_lease = "b" * 43
         bridge._lease = new_lease
         bridge._lease_pane = "%42"
-        bridge._kill_exact_pane_locked = mock.Mock(return_value=True)
+        bridge._shutdown_exact_pane_locked = mock.Mock(return_value=True)
 
         self.assertFalse(bridge.release(old_lease))
-        bridge._kill_exact_pane_locked.assert_not_called()
+        bridge._shutdown_exact_pane_locked.assert_not_called()
         self.assertTrue(bridge.release(new_lease))
-        bridge._kill_exact_pane_locked.assert_called_once_with("%42")
+        bridge._shutdown_exact_pane_locked.assert_called_once_with("%42")
         self.assertIsNone(bridge._lease)
         self.assertIsNone(bridge._lease_pane)
 
@@ -308,34 +361,45 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
                 return types.SimpleNamespace(returncode=1, stdout="", stderr="wrong pane")
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"), runner=runner)
+        bridge = KimiTerminalBridge(
+            command=Path("/fake/kimi"), cwd=Path("/fake/workspace"), runner=runner,
+            process_killer=lambda _pid, _signal: None, shutdown_wait_seconds=0.05,
+        )
         bridge._lease, bridge._lease_pane = "a" * 43, "%41"
+        bridge._shutdown_exact_pane_locked = mock.Mock(return_value=False)
         self.assertFalse(bridge.release("a" * 43))
         self.assertFalse(any(argv[1] == "kill-pane" for argv in calls))
 
         bridge._lease_pane = "%42"
+        bridge._shutdown_exact_pane_locked.return_value = True
         self.assertTrue(bridge.release("a" * 43))
-        self.assertIn(["tmux", "kill-pane", "-t", "%42"], calls)
+        bridge._shutdown_exact_pane_locked.assert_called_with("%42")
         self.assertFalse(any(argv[1] == "kill-session" for argv in calls))
 
-    def test_kimi_idle_reaper_uses_bound_pane_after_idle(self):
+    def test_kimi_idle_reaper_conservatively_retains_a_live_bound_pane(self):
         bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"), idle_seconds=1)
         bridge._lease, bridge._lease_pane = "a" * 43, "%42"
         bridge._last_activity = 10.0
         bridge._kill_exact_pane_locked = mock.Mock(return_value=True)
+        bridge._pane_status_locked = mock.Mock(return_value=("%42", False))
         with mock.patch("push.time.monotonic", return_value=12.0):
             bridge._reap_if_idle()
-        bridge._kill_exact_pane_locked.assert_called_once_with("%42")
-        self.assertIsNone(bridge._lease)
-        self.assertIsNone(bridge._lease_pane)
+        bridge._kill_exact_pane_locked.assert_not_called()
+        self.assertEqual("a" * 43, bridge._lease)
+        self.assertEqual("%42", bridge._lease_pane)
+        if bridge._timer is not None:
+            bridge._timer.cancel()
 
     def test_kimi_restart_adoption_binds_a_fresh_lease_to_existing_owned_pane(self):
         bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"))
         bridge._has_session_locked = mock.Mock(return_value=True)
         bridge._owns_session_locked = mock.Mock(return_value=True)
         bridge._pane_status_locked = mock.Mock(return_value=("%55", False))
+        bridge._bound_session_locked = mock.Mock(
+            return_value=bridge._fingerprint_session("session-current")
+        )
 
-        self.assertEqual("%55", bridge.ensure())
+        self.assertEqual("%55", bridge.ensure("session-current"))
         self.assertEqual("%55", bridge._lease_pane)
         self.assertRegex(str(bridge._lease), r"^[A-Za-z0-9_-]{32,128}$")
         if bridge._timer is not None:
@@ -348,15 +412,225 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         bridge._has_session_locked = mock.Mock(return_value=True)
         bridge._owns_session_locked = mock.Mock(return_value=True)
         bridge._pane_status_locked = mock.Mock(side_effect=[("%41", True), ("%42", False)])
-        bridge._kill_exact_pane_locked = mock.Mock(return_value=True)
+        bridge._bound_session_locked = mock.Mock(return_value="")
+        bridge._shutdown_exact_pane_locked = mock.Mock(return_value=True)
         bridge._run_tmux = mock.Mock(return_value=types.SimpleNamespace(returncode=0, stdout="", stderr=""))
+        bridge._bound_session_locked = mock.Mock(
+            side_effect=["", bridge._fingerprint_session("session-next")]
+        )
         with mock.patch("push.Path.is_file", return_value=True), mock.patch("push.os.access", return_value=True), mock.patch("push.Path.is_dir", return_value=True):
-            self.assertEqual("%42", bridge.ensure())
-        bridge._kill_exact_pane_locked.assert_called_once_with("%41")
+            self.assertEqual("%42", bridge.ensure("session-next"))
+        bridge._shutdown_exact_pane_locked.assert_called_once_with("%41")
         self.assertEqual("%42", bridge._lease_pane)
         self.assertNotEqual(old_lease, bridge._lease)
         if bridge._timer is not None:
             bridge._timer.cancel()
+
+    def test_active_durable_session_change_respawns_and_rotates_lease(self):
+        calls = []
+        bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"))
+        old_lease = "a" * 43
+        bridge._lease, bridge._lease_pane = old_lease, "%41"
+        bridge._session_fingerprint = bridge._fingerprint_session("session-old")
+        bridge._has_session_locked = mock.Mock(return_value=True)
+        bridge._owns_session_locked = mock.Mock(return_value=True)
+        bridge._pane_status_locked = mock.Mock(side_effect=[("%41", False), ("%42", False)])
+        bridge._bound_session_locked = mock.Mock(side_effect=[
+            bridge._fingerprint_session("session-old"),
+            bridge._fingerprint_session("session-new"),
+        ])
+        bridge._shutdown_exact_pane_locked = mock.Mock(return_value=True)
+        bridge._run_tmux = mock.Mock(side_effect=lambda argv: (
+            calls.append(argv)
+            or types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        ))
+        with mock.patch("push.Path.is_file", return_value=True), mock.patch("push.os.access", return_value=True), mock.patch("push.Path.is_dir", return_value=True):
+            self.assertEqual("%42", bridge.ensure("session-new"))
+        launch = next(argv for argv in calls if "respawn-pane" in argv)
+        self.assertEqual(["--session", "session-new"], launch[-2:])
+        self.assertNotIn("--continue", launch)
+        self.assertNotIn("--model", launch)
+        self.assertNotEqual(old_lease, bridge._lease)
+        bridge._shutdown_exact_pane_locked.assert_called_once_with("%41")
+        if bridge._timer is not None:
+            bridge._timer.cancel()
+
+    def test_graceful_shutdown_signals_verified_pid_then_exact_pane_fallback(self):
+        calls = []
+        signals = []
+        state = {"dead": False, "exists": True}
+
+        def runner(argv, **_kwargs):
+            calls.append(argv)
+            if argv[1] == "has-session":
+                return types.SimpleNamespace(returncode=0 if state["exists"] else 1, stdout="", stderr="")
+            if argv[1] == "show-options":
+                return types.SimpleNamespace(returncode=0, stdout=KIMI_TERMINAL_OWNER_VALUE + "\n", stderr="")
+            if argv[1] == "display-message":
+                if argv[-1] == "#{pane_id}|#{pane_pid}":
+                    return types.SimpleNamespace(returncode=0, stdout="%42|4321\n", stderr="")
+                return types.SimpleNamespace(returncode=0, stdout=f"%42|{1 if state['dead'] else 0}\n", stderr="")
+            if argv[1] == "kill-pane":
+                self.assertEqual(["tmux", "kill-pane", "-t", "%42"], argv)
+                state["exists"] = False
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(argv)
+
+        def terminate(pid, sig):
+            signals.append((pid, sig))
+            state["dead"] = True
+
+        bridge = KimiTerminalBridge(
+            command=Path("/fake/kimi"), cwd=Path("/fake/workspace"),
+            runner=runner, process_killer=terminate, shutdown_wait_seconds=0.1,
+        )
+        bridge._lease, bridge._lease_pane = "a" * 43, "%42"
+        self.assertTrue(bridge.release("a" * 43))
+        self.assertEqual([(4321, __import__("signal").SIGTERM)], signals)
+        self.assertIn(["tmux", "kill-pane", "-t", "%42"], calls)
+        self.assertFalse(any(argv[1] == "kill-session" for argv in calls))
+
+    def test_terminal_busy_refuses_capture_without_closing_acp(self):
+        handler = object.__new__(PushHandler)
+        handler.path = "/tmux/capture?session=kimi"
+        acp = types.SimpleNamespace(
+            busy=False,
+            load_session_id=lambda: "session-current",
+            validated_local_session_id=lambda value: value,
+            close=mock.Mock(),
+        )
+        bridge = types.SimpleNamespace(
+            input_transaction=lambda: nullcontext(),
+            ensure=mock.Mock(return_value="%42"),
+        )
+        handler.state = types.SimpleNamespace(
+            default_session="cctg", active_session="cctg",
+            kimi_turn_lock=threading.RLock(),
+            kimi_active_turn={"user_ts": "busy"}, kimi_prepare_token="",
+            kimi_acp=acp, kimi_terminal=bridge,
+        )
+        handler.responses = []
+        handler._send_json = lambda status, payload: handler.responses.append((status, payload))
+        handler._handle_tmux_capture()
+        self.assertEqual(423, handler.responses[-1][0])
+        self.assertEqual("kimi_busy", handler.responses[-1][1]["error"])
+        acp.close.assert_not_called()
+        bridge.ensure.assert_not_called()
+
+    def test_foreign_or_missing_durable_session_returns_safe_409_without_spawn(self):
+        handler = object.__new__(PushHandler)
+        handler.path = "/tmux/capture?session=kimi"
+        acp = types.SimpleNamespace(
+            busy=False,
+            load_session_id=lambda: "foreign-session",
+            validated_local_session_id=lambda _value: "",
+            close=mock.Mock(),
+        )
+        bridge = types.SimpleNamespace(
+            input_transaction=lambda: nullcontext(),
+            ensure=mock.Mock(return_value="%42"),
+        )
+        handler.state = types.SimpleNamespace(
+            default_session="cctg", active_session="cctg",
+            kimi_turn_lock=threading.RLock(), kimi_active_turn={},
+            kimi_prepare_token="", kimi_acp=acp, kimi_terminal=bridge,
+        )
+        handler.responses = []
+        handler._send_json = lambda status, payload: handler.responses.append((status, payload))
+        handler._handle_tmux_capture()
+        self.assertEqual(409, handler.responses[-1][0])
+        self.assertEqual("no_active_kimi_session", handler.responses[-1][1]["error"])
+        self.assertNotIn("foreign-session", json.dumps(handler.responses[-1][1]))
+        acp.close.assert_not_called()
+        bridge.ensure.assert_not_called()
+
+    def test_prepare_reservation_beats_terminal_acquire_without_deadlock(self):
+        handler = object.__new__(PushHandler)
+        input_lock = threading.Lock()
+        released = threading.Event()
+
+        class Bridge:
+            def input_transaction(self): return input_lock
+            def release_for_acp(self): released.set(); return True
+            ensure = mock.Mock(return_value="%42")
+
+        acp = types.SimpleNamespace(
+            busy=False, load_session_id=lambda: "session-current",
+            validated_local_session_id=lambda value: value, close=mock.Mock(),
+        )
+        handler.state = types.SimpleNamespace(
+            kimi_turn_lock=threading.RLock(), kimi_active_turn={},
+            kimi_prepare_token="", kimi_acp=acp, kimi_terminal=Bridge(),
+        )
+        handler.responses = []
+        handler._send_json = lambda status, payload: handler.responses.append((status, payload))
+
+        input_lock.acquire()
+        result = []
+        worker = threading.Thread(target=lambda: result.append(handler._reserve_kimi_control("switch")))
+        worker.start()
+        deadline = time.monotonic() + 1
+        while not handler.state.kimi_prepare_token and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertTrue(handler.state.kimi_prepare_token)
+        with self.assertRaises(Exception) as caught:
+            handler._acquire_kimi_terminal()
+        self.assertEqual("KimiTerminalBusy", type(caught.exception).__name__)
+        input_lock.release()
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive(), "handoff lock order must not deadlock")
+        self.assertTrue(result[0])
+        self.assertTrue(released.is_set())
+        acp.close.assert_not_called()
+
+    def test_new_switch_and_forge_control_reservations_all_handoff_terminal(self):
+        handler = object.__new__(PushHandler)
+        releases = []
+        handler.state = types.SimpleNamespace(
+            kimi_turn_lock=threading.RLock(), kimi_active_turn={},
+            kimi_prepare_token="", kimi_acp=types.SimpleNamespace(busy=False),
+            kimi_terminal=types.SimpleNamespace(
+                input_transaction=lambda: nullcontext(),
+                release_for_acp=lambda: releases.append("release") or True,
+            ),
+        )
+        handler.responses = []
+        handler._send_json = lambda status, payload: handler.responses.append((status, payload))
+        for action in ("new_session", "switch_session", "forge"):
+            token = handler._reserve_kimi_control(action)
+            self.assertTrue(token)
+            handler._release_kimi_control(token)
+        self.assertEqual(["release", "release", "release"], releases)
+
+    def test_uncertain_tui_prompt_requires_explicit_release_before_acp_handoff(self):
+        bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"))
+        bridge._lease, bridge._lease_pane = "a" * 43, "%42"
+        bridge.mark_prompt_submitted()
+        bridge._has_session_locked = mock.Mock(return_value=True)
+        bridge._owns_session_locked = mock.Mock(return_value=True)
+        bridge._pane_status_locked = mock.Mock(return_value=("%42", False))
+        bridge._shutdown_exact_pane_locked = mock.Mock(return_value=True)
+        with self.assertRaises(Exception) as caught:
+            bridge.release_for_acp()
+        self.assertEqual("KimiTerminalBusy", type(caught.exception).__name__)
+        bridge._shutdown_exact_pane_locked.assert_not_called()
+        self.assertTrue(bridge.release("a" * 43))
+        self.assertFalse(bridge._prompt_active_uncertain)
+
+    def test_identity_changing_kimi_commands_are_rejected_before_terminal_acquire(self):
+        for command in ("/new", "/sessions", "/fork branch", "/resume abc"):
+            with self.subTest(command=command):
+                handler = object.__new__(PushHandler)
+                handler.state = types.SimpleNamespace(active_session="cctg", default_session="cctg")
+                handler.responses = []
+                handler._send_json = lambda status, payload: handler.responses.append((status, payload))
+                handler._resolve_terminal_session = mock.Mock()
+                handler._handle_tmux_send_transaction({
+                    "session": "kimi", "keys": command, "enter": True,
+                })
+                self.assertEqual(400, handler.responses[-1][0])
+                self.assertEqual("kimi_session_command_blocked", handler.responses[-1][1]["error"])
+                handler._resolve_terminal_session.assert_not_called()
 
     def test_kimi_terminal_routes_require_native_pairing_before_body_or_bridge(self):
         capture = object.__new__(PushHandler)

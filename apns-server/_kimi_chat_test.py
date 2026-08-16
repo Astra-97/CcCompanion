@@ -1,11 +1,11 @@
 import threading
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from kimi_acp import KimiACPCancelled, KimiACPError
 from link_preview import LinkPreviewBundle
-from push import PushHandler, _should_generate_chat_append_tts
+from push import KimiTerminalBusy, PushHandler, _should_generate_chat_append_tts
 
 
 class FakeChat:
@@ -127,6 +127,44 @@ class KimiChatRoutingTest(unittest.TestCase):
         self.assertEqual(200, handler.responses[-1][0])
         self.assertEqual("kimi-acp", handler.responses[-1][1]["turn"]["transport"])
         self.assertEqual("session-1", handler.state.kimi_active_turn["session_id"])
+
+    def test_chat_releases_idle_terminal_before_preparing_acp(self):
+        handler, _kimi, _xiaoke = self.handler()
+        order = []
+        handler.state.kimi_terminal = types.SimpleNamespace(
+            input_transaction=lambda: __import__("contextlib").nullcontext(),
+            release_for_acp=lambda: order.append("terminal-release") or True,
+        )
+        handler.state.kimi_acp.prepare_session = lambda: order.append("acp-prepare") or "session-1"
+
+        class DeferredThread:
+            def __init__(self, target, **_kwargs): self.target = target
+            def start(self): pass
+
+        with patch("push.threading.Thread", DeferredThread):
+            handler._handle_kimi_chat_send({"text": "hello"}, "kimi")
+
+        self.assertEqual(["terminal-release", "acp-prepare"], order)
+        self.assertEqual(200, handler.responses[-1][0])
+
+    def test_busy_terminal_rejects_chat_before_user_history_or_acp_prepare(self):
+        handler, kimi, _xiaoke = self.handler()
+        prepare = Mock(return_value="session-1")
+        handler.state.kimi_acp.prepare_session = prepare
+        handler.state.kimi_terminal = types.SimpleNamespace(
+            input_transaction=lambda: __import__("contextlib").nullcontext(),
+            release_for_acp=lambda: (_ for _ in ()).throw(
+                KimiTerminalBusy("Kimi 终端可能仍在生成，请先离开终端后再发送")
+            ),
+        )
+
+        handler._handle_kimi_chat_send({"text": "must not persist"}, "kimi")
+
+        self.assertEqual([], kimi.records)
+        prepare.assert_not_called()
+        self.assertEqual(409, handler.responses[-1][0])
+        self.assertEqual("kimi_terminal_busy", handler.responses[-1][1]["error"])
+        self.assertEqual("", handler.state.kimi_prepare_token)
 
     def test_second_kimi_turn_is_rejected_before_it_can_enter_history(self):
         handler, kimi, xiaoke = self.handler()

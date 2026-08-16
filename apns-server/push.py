@@ -801,6 +801,7 @@ KAIROS_TERMINAL_READY_OPTION = "@ccc_kairos_terminal_ready"
 KAIROS_TERMINAL_READY_VALUE = "cccompanion:qiaokairos:ready:v1"
 KIMI_TERMINAL_OWNER_OPTION = "@ccc_kimi_terminal_owner"
 KIMI_TERMINAL_OWNER_VALUE = "cccompanion:kimi-terminal:v1"
+KIMI_TERMINAL_SESSION_OPTION = "@ccc_kimi_terminal_session"
 KAIROS_TERMINAL_COMPAT_LOCK_WAIT_TEXT = (
     "旧版 standalone 客户端占用兼容锁；等待它退出后自动连接…"
 )
@@ -1146,17 +1147,16 @@ class KimiTerminalUnavailable(RuntimeError):
     """Safe failure while opening the dedicated interactive Kimi console."""
 
 
-class KimiTerminalBridge:
-    """Own one Kimi Code TUI pane without touching the chat ACP client.
+class KimiTerminalBusy(KimiTerminalUnavailable):
+    """The ACP/TUI single-writer handoff is currently unavailable."""
 
-    The App chat process talks to ``kimi acp`` over its own stdio pipe and
-    persists its selected ACP session separately.  This bridge starts a plain
-    Kimi Code TUI with neither ``--session`` nor ``--continue``; Kimi Code
-    therefore allocates a new terminal-only session in the same configured
-    account, instead of attaching to the ACP chat session.  The console is
-    deliberately kept in ``DEFAULT_KIMI_CWD`` so its tool permissions stay
-    within Karami's existing workspace boundary.
-    """
+
+class KimiTerminalNoActiveSession(KimiTerminalUnavailable):
+    """There is no validated durable Karami session to resume."""
+
+
+class KimiTerminalBridge:
+    """Own one TUI for the durable Kimi chat session, never a second session."""
 
     def __init__(
         self,
@@ -1164,16 +1164,18 @@ class KimiTerminalBridge:
         command: Path = Path("/root/.kimi-code/bin/kimi"),
         cwd: Path = Path(DEFAULT_KIMI_CWD),
         tmux_session: str = "ccc-kimi-terminal",
-        model: str = "kimi-code/k3-256k",
         idle_seconds: float = 45.0,
         runner: Any = subprocess.run,
+        process_killer: Any = os.kill,
+        shutdown_wait_seconds: float = 1.0,
     ) -> None:
         self.command = command
         self.cwd = cwd
         self.tmux_session = tmux_session
-        self.model = model
         self.idle_seconds = max(1.0, float(idle_seconds))
         self._run = runner
+        self._process_killer = process_killer
+        self.shutdown_wait_seconds = max(0.05, min(float(shutdown_wait_seconds), 3.0))
         self._lock = threading.RLock()
         # Kimi has its own input transaction.  Never use the normal tmux
         # buffer: a concurrent XiaoKe send must not replace an in-flight Kimi
@@ -1184,6 +1186,11 @@ class KimiTerminalBridge:
         # is returned only to the authenticated App in Kimi capture results.
         self._lease: str | None = None
         self._lease_pane: str | None = None
+        self._session_fingerprint: str | None = None
+        # The TUI protocol has no trustworthy completion event. Once Enter
+        # submits a prompt, automatic ACP takeover must fail closed until the
+        # App explicitly releases this pane (normally when leaving the tab).
+        self._prompt_active_uncertain = False
         self._timer: threading.Timer | None = None
         self._last_activity = 0.0
 
@@ -1203,6 +1210,18 @@ class KimiTerminalBridge:
         ])
         return result.returncode == 0 and result.stdout.rstrip("\r\n") == KIMI_TERMINAL_OWNER_VALUE
 
+    @staticmethod
+    def _fingerprint_session(session_id: str) -> str:
+        return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+
+    def _bound_session_locked(self) -> str:
+        result = self._run_tmux([
+            "tmux", "show-options", "-v", "-t", self.tmux_session,
+            KIMI_TERMINAL_SESSION_OPTION,
+        ])
+        value = result.stdout.rstrip("\r\n")
+        return value if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{64}", value) else ""
+
     def _pane_status_locked(self) -> tuple[str, bool]:
         result = self._run_tmux([
             "tmux", "display-message", "-p", "-t", self.tmux_session,
@@ -1217,6 +1236,22 @@ class KimiTerminalBridge:
         ):
             raise KimiTerminalUnavailable("Kimi 终端 pane 状态异常")
         return fields[0], fields[1] == "1"
+
+    def _pane_pid_locked(self, expected_pane: str) -> int:
+        result = self._run_tmux([
+            "tmux", "display-message", "-p", "-t", expected_pane,
+            "#{pane_id}|#{pane_pid}",
+        ])
+        fields = result.stdout.rstrip("\r\n").split("|", 1)
+        if (
+            result.returncode != 0
+            or len(fields) != 2
+            or not hmac.compare_digest(fields[0], expected_pane)
+            or not fields[1].isdigit()
+            or int(fields[1]) <= 1
+        ):
+            raise KimiTerminalUnavailable("Kimi 终端进程身份异常")
+        return int(fields[1])
 
     def _schedule_reaper_locked(self, delay: float | None = None) -> None:
         if self._timer is not None:
@@ -1233,6 +1268,12 @@ class KimiTerminalBridge:
         """Record successful Kimi capture/input without exposing pane identity."""
         with self._lock:
             if self._lease is not None:
+                self._touch_locked()
+
+    def mark_prompt_submitted(self) -> None:
+        with self._lock:
+            if self._lease is not None and self._lease_pane is not None:
+                self._prompt_active_uncertain = True
                 self._touch_locked()
 
     def _kill_exact_pane_locked(self, expected_pane: str) -> bool:
@@ -1257,7 +1298,42 @@ class KimiTerminalBridge:
             raise KimiTerminalUnavailable("Kimi 终端释放失败")
         return True
 
-    def _ensure_locked(self) -> str:
+    def _shutdown_exact_pane_locked(self, expected_pane: str) -> bool:
+        """Gracefully stop one verified owned process, then exact-pane cleanup."""
+        if not re.fullmatch(r"%[0-9]+", expected_pane):
+            raise KimiTerminalUnavailable("Kimi 终端 pane 身份异常")
+        if not self._has_session_locked() or not self._owns_session_locked():
+            return False
+        pane_id, pane_dead = self._pane_status_locked()
+        if not hmac.compare_digest(pane_id, expected_pane):
+            return False
+        if not pane_dead:
+            pid = self._pane_pid_locked(expected_pane)
+            try:
+                self._process_killer(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                raise KimiTerminalUnavailable("Kimi 终端无法安全停止") from exc
+            deadline = time.monotonic() + self.shutdown_wait_seconds
+            while time.monotonic() < deadline:
+                time.sleep(0.05)
+                try:
+                    current, dead = self._pane_status_locked()
+                except KimiTerminalUnavailable:
+                    return True
+                if not hmac.compare_digest(current, expected_pane):
+                    return False
+                if dead:
+                    break
+        # tmux retains dead panes under remain-on-exit and a still-running TUI
+        # may ignore SIGTERM.  Revalidate identity, then use exact pane only.
+        return self._kill_exact_pane_locked(expected_pane)
+
+    def _ensure_locked(self, session_id: str) -> str:
+        if not session_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", session_id):
+            raise KimiTerminalNoActiveSession("Kimi 当前没有可恢复的活跃会话")
+        expected_fingerprint = self._fingerprint_session(session_id)
         try:
             exists = self._has_session_locked()
         except Exception as exc:
@@ -1266,22 +1342,30 @@ class KimiTerminalBridge:
             if not self._owns_session_locked():
                 raise KimiTerminalUnavailable("Kimi 终端名称已被其他会话占用")
             pane_id, pane_dead = self._pane_status_locked()
-            if not pane_dead:
+            binding = self._bound_session_locked()
+            if not pane_dead and hmac.compare_digest(binding, expected_fingerprint):
                 # A process restart can find its still-owned pane but has no
-                # in-memory lease; make a fresh opaque generation for it.
+                # in-memory lease or completion bit. Make a fresh opaque
+                # generation and conservatively require explicit release
+                # before ACP takeover.
                 if self._lease is None:
                     self._lease = secrets.token_urlsafe(32)
                     self._lease_pane = pane_id
+                    self._prompt_active_uncertain = True
                 elif self._lease_pane != pane_id:
                     # An owned pane replacement is a new generation even
                     # before Android sees it; old leases become stale.
                     self._lease = secrets.token_urlsafe(32)
                     self._lease_pane = pane_id
+                    self._prompt_active_uncertain = True
                 self._touch_locked()
+                self._session_fingerprint = expected_fingerprint
                 return pane_id
-            self._kill_exact_pane_locked(pane_id)
+            self._shutdown_exact_pane_locked(pane_id)
             self._lease = None
             self._lease_pane = None
+            self._session_fingerprint = None
+            self._prompt_active_uncertain = False
         if not self.command.is_file() or not os.access(self.command, os.X_OK):
             raise KimiTerminalUnavailable("Kimi Code 终端入口未安装")
         if not self.cwd.is_dir():
@@ -1301,17 +1385,30 @@ class KimiTerminalBridge:
         ])
         if marked.returncode != 0 or not self._owns_session_locked():
             raise KimiTerminalUnavailable("Kimi 终端归属标记失败")
-        # No --session/--continue: this always creates a fresh TUI session
-        # and cannot resume or drive the ACP session used by chat.
+        bound = self._run_tmux([
+            "tmux", "set-option", "-t", self.tmux_session,
+            KIMI_TERMINAL_SESSION_OPTION, expected_fingerprint,
+        ])
+        if bound.returncode != 0 or not hmac.compare_digest(
+            self._bound_session_locked(), expected_fingerprint,
+        ):
+            try:
+                staged_pane, _staged_dead = self._pane_status_locked()
+                self._shutdown_exact_pane_locked(staged_pane)
+            except KimiTerminalUnavailable:
+                pass
+            raise KimiTerminalUnavailable("Kimi 终端会话绑定失败")
+        # Resume the one validated durable chat session explicitly.  Never use
+        # --continue (ambiguous) and never let a model flag create a new one.
         launched = self._run_tmux([
             "tmux", "respawn-pane", "-k", "-t", self.tmux_session,
             "/usr/bin/env", "CCC_KIMI_TERMINAL_BRIDGE=1", str(self.command),
-            "--model", self.model,
+            "--session", session_id,
         ])
         if launched.returncode != 0:
             try:
                 staged_pane, _staged_dead = self._pane_status_locked()
-                self._kill_exact_pane_locked(staged_pane)
+                self._shutdown_exact_pane_locked(staged_pane)
             except KimiTerminalUnavailable:
                 pass
             raise KimiTerminalUnavailable("Kimi 终端启动失败")
@@ -1320,19 +1417,24 @@ class KimiTerminalBridge:
             raise KimiTerminalUnavailable("Kimi 终端启动后立即退出")
         self._lease = secrets.token_urlsafe(32)
         self._lease_pane = pane_id
+        self._session_fingerprint = expected_fingerprint
+        self._prompt_active_uncertain = False
         self._touch_locked()
         return pane_id
 
-    def ensure(self) -> str:
+    def ensure(self, session_id: str) -> str:
         with self._lock:
-            return self._ensure_locked()
+            return self._ensure_locked(session_id)
 
     def lease_for_pane(self, pane_id: str) -> str:
         """Return the opaque lease only while ``pane_id`` is still current."""
         with self._lock:
-            current = self._ensure_locked()
+            if not self._has_session_locked() or not self._owns_session_locked():
+                raise KimiTerminalUnavailable("Kimi 终端已切换")
+            current, pane_dead = self._pane_status_locked()
             if (
-                not hmac.compare_digest(current, str(pane_id))
+                pane_dead
+                or not hmac.compare_digest(current, str(pane_id))
                 or self._lease is None
                 or self._lease_pane is None
                 or not hmac.compare_digest(current, self._lease_pane)
@@ -1356,10 +1458,12 @@ class KimiTerminalBridge:
                     or not hmac.compare_digest(candidate, self._lease)
                 ):
                     return False
-                released = self._kill_exact_pane_locked(self._lease_pane)
+                released = self._shutdown_exact_pane_locked(self._lease_pane)
                 if released:
                     self._lease = None
                     self._lease_pane = None
+                    self._session_fingerprint = None
+                    self._prompt_active_uncertain = False
                     if self._timer is not None:
                         self._timer.cancel()
                         self._timer = None
@@ -1369,17 +1473,46 @@ class KimiTerminalBridge:
             except Exception as exc:
                 raise KimiTerminalUnavailable("Kimi 终端释放失败") from exc
 
+    def release_for_acp(self) -> bool:
+        """Single-writer handoff used after an ACP prepare reservation exists."""
+        with self._lock:
+            if self._prompt_active_uncertain:
+                try:
+                    if (
+                        self._lease_pane
+                        and self._has_session_locked()
+                        and self._owns_session_locked()
+                    ):
+                        pane_id, pane_dead = self._pane_status_locked()
+                        if not pane_dead and hmac.compare_digest(pane_id, self._lease_pane):
+                            raise KimiTerminalBusy("Kimi 终端可能仍在生成，请先离开终端后再发送")
+                except KimiTerminalBusy:
+                    raise
+                except Exception as exc:
+                    raise KimiTerminalBusy("Kimi 终端状态未确认，请先离开终端后再发送") from exc
+                self._prompt_active_uncertain = False
+            return self.release_for_shutdown()
+
     def release_for_shutdown(self) -> bool:
         """Server-lifecycle cleanup; HTTP callers must use an exact lease."""
         with self._lock:
             try:
                 if not self._lease_pane:
                     self._lease = None
-                    return False
-                released = self._kill_exact_pane_locked(self._lease_pane)
+                    if not self._has_session_locked() or not self._owns_session_locked():
+                        return False
+                    pane_id, _pane_dead = self._pane_status_locked()
+                    released = self._shutdown_exact_pane_locked(pane_id)
+                    if released:
+                        self._session_fingerprint = None
+                        self._prompt_active_uncertain = False
+                    return released
+                released = self._shutdown_exact_pane_locked(self._lease_pane)
                 if released:
                     self._lease = None
                     self._lease_pane = None
+                    self._session_fingerprint = None
+                    self._prompt_active_uncertain = False
                 if self._timer is not None:
                     self._timer.cancel()
                     self._timer = None
@@ -1403,9 +1536,19 @@ class KimiTerminalBridge:
                     self._schedule_reaper_locked(remaining)
                     return
                 try:
-                    self._kill_exact_pane_locked(self._lease_pane)
-                    self._lease = None
-                    self._lease_pane = None
+                    # A live TUI does not expose a trustworthy "model is
+                    # generating" bit.  Fail conservatively: retain live panes
+                    # and let explicit App/ACP handoff release them.  The
+                    # reaper only removes an exact owned pane already dead.
+                    pane_id, pane_dead = self._pane_status_locked()
+                    if pane_dead and hmac.compare_digest(pane_id, self._lease_pane):
+                        self._kill_exact_pane_locked(self._lease_pane)
+                        self._lease = None
+                        self._lease_pane = None
+                        self._session_fingerprint = None
+                        self._prompt_active_uncertain = False
+                    else:
+                        self._touch_locked()
                 except Exception:
                     logger.exception("failed to reap idle Kimi terminal")
 
@@ -2789,9 +2932,8 @@ class ServerState:
             else None
         )
         self.kairos_terminal = KairosTerminalBridge()
-        # This is intentionally a separate TUI process, not a handle to
-        # ``self.kimi_acp``.  The two may use the same configured Kimi account
-        # but never share a prompt pipe or resume each other's session.
+        # ACP and TUI are separate processes but alternate ownership of the
+        # same durable session through the handler's single-writer handoff.
         self.kimi_terminal = KimiTerminalBridge(
             command=Path(server_cfg.get("kimi_bin", "/root/.kimi-code/bin/kimi")),
             cwd=Path(server_cfg.get("kimi_cwd", DEFAULT_KIMI_CWD)),
@@ -9717,6 +9859,25 @@ class PushHandler(BaseHTTPRequestHandler):
             self.state.kimi_prepare_token = prepare_token
 
         try:
+            handed_off = self._handoff_kimi_terminal_to_acp(prepare_token)
+        except KimiTerminalBusy as exc:
+            self._release_kimi_control(prepare_token)
+            self._send_json(409, {
+                "ok": False,
+                "error": "kimi_terminal_busy",
+                "reason": str(exc),
+            })
+            return
+        if not handed_off:
+            self._release_kimi_control(prepare_token)
+            self._send_json(503, {
+                "ok": False,
+                "error": "kimi_terminal_handoff_failed",
+                "reason": "Kimi 终端未能安全交还聊天，本次消息未发送。",
+            })
+            return
+
+        try:
             model, effort = self._kimi_selection()
             session_id = self._prepare_kimi_selected_session(model, effort)
             try:
@@ -11499,12 +11660,101 @@ class PushHandler(BaseHTTPRequestHandler):
                 return None
             token = f"control:{action}:{secrets.token_hex(16)}"
             self.state.kimi_prepare_token = token
-            return token
+        try:
+            handed_off = self._handoff_kimi_terminal_to_acp(token)
+        except KimiTerminalBusy as exc:
+            self._release_kimi_control(token)
+            self._send_json(409, {
+                "ok": False,
+                "error": "kimi_terminal_busy",
+                "reason": str(exc),
+            })
+            return None
+        if not handed_off:
+            self._release_kimi_control(token)
+            self._send_json(503, {
+                "ok": False,
+                "error": "kimi_terminal_handoff_failed",
+                "reason": "Kimi 终端未能安全交还控制操作。",
+            })
+            return None
+        return token
 
     def _release_kimi_control(self, token: str) -> None:
         with self.state.kimi_turn_lock:
             if self.state.kimi_prepare_token == token:
                 self.state.kimi_prepare_token = ""
+
+    def _handoff_kimi_terminal_to_acp(self, prepare_token: str) -> bool:
+        """Release the TUI after reserving ACP ownership, without lock inversion.
+
+        The caller first publishes ``kimi_prepare_token`` under
+        ``kimi_turn_lock`` and releases that lock.  Only then do we take the
+        terminal input lock.  A concurrent Terminal acquire takes input first
+        and observes the reservation under the turn lock, so there is never a
+        turn-lock -> input-lock nesting or a two-writer window.
+        """
+        terminal = getattr(self.state, "kimi_terminal", None)
+        release = getattr(terminal, "release_for_acp", None)
+        input_transaction = getattr(terminal, "input_transaction", None)
+        if not callable(release) or not callable(input_transaction):
+            return True
+        try:
+            with input_transaction():
+                with self.state.kimi_turn_lock:
+                    if self.state.kimi_prepare_token != prepare_token:
+                        return False
+                release()
+            return True
+        except KimiTerminalBusy:
+            raise
+        except KimiTerminalUnavailable:
+            logger.warning("Kimi terminal-to-ACP handoff failed", exc_info=True)
+            return False
+
+    def _acquire_kimi_terminal(self) -> str:
+        """Acquire the single writer and resume only the durable local session.
+
+        Kimi terminal routes already hold ``input_transaction`` before calling
+        this method.  Holding the turn lock through idle ACP close and TUI
+        ensure makes the handoff atomic from all chat/control reservations.
+        """
+        acp = getattr(self.state, "kimi_acp", None)
+        if acp is None:
+            raise KimiTerminalNoActiveSession("Kimi 当前没有可恢复的活跃会话")
+        with self.state.kimi_turn_lock:
+            if (
+                self.state.kimi_active_turn
+                or self.state.kimi_prepare_token
+                or bool(getattr(acp, "busy", False))
+            ):
+                raise KimiTerminalBusy("Kimi 正在回复，暂时不能接管终端")
+            raw_session_id = str(acp.load_session_id() or "")
+            validate = getattr(acp, "validated_local_session_id", None)
+            session_id = validate(raw_session_id) if callable(validate) else ""
+            if not session_id:
+                raise KimiTerminalNoActiveSession("Kimi 当前没有可恢复的活跃会话")
+            acp.close()
+            return self.state.kimi_terminal.ensure(session_id)
+
+    def _send_kimi_terminal_unavailable(self, exc: KimiTerminalUnavailable) -> None:
+        if isinstance(exc, KimiTerminalBusy):
+            self._send_json(423, {
+                "ok": False,
+                "error": "kimi_busy",
+                "target": KIMI_TERMINAL_ALIAS,
+                "message": str(exc),
+            })
+            return
+        if isinstance(exc, KimiTerminalNoActiveSession):
+            self._send_json(409, {
+                "ok": False,
+                "error": "no_active_kimi_session",
+                "target": KIMI_TERMINAL_ALIAS,
+                "message": str(exc),
+            })
+            return
+        self._send_json(503, {"error": str(exc), "target": KIMI_TERMINAL_ALIAS})
 
     def _kimi_preferences_payload(self) -> dict[str, Any]:
         model, effort = self.state.kimi_preferences.snapshot()
@@ -17419,12 +17669,9 @@ class PushHandler(BaseHTTPRequestHandler):
                 physical = self.state.kairos_terminal.require_ready()
             return physical, KAIROS_TERMINAL_ALIAS, True
         if requested.strip().lower() == KIMI_TERMINAL_ALIAS:
-            # Do not use kimi_acp here.  This owns an independent Kimi TUI
-            # process whose new CLI session cannot drive the chat ACP pipe.
-            # ``ensure`` returns an exact owned pane id, never the reusable
-            # tmux session name.  This fences all Kimi capture/input against
-            # an unrelated same-named session appearing between requests.
-            return self.state.kimi_terminal.ensure(), KIMI_TERMINAL_ALIAS, False
+            # The TUI is the other front end for the exact durable chat
+            # session. Acquire the shared single-writer before resuming it.
+            return self._acquire_kimi_terminal(), KIMI_TERMINAL_ALIAS, False
         # Selecting any regular tmux pane hands the shared Codex lock back to
         # the App before XiaoKe input/capture proceeds.  The release itself
         # participates in the Kairos input transaction so a target switch
@@ -17527,19 +17774,28 @@ class PushHandler(BaseHTTPRequestHandler):
             lines = int(qs.get("lines", ["120"])[0])
         except Exception:
             lines = 120
+        if str(requested_session).strip().lower() == KIMI_TERMINAL_ALIAS:
+            # One continuous input transaction fences acquire, lease and
+            # capture. Chat can publish its prepare reservation first or wait
+            # for this capture to finish, but can never close the pane between
+            # those three operations.
+            with self.state.kimi_terminal.input_transaction():
+                self._handle_tmux_capture_transaction(requested_session, lines)
+            return
+        self._handle_tmux_capture_transaction(requested_session, lines)
+
+    def _handle_tmux_capture_transaction(self, requested_session: str, lines: int) -> None:
         try:
             session, public_session, is_kairos = self._resolve_terminal_session(requested_session)
         except KairosTerminalUnavailable as exc:
             self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
             return
         except KimiTerminalUnavailable as exc:
-            self._send_json(503, {"error": str(exc), "target": KIMI_TERMINAL_ALIAS})
+            self._send_kimi_terminal_unavailable(exc)
             return
         kimi_lease = ""
-        capture_transaction = (
-            self.state.kimi_terminal.input_transaction()
-            if public_session == KIMI_TERMINAL_ALIAS else nullcontext()
-        )
+        # Kimi callers hold input_transaction across this entire helper.
+        capture_transaction = nullcontext()
         try:
             terminal_state = "ready"
             capture_pane: str | None = None
@@ -17679,7 +17935,7 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
             return
         except KimiTerminalUnavailable as exc:
-            self._send_json(503, {"error": str(exc), "target": KIMI_TERMINAL_ALIAS})
+            self._send_kimi_terminal_unavailable(exc)
             return
         try:
             result = subprocess.run(
@@ -17693,6 +17949,10 @@ class PushHandler(BaseHTTPRequestHandler):
                     self._send_json(500, {"error": result.stderr.strip() or "send-keys failed"})
                 return
             if public_session == KIMI_TERMINAL_ALIAS:
+                if key_name == "Enter":
+                    mark_submitted = getattr(self.state.kimi_terminal, "mark_prompt_submitted", None)
+                    if callable(mark_submitted):
+                        mark_submitted()
                 self.state.kimi_terminal.touch()
             self._send_json(200, {"ok": True, "key": key_name, "session": public_session})
         except Exception as e:
@@ -17719,6 +17979,20 @@ class PushHandler(BaseHTTPRequestHandler):
         # (build 199 fix: /switch 后 iOS 没传 session 字段也能 follow active)
         requested_session = body.get("session") or self.state.active_session or self.state.default_session
         enter = bool(body.get("enter", True))
+        is_kimi_request = str(requested_session).strip().lower() == KIMI_TERMINAL_ALIAS
+        if is_kimi_request and isinstance(keys, str):
+            # These commands can detach the TUI from the server-owned durable
+            # pointer and defeat the ACP/TUI single-writer invariant.  Reject
+            # them before a pane is acquired; ordinary prompts and read-only
+            # commands such as /status remain available.
+            command = keys.strip().split(None, 1)[0].lower() if keys.strip() else ""
+            if command in {"/new", "/sessions", "/fork", "/resume", "/continue"}:
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "kimi_session_command_blocked",
+                    "target": KIMI_TERMINAL_ALIAS,
+                })
+                return
         # 2026-05-19 新增 key 字段: 真发特殊键 (Escape / Up / Down / Enter / Tab / C-c)
         # 跟 keys (文本) 区分 — keys 走 paste-buffer 文本注入 / key 走 send-keys 键名
         # 解决之前 sendEscape sendRawKey("Escape") 字面粘到 shell 不是真按 esc 的问题
@@ -17740,7 +18014,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
                 return
             except KimiTerminalUnavailable as exc:
-                self._send_json(503, {"error": str(exc), "target": KIMI_TERMINAL_ALIAS})
+                self._send_kimi_terminal_unavailable(exc)
                 return
             try:
                 result = subprocess.run(
@@ -17754,6 +18028,10 @@ class PushHandler(BaseHTTPRequestHandler):
                         self._send_json(500, {"error": result.stderr.strip() or "send-keys failed"})
                     return
                 if public_session == KIMI_TERMINAL_ALIAS:
+                    if special_key == "Enter":
+                        mark_submitted = getattr(self.state.kimi_terminal, "mark_prompt_submitted", None)
+                        if callable(mark_submitted):
+                            mark_submitted()
                     self.state.kimi_terminal.touch()
                 self._send_json(200, {"ok": True, "session": public_session, "key": special_key})
             except Exception as e:
@@ -17777,7 +18055,7 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
             return
         except KimiTerminalUnavailable as exc:
-            self._send_json(503, {"error": str(exc), "target": KIMI_TERMINAL_ALIAS})
+            self._send_kimi_terminal_unavailable(exc)
             return
         buffer_name: str | None = None
         is_kimi = public_session == KIMI_TERMINAL_ALIAS
@@ -17832,6 +18110,10 @@ class PushHandler(BaseHTTPRequestHandler):
                 else:
                     subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=False)
             if is_kimi:
+                if enter:
+                    mark_submitted = getattr(self.state.kimi_terminal, "mark_prompt_submitted", None)
+                    if callable(mark_submitted):
+                        mark_submitted()
                 self.state.kimi_terminal.touch()
             self._send_json(200, {"ok": True, "session": public_session})
         except Exception as e:
