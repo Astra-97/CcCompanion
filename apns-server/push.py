@@ -189,12 +189,15 @@ def _format_schedule_todo_when(
     except ValueError:
         scheduled_date = None
     local_today = today or datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    weekdays = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
     date_label = (
         "今天" if scheduled_date == local_today else
         f"{scheduled_date.month}月{scheduled_date.day}日" if scheduled_date and scheduled_date.year == local_today.year else
         f"{scheduled_date.year}年{scheduled_date.month}月{scheduled_date.day}日" if scheduled_date else
         "日期待定"
     )
+    if scheduled_date is not None:
+        date_label = f"{date_label} {weekdays[scheduled_date.weekday()]}"
     if raw_time is None:
         time_label = "全天"
     elif isinstance(raw_time, str) and re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", raw_time):

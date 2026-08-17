@@ -152,7 +152,7 @@ class TodosHandlerAuthTest(unittest.TestCase):
         record = handler.history_records[0]
         self.assertEqual(record["role"], "user")
         self.assertEqual(record["source"], "todos")
-        self.assertEqual(record["text"], "日程更新\n✅ 已完成：私密日程\n2099年8月16日 · 09:00")
+        self.assertEqual(record["text"], "日程更新\n✅ 已完成：私密日程\n2099年8月16日 周日 · 09:00")
         self.assertEqual(record["metadata"], {
             "todo_share": True,
             "event_id": "evt1",
@@ -174,7 +174,7 @@ class TodosHandlerAuthTest(unittest.TestCase):
         handler.responses.clear()
         handler._handle_todos_toggle({"event_id": "evt1", "expected_done": True})
         self.assertEqual(handler.responses[0][0], 200)
-        self.assertEqual(handler.history_records[0]["text"], "日程更新\n↩️ 已取消完成：私密日程\n2099年8月16日 · 09:00")
+        self.assertEqual(handler.history_records[0]["text"], "日程更新\n↩️ 已取消完成：私密日程\n2099年8月16日 周日 · 09:00")
         self.assertEqual(handler.history_records[0]["metadata"]["done"], False)
         self.assertEqual(handler.notifications, [handler.history_records[0]["text"]])
 
@@ -210,10 +210,10 @@ class TodosHandlerAuthTest(unittest.TestCase):
 
     def test_visible_schedule_when_formats_today_future_all_day_and_invalid_values(self):
         today = date(2026, 8, 16)
-        self.assertEqual(_format_schedule_todo_when("2026-08-16", "19:00", today=today), "今天 · 19:00")
-        self.assertEqual(_format_schedule_todo_when("2026-08-18", "09:30", today=today), "8月18日 · 09:30")
-        self.assertEqual(_format_schedule_todo_when("2027-01-02", "09:30", today=today), "2027年1月2日 · 09:30")
-        self.assertEqual(_format_schedule_todo_when("2026-08-16", None, today=today), "今天 · 全天")
+        self.assertEqual(_format_schedule_todo_when("2026-08-16", "19:00", today=today), "今天 周日 · 19:00")
+        self.assertEqual(_format_schedule_todo_when("2026-08-18", "09:30", today=today), "8月18日 周二 · 09:30")
+        self.assertEqual(_format_schedule_todo_when("2027-01-02", "09:30", today=today), "2027年1月2日 周六 · 09:30")
+        self.assertEqual(_format_schedule_todo_when("2026-08-16", None, today=today), "今天 周日 · 全天")
         self.assertEqual(_format_schedule_todo_when("invalid", "09:30", today=today), "日期待定 · 09:30")
 
 
