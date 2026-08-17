@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { createHttpAdapter, createMockAdapter, normalizeInstrument, normalizeLiveState, normalizeRecord, normalizeTerminal } from '../src/api.js';
+import { createHttpAdapter, createMockAdapter, normalizeHistory, normalizeInstrument, normalizeLiveState, normalizeRecord, normalizeSendRecord, normalizeTerminal, reconcileHistorySnapshot, upsertHistoryRecord } from '../src/api.js';
 import { createPwaBootstrap, isExplicitMockMode } from '../src/bootstrap.js';
 import { createComposerState } from '../src/composer-state.js';
 import { PAIRING_ALPHABET, formatPairingCode, normalizePairingCode } from '../src/pairing-code.js';
@@ -202,6 +202,38 @@ test('normalizes only flat same-origin attachment paths and rejects encoded trav
     { name: 'absolute-safe.png', url: '/attachments/absolute-safe.png', type: 'file', size: 0 },
     { name: 'ok.png', url: '/attachments/ok.png', type: 'image', size: 0 },
   ]);
+});
+
+test('POST send record is canonical, attachment-aware, and idempotent across snapshots', () => {
+  const first = { id: 'server-user-42', role: 'user', text: '带附件', ts: '2026-08-09T05:00:00Z', metadata: { attachments: [{ attachment_url: '/attachments/photo.png', filename: 'photo.png', type: 'image' }] } };
+  const canonical = normalizeSendRecord({ record: first });
+  const inserted = upsertHistoryRecord([{ id: 'old', role: 'assistant', body: '之前', time: '08:00', attachments: [] }], canonical);
+  assert.equal(inserted.record.id, 'server-user-42');
+  assert.deepEqual(inserted.record.attachments, [{ name: 'photo.png', url: '/attachments/photo.png', type: 'image', size: 0 }]);
+  const repeated = upsertHistoryRecord(inserted.history, { ...canonical, body: '服务器最终文本' });
+  assert.equal(repeated.history.filter(({ id }) => id === 'server-user-42').length, 1);
+  assert.equal(repeated.history.at(-1).body, '服务器最终文本');
+  assert.equal(normalizeSendRecord({ accepted: true }), null, 'no local placeholder ID is manufactured');
+  assert.equal(normalizeRecord({ role: 'user', text: 'missing identity' }).id, '');
+  assert.equal(normalizeHistory([{ ...first }, { ...first, text: 'snapshot duplicate' }]).filter(({ id }) => id === 'server-user-42').length, 1);
+});
+
+test('stale snapshots retain pending canonical sends, then confirm and clear per contact without re-normalizing UI records', () => {
+  const sent = normalizeSendRecord({ record: { id: 'send-a', role: 'user', text: '刚发出', ts: '2026-08-09T05:00:00Z' } });
+  const current = [{ id: 'old', role: 'assistant', body: '旧消息', time: '08:41', attachments: [] }, sent];
+  const stale = reconcileHistorySnapshot(current, [current[0]], ['send-a']);
+  assert.deepEqual(stale.pendingIds, ['send-a']);
+  assert.equal(stale.history.find(({ id }) => id === 'send-a').time, sent.time);
+  assert.deepEqual(stale.history.find(({ id }) => id === 'old'), current[0], 'existing UI metadata/time is preserved');
+
+  const confirmed = reconcileHistorySnapshot(stale.history, [current[0], { ...sent, body: '历史快照正文' }], stale.pendingIds);
+  assert.deepEqual(confirmed.pendingIds, []);
+  assert.equal(confirmed.history.filter(({ id }) => id === 'send-a').length, 1);
+  assert.equal(confirmed.history.find(({ id }) => id === 'send-a').body, '历史快照正文');
+
+  const isolated = reconcileHistorySnapshot([{ id: 'other', body: 'B', time: '09:00' }], [{ id: 'other', body: 'B', time: '09:00' }], []);
+  assert.deepEqual(isolated.pendingIds, [], 'another contact cannot inherit pending IDs');
+  assert.equal(isolated.history.length, 1);
 });
 
 test('stop routing preserves the opaque per-contact server fence', async () => {
@@ -461,11 +493,11 @@ test('PWA shell declares installability and has no secret persistence', async ()
   assert.match(manifest, /icon-192\.png/);
   assert.match(manifest, /icon-512\.png/);
   assert.match(serviceWorker, /addEventListener\('fetch'/);
-  assert.match(serviceWorker, /cccompanion-desk-v11/);
-  assert.match(serviceWorker, /src\/styles\.css\?v=11/);
-  assert.match(serviceWorker, /src\/app\.js\?v=11/);
-  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=11/);
-  assert.match(serviceWorker, /src\/sticker-protocol\.js\?v=11/);
+  assert.match(serviceWorker, /cccompanion-desk-v12/);
+  assert.match(serviceWorker, /src\/styles\.css\?v=12/);
+  assert.match(serviceWorker, /src\/app\.js\?v=12/);
+  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=12/);
+  assert.match(serviceWorker, /src\/sticker-protocol\.js\?v=12/);
   assert.match(serviceWorker, /src\/live-messages\.js/);
   assert.match(serviceWorker, /src\/pairing-code\.js/);
   assert.doesNotMatch(source, /shared_secret|localStorage\.setItem|sessionStorage\.setItem|credentials:\s*'include'/);
@@ -482,8 +514,8 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   ]);
   assert.match(html, /id="latest-button"/);
   assert.match(html, /id="pairing-code"/);
-  assert.match(html, /href="\.\/src\/styles\.css\?v=11"/);
-  assert.match(html, /src="\.\/src\/app\.js\?v=11"/);
+  assert.match(html, /href="\.\/src\/styles\.css\?v=12"/);
+  assert.match(html, /src="\.\/src\/app\.js\?v=12"/);
   assert.match(html, /autocomplete="one-time-code"/);
   assert.match(html, /id="pairing-form"/);
   assert.match(html, /<details class="password-fallback">/);
@@ -515,6 +547,10 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   assert.match(app, /const nearEnd = list\.scrollHeight - list\.scrollTop - list\.clientHeight < 28/);
   assert.doesNotMatch(html + app, /xterm|terminal\/key|tmux\/capture/);
   assert.match(app, /adapter\.sendMessage\(contactId,/);
+  assert.match(app, /normalizeSendRecord\(response\)/);
+  assert.match(app, /if \(!record\) throw new Error\('发送响应缺少 canonical record'\)/);
+  assert.match(app, /upsertHistoryRecord\(state\.histories\[contactId\]/);
+  assert.match(app, /renderMessages\(\{ forceLatest: true \}\)/);
   assert.match(html, /id="sticker-button"[^>]*aria-label="打开表情包"[^>]*aria-haspopup="dialog"/);
   assert.match(html, /id="sticker-status"[^>]*aria-live="polite"/);
   assert.match(app, /insertStickerToken\(draft\.text, selection\.start, selection\.end/);

@@ -1,10 +1,10 @@
-import { createPwaBootstrap } from './bootstrap.js?v=11';
-import { createComposerState } from './composer-state.js?v=11';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=11';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=11';
-import { normalizeLiveState } from './api.js?v=11';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=11';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=11';
+import { createPwaBootstrap } from './bootstrap.js?v=12';
+import { createComposerState } from './composer-state.js?v=12';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=12';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=12';
+import { normalizeLiveState, normalizeSendRecord, reconcileHistorySnapshot, upsertHistoryRecord } from './api.js?v=12';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=12';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=12';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -24,7 +24,7 @@ const state = {
   contacts: [], activeContactId: '', histories: {}, live: {}, taxonomy: null,
   selectedScope: null, deferredInstall: null, loginBound: false, stopLive: null, streams: {}, epoch: 0,
   composerState: createComposerState(), appearance: 'default', followLatest: {}, scrollTops: {},
-  stickerCatalog: null, stickerLoading: false, stickerLoadId: 0, stickerError: '', stickerCategory: '__all', stickerSearch: '', stickerTargetContactId: '', stickerSelection: { start: 0, end: 0 },
+  stickerCatalog: null, stickerLoading: false, stickerLoadId: 0, stickerError: '', stickerCategory: '__all', stickerSearch: '', stickerTargetContactId: '', stickerSelection: { start: 0, end: 0 }, pendingCanonical: {},
   stickerUpload: { file: null, previewUrl: '', uploading: false, controller: null },
 };
 const contactList = $('#contact-list'); const messages = $('#message-list'); const input = $('#message-input');
@@ -193,12 +193,15 @@ async function switchContact(id) {
   if (await refreshContact(id, { epoch }) && epoch === state.epoch && id === state.activeContactId) watchLive(id, epoch);
 }
 async function refreshContact(id, { epoch = state.epoch } = {}) {
-  try { const [history, live] = await Promise.all([adapter.getHistory(id), adapter.getLiveState(id)]); if (epoch !== state.epoch) return false; state.histories[id] = history; state.live[id] = live; if (id === state.activeContactId) renderAll(); else renderContacts(); }
+  try { const [history, live] = await Promise.all([adapter.getHistory(id), adapter.getLiveState(id)]); if (epoch !== state.epoch) return false; const reconciled = reconcileHistorySnapshot(state.histories[id] || [], history, state.pendingCanonical[id] || []); state.histories[id] = reconciled.history; state.pendingCanonical[id] = reconciled.pendingIds; state.live[id] = live; if (id === state.activeContactId) renderAll(); else renderContacts(); }
   catch (error) { $('#connection-state').textContent = '离线草稿'; console.warn('CcCompanion adapter unavailable', error); }
   if (epoch !== state.epoch) return false;
   return true;
 }
-function updateMessage(contactId, message) { const history = state.histories[contactId] || []; const found = history.findIndex(({ id }) => id === message.id); if (found >= 0) history[found] = message; else history.push(message); state.histories[contactId] = history; }
+function updateMessage(contactId, message) {
+  const result = upsertHistoryRecord(state.histories[contactId] || [], message);
+  state.histories[contactId] = result.history;
+}
 async function send(event) {
   event.preventDefault(); const contactId = state.activeContactId; const draft = composer(contactId); const text = input.value.trim();
   if (sendOperation(contactId) || (!text && !draft.attachments.length) || !contactId || contact().readOnly) return;
@@ -215,7 +218,16 @@ async function send(event) {
       },
     });
     operation.uploading = false; if (contactId === state.activeContactId && state.composerState.isCurrent(contactId, operation)) renderHeader();
-    await adapter.sendMessage(contactId, { text, attachmentIds: staged.map(({ attachment_id }) => attachment_id) });
+    const response = await adapter.sendMessage(contactId, { text, attachmentIds: staged.map(({ attachment_id }) => attachment_id) });
+    // The server's record is authoritative (including its canonical id and
+    // normalized attachment metadata). Render it immediately; the next
+    // polling snapshot then replaces/deduplicates by that same id.
+    const record = normalizeSendRecord(response);
+    if (!record) throw new Error('发送响应缺少 canonical record');
+    state.pendingCanonical[contactId] = [...new Set([...(state.pendingCanonical[contactId] || []), record.id])];
+    const merged = upsertHistoryRecord(state.histories[contactId] || [], record);
+    state.histories[contactId] = merged.history;
+    if (contactId === state.activeContactId && state.composerState.isCurrent(contactId, operation)) renderMessages({ forceLatest: true });
     if (state.composerState.isCurrent(contactId, operation)) draft.attachments = [];
   } catch (error) {
     if (staged.length) await adapter.cancelUploads(staged).catch(() => {});
@@ -239,7 +251,7 @@ function renderTaxonomy() {
 }
 async function selectMemory(scope) { state.selectedScope = scope; renderTaxonomy(); const result = $('#memory-results'); result.replaceChildren(el('p', { class: 'loading', text: '正在读取记忆…' })); try { const entries = await adapter.listMemories(scope); result.replaceChildren(...entries.map((entry) => el('article', { class: 'memory-card' }, [el('small', { text: entry.timestamp || entry.created_at || '记忆条目' }), el('h3', { text: entry.title || entry.content?.slice(0, 40) || '无标题' }), el('p', { text: entry.body || entry.content || '' })]))); } catch { result.replaceChildren(el('p', { class: 'error', text: '这个分类暂时无法读取。' })); } }
 function applyLiveEvent(event) {
-  if (event.type === 'message') updateMessage(event.contactId, event.message); if (event.type === 'state') state.live[event.contactId] = event.state; if (event.type === 'snapshot') { state.histories[event.contactId] = event.history; state.live[event.contactId] = event.state; state.streams[event.contactId] = reconcileSnapshotStream(state.streams[event.contactId], event.state); }
+  if (event.type === 'message') updateMessage(event.contactId, event.message); if (event.type === 'state') state.live[event.contactId] = event.state; if (event.type === 'snapshot') { const reconciled = reconcileHistorySnapshot(state.histories[event.contactId] || [], event.history, state.pendingCanonical[event.contactId] || []); state.histories[event.contactId] = reconciled.history; state.pendingCanonical[event.contactId] = reconciled.pendingIds; state.live[event.contactId] = event.state; state.streams[event.contactId] = reconcileSnapshotStream(state.streams[event.contactId], event.state); }
   if (event.type === 'stream') {
     const next = reduceStreamDraft(state.streams[event.contactId], event.payload);
     state.streams[event.contactId] = next;
@@ -381,7 +393,7 @@ $('#sticker-upload-open').addEventListener('click', showStickerUpload); $('#stic
 $('#sticker-upload-file').addEventListener('change', (event) => setStickerUploadFile(event.target.files?.[0])); $('#sticker-upload-form').addEventListener('change', (event) => { if (event.target.name === 'sticker-category-mode') renderStickerCategoryFields(); }); $('#sticker-upload-form').addEventListener('submit', uploadSticker);
 $('#upload-cancel-button').addEventListener('click', () => state.composerState.cancel(state.activeContactId)); $('#stop-button').addEventListener('click', () => adapter.stop(state.activeContactId, state.live[state.activeContactId]?.stopRequest).catch(() => { $('#connection-state').textContent = '停止请求失效'; }));
 $('#memory-button').addEventListener('click', openMemory); $('#memory-close').addEventListener('click', () => $('#memory-dialog').close()); $('#worker-toggle').addEventListener('click', () => setWorkers(!document.body.classList.contains('workers-open'))); $('#worker-close').addEventListener('click', closeWorkers);
-async function logout() { state.epoch += 1; state.stickerLoadId += 1; state.composerState.cancelAll(); state.stickerUpload.controller?.abort(); state.stickerUpload.uploading = false; closeStickerDialog(); state.stickerCatalog = null; state.stickerLoading = false; state.stickerError = ''; state.stickerSearch = ''; state.stickerCategory = '__all'; state.stickerTargetContactId = ''; try { await adapter.logout(); } finally { state.stopLive?.(); state.stopLive = null; state.contacts = []; state.histories = {}; state.live = {}; state.streams = {}; state.composerState = createComposerState(); state.activeContactId = ''; renderAll(); if (!bootstrap.mock) showLogin(); } }
+async function logout() { state.epoch += 1; state.stickerLoadId += 1; state.composerState.cancelAll(); state.stickerUpload.controller?.abort(); state.stickerUpload.uploading = false; closeStickerDialog(); state.stickerCatalog = null; state.stickerLoading = false; state.stickerError = ''; state.stickerSearch = ''; state.stickerCategory = '__all'; state.stickerTargetContactId = ''; try { await adapter.logout(); } finally { state.stopLive?.(); state.stopLive = null; state.contacts = []; state.histories = {}; state.live = {}; state.streams = {}; state.pendingCanonical = {}; state.composerState = createComposerState(); state.activeContactId = ''; renderAll(); if (!bootstrap.mock) showLogin(); } }
 $('#logout-button').addEventListener('click', logout); $('#drawer-logout-button').addEventListener('click', logout);
 $('#appearance-button').addEventListener('click', cycleAppearance); $('#drawer-appearance-button').addEventListener('click', cycleAppearance);
 window.addEventListener('keydown', (event) => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); input.focus(); } if (event.altKey && /^[1-9]$/.test(event.key)) { const target = state.contacts[Number(event.key) - 1]; if (target) switchContact(target.id); } if (event.key === 'Escape') { if ($('#sticker-dialog').open) closeStickerDialog({ returnFocus: true }); if ($('#memory-dialog').open) $('#memory-dialog').close(); if (document.body.classList.contains('workers-open')) closeWorkers(); } });

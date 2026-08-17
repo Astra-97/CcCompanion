@@ -1,6 +1,6 @@
-import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY } from './data.js?v=11';
-import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=11';
-import { normalizeStickerCatalog } from './sticker-protocol.js?v=11';
+import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY } from './data.js?v=12';
+import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=12';
+import { normalizeStickerCatalog } from './sticker-protocol.js?v=12';
 
 const clone = (value) => structuredClone(value);
 const now = () => new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
@@ -114,12 +114,75 @@ export function normalizeRecord(record = {}) {
     seenAttachments.add(attachment.url); return true;
   });
   return {
-    id: String(record.id || record.ts || crypto.randomUUID()),
+    // A missing server identity is not safe to replace with a client UUID:
+    // the same record could then be inserted again when the next snapshot
+    // arrives.  Real chat records have either an id or a canonical timestamp.
+    id: String(record.id || record.ts || record.created_at || ''),
     role: record.role === 'user' ? 'user' : 'assistant',
     body: String(record.text ?? record.content ?? record.body ?? ''),
     time,
     attachments,
   };
+}
+
+/** De-duplicate already-normalized UI history without changing its records. */
+export function dedupeHistory(records = []) {
+  if (!Array.isArray(records)) return [];
+  const result = [];
+  const positions = new Map();
+  records.forEach((raw) => {
+    const record = raw;
+    if (!record || typeof record !== 'object') return;
+    if (record.id && positions.has(record.id)) result[positions.get(record.id)] = record;
+    else {
+      if (record.id) positions.set(record.id, result.length);
+      result.push(record);
+    }
+  });
+  return result;
+}
+
+/** Normalize raw server history once, at the adapter boundary. */
+export function normalizeHistory(records = []) {
+  if (!Array.isArray(records)) return [];
+  return dedupeHistory(records.map(normalizeRecord));
+}
+
+/**
+ * Upsert an already-normalized canonical UI record returned by POST /chat/send.
+ * Call normalizeSendRecord at the server boundary first.
+ */
+export function upsertHistoryRecord(history = [], record) {
+  const next = dedupeHistory(history);
+  if (!record || typeof record !== 'object' || !record.id) return { history: next, record: null };
+  const found = next.findIndex(({ id }) => id === record.id);
+  if (found >= 0) next[found] = record;
+  else next.push(record);
+  return { history: next, record };
+}
+
+/**
+ * Reconcile a server snapshot with records returned by a successful send.
+ * A poll that started before POST /chat/send may be stale, so retain pending
+ * canonical records until a snapshot explicitly contains each one.
+ */
+export function reconcileHistorySnapshot(currentHistory = [], snapshot = [], pendingIds = []) {
+  const next = dedupeHistory(snapshot);
+  const pending = new Set(pendingIds);
+  const snapshotIds = new Set(next.map(({ id }) => id).filter(Boolean));
+  pending.forEach((id) => {
+    if (snapshotIds.has(id)) return pending.delete(id);
+    const retained = currentHistory.find((record) => record?.id === id);
+    if (retained && !snapshotIds.has(id)) next.push(retained);
+  });
+  return { history: dedupeHistory(next), pendingIds: [...pending] };
+}
+
+export function normalizeSendRecord(result) {
+  const record = result && typeof result === 'object' ? (result.record || result.message) : null;
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return null;
+  const normalized = normalizeRecord(record);
+  return normalized.id ? normalized : null;
 }
 
 export function normalizeAttachment(raw = {}) {
@@ -196,7 +259,7 @@ export function createHttpAdapter({ baseUrl = '', request = defaultRequest, uplo
     async getHistory(contactId, { signal } = {}) {
       const result = await call(url(`/chat/history?contact_id=${encodeURIComponent(contactId)}`), { signal });
       const records = Array.isArray(result) ? result : (result.records || result.messages || []);
-      return records.map(normalizeRecord);
+      return normalizeHistory(records);
     },
     async getLiveState(contactId, { signal } = {}) {
       const status = await call(url(`/chat/status?contact_id=${encodeURIComponent(contactId)}`), { signal });
