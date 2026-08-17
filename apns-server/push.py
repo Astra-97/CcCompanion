@@ -17485,12 +17485,93 @@ class PushHandler(BaseHTTPRequestHandler):
                 })
                 self._send_json(503, res)
                 return
-            # The visible user record and XiaoKe's one chain notification have
-            # the same content.  Keeping the legacy notifier as the only
-            # injection avoids a duplicate AI turn.
-            self._notify_chain_todo(share_text)
+            # The schedule write and visible XiaoKe record are durable before
+            # we enqueue the informational channel notification.  Do not use
+            # the legacy fire-and-forget bus sender here: on normal community
+            # installs it may not exist, has no explicit XiaoKe target, and
+            # cannot prove that this record reached the active channel.
+            delivered, delivery_error, message_id = self._deliver_schedule_todo_to_xiaoke(
+                record=record,
+                event_id=str(res.get("event_id") or ""),
+            )
+            if not delivered:
+                logger.warning(
+                    "schedule todo XiaoKe channel delivery failed event_id=%s message_id=%s error=%s",
+                    res.get("event_id"),
+                    message_id,
+                    delivery_error,
+                )
+                # The schedule and its visible record are already durable.
+                # Surface that the live-session notification was not accepted
+                # rather than reporting an end-to-end success.
+                res.update({
+                    "ok": False,
+                    "schedule_updated": True,
+                    "record": record,
+                    "partial_failure": "xiaoke_channel_delivery_failed",
+                    "error": "schedule_updated_but_xiaoke_channel_delivery_failed",
+                    "delivery_error": delivery_error,
+                    "message_id": message_id,
+                })
+                self._send_json(503, res)
+                return
             res["record"] = record
+            res["queued"] = True
+            res["transport"] = "channel"
+            res["message_id"] = message_id
         self._send_json(200 if res.get("ok") else 400, res)
+
+    def _deliver_schedule_todo_to_xiaoke(
+        self,
+        *,
+        record: dict[str, Any],
+        event_id: str,
+    ) -> tuple[bool, str, str]:
+        """Queue one already-visible schedule update on XiaoKe's live channel.
+
+        The channel owns busy ordering and deduplicates its ``message_id``.
+        No history write occurs here: ``record`` was appended exactly once by
+        ``_handle_todos_toggle`` before this helper is called.
+        """
+        contact_id = "xiaoke"
+        record_text = str(record.get("text") or "")
+        record_ts = str(record.get("ts") or "")
+        record_metadata = record.get("metadata")
+        transition_done = (
+            bool(record_metadata.get("done"))
+            if isinstance(record_metadata, dict)
+            else False
+        )
+        digest = hashlib.sha256(
+            # A test history (and a coarse real clock) can assign the same
+            # timestamp to a completion and its immediate undo.  Include the
+            # transition and exact visible content so the channel's durable
+            # dedupe key cannot collapse those distinct updates.
+            f"{event_id}\0{record_ts}\0{int(transition_done)}\0{record_text}".encode("utf-8")
+        ).hexdigest()[:32]
+        message_id = f"todo:{digest}"
+        if not record_text:
+            return False, "schedule record text is empty", message_id
+        if not self._channel_transport_enabled_for(contact_id):
+            return False, "xiaoke channel transport is unavailable", message_id
+
+        ok, error = _channel_transport_post(
+            self.state,
+            message_id=message_id,
+            contact_id=contact_id,
+            # Keep the live notification byte-for-byte equal to the visible
+            # record; it is an informational update, not another user turn.
+            text=record_text,
+            metadata={
+                "source": "todos",
+                "transport": "channel",
+                "user_record_ts": record_ts,
+                "todo_share": True,
+                "informational": True,
+                "no_reply": True,
+            },
+        )
+        return ok, error, message_id
 
     def _handle_todos_list(self):
         if not self._check_auth():

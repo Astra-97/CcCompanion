@@ -1,8 +1,10 @@
 """Schedule-backed homepage todo contract tests (all fixtures are temporary)."""
 
 import fcntl
+import http.server
 import json
 import tempfile
+import threading
 import types
 import unittest
 from datetime import date
@@ -10,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 import todos
-from push import PushHandler, _format_schedule_todo_when
+from push import PushHandler, _channel_transport_post, _format_schedule_todo_when
 
 
 def _event(event_id: str, title: str, date: str, event_time: str | None, *, done=False, note=None):
@@ -100,6 +102,65 @@ class ScheduleTodosTest(unittest.TestCase):
             todos.collect_all(self.path)
 
 
+class ChannelTransportPostContractTest(unittest.TestCase):
+    def setUp(self):
+        self.requests = []
+        received = self.requests
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                received.append({
+                    "path": self.path,
+                    "token": self.headers.get("X-Auth-Token"),
+                    "body": json.loads(self.rfile.read(length)),
+                })
+                self.send_response(202)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok":true,"queued":true}')
+
+            def log_message(self, _format, *_args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.thread.join(timeout=1)
+        self.server.server_close()
+
+    def test_posts_exact_schedule_record_to_authenticated_messages_endpoint(self):
+        state = types.SimpleNamespace(
+            channel_transport_url=f"http://127.0.0.1:{self.server.server_port}",
+            channel_transport_token="channel-test-token",
+            channel_transport_timeout_seconds=1,
+        )
+        visible_text = "日程更新\n✅ 已完成：私教课\n今天 周日 · 19:00"
+        ok, error = _channel_transport_post(
+            state,
+            message_id="todo:abc123",
+            contact_id="xiaoke",
+            text=visible_text,
+            metadata={"informational": True, "no_reply": True},
+        )
+
+        self.assertTrue(ok, error)
+        self.assertEqual(len(self.requests), 1)
+        request = self.requests[0]
+        self.assertEqual(request["path"], "/messages")
+        self.assertEqual(request["token"], "channel-test-token")
+        self.assertEqual(request["body"], {
+            "message_id": "todo:abc123",
+            "contact_id": "xiaoke",
+            "text": visible_text,
+            "quoted_ts": None,
+            "metadata": {"informational": True, "no_reply": True},
+        })
+
+
 class TodosHandlerAuthTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -123,12 +184,12 @@ class TodosHandlerAuthTest(unittest.TestCase):
             strict_auth=True,
             shared_secret="test-secret",
             todos_schedule_path=str(self.path),
-            bus_send_path="/unused",
             contact_chats={"xiaoke": _History()},
         )
         handler.headers = {"X-Auth-Token": token}
         handler.responses = []
         handler._send_json = lambda status, payload: handler.responses.append((status, payload))
+        handler._channel_transport_enabled_for = lambda contact_id: contact_id == "xiaoke"
         handler._notify_chain_todo = lambda text: handler.notifications.append(text)
         return handler
 
@@ -145,9 +206,12 @@ class TodosHandlerAuthTest(unittest.TestCase):
         self.assertEqual(handler.responses[0][0], 200)
         self.assertEqual(handler.responses[0][1]["sections"][0]["items"][0]["event_id"], "evt1")
         handler.responses.clear()
-        handler._handle_todos_toggle({"event_id": "evt1", "expected_done": False})
+        with mock.patch("push._channel_transport_post", return_value=(True, "")) as channel_post:
+            handler._handle_todos_toggle({"event_id": "evt1", "expected_done": False})
         self.assertEqual(handler.responses[0][0], 200)
         self.assertTrue(handler.responses[0][1]["new_done"])
+        self.assertTrue(handler.responses[0][1]["queued"])
+        self.assertEqual(handler.responses[0][1]["transport"], "channel")
         self.assertEqual(len(handler.history_records), 1)
         record = handler.history_records[0]
         self.assertEqual(record["role"], "user")
@@ -160,7 +224,21 @@ class TodosHandlerAuthTest(unittest.TestCase):
             "date": "2099-08-16",
             "time": "09:00",
         })
-        self.assertEqual(handler.notifications, [record["text"]])
+        # The schedule update reaches the actual XiaoKe channel exactly once;
+        # it must not merely invoke the legacy bus notifier or append again.
+        channel_post.assert_called_once()
+        self.assertEqual(channel_post.call_args.kwargs["contact_id"], "xiaoke")
+        self.assertEqual(channel_post.call_args.kwargs["text"], record["text"])
+        self.assertEqual(channel_post.call_args.kwargs["metadata"], {
+            "source": "todos",
+            "transport": "channel",
+            "user_record_ts": "test-turn",
+            "todo_share": True,
+            "informational": True,
+            "no_reply": True,
+        })
+        self.assertTrue(channel_post.call_args.kwargs["message_id"].startswith("todo:"))
+        self.assertEqual(handler.notifications, [])
 
         # A replay/race is not a second user utterance or AI notification.
         handler.responses.clear()
@@ -172,11 +250,39 @@ class TodosHandlerAuthTest(unittest.TestCase):
         self.assertEqual(handler.notifications, [])
 
         handler.responses.clear()
-        handler._handle_todos_toggle({"event_id": "evt1", "expected_done": True})
+        with mock.patch("push._channel_transport_post", return_value=(True, "")) as undo_channel_post:
+            handler._handle_todos_toggle({"event_id": "evt1", "expected_done": True})
         self.assertEqual(handler.responses[0][0], 200)
         self.assertEqual(handler.history_records[0]["text"], "日程更新\n↩️ 已取消完成：私密日程\n2099年8月16日 周日 · 09:00")
         self.assertEqual(handler.history_records[0]["metadata"]["done"], False)
-        self.assertEqual(handler.notifications, [handler.history_records[0]["text"]])
+        undo_channel_post.assert_called_once()
+        # The fixture deliberately reuses ``test-turn`` for both records: an
+        # immediate completion+undo must still be two channel deliveries.
+        self.assertNotEqual(
+            channel_post.call_args.kwargs["message_id"],
+            undo_channel_post.call_args.kwargs["message_id"],
+        )
+        self.assertEqual(handler.notifications, [])
+
+    def test_schedule_toggle_surfaces_channel_delivery_failure_without_legacy_fallback(self):
+        handler = self.handler("test-secret")
+        with mock.patch("push._channel_transport_post", return_value=(False, "channel offline")) as channel_post, \
+                mock.patch("push.logger.warning") as warning:
+            handler._handle_todos_toggle({"event_id": "evt1", "expected_done": False})
+
+        self.assertEqual(handler.responses[0][0], 503)
+        payload = handler.responses[0][1]
+        self.assertFalse(payload["ok"])
+        self.assertTrue(payload["schedule_updated"])
+        self.assertEqual(payload["partial_failure"], "xiaoke_channel_delivery_failed")
+        self.assertEqual(payload["error"], "schedule_updated_but_xiaoke_channel_delivery_failed")
+        self.assertEqual(payload["delivery_error"], "channel offline")
+        self.assertEqual(len(handler.history_records), 1)
+        self.assertEqual(payload["record"]["text"], handler.history_records[0]["text"])
+        self.assertTrue(json.loads(self.path.read_text(encoding="utf-8"))[0]["done"])
+        channel_post.assert_called_once()
+        warning.assert_called_once()
+        self.assertEqual(handler.notifications, [])
 
     def test_successful_schedule_write_surfaces_history_append_partial_failure(self):
         handler = self.handler("test-secret")
