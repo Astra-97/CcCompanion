@@ -66,6 +66,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from jwt_helper import APNsJWT
 from apns_client import APNsClient, APNsResponse
@@ -174,6 +175,33 @@ CLIENT_LOG_PATH = HERE / "client_logs.jsonl"
 CLIENT_LOG_MAX_FIELD = 20_000
 WINDOWS_PWA_ROOT = HERE.parent / "windows-pwa"
 MCP_SERVICES = McpServiceStore(HERE / "state" / "mcp_services.json")
+
+
+def _format_schedule_todo_when(
+    raw_date: Any,
+    raw_time: Any,
+    *,
+    today: date | None = None,
+) -> str:
+    """Format only schedule values returned after the locked toggle write."""
+    try:
+        scheduled_date = date.fromisoformat(raw_date) if isinstance(raw_date, str) else None
+    except ValueError:
+        scheduled_date = None
+    local_today = today or datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    date_label = (
+        "今天" if scheduled_date == local_today else
+        f"{scheduled_date.month}月{scheduled_date.day}日" if scheduled_date and scheduled_date.year == local_today.year else
+        f"{scheduled_date.year}年{scheduled_date.month}月{scheduled_date.day}日" if scheduled_date else
+        "日期待定"
+    )
+    if raw_time is None:
+        time_label = "全天"
+    elif isinstance(raw_time, str) and re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", raw_time):
+        time_label = raw_time
+    else:
+        time_label = "时间待定"
+    return f"{date_label} · {time_label}"
 
 
 # The installed web/PWA client is deliberately a same-origin client.  It must
@@ -17421,8 +17449,12 @@ class PushHandler(BaseHTTPRequestHandler):
             # The title comes from the just-locked schedule event, never from
             # an untrusted client echo field.
             todo_title = str(res.get("title") or "")
+            todo_when = _format_schedule_todo_when(
+                res.get("date"),
+                res.get("time"),
+            )
             share_text = (
-                f"日程更新\n{'✅ 已完成' if done else '↩️ 已取消完成'}：{todo_title}"
+                f"日程更新\n{'✅ 已完成' if done else '↩️ 已取消完成'}：{todo_title}\n{todo_when}"
             )
             try:
                 record = self._chat_for_contact("xiaoke").append(
@@ -17431,8 +17463,10 @@ class PushHandler(BaseHTTPRequestHandler):
                     source="todos",
                     metadata={
                         "todo_share": True,
-                        "event_id": str(res.get("event_id") or body.get("event_id") or ""),
+                        "event_id": str(res.get("event_id") or ""),
                         "done": bool(done),
+                        "date": res.get("date"),
+                        "time": res.get("time"),
                     },
                 )
             except Exception:

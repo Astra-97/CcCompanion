@@ -196,6 +196,10 @@ def toggle(
                 "new_done": event["done"],
                 "event_id": event_id,
                 "title": event["title"],
+                # These values are read from the event while its schedule lock
+                # is held.  The client must never supply its own display time.
+                "date": event["date"],
+                "time": event["time"],
             }
     except ScheduleTodoStoreError:
         return {"ok": False, "error": "schedule_unavailable"}
