@@ -17486,7 +17486,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(503, res)
                 return
             # The schedule write and visible XiaoKe record are durable before
-            # we enqueue the informational channel notification.  Do not use
+            # we enqueue the normal inbound channel turn.  Do not use
             # the legacy fire-and-forget bus sender here: on normal community
             # installs it may not exist, has no explicit XiaoKe target, and
             # cannot prove that this record reached the active channel.
@@ -17559,16 +17559,15 @@ class PushHandler(BaseHTTPRequestHandler):
             self.state,
             message_id=message_id,
             contact_id=contact_id,
-            # Keep the live notification byte-for-byte equal to the visible
-            # record; it is an informational update, not another user turn.
+            # Keep the live turn byte-for-byte equal to the visible record.
+            # ``user_record_ts`` lets the channel reuse that durable history
+            # record while still allowing XiaoKe to reply normally.
             text=record_text,
             metadata={
                 "source": "todos",
                 "transport": "channel",
                 "user_record_ts": record_ts,
                 "todo_share": True,
-                "informational": True,
-                "no_reply": True,
             },
         )
         return ok, error, message_id

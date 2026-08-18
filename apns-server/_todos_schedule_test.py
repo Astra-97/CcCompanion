@@ -234,9 +234,9 @@ class TodosHandlerAuthTest(unittest.TestCase):
             "transport": "channel",
             "user_record_ts": "test-turn",
             "todo_share": True,
-            "informational": True,
-            "no_reply": True,
         })
+        self.assertNotIn("informational", channel_post.call_args.kwargs["metadata"])
+        self.assertNotIn("no_reply", channel_post.call_args.kwargs["metadata"])
         self.assertTrue(channel_post.call_args.kwargs["message_id"].startswith("todo:"))
         self.assertEqual(handler.notifications, [])
 
