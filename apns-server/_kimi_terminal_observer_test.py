@@ -467,6 +467,42 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         if bridge._timer is not None:
             bridge._timer.cancel()
 
+    def test_owns_live_session_accepts_only_matching_uncertain_tui(self):
+        bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"))
+        bridge._lease, bridge._lease_pane = "a" * 43, "%42"
+        bridge._session_fingerprint = bridge._fingerprint_session("session-current")
+        bridge._prompt_active_uncertain = True
+        bridge._has_session_locked = mock.Mock(return_value=True)
+        bridge._owns_session_locked = mock.Mock(return_value=True)
+        bridge._pane_status_locked = mock.Mock(return_value=("%42", False))
+
+        self.assertTrue(bridge.owns_live_session("session-current"))
+
+    def test_owns_live_session_rejects_no_lease(self):
+        bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"))
+        bridge._session_fingerprint = bridge._fingerprint_session("session-current")
+        bridge._prompt_active_uncertain = True
+
+        self.assertFalse(bridge.owns_live_session("session-current"))
+
+    def test_owns_live_session_rejects_mismatched_session_fingerprint(self):
+        bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"))
+        bridge._lease, bridge._lease_pane = "a" * 43, "%42"
+        bridge._session_fingerprint = bridge._fingerprint_session("session-other")
+        bridge._prompt_active_uncertain = True
+
+        self.assertFalse(bridge.owns_live_session("session-current"))
+
+    def test_owns_live_session_rejects_idle_matching_lease(self):
+        bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"))
+        bridge._lease, bridge._lease_pane = "a" * 43, "%42"
+        bridge._session_fingerprint = bridge._fingerprint_session("session-current")
+        bridge._has_session_locked = mock.Mock(return_value=True)
+        bridge._owns_session_locked = mock.Mock(return_value=True)
+        bridge._pane_status_locked = mock.Mock(return_value=("%42", False))
+
+        self.assertFalse(bridge.owns_live_session("session-current"))
+
     def test_kimi_restart_adoption_binds_a_fresh_lease_to_existing_owned_pane(self):
         bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"))
         bridge._has_session_locked = mock.Mock(return_value=True)
@@ -654,6 +690,39 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         worker.join(1)
         self.assertFalse(worker.is_alive())
         bridge.ensure.assert_called_once_with("session-current")
+        self.assertEqual("", handler.state.kimi_terminal_acquire_token)
+
+    def test_busy_web_session_allows_only_the_same_live_kimi_tui_to_capture(self):
+        web = types.SimpleNamespace(
+            cwd="/workspace",
+            start=lambda: None,
+            load_active_session_id=lambda: "session-current",
+            _valid_session_id=lambda value: value,
+            list_sessions=lambda: [{"id": "session-current", "metadata": {"cwd": "/workspace"}}],
+            get_session_status=lambda _session: {"busy": True},
+        )
+
+        def handler_for(owns_live):
+            bridge = types.SimpleNamespace(
+                ensure=mock.Mock(return_value="%42"),
+                owns_live_session=mock.Mock(return_value=owns_live),
+            )
+            handler = object.__new__(PushHandler)
+            handler.state = types.SimpleNamespace(
+                kimi_turn_lock=threading.RLock(), kimi_active_turn={}, kimi_prepare_token="",
+                kimi_recovery_token="", kimi_terminal_acquire_token="", kimi_web=web, kimi_terminal=bridge,
+            )
+            return handler, bridge
+
+        handler, bridge = handler_for(True)
+        self.assertEqual("%42", handler._acquire_kimi_terminal())
+        bridge.owns_live_session.assert_called_once_with("session-current")
+        bridge.ensure.assert_called_once_with("session-current")
+
+        handler, bridge = handler_for(False)
+        with self.assertRaises(KimiTerminalBusy):
+            handler._acquire_kimi_terminal()
+        bridge.ensure.assert_not_called()
         self.assertEqual("", handler.state.kimi_terminal_acquire_token)
 
     def test_kimi_capture_does_not_fall_back_to_an_acp_session(self):

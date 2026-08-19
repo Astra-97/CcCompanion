@@ -1307,6 +1307,35 @@ class KimiTerminalBridge:
                 self._prompt_active_uncertain = True
                 self._touch_locked()
 
+    def owns_live_session(self, session_id: str) -> bool:
+        """Whether this process still owns the exact live TUI for ``session_id``.
+
+        A submitted terminal prompt can make the Web session report ``busy``.
+        That must not prevent the App from capturing *its own* already-leased
+        TUI output.  It is an exception only after this TUI submitted Enter:
+        an otherwise idle leased pane must not be used to explain an unrelated
+        busy Web prompt.  The in-memory lease plus current tmux ownership also
+        means a process restart never mistakes an arbitrary busy Web session
+        for a terminal it may safely adopt.
+        """
+        expected = self._fingerprint_session(str(session_id))
+        with self._lock:
+            if (
+                not self._lease
+                or not self._lease_pane
+                or not self._session_fingerprint
+                or not self._prompt_active_uncertain
+                or not hmac.compare_digest(self._session_fingerprint, expected)
+            ):
+                return False
+            try:
+                if not self._has_session_locked() or not self._owns_session_locked():
+                    return False
+                pane_id, pane_dead = self._pane_status_locked()
+                return not pane_dead and hmac.compare_digest(pane_id, self._lease_pane)
+            except Exception:
+                return False
+
     def _kill_exact_pane_locked(self, expected_pane: str) -> bool:
         """Kill one verified owned pane; never target the reusable session name."""
         if not re.fullmatch(r"%[0-9]+", expected_pane):
@@ -12980,7 +13009,14 @@ class PushHandler(BaseHTTPRequestHandler):
             if not matched or str(metadata.get("cwd") or "") != str(web.cwd):
                 raise KimiTerminalNoActiveSession("Kimi 当前没有可恢复的活跃会话")
             if bool(web.get_session_status(session_id).get("busy")):
-                raise KimiTerminalBusy("Kimi 正在回复，暂时不能接管终端")
+                # A busy status is normally an existing Web writer and must
+                # fail closed. The sole exception is the same process's
+                # already-leased TUI after its own Enter: capture/resize must
+                # remain able to show that real output without opening a
+                # second pane or reviving a post-restart writer.
+                owns_live = getattr(self.state.kimi_terminal, "owns_live_session", None)
+                if not callable(owns_live) or not owns_live(session_id):
+                    raise KimiTerminalBusy("Kimi 正在回复，暂时不能接管终端")
             with self.state.kimi_turn_lock:
                 if (
                     self.state.kimi_terminal_acquire_token != acquire_token
