@@ -11,15 +11,19 @@ import logging
 import os
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import urllib.error
 import urllib.parse
 import urllib.request
+
+import fcntl
 
 DEFAULT_KIMI_BIN = "/root/.kimi-code/bin/kimi"
 DEFAULT_KIMI_CODE_HOME = Path.home() / ".kimi-code"
@@ -30,6 +34,18 @@ DEFAULT_KIMI_CWD = "/root/Karami-Workspace"
 
 class KimiWebError(RuntimeError):
     pass
+
+
+class KimiWebSessionBusy(KimiWebError):
+    """A typed busy result that keeps the affected Web session fenced."""
+
+    def __init__(self, session_id: str):
+        self.session_id = str(session_id or "")
+        super().__init__("Kimi Web session is already busy")
+
+
+class KimiWebRecoveryConflict(KimiWebError):
+    """The upstream prompt changed or cannot be identified safely."""
 
 
 class KimiWebClient:
@@ -53,6 +69,10 @@ class KimiWebClient:
         self.logger = logger or logging.getLogger(__name__)
         self.start_timeout = max(5.0, float(start_timeout))
         self.state_path = Path(state_path).expanduser() if state_path is not None else None
+        self.turn_lease_path = (
+            self.state_path.with_name("kimi_web_turn_lease.json")
+            if self.state_path is not None else None
+        )
         self.cwd = str(Path(cwd).expanduser().resolve())
         self._process: subprocess.Popen[str] | None = None
         self._token = ""
@@ -213,14 +233,14 @@ class KimiWebClient:
         items = data.get("items")
         return items if isinstance(items, list) else []
 
-    def get_session_status(self, session_id: str) -> dict[str, Any]:
+    def get_session_status(self, session_id: str, *, timeout: float = 5.0) -> dict[str, Any]:
         session_id = str(session_id or "").strip()
         if not session_id:
             raise KimiWebError("session_id is required")
         return self._request(
             "GET",
             f"/api/v1/sessions/{session_id}/status",
-            timeout=5.0,
+            timeout=max(0.1, min(float(timeout), 5.0)),
         )
 
     def get_session(self, session_id: str) -> dict[str, Any]:
@@ -272,6 +292,173 @@ class KimiWebClient:
         os.chmod(temporary, 0o600)
         os.replace(temporary, self.state_path)
 
+    @staticmethod
+    def _valid_prompt_id(value: Any) -> str:
+        prompt_id = str(value or "").strip()
+        return prompt_id if 0 < len(prompt_id) <= 200 else ""
+
+    @contextmanager
+    def _turn_lease_lock(self, *, exclusive: bool):
+        """Serialize lease CAS operations across service processes."""
+        if self.turn_lease_path is None:
+            raise KimiWebError("Kimi Web turn lease path is required")
+        self.turn_lease_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.turn_lease_path.with_suffix(".lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def _load_turn_lease_unlocked(self) -> dict[str, str]:
+        assert self.turn_lease_path is not None
+        try:
+            payload = json.loads(self.turn_lease_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or payload.get("version") != 1:
+                return {}
+            session_id = self._valid_session_id(payload.get("session_id"))
+            prompt_id = self._valid_prompt_id(payload.get("prompt_id"))
+            user_ts = str(payload.get("user_ts") or "").strip()
+            state = str(payload.get("state") or "").strip()
+            created_at = str(payload.get("created_at") or "").strip()
+            if not (session_id and prompt_id and user_ts and state and created_at):
+                return {}
+            return {
+                "version": "1", "session_id": session_id, "prompt_id": prompt_id,
+                "user_ts": user_ts[:200], "state": state[:40], "created_at": created_at[:64],
+                **({"claim_nonce": str(payload.get("claim_nonce") or "")[:80], "claim_started_at": str(payload.get("claim_started_at") or "")[:32]} if payload.get("claim_nonce") else {}),
+            }
+        except (FileNotFoundError, OSError, ValueError):
+            return {}
+
+    def _write_turn_lease_unlocked(self, payload: dict[str, Any]) -> None:
+        assert self.turn_lease_path is not None
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{self.turn_lease_path.name}.", suffix=".tmp", dir=self.turn_lease_path.parent,
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_name, self.turn_lease_path)
+            directory_fd = os.open(self.turn_lease_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def load_turn_lease(self) -> dict[str, str]:
+        """Load the minimal, private proof that this App owns one prompt."""
+        if self.turn_lease_path is None:
+            return {}
+        with self._turn_lease_lock(exclusive=False):
+            return self._load_turn_lease_unlocked()
+
+    def save_turn_lease(self, *, session_id: str, prompt_id: str, user_ts: str, state: str) -> None:
+        """Atomically persist no-content ownership metadata before stream use."""
+        if self.turn_lease_path is None:
+            raise KimiWebError("Kimi Web turn lease path is required")
+        session_id = self._valid_session_id(session_id)
+        prompt_id = self._valid_prompt_id(prompt_id)
+        user_ts = str(user_ts or "").strip()
+        state = str(state or "").strip()
+        if not session_id or not prompt_id or not user_ts or not state or len(user_ts) > 200 or len(state) > 40:
+            raise KimiWebError("Kimi Web turn lease is invalid")
+        with self._turn_lease_lock(exclusive=True):
+            current = self._load_turn_lease_unlocked()
+            if current and (current.get("session_id") != session_id or current.get("prompt_id") != prompt_id):
+                raise KimiWebRecoveryConflict("Kimi Web turn lease belongs to another prompt")
+            self._write_turn_lease_unlocked({
+                "version": 1, "session_id": session_id, "prompt_id": prompt_id,
+                "user_ts": user_ts, "state": state, "created_at": str(int(time.time())),
+            })
+
+    def clear_turn_lease(self, *, session_id: str, prompt_id: str) -> bool:
+        """Clear only the same exact prompt's durable ownership record."""
+        with self._turn_lease_lock(exclusive=True):
+            lease = self._load_turn_lease_unlocked()
+            if not lease or lease.get("session_id") != self._valid_session_id(session_id) or lease.get("prompt_id") != self._valid_prompt_id(prompt_id):
+                return False
+            try:
+                assert self.turn_lease_path is not None
+                self.turn_lease_path.unlink()
+                directory_fd = os.open(self.turn_lease_path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+                return True
+            except FileNotFoundError:
+                return False
+            except OSError as exc:
+                raise KimiWebError("Kimi Web turn lease could not be cleared") from exc
+
+    def set_turn_lease_state(self, *, session_id: str, prompt_id: str, state: str) -> bool:
+        """Mark an exact owned prompt without ever replacing another lease."""
+        state = str(state or "").strip()
+        if not state or len(state) > 40:
+            raise KimiWebError("Kimi Web turn lease state is invalid")
+        with self._turn_lease_lock(exclusive=True):
+            lease = self._load_turn_lease_unlocked()
+            if not lease or lease.get("session_id") != self._valid_session_id(session_id) or lease.get("prompt_id") != self._valid_prompt_id(prompt_id):
+                return False
+            self._write_turn_lease_unlocked({
+                "version": 1, "session_id": lease["session_id"], "prompt_id": lease["prompt_id"],
+                "user_ts": lease["user_ts"], "state": state, "created_at": lease["created_at"],
+                **({"claim_nonce": lease["claim_nonce"], "claim_started_at": lease.get("claim_started_at", "")} if lease.get("claim_nonce") else {}),
+            })
+            return True
+
+    def claim_turn_lease(self, *, session_id: str, prompt_id: str, nonce: str, stale_after: float = 8.0) -> bool:
+        """CAS-claim one exact lease so only one process can recover it."""
+        nonce = str(nonce or "").strip()
+        if not nonce or len(nonce) > 80:
+            return False
+        with self._turn_lease_lock(exclusive=True):
+            lease = self._load_turn_lease_unlocked()
+            if not lease or lease.get("session_id") != self._valid_session_id(session_id) or lease.get("prompt_id") != self._valid_prompt_id(prompt_id):
+                return False
+            try:
+                claimed_at = float(lease.get("claim_started_at") or 0)
+            except ValueError:
+                claimed_at = 0.0
+            existing = lease.get("claim_nonce", "")
+            if existing and existing != nonce and time.time() - claimed_at < max(1.0, stale_after):
+                return False
+            lease["claim_nonce"], lease["claim_started_at"] = nonce, str(time.time())
+            self._write_turn_lease_unlocked({
+                "version": 1, "session_id": lease["session_id"], "prompt_id": lease["prompt_id"],
+                "user_ts": lease["user_ts"], "state": lease["state"], "created_at": lease["created_at"],
+                "claim_nonce": nonce, "claim_started_at": lease["claim_started_at"],
+            })
+            return True
+
+    def release_turn_lease_claim(self, *, session_id: str, prompt_id: str, nonce: str) -> bool:
+        with self._turn_lease_lock(exclusive=True):
+            lease = self._load_turn_lease_unlocked()
+            if not lease or lease.get("session_id") != self._valid_session_id(session_id) or lease.get("prompt_id") != self._valid_prompt_id(prompt_id) or lease.get("claim_nonce") != str(nonce or ""):
+                return False
+            self._write_turn_lease_unlocked({
+                "version": 1, "session_id": lease["session_id"], "prompt_id": lease["prompt_id"],
+                "user_ts": lease["user_ts"], "state": lease["state"], "created_at": lease["created_at"],
+            })
+            return True
+
     def create_session(
         self,
         *,
@@ -300,7 +487,7 @@ class KimiWebClient:
         self.save_active_session_id(session_id)
         return session_id
 
-    def ensure_active_session(self, *, model: str = "", thinking: str = "") -> str:
+    def ensure_active_session(self, *, model: str = "", thinking: str = "", status_timeout: float = 5.0) -> str:
         """Use the Web-only pointer or create a fresh Web session.
 
         The ACP pointer is deliberately never imported or overwritten.  It
@@ -311,16 +498,111 @@ class KimiWebClient:
         session_id = self.load_active_session_id()
         if session_id:
             try:
-                status = self.get_session_status(session_id)
+                status = self.get_session_status(session_id, timeout=status_timeout)
             except KimiWebError:
                 # A stale/deleted pointer is recoverable; retain the ACP
                 # pointer untouched and make a fresh Web session below.
                 status = {}
             if status:
                 if bool(status.get("busy")):
-                    raise KimiWebError("Kimi Web session is already busy")
+                    raise KimiWebSessionBusy(session_id)
                 return session_id
         return self.create_session(model=model, thinking=thinking)
+
+    @staticmethod
+    def _prompt_id_from(value: Any) -> str:
+        """Project only an abort-safe prompt id from a Web API object."""
+        if not isinstance(value, dict):
+            return ""
+        current = value.get("current_prompt")
+        if not isinstance(current, dict):
+            current = value.get("currentPrompt")
+        nested = current if isinstance(current, dict) else {}
+        candidate = (
+            value.get("prompt_id") or value.get("promptId")
+            or value.get("current_prompt_id") or value.get("currentPromptId")
+            or nested.get("id") or nested.get("prompt_id") or nested.get("promptId")
+        )
+        prompt_id = str(candidate or "").strip()
+        return KimiWebClient._valid_prompt_id(prompt_id)
+
+    def _active_prompt_id(self, session_id: str, *, timeout: float = 1.0) -> str:
+        """Read one exact active prompt, failing closed on a moving target."""
+        snapshot = self.get_snapshot(session_id, timeout=timeout)
+        snapshot_prompt = self._prompt_id_from(snapshot)
+        in_flight = snapshot.get("in_flight_turn") if isinstance(snapshot, dict) else None
+        snapshot_prompt = snapshot_prompt or self._prompt_id_from(in_flight)
+
+        prompts = self.list_prompts(session_id, timeout=timeout)
+        active = prompts.get("active") if isinstance(prompts, dict) else None
+        listed_prompt = self._prompt_id_from(active)
+        if snapshot_prompt and listed_prompt and snapshot_prompt != listed_prompt:
+            raise KimiWebRecoveryConflict("Kimi Web active prompt changed during recovery")
+        return listed_prompt or snapshot_prompt
+
+    def recover_owned_orphaned_prompt(
+        self,
+        lease: dict[str, Any],
+        *,
+        settle_timeout: float = 0.6,
+    ) -> bool:
+        """Abort an *unchanged* busy prompt and wait briefly for it to settle.
+
+        This deliberately never aborts a whole session or an unknown busy
+        prompt.  The durable lease proves App ownership; this method supplies
+        the upstream fence by resolving the same prompt twice before POSTing
+        only to that exact prompt id.
+        """
+        session_id = self._valid_session_id(lease.get("session_id") if isinstance(lease, dict) else "")
+        prompt_id = self._valid_prompt_id(lease.get("prompt_id") if isinstance(lease, dict) else "")
+        if not session_id or not prompt_id:
+            raise KimiWebRecoveryConflict("Kimi Web ownership lease is invalid")
+        deadline = time.monotonic() + 4.5
+
+        def remaining_timeout() -> float:
+            return max(0.1, min(0.75, deadline - time.monotonic()))
+
+        status = self.get_session_status(session_id, timeout=remaining_timeout())
+        if not bool(status.get("busy")):
+            return True
+        if self._active_prompt_id(session_id, timeout=remaining_timeout()) != prompt_id:
+            raise KimiWebRecoveryConflict("Kimi Web busy prompt is not App-owned")
+        # The second lookup is the race fence.  A stale abort URL is harmless
+        # only when it remains bound to the same exact prompt id.
+        if self._active_prompt_id(session_id, timeout=remaining_timeout()) != prompt_id:
+            raise KimiWebRecoveryConflict("Kimi Web active prompt changed during recovery")
+        try:
+            self.abort_prompt(session_id, prompt_id, timeout=remaining_timeout())
+        except KimiWebError:
+            # An upstream completion between the final lookup and abort is a
+            # successful recovery only if the session is now actually idle.
+            if not bool(self.get_session_status(session_id, timeout=remaining_timeout()).get("busy")):
+                return True
+            raise
+        settle_deadline = min(deadline, time.monotonic() + max(0.0, min(float(settle_timeout), 1.0)))
+        while True:
+            if not bool(self.get_session_status(session_id, timeout=remaining_timeout()).get("busy")):
+                return True
+            if time.monotonic() >= settle_deadline:
+                return False
+            time.sleep(0.1)
+
+    def reconcile_owned_idle_lease(self, *, timeout: float = 0.75) -> dict[str, str]:
+        """Clear a proven old lease when its upstream session is already idle."""
+        lease = self.load_turn_lease()
+        if not lease:
+            return {}
+        nonce = uuid.uuid4().hex
+        if not self.claim_turn_lease(session_id=lease["session_id"], prompt_id=lease["prompt_id"], nonce=nonce):
+            return {}
+        try:
+            if bool(self.get_session_status(lease["session_id"], timeout=timeout).get("busy")):
+                return {}
+            if self.clear_turn_lease(session_id=lease["session_id"], prompt_id=lease["prompt_id"]):
+                return lease
+            return {}
+        finally:
+            self.release_turn_lease_claim(session_id=lease["session_id"], prompt_id=lease["prompt_id"], nonce=nonce)
 
     def submit_prompt(
         self,
@@ -362,7 +644,7 @@ class KimiWebClient:
                 submitted["prompt_id"] = candidate
         return submitted
 
-    def abort_prompt(self, session_id: str, prompt_id: str) -> dict[str, Any]:
+    def abort_prompt(self, session_id: str, prompt_id: str, *, timeout: float = 10.0) -> dict[str, Any]:
         session_id = self._valid_session_id(session_id)
         prompt = str(prompt_id or "").strip()
         if not session_id or not prompt or len(prompt) > 200:
@@ -370,7 +652,7 @@ class KimiWebClient:
         return self._request(
             "POST",
             f"/api/v1/sessions/{session_id}/prompts/{urllib.parse.quote(prompt, safe='')}:abort",
-            data={},
+            data={}, timeout=max(0.1, min(float(timeout), 10.0)),
         )
 
     def get_messages(self, session_id: str) -> list[dict[str, Any]]:
@@ -381,11 +663,11 @@ class KimiWebClient:
         items = data.get("items") if isinstance(data, dict) else None
         return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
 
-    def list_prompts(self, session_id: str) -> dict[str, Any]:
+    def list_prompts(self, session_id: str, *, timeout: float = 10.0) -> dict[str, Any]:
         session_id = self._valid_session_id(session_id)
         if not session_id:
             raise KimiWebError("session id is required")
-        return self._request("GET", f"/api/v1/sessions/{session_id}/prompts")
+        return self._request("GET", f"/api/v1/sessions/{session_id}/prompts", timeout=max(0.1, min(float(timeout), 10.0)))
 
     def list_approvals(self, session_id: str) -> list[dict[str, Any]]:
         session_id = self._valid_session_id(session_id)
@@ -408,11 +690,11 @@ class KimiWebClient:
             data={"decision": "approved"},
         )
 
-    def get_snapshot(self, session_id: str) -> dict[str, Any]:
+    def get_snapshot(self, session_id: str, *, timeout: float = 10.0) -> dict[str, Any]:
         session_id = self._valid_session_id(session_id)
         if not session_id:
             raise KimiWebError("session id is required")
-        return self._request("GET", f"/api/v1/sessions/{session_id}/snapshot")
+        return self._request("GET", f"/api/v1/sessions/{session_id}/snapshot", timeout=max(0.1, min(float(timeout), 10.0)))
 
     def stream_session(
         self,

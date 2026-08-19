@@ -8,7 +8,7 @@ import types
 import unittest
 from unittest.mock import Mock, patch
 
-from kimi_web_client import KimiWebClient, KimiWebError
+from kimi_web_client import KimiWebClient, KimiWebError, KimiWebRecoveryConflict, KimiWebSessionBusy
 from push import PushHandler, ServerState
 
 
@@ -157,6 +157,31 @@ class KimiWebIsolationTest(unittest.TestCase):
                 payload,
             )
 
+    def test_turn_lease_is_private_atomic_and_clears_only_the_exact_prompt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pointer = os.path.join(directory, "kimi_web_session.json")
+            client = KimiWebClient(command="/unused/kimi", state_path=pointer, cwd="/tmp/kimi-cwd")
+            client.save_turn_lease(
+                session_id="web_session-1", prompt_id="prompt-1", user_ts="1700000000.1", state="submitted",
+            )
+            lease_path = os.path.join(directory, "kimi_web_turn_lease.json")
+            self.assertEqual(0o600, os.stat(lease_path).st_mode & 0o777)
+            self.assertEqual("prompt-1", client.load_turn_lease()["prompt_id"])
+            with self.assertRaises(KimiWebRecoveryConflict):
+                client.save_turn_lease(
+                    session_id="web_session-1", prompt_id="prompt-2", user_ts="1700000000.2", state="submitted",
+                )
+            self.assertFalse(client.clear_turn_lease(session_id="web_session-1", prompt_id="other"))
+            self.assertFalse(client.set_turn_lease_state(session_id="web_session-1", prompt_id="other", state="stopping"))
+            self.assertTrue(client.claim_turn_lease(session_id="web_session-1", prompt_id="prompt-1", nonce="process-a"))
+            self.assertFalse(client.claim_turn_lease(session_id="web_session-1", prompt_id="prompt-1", nonce="process-b", stale_after=60))
+            self.assertTrue(client.release_turn_lease_claim(session_id="web_session-1", prompt_id="prompt-1", nonce="process-a"))
+            self.assertEqual("submitted", client.load_turn_lease()["state"])
+            client.set_turn_lease_state(session_id="web_session-1", prompt_id="prompt-1", state="stream_lost")
+            self.assertEqual("stream_lost", client.load_turn_lease()["state"])
+            self.assertTrue(client.clear_turn_lease(session_id="web_session-1", prompt_id="prompt-1"))
+            self.assertEqual({}, client.load_turn_lease())
+
     def test_submit_resolves_exact_abort_prompt_id_from_active_prompt(self):
         client = KimiWebClient(command="/unused/kimi")
         calls = []
@@ -172,6 +197,99 @@ class KimiWebIsolationTest(unittest.TestCase):
 
         self.assertEqual("prompt-1", result["prompt_id"])
         self.assertEqual(("GET", "/api/v1/sessions/session-1/prompts", None), calls[-1])
+
+    def test_orphaned_pending_approval_is_aborted_by_exact_prompt_and_settles(self):
+        client = KimiWebClient(command="/unused/kimi")
+        calls, status_checks = [], 0
+
+        def fake_request(method, path, *, data=None, timeout=10.0):
+            nonlocal status_checks
+            calls.append((method, path, data))
+            if path.endswith("/status"):
+                status_checks += 1
+                return {"busy": status_checks == 1}
+            if path.endswith("/snapshot"):
+                return {
+                    "current_prompt_id": "prompt-approval",
+                    "pending_approvals": [{"approval_id": "approval-1"}],
+                }
+            if path.endswith("/prompts"):
+                return {"active": {"prompt_id": "prompt-approval"}}
+            if path.endswith(":abort"):
+                return {}
+            raise AssertionError(path)
+
+        client._request = fake_request
+        self.assertTrue(client.recover_owned_orphaned_prompt(
+            {"session_id": "session-1", "prompt_id": "prompt-approval"}, settle_timeout=0,
+        ))
+        self.assertIn(
+            ("POST", "/api/v1/sessions/session-1/prompts/prompt-approval:abort", {}), calls,
+        )
+        self.assertFalse(any("approvals" in path for _, path, _ in calls))
+
+    def test_owned_recovery_accepts_real_in_flight_current_prompt_shape(self):
+        client = KimiWebClient(command="/unused/kimi")
+        calls, checks = [], 0
+
+        def fake_request(method, path, *, data=None, timeout=10.0):
+            nonlocal checks
+            calls.append((method, path, data))
+            if path.endswith("/status"):
+                checks += 1
+                return {"busy": checks == 1}
+            if path.endswith("/snapshot"):
+                return {"in_flight_turn": {"current_prompt_id": "prompt-1"}}
+            if path.endswith("/prompts"):
+                return {"active": {}}
+            if path.endswith(":abort"):
+                return {}
+            raise AssertionError(path)
+
+        client._request = fake_request
+        self.assertTrue(client.recover_owned_orphaned_prompt(
+            {"session_id": "session-1", "prompt_id": "prompt-1"}, settle_timeout=0,
+        ))
+        self.assertTrue(any(path.endswith("/prompts/prompt-1:abort") for _, path, _ in calls))
+
+    def test_orphan_recovery_refuses_a_prompt_that_changes_during_fence_check(self):
+        client = KimiWebClient(command="/unused/kimi")
+        calls, snapshots = [], iter(("prompt-old", "prompt-new"))
+
+        def fake_request(method, path, *, data=None, timeout=10.0):
+            calls.append((method, path, data))
+            if path.endswith("/status"):
+                return {"busy": True}
+            if path.endswith("/snapshot"):
+                return {"current_prompt_id": next(snapshots)}
+            if path.endswith("/prompts"):
+                return {"active": {}}
+            raise AssertionError(path)
+
+        client._request = fake_request
+        with self.assertRaises(KimiWebRecoveryConflict):
+            client.recover_owned_orphaned_prompt({"session_id": "session-1", "prompt_id": "prompt-old"})
+        self.assertFalse(any(path.endswith(":abort") for _, path, _ in calls))
+
+    def test_orphan_recovery_propagates_abort_failure_when_still_busy(self):
+        client = KimiWebClient(command="/unused/kimi")
+
+        def fake_request(method, path, *, data=None, timeout=10.0):
+            if path.endswith("/status"):
+                return {"busy": True}
+            if path.endswith("/snapshot"):
+                return {"current_prompt_id": "prompt-1"}
+            if path.endswith("/prompts"):
+                return {"active": {"prompt_id": "prompt-1"}}
+            if path.endswith(":abort"):
+                raise KimiWebError("abort rejected")
+            raise AssertionError(path)
+
+        client._request = fake_request
+        with self.assertRaises(KimiWebError):
+            client.recover_owned_orphaned_prompt(
+                {"session_id": "session-1", "prompt_id": "prompt-1"}, settle_timeout=0,
+            )
 
     def test_web_send_route_fails_closed_without_adapter_instead_of_calling_acp(self):
         handler = object.__new__(PushHandler)

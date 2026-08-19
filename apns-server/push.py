@@ -156,7 +156,7 @@ from kimi_preferences import (
     KimiPreferenceStore,
 )
 from kimi_terminal_observer import KimiTerminalObserver
-from kimi_web_client import KimiWebClient, KimiWebError
+from kimi_web_client import KimiWebClient, KimiWebError, KimiWebRecoveryConflict, KimiWebSessionBusy
 import todos as todos_mod
 from studyroom import StudyroomDB
 from ai_chat import AIChatManager
@@ -1183,7 +1183,7 @@ class KimiTerminalBusy(KimiTerminalUnavailable):
 
 
 class KimiTerminalNoActiveSession(KimiTerminalUnavailable):
-    """There is no validated durable Karami session to resume."""
+    """There is no validated durable Kimi Web session to resume."""
 
 
 class KimiTerminalBridge:
@@ -1505,8 +1505,36 @@ class KimiTerminalBridge:
                 raise KimiTerminalUnavailable("Kimi 终端释放失败") from exc
 
     def release_for_acp(self) -> bool:
-        """Single-writer handoff used after an ACP prepare reservation exists."""
+        """Release only a known-idle TUI for a normal writer handoff.
+
+        A process restart can leave an owned live pane with no in-memory lease.
+        That pane may be generating, so a Web/ACP request must adopt it as an
+        uncertain generation and refuse handoff.  Only the server shutdown
+        path is allowed to tear down a lease-less owned pane.
+        """
         with self._lock:
+            if not self._lease_pane:
+                try:
+                    if not self._has_session_locked() or not self._owns_session_locked():
+                        return True
+                    pane_id, pane_dead = self._pane_status_locked()
+                    if pane_dead:
+                        # A dead pane owns no writer. Leave exact cleanup to a
+                        # later terminal acquire or service shutdown.
+                        return True
+                    binding = self._bound_session_locked()
+                    if not binding:
+                        raise KimiTerminalBusy("Kimi 终端状态未确认，请先离开终端后再发送")
+                    self._lease = secrets.token_urlsafe(32)
+                    self._lease_pane = pane_id
+                    self._session_fingerprint = binding
+                    self._prompt_active_uncertain = True
+                    self._touch_locked()
+                    raise KimiTerminalBusy("Kimi 终端可能仍在生成，请先离开终端后再发送")
+                except KimiTerminalBusy:
+                    raise
+                except Exception as exc:
+                    raise KimiTerminalBusy("Kimi 终端状态未确认，请先离开终端后再发送") from exc
             if self._prompt_active_uncertain:
                 try:
                     if (
@@ -1522,7 +1550,10 @@ class KimiTerminalBridge:
                 except Exception as exc:
                     raise KimiTerminalBusy("Kimi 终端状态未确认，请先离开终端后再发送") from exc
                 self._prompt_active_uncertain = False
-            return self.release_for_shutdown()
+            # This calls the same exact-lease primitive exposed to the App;
+            # unlike release_for_shutdown it can never target a lease-less
+            # pane by its reusable tmux session name.
+            return self.release(self._lease)
 
     def release_for_shutdown(self) -> bool:
         """Server-lifecycle cleanup; HTTP callers must use an exact lease."""
@@ -1567,17 +1598,19 @@ class KimiTerminalBridge:
                     self._schedule_reaper_locked(remaining)
                     return
                 try:
-                    # A live TUI does not expose a trustworthy "model is
-                    # generating" bit.  Fail conservatively: retain live panes
-                    # and let explicit App/ACP handoff release them.  The
-                    # reaper only removes an exact owned pane already dead.
+                    # Enter is the only transition that can start a Kimi turn.
+                    # Before it, an idle live TUI is safe to reap exactly; once
+                    # it has been submitted, retain it fail-closed because the
+                    # TUI has no trustworthy completion event.
                     pane_id, pane_dead = self._pane_status_locked()
-                    if pane_dead and hmac.compare_digest(pane_id, self._lease_pane):
-                        self._kill_exact_pane_locked(self._lease_pane)
-                        self._lease = None
-                        self._lease_pane = None
-                        self._session_fingerprint = None
-                        self._prompt_active_uncertain = False
+                    if hmac.compare_digest(pane_id, self._lease_pane) and (
+                        pane_dead or not self._prompt_active_uncertain
+                    ):
+                        if self._kill_exact_pane_locked(self._lease_pane):
+                            self._lease = None
+                            self._lease_pane = None
+                            self._session_fingerprint = None
+                            self._prompt_active_uncertain = False
                     else:
                         self._touch_locked()
                 except Exception:
@@ -3275,6 +3308,10 @@ class ServerState:
         self.kimi_turn_lock = threading.RLock()
         self.kimi_active_turn: dict[str, Any] = {}
         self.kimi_prepare_token = ""
+        self.kimi_recovery_token = ""
+        # Short reservation while an authenticated terminal capture verifies
+        # the Web-owned session outside the turn lock.
+        self.kimi_terminal_acquire_token = ""
         # A Kimi ACP process is not a tmux console.  Keep its terminal-shaped
         # UI as a separate, prompt-free observer rather than ever capturing
         # ACP stdio or giving it remote terminal input.
@@ -6206,7 +6243,7 @@ class PushHandler(BaseHTTPRequestHandler):
         # session/target lives in the JSON body for these routes. Fail closed
         # for the whole terminal mutation surface before reading it; otherwise
         # strict_auth=false would let an unauthenticated request reach Kimi.
-        if request_path in {"/terminal/key", "/tmux/send", "/terminal/release"} and not self._native_pairing_auth_matches():
+        if request_path in {"/terminal/key", "/terminal/resize", "/tmux/send", "/terminal/release"} and not self._native_pairing_auth_matches():
             self._send_json(401, {"error": "unauthorized"})
             return
         if self.path == "/login":
@@ -6551,6 +6588,11 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(403, {"error": "remote_control disabled"})
                 return
             self._handle_terminal_key(body)
+        elif self.path == "/terminal/resize":
+            if not self.state.allow_remote_control:
+                self._send_json(403, {"error": "remote_control disabled"})
+                return
+            self._handle_terminal_resize(body)
         elif self.path == "/tmux/send":
             # P0-2: direct tmux send-keys — remote control gate
             if not self.state.allow_remote_control:
@@ -9036,6 +9078,9 @@ class PushHandler(BaseHTTPRequestHandler):
         if not sid:
             self._send_json(400, {"error": "sid required"})
             return
+        if self._is_reserved_kimi_physical_target(sid):
+            self._send_json(400, {"ok": False, "error": "kimi_terminal_physical_target_blocked"})
+            return
         # Verify session exists
         try:
             res = subprocess.run(
@@ -10070,6 +10115,134 @@ class PushHandler(BaseHTTPRequestHandler):
         # belongs to the explicit rollback record and may be another history.
         self._send_json(503, {"ok": False, "error": "kimi_web_unavailable"})
 
+    def _recover_orphaned_kimi_web_prompt(self, web: Any, session_id: str, prepare_token: str) -> tuple[str, dict[str, Any]]:
+        """Recover a Web-only orphan while retaining both local and remote fences.
+
+        This is deliberately available only to the request that owns the
+        preparation reservation.  A live App turn, a newer reservation, an
+        ambiguous provider prompt, or a still-busy provider all stay conflicts
+        rather than risking another caller's work.
+        """
+        recover = getattr(web, "recover_owned_orphaned_prompt", None)
+        load_lease = getattr(web, "load_turn_lease", None)
+        claim_lease = getattr(web, "claim_turn_lease", None)
+        release_claim = getattr(web, "release_turn_lease_claim", None)
+        if not callable(recover) or not callable(load_lease) or not callable(claim_lease) or not callable(release_claim):
+            return "unavailable", {}
+        # Disk metadata has no prompt content and is read before the short
+        # state transition; all potentially slow Web calls occur unlocked.
+        try:
+            lease = load_lease()
+        except Exception:
+            logger.warning("Kimi Web ownership lease could not be read")
+            return "failed", {}
+        if not isinstance(lease, dict) or str(lease.get("session_id") or "") != session_id or not str(lease.get("prompt_id") or ""):
+            return "upstream_conflict", {}
+        recovery_token = secrets.token_hex(16)
+        with self.state.kimi_turn_lock:
+            if (
+                self.state.kimi_active_turn
+                or self.state.kimi_prepare_token != prepare_token
+                or getattr(self.state, "kimi_recovery_token", "")
+            ):
+                return "local_conflict", {}
+            self.state.kimi_recovery_token = recovery_token
+        try:
+            claimed = bool(claim_lease(
+                session_id=lease["session_id"], prompt_id=lease["prompt_id"], nonce=recovery_token,
+            ))
+        except Exception:
+            claimed = False
+        if not claimed:
+            with self.state.kimi_turn_lock:
+                if self.state.kimi_recovery_token == recovery_token:
+                    self.state.kimi_recovery_token = ""
+            return "upstream_conflict", {}
+        try:
+            recovered = bool(recover(lease))
+        except KimiWebRecoveryConflict:
+            logger.info("Kimi Web orphan recovery refused an ambiguous prompt")
+            outcome = "upstream_conflict"
+        except KimiWebError:
+            logger.warning("Kimi Web orphan recovery failed")
+            outcome = "failed"
+        except Exception:
+            logger.exception("Kimi Web orphan recovery crashed")
+            outcome = "failed"
+        else:
+            outcome = "recovered" if recovered else "pending"
+        if outcome != "recovered":
+            try:
+                release_claim(session_id=lease["session_id"], prompt_id=lease["prompt_id"], nonce=recovery_token)
+            except Exception:
+                logger.warning("Kimi Web recovery claim release failed")
+        with self.state.kimi_turn_lock:
+            owns_reservation = (
+                self.state.kimi_prepare_token == prepare_token
+                and self.state.kimi_recovery_token == recovery_token
+                and not self.state.kimi_active_turn
+            )
+            if self.state.kimi_recovery_token == recovery_token:
+                self.state.kimi_recovery_token = ""
+            if not owns_reservation:
+                return "local_conflict", {}
+        if outcome == "recovered":
+            try:
+                web.clear_turn_lease(session_id=lease["session_id"], prompt_id=lease["prompt_id"])
+            except Exception:
+                logger.warning("Kimi Web orphan lease cleanup failed")
+                return "failed", {}
+        return outcome, dict(lease)
+
+    def _mark_kimi_orphan_terminal(self, lease: dict[str, Any], *, outcome: str) -> None:
+        """Make a recovered pre-restart turn visible once, fenced by user_ts."""
+        user_ts = str(lease.get("user_ts") or "")
+        session_id = str(lease.get("session_id") or "")
+        if not user_ts or not session_id:
+            return
+        try:
+            chat = self._chat_for_contact("kimi")
+            for row in chat.tail(200):
+                metadata = row.get("metadata") if isinstance(row, dict) else None
+                if (
+                    isinstance(metadata, dict)
+                    and str(metadata.get("kimi_user_ts") or "") == user_ts
+                    and (metadata.get("orphan_recovery") is True or str(row.get("source") or "").startswith("kimi-web:"))
+                ):
+                    return
+            text = "上一轮 Kimi 生成已在恢复时安全中断。" if outcome == "interrupted" else "上一轮 Kimi 生成未完成，已安全结束。"
+            chat.append(
+                role="assistant", text=text, source=f"kimi-web:{outcome}",
+                metadata={"kimi_user_ts": user_ts, "orphan_recovery": True},
+            )
+            if outcome == "interrupted":
+                self._set_chat_interrupted("kimi", user_ts=user_ts, final_ts="", source=f"kimi-web:{outcome}", session_id=session_id)
+            else:
+                self._set_chat_failed("kimi", user_ts=user_ts, source=f"kimi-web:{outcome}", session_id=session_id)
+        except Exception:
+            logger.warning("Kimi Web orphan terminal history update failed")
+
+    @staticmethod
+    def _kimi_is_routine_readonly_approval(approval: dict[str, Any]) -> bool:
+        """Allow one recognizable local read; unknown/manual work stays blocked.
+
+        Kimi Web does not expose a stable risk-classification API.  This is a
+        deliberately narrow metadata allowlist, never a global yolo mode.
+        """
+        if not isinstance(approval, dict):
+            return False
+        invocation = approval.get("invocation") if isinstance(approval.get("invocation"), dict) else {}
+        tool = str(
+            approval.get("tool_name") or approval.get("tool") or approval.get("name")
+            or invocation.get("tool_name") or invocation.get("tool") or ""
+        ).strip().lower()
+        action = " ".join(str(approval.get(key) or "") for key in (
+            "action", "tool_input_display", "input", "arguments", "command",
+        )).lower()
+        safe_tools = {"read_file", "readfile", "list_dir", "list_directory", "glob", "grep", "search"}
+        dangerous = ("write", "edit", "delete", "remove", "rm ", "move", "rename", "chmod", "install", "exec", "shell", "bash", "curl", "upload", "send", "email", "post", "publish", "deploy", "payment", "external")
+        return bool(tool in safe_tools and not any(word in action for word in dangerous))
+
     def _handle_kimi_web_chat_send(self, body: dict[str, Any], contact_id: str, web: Any) -> None:
         text = str(body.get("text") or "").strip()
         quoted_ts = body.get("quoted_ts") or None
@@ -10080,7 +10253,12 @@ class PushHandler(BaseHTTPRequestHandler):
         xhs_login_card_allowed = self._kimi_xhs_login_card_allowed(link_bundle)
         metadata = merge_preview_metadata(None, link_bundle)
         with self.state.kimi_turn_lock:
-            if self.state.kimi_active_turn or self.state.kimi_prepare_token:
+            if (
+                self.state.kimi_active_turn
+                or self.state.kimi_prepare_token
+                or getattr(self.state, "kimi_recovery_token", "")
+                or getattr(self.state, "kimi_terminal_acquire_token", "")
+            ):
                 self._send_json(409, {
                     "ok": False,
                     "error": "kimi_turn_active",
@@ -10090,8 +10268,64 @@ class PushHandler(BaseHTTPRequestHandler):
             prepare_token = secrets.token_hex(16)
             self.state.kimi_prepare_token = prepare_token
         try:
+            handed_off = self._handoff_kimi_terminal_to_writer(prepare_token)
+        except KimiTerminalBusy:
+            self._release_kimi_control(prepare_token)
+            self._send_json(409, {
+                "ok": False,
+                "error": "kimi_terminal_busy",
+                "reason": "Kimi 终端可能仍在生成；请先在终端停止或离开后再发送。",
+            })
+            return
+        if not handed_off:
+            self._release_kimi_control(prepare_token)
+            self._send_json(503, {"ok": False, "error": "kimi_terminal_handoff_failed"})
+            return
+        reconcile_idle = getattr(web, "reconcile_owned_idle_lease", None)
+        if callable(reconcile_idle):
+            try:
+                idle_lease = reconcile_idle(timeout=0.75)
+            except KimiWebError:
+                idle_lease = {}
+            except Exception:
+                logger.warning("Kimi Web idle lease reconciliation failed")
+                idle_lease = {}
+            if isinstance(idle_lease, dict) and idle_lease:
+                self._mark_kimi_orphan_terminal(idle_lease, outcome="failed")
+                self._release_kimi_control(prepare_token)
+                self._send_json(409, {
+                    "ok": False, "error": "kimi_web_orphan_recovered_retry",
+                    "reason": "已整理上一轮 Kimi 的残留状态；请重新发送这条消息。",
+                })
+                return
+        try:
             model, effort = self._kimi_selection()
-            session_id = web.ensure_active_session(model=model, thinking=effort)
+            session_id = web.ensure_active_session(model=model, thinking=effort, status_timeout=0.75)
+        except KimiWebSessionBusy as exc:
+            recovery, recovered_lease = self._recover_orphaned_kimi_web_prompt(web, exc.session_id, prepare_token)
+            if recovery == "recovered":
+                self._mark_kimi_orphan_terminal(recovered_lease, outcome="interrupted")
+                self._release_kimi_control(prepare_token)
+                self._send_json(409, {
+                    "ok": False, "error": "kimi_web_orphan_recovered_retry",
+                    "reason": "上一轮 Kimi 已安全回收；请重新发送这条消息。",
+                })
+                return
+            else:
+                self._release_kimi_control(prepare_token)
+                status, error = (
+                    (409, "kimi_turn_active") if recovery == "local_conflict" else
+                    (409, "kimi_web_busy_recovery_pending") if recovery == "pending" else
+                    (409, "kimi_web_busy_recovery_conflict") if recovery == "upstream_conflict" else
+                    (503, "kimi_web_recovery_failed")
+                )
+                reasons = {
+                    "kimi_web_busy_recovery_pending": "上一轮 Kimi 仍在停止中，请稍后重试。",
+                    "kimi_web_busy_recovery_conflict": "检测到非本 App 可证明拥有的 Kimi 工作，未做中止。",
+                    "kimi_web_recovery_failed": "Kimi 回收暂时失败，未提交这条消息。",
+                }
+                self._send_json(status, {"ok": False, "error": error, **({"reason": reasons[error]} if error in reasons else {})})
+                return
         except KimiWebError:
             self._release_kimi_control(prepare_token)
             self._send_json(503, {"ok": False, "error": "kimi_web_unavailable"})
@@ -10218,6 +10452,7 @@ class PushHandler(BaseHTTPRequestHandler):
             # frame is not a successful answer.  Only a fenced provider
             # completion below can promote this to completed.
             terminal_reason = "failed"
+            lease_terminal_confirmed = False
             approval_resolution_started = False
             observer_visible_text = ""
             bound_turn_id = ""
@@ -10233,6 +10468,23 @@ class PushHandler(BaseHTTPRequestHandler):
                         logger.debug("Kimi Web terminal observer update failed", exc_info=True)
 
             def cleanup_turn() -> None:
+                # Keep ownership after a stream/lifecycle failure: a restart
+                # must be able to prove and recover this exact prompt.  Only
+                # exact terminal outcomes may erase it.
+                if prompt_id:
+                    try:
+                        safe_terminal = (
+                            terminal_reason == "completed"
+                            or (terminal_reason in {"interrupted", "cancelled", "blocked"} and lease_terminal_confirmed)
+                        )
+                        if safe_terminal:
+                            web.clear_turn_lease(session_id=session_id, prompt_id=prompt_id)
+                        else:
+                            web.set_turn_lease_state(
+                                session_id=session_id, prompt_id=prompt_id, state="stream_lost",
+                            )
+                    except Exception:
+                        logger.warning("Kimi Web turn lease finalization failed")
                 finish_observer(
                     "completed" if terminal_reason == "completed" else
                     ("interrupted" if terminal_reason in {"interrupted", "cancelled"} else "failed")
@@ -10375,7 +10627,7 @@ class PushHandler(BaseHTTPRequestHandler):
 
             def resolve_pending_interaction(snapshot: dict[str, Any]) -> None:
                 """Mirror ACP's bounded allow-once policy without yolo mode."""
-                nonlocal approval_resolution_started, terminal_reason
+                nonlocal approval_resolution_started, terminal_reason, lease_terminal_confirmed
                 if approval_resolution_started:
                     return
                 approvals = snapshot.get("pending_approvals")
@@ -10393,7 +10645,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         user_ts=rec["ts"],
                     )
                     return
-                if len(approval_items) == 1 and not question_items:
+                if len(approval_items) == 1 and not question_items and self._kimi_is_routine_readonly_approval(approval_items[0]):
                     approval_id = str(approval_items[0].get("approval_id") or "").strip()
                     if approval_id:
                         approval_resolution_started = True
@@ -10421,6 +10673,12 @@ class PushHandler(BaseHTTPRequestHandler):
                 )
                 try:
                     web.abort_prompt(session_id, prompt_id)
+                    # HTTP acceptance is not a terminal lifecycle event.  The
+                    # exact lease remains until Web confirms aborted/ended or
+                    # a later recovery observes idle.
+                    web.set_turn_lease_state(
+                        session_id=session_id, prompt_id=prompt_id, state="stopping",
+                    )
                 except KimiWebError:
                     logger.warning("Kimi Web could not abort a blocked prompt")
                 cancel_event.set()
@@ -10452,7 +10710,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 resolve_pending_interaction(snapshot)
 
             def on_event(frame: dict[str, Any]) -> None:
-                nonlocal last_published, terminal_reason
+                nonlocal last_published, terminal_reason, lease_terminal_confirmed
                 payload = frame.get("payload") if isinstance(frame.get("payload"), dict) else {}
                 event_type = str(frame.get("type") or "").lower()
                 event_prompt_id = prompt_id_from(payload, frame)
@@ -10506,6 +10764,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         user_ts=rec["ts"],
                     )
                 elif event_type == "prompt.completed":
+                    lease_terminal_confirmed = True
                     incoming_reason = str(payload.get("reason") or "completed")
                     with self.state.kimi_turn_lock:
                         active = self.state.kimi_active_turn
@@ -10526,9 +10785,11 @@ class PushHandler(BaseHTTPRequestHandler):
                         terminal_reason = incoming_reason
                     cancel_event.set()
                 elif event_type == "prompt.aborted":
+                    lease_terminal_confirmed = True
                     terminal_reason = "interrupted"
                     cancel_event.set()
                 elif event_type == "turn.ended":
+                    lease_terminal_confirmed = True
                     incoming_reason = str(payload.get("reason") or "failed")
                     # Completion and an exact Stop have a single winner.  Do
                     # not let a late provider completion overwrite a locally
@@ -10647,8 +10908,23 @@ class PushHandler(BaseHTTPRequestHandler):
             prompt_id = str(submitted.get("id") or submitted.get("prompt_id") or "").strip()
             if not prompt_id:
                 raise KimiWebError("Kimi Web did not return an abort-safe prompt id")
+            web.save_turn_lease(
+                session_id=session_id,
+                prompt_id=prompt_id,
+                user_ts=str(rec.get("ts") or ""),
+                state="submitted",
+            )
         except Exception:
             logger.warning("Kimi Web prompt submit failed", exc_info=True)
+            # If the provider accepted a prompt but its ownership lease could
+            # not be committed, do not leave an unprovable background turn.
+            # The abort remains exact; a failed abort is surfaced as the
+            # existing send failure and never guessed at on a later restart.
+            if prompt_id:
+                try:
+                    web.abort_prompt(session_id, prompt_id)
+                except Exception:
+                    logger.warning("Kimi Web could not abort an unleased prompt")
             cancel_event.set()
             with self.state.kimi_turn_lock:
                 if str(self.state.kimi_active_turn.get("user_ts") or "") == str(rec.get("ts") or ""):
@@ -10689,7 +10965,11 @@ class PushHandler(BaseHTTPRequestHandler):
         # bounded link preview schema is stored alongside the Kimi message.
         metadata = merge_preview_metadata(None, link_bundle)
         with self.state.kimi_turn_lock:
-            if self.state.kimi_active_turn or self.state.kimi_prepare_token:
+            if (
+                self.state.kimi_active_turn
+                or self.state.kimi_prepare_token
+                or getattr(self.state, "kimi_terminal_acquire_token", "")
+            ):
                 self._send_json(409, {
                     "ok": False,
                     "error": "kimi_turn_active",
@@ -10700,7 +10980,7 @@ class PushHandler(BaseHTTPRequestHandler):
             self.state.kimi_prepare_token = prepare_token
 
         try:
-            handed_off = self._handoff_kimi_terminal_to_acp(prepare_token)
+            handed_off = self._handoff_kimi_terminal_to_writer(prepare_token)
         except KimiTerminalBusy as exc:
             self._release_kimi_control(prepare_token)
             self._send_json(409, {
@@ -11505,6 +11785,58 @@ class PushHandler(BaseHTTPRequestHandler):
             "message": "已停止小克生成。",
         })
 
+    def _stop_orphaned_kimi_web_turn(self, user_ts: str) -> tuple[bool, str]:
+        """Stop a restart-orphan only when its durable identity matches."""
+        web = getattr(self.state, "kimi_web", None)
+        load_lease = getattr(web, "load_turn_lease", None)
+        recover = getattr(web, "recover_owned_orphaned_prompt", None)
+        if not callable(load_lease) or not callable(recover):
+            return False, "none"
+        try:
+            lease = load_lease()
+        except Exception:
+            return False, "failed"
+        if not isinstance(lease, dict) or str(lease.get("user_ts") or "") != user_ts:
+            return False, "none"
+        session_id, prompt_id = str(lease.get("session_id") or ""), str(lease.get("prompt_id") or "")
+        if not session_id or not prompt_id:
+            return False, "none"
+        token = secrets.token_hex(16)
+        with self.state.kimi_turn_lock:
+            if (
+                self.state.kimi_active_turn
+                or getattr(self.state, "kimi_prepare_token", "")
+                or getattr(self.state, "kimi_recovery_token", "")
+                or getattr(self.state, "kimi_terminal_acquire_token", "")
+            ):
+                return False, "conflict"
+            self.state.kimi_recovery_token = token
+        try:
+            stopped = bool(recover(lease))
+        except KimiWebRecoveryConflict:
+            outcome = "conflict"
+        except KimiWebError:
+            outcome = "failed"
+        except Exception:
+            logger.exception("Kimi Web durable Stop recovery crashed")
+            outcome = "failed"
+        else:
+            outcome = "stopped" if stopped else "pending"
+        with self.state.kimi_turn_lock:
+            owns = not self.state.kimi_active_turn and self.state.kimi_recovery_token == token
+            if self.state.kimi_recovery_token == token:
+                self.state.kimi_recovery_token = ""
+        if not owns:
+            return False, "conflict"
+        if outcome == "stopped":
+            try:
+                web.clear_turn_lease(session_id=session_id, prompt_id=prompt_id)
+            except Exception:
+                return False, "failed"
+            self._mark_kimi_orphan_terminal(lease, outcome="interrupted")
+            return True, "stopped"
+        return False, outcome
+
     def _handle_kimi_chat_stop(self, user_ts: str) -> None:
         if not user_ts:
             self._send_json(400, {
@@ -11517,31 +11849,42 @@ class PushHandler(BaseHTTPRequestHandler):
             active = dict(self.state.kimi_active_turn)
             active_ts = str(active.get("user_ts") or "")
             if not active:
+                active_ts = ""
+            else:
+                if not active_ts or user_ts != active_ts:
+                    self._send_json(409, {
+                        "ok": False,
+                        "error": "stale_turn",
+                        "reason": "当前 Kimi 轮次与停止目标不一致，未发送停止指令。",
+                    })
+                    return
+                session_id = str(active.get("session_id") or "")
+                if not session_id:
+                    self._send_json(409, {
+                        "ok": False,
+                        "error": "invalid_turn_identity",
+                        "reason": "当前 Kimi 轮次缺少会话标识，未发送停止指令。",
+                    })
+                    return
+                transport = str(active.get("transport") or "")
+                prompt_id = str(active.get("prompt_id") or "")
+                cancel_event = active.get("cancel_event")
+        if not active:
+            stopped, outcome = self._stop_orphaned_kimi_web_turn(user_ts)
+            if stopped:
                 self._send_json(200, {
-                    "ok": True,
-                    "stopped": False,
-                    "already_finished": True,
+                    "ok": True, "stopped": True, "user_ts": user_ts, "message": "已停止 Kimi 生成。",
+                })
+            elif outcome == "none":
+                self._send_json(200, {
+                    "ok": True, "stopped": False, "already_finished": True,
                     "message": "这轮 Kimi 生成已经结束。",
                 })
-                return
-            if not active_ts or user_ts != active_ts:
-                self._send_json(409, {
-                    "ok": False,
-                    "error": "stale_turn",
-                    "reason": "当前 Kimi 轮次与停止目标不一致，未发送停止指令。",
-                })
-                return
-            session_id = str(active.get("session_id") or "")
-            if not session_id:
-                self._send_json(409, {
-                    "ok": False,
-                    "error": "invalid_turn_identity",
-                    "reason": "当前 Kimi 轮次缺少会话标识，未发送停止指令。",
-                })
-                return
-            transport = str(active.get("transport") or "")
-            prompt_id = str(active.get("prompt_id") or "")
-            cancel_event = active.get("cancel_event")
+            elif outcome in {"conflict", "pending"}:
+                self._send_json(409, {"ok": False, "error": "kimi_web_busy_recovery_pending"})
+            else:
+                self._send_json(503, {"ok": False, "error": "kimi_web_recovery_failed"})
+            return
         if transport == "kimi-web":
             if not prompt_id:
                 self._send_json(409, {
@@ -11578,7 +11921,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     return
                 current["stop_requested"] = True
             try:
-                self.state.kimi_web.abort_prompt(session_id, prompt_id)
+                self.state.kimi_web.abort_prompt(session_id, prompt_id, timeout=0.75)
             except KimiWebError:
                 # Do not turn a transient provider failure into a fake local
                 # cancellation.  Keep an already-recorded completion intact.
@@ -11592,6 +11935,12 @@ class PushHandler(BaseHTTPRequestHandler):
                         current["stop_requested"] = False
                 self._send_json(503, {"ok": False, "error": "kimi_web_unavailable"})
                 return
+            try:
+                self.state.kimi_web.set_turn_lease_state(
+                    session_id=session_id, prompt_id=prompt_id, state="stopping",
+                )
+            except Exception:
+                logger.warning("Kimi Web turn lease update after Stop failed")
         if isinstance(cancel_event, threading.Event):
             cancel_event.set()
         # Web abort is fenced by the exact prompt id. ACP compatibility keeps
@@ -12533,6 +12882,8 @@ class PushHandler(BaseHTTPRequestHandler):
             return bool(
                 self.state.kimi_active_turn
                 or self.state.kimi_prepare_token
+                or getattr(self.state, "kimi_recovery_token", "")
+                or getattr(self.state, "kimi_terminal_acquire_token", "")
             )
 
     def _reserve_kimi_control(self, action: str) -> str | None:
@@ -12541,6 +12892,8 @@ class PushHandler(BaseHTTPRequestHandler):
             if (
                 self.state.kimi_active_turn
                 or self.state.kimi_prepare_token
+                or getattr(self.state, "kimi_recovery_token", "")
+                or getattr(self.state, "kimi_terminal_acquire_token", "")
             ):
                 self._send_json(409, {
                     "ok": False,
@@ -12557,8 +12910,8 @@ class PushHandler(BaseHTTPRequestHandler):
             if self.state.kimi_prepare_token == token:
                 self.state.kimi_prepare_token = ""
 
-    def _handoff_kimi_terminal_to_acp(self, prepare_token: str) -> bool:
-        """Release the TUI after reserving ACP ownership, without lock inversion.
+    def _handoff_kimi_terminal_to_writer(self, prepare_token: str) -> bool:
+        """Release an idle TUI after reserving a Web/ACP writer, without lock inversion.
 
         The caller first publishes ``kimi_prepare_token`` under
         ``kimi_turn_lock`` and releases that lock.  Only then do we take the
@@ -12581,33 +12934,72 @@ class PushHandler(BaseHTTPRequestHandler):
         except KimiTerminalBusy:
             raise
         except KimiTerminalUnavailable:
-            logger.warning("Kimi terminal-to-ACP handoff failed", exc_info=True)
+            logger.warning("Kimi terminal-to-writer handoff failed", exc_info=True)
             return False
 
     def _acquire_kimi_terminal(self) -> str:
-        """Acquire the single writer and resume only the durable local session.
+        """Acquire Kimi's terminal writer for its exact durable Web session.
 
-        Kimi terminal routes already hold ``input_transaction`` before calling
-        this method.  Holding the turn lock through idle ACP close and TUI
-        ensure makes the handoff atomic from all chat/control reservations.
+        The App chat transport owns the same Kimi Code session through its
+        loopback Web API.  A terminal must therefore prove that the current
+        active Web pointer is a workspace-local, idle session before launching
+        ``kimi --session``.  It never falls back to an ACP pointer or
+        ``--continue``: either the exact Web history is resumed or the request
+        fails closed.
+
+        Terminal routes hold ``input_transaction`` before calling this method.
+        The turn lock then makes the Web-to-TUI handoff atomic with future chat
+        reservations, leaving no two-writer window.
         """
-        acp = getattr(self.state, "kimi_acp", None)
-        if acp is None:
+        web = getattr(self.state, "kimi_web", None)
+        if web is None:
             raise KimiTerminalNoActiveSession("Kimi 当前没有可恢复的活跃会话")
+        acquire_token = f"terminal:{secrets.token_hex(16)}"
         with self.state.kimi_turn_lock:
             if (
                 self.state.kimi_active_turn
                 or self.state.kimi_prepare_token
-                or bool(getattr(acp, "busy", False))
+                or getattr(self.state, "kimi_recovery_token", "")
+                or getattr(self.state, "kimi_terminal_acquire_token", "")
             ):
                 raise KimiTerminalBusy("Kimi 正在回复，暂时不能接管终端")
-            raw_session_id = str(acp.load_session_id() or "")
-            validate = getattr(acp, "validated_local_session_id", None)
-            session_id = validate(raw_session_id) if callable(validate) else ""
+            self.state.kimi_terminal_acquire_token = acquire_token
+        try:
+            # These loopback calls can block on a Web restart. They must never
+            # hold kimi_turn_lock: Stop and a competing chat request need to
+            # observe this reservation promptly rather than appear frozen.
+            web.start()
+            raw_session_id = str(web.load_active_session_id() or "")
+            valid_session = getattr(web, "_valid_session_id", None)
+            session_id = valid_session(raw_session_id) if callable(valid_session) else raw_session_id
             if not session_id:
                 raise KimiTerminalNoActiveSession("Kimi 当前没有可恢复的活跃会话")
-            acp.close()
-            return self.state.kimi_terminal.ensure(session_id)
+            records = web.list_sessions()
+            matched = next((item for item in records if isinstance(item, dict) and str(item.get("id") or item.get("session_id") or "") == session_id), None)
+            metadata = matched.get("metadata") if isinstance(matched, dict) and isinstance(matched.get("metadata"), dict) else {}
+            if not matched or str(metadata.get("cwd") or "") != str(web.cwd):
+                raise KimiTerminalNoActiveSession("Kimi 当前没有可恢复的活跃会话")
+            if bool(web.get_session_status(session_id).get("busy")):
+                raise KimiTerminalBusy("Kimi 正在回复，暂时不能接管终端")
+            with self.state.kimi_turn_lock:
+                if (
+                    self.state.kimi_terminal_acquire_token != acquire_token
+                    or self.state.kimi_active_turn
+                    or self.state.kimi_prepare_token
+                    or getattr(self.state, "kimi_recovery_token", "")
+                ):
+                    raise KimiTerminalBusy("Kimi 正在回复，暂时不能接管终端")
+                # Holding the short lock across only local tmux setup fences
+                # the verified idle Web session until this TUI owns it.
+                return self.state.kimi_terminal.ensure(session_id)
+        except KimiTerminalUnavailable:
+            raise
+        except KimiWebError as exc:
+            raise KimiTerminalUnavailable("Kimi 终端会话状态不可用") from exc
+        finally:
+            with self.state.kimi_turn_lock:
+                if self.state.kimi_terminal_acquire_token == acquire_token:
+                    self.state.kimi_terminal_acquire_token = ""
 
     def _send_kimi_terminal_unavailable(self, exc: KimiTerminalUnavailable) -> None:
         if isinstance(exc, KimiTerminalBusy):
@@ -14743,7 +15135,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 except KimiWebError:
                     self._set_chat_activity("apples", activity_text="Kimi 需要确认，但确认状态暂不可读取", activity_count=0, user_ts=user_ts)
                     return
-                if len(approvals) == 1 and not questions:
+                if len(approvals) == 1 and not questions and self._kimi_is_routine_readonly_approval(approvals[0]):
                     approval_id = str(approvals[0].get("approval_id") or "").strip()
                     if approval_id:
                         approval_resolution_started = True
@@ -19109,15 +19501,12 @@ class PushHandler(BaseHTTPRequestHandler):
 
     # ---------- tmux 终端 endpoints ----------
 
-    def _send_kimi_terminal_disabled(self) -> None:
-        """Fail closed: Kimi is Web-only and no longer owns a tmux pane."""
-        self._send_json(409, {
-            "ok": False,
-            "error": "kimi_terminal_disabled",
-            "target": KIMI_TERMINAL_ALIAS,
-            "message": "Kimi 已切换为 Web 会话；终端仅可通过只读 observer 查看。",
-            "observer_endpoint": "/kimi/terminal/observer",
-        })
+    def _is_reserved_kimi_physical_target(self, requested: Any) -> bool:
+        """Keep the bridge's tmux name private; only ``kimi`` is routable."""
+        value = str(requested or "").strip().lower()
+        terminal = getattr(self.state, "kimi_terminal", None)
+        owned_name = str(getattr(terminal, "tmux_session", "") or "").strip().lower()
+        return value in {"ccc-kimi-terminal", owned_name} - {""}
 
     def _resolve_terminal_session(
         self,
@@ -19126,15 +19515,20 @@ class PushHandler(BaseHTTPRequestHandler):
         require_ready: bool = False,
     ) -> tuple[str, str, bool]:
         """Return (physical tmux target, public identity, is_kairos)."""
+        if self._is_reserved_kimi_physical_target(requested):
+            raise KimiTerminalUnavailable("Kimi 终端必须通过 kimi 入口访问")
         if requested.strip().lower() == KAIROS_TERMINAL_ALIAS:
             physical = self.state.kairos_terminal.ensure()
             if require_ready:
                 physical = self.state.kairos_terminal.require_ready()
             return physical, KAIROS_TERMINAL_ALIAS, True
         if requested.strip().lower() == KIMI_TERMINAL_ALIAS:
-            # Do not revive the legacy ACP/TUI owner from any HTTP route.
-            # Kimi's active pointer and terminal projection are Web-only.
-            raise KimiTerminalUnavailable("Kimi 终端已停用；请使用只读 observer")
+            # The terminal bridge only accepts the Web transport's exact
+            # workspace-local active session.  It never creates or guesses a
+            # Kimi history, and the caller's input transaction covers this
+            # acquire through capture/paste/Enter.
+            physical = self._acquire_kimi_terminal()
+            return physical, KIMI_TERMINAL_ALIAS, False
         # Selecting any regular tmux pane hands the shared Codex lock back to
         # the App before XiaoKe input/capture proceeds.  The release itself
         # participates in the Kairos input transaction so a target switch
@@ -19191,10 +19585,21 @@ class PushHandler(BaseHTTPRequestHandler):
     def _handle_terminal_release(self, body: dict[str, Any]) -> None:
         target = str(body.get("target") or "").strip().lower()
         if target == KIMI_TERMINAL_ALIAS:
-            self._send_kimi_terminal_disabled()
+            lease = str(body.get("lease") or "")
+            with self.state.kimi_terminal.input_transaction():
+                try:
+                    released = self.state.kimi_terminal.release(lease)
+                except KimiTerminalUnavailable as exc:
+                    self._send_kimi_terminal_unavailable(exc)
+                    return
+            self._send_json(200, {
+                "ok": True,
+                "target": KIMI_TERMINAL_ALIAS,
+                "released": released,
+            })
             return
         if target != KAIROS_TERMINAL_ALIAS:
-            self._send_json(400, {"error": "target must be kairos"})
+            self._send_json(400, {"error": "target must be kairos or kimi"})
             return
         with self.state.kairos_terminal.input_transaction():
             try:
@@ -19215,7 +19620,18 @@ class PushHandler(BaseHTTPRequestHandler):
                 capture_output=True, text=True, timeout=3
             )
             sessions = [s.strip() for s in result.stdout.split("\n") if s.strip()]
-            self._send_json(200, {"ok": True, "sessions": sessions})
+            exposed: list[str] = []
+            for name in sessions:
+                # Hide both the configured bridge target and the historical
+                # default name.  The latter remains reserved even after a
+                # configuration change, so it must never leak as a generic
+                # tmux target that bypasses the alias/input-lock path.
+                if self._is_reserved_kimi_physical_target(name):
+                    if KIMI_TERMINAL_ALIAS not in exposed:
+                        exposed.append(KIMI_TERMINAL_ALIAS)
+                else:
+                    exposed.append(name)
+            self._send_json(200, {"ok": True, "sessions": exposed})
         except Exception as e:
             self._send_json(500, {"error": str(e)})
 
@@ -19228,7 +19644,8 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception:
             lines = 120
         if str(requested_session).strip().lower() == KIMI_TERMINAL_ALIAS:
-            self._send_kimi_terminal_disabled()
+            with self.state.kimi_terminal.input_transaction():
+                self._handle_tmux_capture_transaction(requested_session, lines)
             return
         self._handle_tmux_capture_transaction(requested_session, lines)
 
@@ -19242,8 +19659,6 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_kimi_terminal_unavailable(exc)
             return
         kimi_lease = ""
-        # Kimi callers hold input_transaction across this entire helper.
-        capture_transaction = nullcontext()
         try:
             terminal_state = "ready"
             capture_pane: str | None = None
@@ -19253,22 +19668,23 @@ class PushHandler(BaseHTTPRequestHandler):
                 # state and content belong to one physical console.
                 capture_pane, _state_before_capture = self.state.kairos_terminal.terminal_state()
                 session = capture_pane
-            with capture_transaction:
-                if public_session == KIMI_TERMINAL_ALIAS:
-                    # Lease is opaque and only binds this capture to the exact
-                    # current owned pane; pane/session identifiers never leave.
-                    kimi_lease = self.state.kimi_terminal.lease_for_pane(session)
-                result = subprocess.run(
-                    ["tmux", "capture-pane", "-t", session, "-p", "-S", str(-lines)],
-                    capture_output=True, text=True, timeout=3
-                )
-                if result.returncode == 0 and public_session == KIMI_TERMINAL_ALIAS:
-                    self.state.kimi_terminal.touch()
+            if public_session == KIMI_TERMINAL_ALIAS:
+                # Lease is opaque and only binds this capture to the exact
+                # current owned pane; pane/session identifiers never leave.
+                kimi_lease = self.state.kimi_terminal.lease_for_pane(session)
+            result = subprocess.run(
+                ["tmux", "capture-pane", "-t", session, "-p", "-S", str(-lines)],
+                capture_output=True, text=True, timeout=3
+            )
+            if result.returncode == 0 and public_session == KIMI_TERMINAL_ALIAS:
+                self.state.kimi_terminal.touch()
             if result.returncode != 0:
                 if is_kairos:
                     self._finish_kairos_terminal_failure(
                         expected_pane=capture_pane,
                     )
+                elif public_session == KIMI_TERMINAL_ALIAS:
+                    self._send_json(503, {"error": "Kimi 终端捕获失败", "target": KIMI_TERMINAL_ALIAS})
                 else:
                     self._send_json(404, {"error": result.stderr.strip() or "session not found"})
                 return
@@ -19330,6 +19746,8 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._finish_kairos_terminal_failure(
                     expected_pane=capture_pane,
                 )
+            elif public_session == KIMI_TERMINAL_ALIAS:
+                self._send_json(503, {"error": "Kimi 终端捕获失败", "target": KIMI_TERMINAL_ALIAS})
             else:
                 self._send_json(500, {"error": str(e)})
 
@@ -19340,9 +19758,59 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._handle_terminal_key_transaction(body)
             return
         if requested_session.lower() == KIMI_TERMINAL_ALIAS:
-            self._send_kimi_terminal_disabled()
+            with self.state.kimi_terminal.input_transaction():
+                self._handle_terminal_key_transaction(body)
             return
         self._handle_terminal_key_transaction(body)
+
+    def _handle_terminal_resize(self, body: dict[str, Any]):
+        """Resize an owned terminal without exposing its tmux pane identity."""
+        requested_session = str(body.get("session", "cctg")).strip() or "cctg"
+        try:
+            columns = int(body.get("columns"))
+            rows = int(body.get("rows"))
+        except (TypeError, ValueError):
+            self._send_json(400, {"error": "columns and rows required"})
+            return
+        # Bound resource use and reject accidental device-pixel dimensions.
+        if not (20 <= columns <= 320 and 8 <= rows <= 160):
+            self._send_json(400, {"error": "terminal size out of range"})
+            return
+        target = requested_session.lower()
+        transaction = (
+            self.state.kairos_terminal.input_transaction()
+            if target == KAIROS_TERMINAL_ALIAS else
+            self.state.kimi_terminal.input_transaction()
+            if target == KIMI_TERMINAL_ALIAS else nullcontext()
+        )
+        with transaction:
+            try:
+                session, public_session, is_kairos = self._resolve_terminal_session(requested_session)
+            except KairosTerminalUnavailable as exc:
+                self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
+                return
+            except KimiTerminalUnavailable as exc:
+                self._send_kimi_terminal_unavailable(exc)
+                return
+            try:
+                result = subprocess.run(
+                    ["tmux", "resize-window", "-t", session, "-x", str(columns), "-y", str(rows)],
+                    capture_output=True, text=True, timeout=3,
+                )
+            except Exception:
+                result = None
+            if result is None or result.returncode != 0:
+                if is_kairos:
+                    self._finish_kairos_terminal_failure(expected_pane=session)
+                else:
+                    self._send_json(503, {"error": "终端尺寸更新失败", "target": public_session})
+                return
+            if public_session == KIMI_TERMINAL_ALIAS:
+                self.state.kimi_terminal.touch()
+            self._send_json(200, {
+                "ok": True, "session": public_session,
+                "columns": columns, "rows": rows,
+            })
 
     def _handle_terminal_key_transaction(self, body: dict[str, Any]):
         """POST /terminal/key — send a special key directly via tmux send-keys.
@@ -19392,6 +19860,8 @@ class PushHandler(BaseHTTPRequestHandler):
             if result.returncode != 0:
                 if is_kairos:
                     self._finish_kairos_terminal_failure(expected_pane=session)
+                elif public_session == KIMI_TERMINAL_ALIAS:
+                    self._send_json(503, {"error": "Kimi 终端按键失败", "target": KIMI_TERMINAL_ALIAS})
                 else:
                     self._send_json(500, {"error": result.stderr.strip() or "send-keys failed"})
                 return
@@ -19405,6 +19875,8 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception as e:
             if is_kairos:
                 self._finish_kairos_terminal_failure(expected_pane=session)
+            elif public_session == KIMI_TERMINAL_ALIAS:
+                self._send_json(503, {"error": "Kimi 终端按键失败", "target": KIMI_TERMINAL_ALIAS})
             else:
                 self._send_json(500, {"error": str(e)})
 
@@ -19415,7 +19887,8 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._handle_tmux_send_transaction(body)
             return
         if str(requested_session).strip().lower() == KIMI_TERMINAL_ALIAS:
-            self._send_kimi_terminal_disabled()
+            with self.state.kimi_terminal.input_transaction():
+                self._handle_tmux_send_transaction(body)
             return
         self._handle_tmux_send_transaction(body)
 
@@ -19470,6 +19943,8 @@ class PushHandler(BaseHTTPRequestHandler):
                 if result.returncode != 0:
                     if is_kairos:
                         self._finish_kairos_terminal_failure(expected_pane=session)
+                    elif public_session == KIMI_TERMINAL_ALIAS:
+                        self._send_json(503, {"error": "Kimi 终端按键失败", "target": KIMI_TERMINAL_ALIAS})
                     else:
                         self._send_json(500, {"error": result.stderr.strip() or "send-keys failed"})
                     return
@@ -19483,6 +19958,8 @@ class PushHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 if is_kairos:
                     self._finish_kairos_terminal_failure(expected_pane=session)
+                elif public_session == KIMI_TERMINAL_ALIAS:
+                    self._send_json(503, {"error": "Kimi 终端按键失败", "target": KIMI_TERMINAL_ALIAS})
                 else:
                     self._send_json(500, {"error": str(e)})
             return

@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 from kimi_acp import KimiACPCancelled, KimiACPError
 from link_preview import LinkPreviewBundle
-from kimi_web_client import KimiWebError
+from kimi_web_client import KimiWebError, KimiWebSessionBusy
 from push import KimiTerminalBusy, PushHandler, _should_generate_chat_append_tts
 
 
@@ -558,7 +558,7 @@ class FakeWebChat:
         self.stop = threading.Event()
         self.message_count = 0
 
-    def ensure_active_session(self, *, model, thinking):
+    def ensure_active_session(self, *, model, thinking, **_kwargs):
         self.calls.append(("ensure", model, thinking))
         return "web-session-1"
 
@@ -585,11 +585,17 @@ class FakeWebChat:
             "in_flight_turn": {"turnId": "turn-1"},
         }
     def get_session(self, _session_id): return {"message_count": self.message_count}
+    def load_turn_lease(self): return {}
+    def save_turn_lease(self, **_kwargs): return None
+    def set_turn_lease_state(self, **_kwargs): return True
+    def clear_turn_lease(self, **_kwargs): return True
+    def claim_turn_lease(self, **_kwargs): return True
+    def release_turn_lease_claim(self, **_kwargs): return True
     # A normal snapshot carries no interaction decision; the worker must not
     # invent one.  Tests that exercise approvals override this explicitly.
     def list_approvals(self, _session_id): raise KimiWebError("no pending approval")
     def approve_once(self, *_args): raise AssertionError("unexpected approval")
-    def abort_prompt(self, session_id, prompt_id):
+    def abort_prompt(self, session_id, prompt_id, **_kwargs):
         self.calls.append(("abort", session_id, prompt_id))
         self.stop.set()
 
@@ -632,6 +638,38 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.assertEqual("kimi-web", handler.responses[-1][1]["turn"]["transport"])
         self.assertEqual(["ensure", "stream", "submit"], [row[0] for row in web.calls[:3]])
 
+    def test_web_chat_releases_an_idle_kimi_tui_before_session_prepare(self):
+        handler, _chat, web = self.make_handler()
+        order = []
+        handler.state.kimi_terminal = types.SimpleNamespace(
+            input_transaction=lambda: __import__("contextlib").nullcontext(),
+            release_for_acp=lambda: order.append("terminal-release") or True,
+        )
+        original_ensure = web.ensure_active_session
+        web.ensure_active_session = lambda **kwargs: order.append("web-prepare") or original_ensure(**kwargs)
+
+        handler._handle_kimi_web_chat_send({"text": "hello"}, "kimi", web)
+        self.wait_idle(handler)
+
+        self.assertEqual(["terminal-release", "web-prepare"], order)
+
+    def test_web_chat_never_appends_or_submits_while_kimi_tui_is_uncertain(self):
+        handler, chat, web = self.make_handler()
+        handler.state.kimi_terminal = types.SimpleNamespace(
+            input_transaction=lambda: __import__("contextlib").nullcontext(),
+            release_for_acp=lambda: (_ for _ in ()).throw(
+                KimiTerminalBusy("Kimi 终端可能仍在生成，请先离开终端后再发送")
+            ),
+        )
+
+        handler._handle_kimi_web_chat_send({"text": "must not submit"}, "kimi", web)
+
+        self.assertEqual([], chat.records)
+        self.assertEqual([], web.calls)
+        self.assertEqual(409, handler.responses[-1][0])
+        self.assertEqual("kimi_terminal_busy", handler.responses[-1][1]["error"])
+        self.assertEqual("", handler.state.kimi_prepare_token)
+
     def test_stream_subscription_is_ready_before_submit_and_exact_stop_is_fenced(self):
         handler, chat, web = self.make_handler(web=FakeWebChat(wait_for_stop=True))
         handler._handle_kimi_chat_send({"text": "hello"}, "kimi")
@@ -655,6 +693,147 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         handler._handle_kimi_chat_send({"text": "first"}, "kimi")
         self.assertEqual(500, handler.responses[-1][0])
         self.assertEqual(["ensure"], [row[0] for row in web.calls])
+
+    def test_orphaned_web_busy_prompt_is_recovered_then_client_retry_appends_once(self):
+        class OrphanedBusyWeb(FakeWebChat):
+            def __init__(self):
+                super().__init__()
+                self.recovered = False
+            def ensure_active_session(self, *, model, thinking, **_kwargs):
+                self.calls.append(("ensure", model, thinking))
+                if not self.recovered:
+                    raise KimiWebSessionBusy("web-session-1")
+                return "web-session-1"
+            def load_turn_lease(self):
+                return {"session_id": "web-session-1", "prompt_id": "prompt-old", "user_ts": "old", "state": "stream_lost", "created_at": "1"}
+            def recover_owned_orphaned_prompt(self, lease):
+                session_id = lease["session_id"]
+                self.calls.append(("recover", session_id))
+                self.recovered = True
+                return True
+
+        handler, chat, web = self.make_handler(web=OrphanedBusyWeb())
+        handler._handle_kimi_chat_send({"text": "retry after orphan"}, "kimi")
+        self.assertEqual(409, handler.responses[-1][0])
+        self.assertEqual("kimi_web_orphan_recovered_retry", handler.responses[-1][1]["error"])
+        self.assertNotIn("retry after orphan", [row["text"] for row in chat.records])
+        self.assertEqual(1, sum(bool(row.get("metadata", {}).get("orphan_recovery")) for row in chat.records))
+        handler._handle_kimi_chat_send({"text": "retry after orphan"}, "kimi")
+        self.wait_idle(handler)
+
+        self.assertEqual(["ensure", "recover", "ensure", "stream", "submit"], [row[0] for row in web.calls])
+        self.assertIn(("recover", "web-session-1"), web.calls)
+        self.assertEqual(1, [row["text"] for row in chat.records].count("retry after orphan"))
+        self.assertEqual(200, handler.responses[-1][0])
+
+    def test_idle_stream_lost_lease_is_reconciled_before_new_history_or_submit(self):
+        class IdleLeaseWeb(FakeWebChat):
+            def __init__(self):
+                super().__init__(); self.reconciled = False
+            def reconcile_owned_idle_lease(self, **_kwargs):
+                if not self.reconciled:
+                    self.reconciled = True
+                    return {"session_id": "web-session-1", "prompt_id": "old", "user_ts": "old-ts", "state": "stream_lost", "created_at": "1"}
+                return {}
+
+        handler, chat, web = self.make_handler(web=IdleLeaseWeb())
+        handler._handle_kimi_chat_send({"text": "new after idle"}, "kimi")
+        self.assertEqual(409, handler.responses[-1][0])
+        self.assertEqual("kimi_web_orphan_recovered_retry", handler.responses[-1][1]["error"])
+        self.assertFalse(any(row[0] == "submit" for row in web.calls))
+        self.assertNotIn("new after idle", [row["text"] for row in chat.records])
+        handler._handle_kimi_chat_send({"text": "new after idle"}, "kimi")
+        self.wait_idle(handler)
+        self.assertEqual(1, [row["text"] for row in chat.records].count("new after idle"))
+
+    def test_upstream_busy_does_not_recover_while_a_legitimate_local_turn_owns_control(self):
+        class ShouldNotRecover(FakeWebChat):
+            def ensure_active_session(self, *, model, thinking, **_kwargs):
+                raise AssertionError("local live turn must reject before Web access")
+            def recover_owned_orphaned_prompt(self, _lease):
+                raise AssertionError("must not abort a legitimate local turn")
+
+        handler, chat, web = self.make_handler(web=ShouldNotRecover())
+        handler.state.kimi_active_turn = {"user_ts": "live", "session_id": "web-session-1"}
+        handler._handle_kimi_chat_send({"text": "do not interrupt"}, "kimi")
+        self.assertEqual(409, handler.responses[-1][0])
+        self.assertEqual([], chat.records)
+
+    def test_ambiguous_orphan_busy_reports_conflict_without_history_append(self):
+        class AmbiguousBusyWeb(FakeWebChat):
+            def ensure_active_session(self, *, model, thinking, **_kwargs):
+                raise KimiWebSessionBusy("web-session-1")
+            def load_turn_lease(self):
+                return {"session_id": "web-session-1", "prompt_id": "prompt-old", "user_ts": "old", "state": "stream_lost", "created_at": "1"}
+            def recover_owned_orphaned_prompt(self, _lease):
+                from kimi_web_client import KimiWebRecoveryConflict
+                raise KimiWebRecoveryConflict("prompt moved")
+
+        handler, chat, web = self.make_handler(web=AmbiguousBusyWeb())
+        handler._handle_kimi_chat_send({"text": "safe conflict"}, "kimi")
+        self.assertEqual(409, handler.responses[-1][0])
+        self.assertEqual("kimi_web_busy_recovery_conflict", handler.responses[-1][1]["error"])
+        self.assertEqual([], chat.records)
+        self.assertEqual("", handler.state.kimi_prepare_token)
+
+    def test_external_busy_without_durable_app_lease_never_aborts_or_appends(self):
+        class ExternalBusyWeb(FakeWebChat):
+            def ensure_active_session(self, *, model, thinking, **_kwargs):
+                raise KimiWebSessionBusy("web-session-1")
+            def recover_owned_orphaned_prompt(self, _lease):
+                raise AssertionError("unknown provider prompt must never be aborted")
+
+        handler, chat, _web = self.make_handler(web=ExternalBusyWeb())
+        handler._handle_kimi_chat_send({"text": "external busy"}, "kimi")
+        self.assertEqual(409, handler.responses[-1][0])
+        self.assertEqual("kimi_web_busy_recovery_conflict", handler.responses[-1][1]["error"])
+        self.assertEqual([], chat.records)
+
+    def test_recovery_network_wait_does_not_hold_kimi_turn_lock(self):
+        entered, release = threading.Event(), threading.Event()
+
+        class BlockingRecoveryWeb(FakeWebChat):
+            def __init__(self):
+                super().__init__(); self.recovered = False
+            def ensure_active_session(self, *, model, thinking, **_kwargs):
+                if not self.recovered:
+                    raise KimiWebSessionBusy("web-session-1")
+                return "web-session-1"
+            def load_turn_lease(self):
+                return {"session_id": "web-session-1", "prompt_id": "prompt-1", "user_ts": "old", "state": "stream_lost", "created_at": "1"}
+            def recover_owned_orphaned_prompt(self, _lease):
+                entered.set(); release.wait(1); self.recovered = True; return True
+
+        handler, _chat, _web = self.make_handler(web=BlockingRecoveryWeb())
+        thread = threading.Thread(target=lambda: handler._handle_kimi_chat_send({"text": "wait"}, "kimi"))
+        thread.start(); self.assertTrue(entered.wait(1))
+        acquired = handler.state.kimi_turn_lock.acquire(blocking=False)
+        self.assertTrue(acquired, "Web recovery network I/O must not hold kimi_turn_lock")
+        if acquired:
+            handler.state.kimi_turn_lock.release()
+        release.set(); thread.join(1)
+        self.assertFalse(thread.is_alive())
+        self.wait_idle(handler)
+
+    def test_stop_can_recover_exact_durable_orphan_but_respects_recovery_reservation(self):
+        class DurableStopWeb(FakeWebChat):
+            def __init__(self):
+                super().__init__(); self.cleared = []
+            def load_turn_lease(self):
+                return {"session_id": "web-session-1", "prompt_id": "prompt-1", "user_ts": "orphan-ts", "state": "stream_lost", "created_at": "1"}
+            def recover_owned_orphaned_prompt(self, lease):
+                self.calls.append(("recover", lease["session_id"], lease["prompt_id"])); return True
+            def clear_turn_lease(self, **kwargs): self.cleared.append(kwargs); return True
+
+        handler, chat, web = self.make_handler(web=DurableStopWeb())
+        handler._handle_kimi_chat_stop("orphan-ts")
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertTrue(handler.responses[-1][1]["stopped"])
+        self.assertEqual([{"session_id": "web-session-1", "prompt_id": "prompt-1"}], web.cleared)
+        self.assertEqual(1, sum(bool(row.get("metadata", {}).get("orphan_recovery")) for row in chat.records))
+        handler.state.kimi_recovery_token = "other"
+        handler._handle_kimi_chat_stop("orphan-ts")
+        self.assertEqual(409, handler.responses[-1][0])
 
     def test_xhs_marker_is_only_a_server_rendered_assistant_card(self):
         handler, _chat, _web = self.make_handler()
@@ -717,6 +896,27 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.assertTrue(event.is_set())
         self.assertIn(("abort", "web-session-1", "prompt-1"), web.calls)
 
+    def test_stop_http_acceptance_keeps_lease_until_provider_terminal_event(self):
+        class BusyAfterAbortWeb(FakeWebChat):
+            def __init__(self):
+                super().__init__(); self.states = []; self.clears = []
+            def set_turn_lease_state(self, **kwargs): self.states.append(kwargs); return True
+            def clear_turn_lease(self, **kwargs): self.clears.append(kwargs); return True
+
+        handler, _chat, web = self.make_handler(web=BusyAfterAbortWeb())
+        event = threading.Event()
+        handler.state.kimi_active_turn = {
+            "user_ts": "turn-1", "cancel_event": event, "session_id": "web-session-1",
+            "prompt_id": "prompt-1", "transport": "kimi-web",
+        }
+        handler._handle_kimi_chat_stop("turn-1")
+        self.assertTrue(event.is_set())
+        self.assertEqual([], web.clears)
+        self.assertEqual(
+            [{"session_id": "web-session-1", "prompt_id": "prompt-1", "state": "stopping"}],
+            web.states,
+        )
+
     def test_web_kimi_is_text_only_across_append_card_and_voice_paths(self):
         handler, kimi, _web = self.make_handler()
         handler._contact_id_from_body = lambda body: str(body.get("contact_id") or "xiaoke")
@@ -757,6 +957,27 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.assertTrue(typing and typing[-1][1].get("is_typing") is False)
         self.assertFalse(hasattr(handler.state.kimi_acp, "prepare_session"))
         self.assertEqual(["ensure", "stream", "submit"], [row[0] for row in web.calls[:3]])
+
+    def test_stream_loss_preserves_exact_durable_lease_for_restart_recovery(self):
+        class LeaseFailingWeb(FakeWebChat):
+            def __init__(self):
+                super().__init__(); self.lease = {}; self.lease_states = []
+            def save_turn_lease(self, **kwargs): self.lease = dict(kwargs)
+            def set_turn_lease_state(self, **kwargs): self.lease_states.append(dict(kwargs)); return True
+            def clear_turn_lease(self, **_kwargs): raise AssertionError("stream loss must preserve ownership lease")
+            def stream_session(self, session_id, *, on_event, on_ready, stop_event, **_kwargs):
+                self.calls.append(("stream", session_id)); on_ready()
+                __import__("time").sleep(0.03)
+                raise KimiWebError("stream lost")
+
+        handler, _chat, web = self.make_handler(web=LeaseFailingWeb())
+        handler._handle_kimi_chat_send({"text": "keep lease"}, "kimi")
+        self.wait_idle(handler)
+        self.assertEqual("prompt-1", web.lease["prompt_id"])
+        self.assertIn(
+            {"session_id": "web-session-1", "prompt_id": "prompt-1", "state": "stream_lost"},
+            web.lease_states,
+        )
 
     def test_private_web_rejects_wrong_current_prompt_and_unbound_events(self):
         class ForeignPromptWeb(FakeWebChat):
@@ -895,7 +1116,7 @@ class KimiWebChatRoutingTest(unittest.TestCase):
                 on_event({"type": "turn.ended", "session_id": session_id, "payload": {"turnId": "turn-1", "reason": "completed"}})
 
         for snapshot, expected_approvals, expect_abort in (
-            ({"current_prompt_id": "prompt-1", "in_flight_turn": {"turnId": "turn-1"}, "pending_approvals": [{"approval_id": "a1"}], "pending_questions": []}, [("web-session-1", "a1")], False),
+            ({"current_prompt_id": "prompt-1", "in_flight_turn": {"turnId": "turn-1"}, "pending_approvals": [{"approval_id": "a1", "tool_name": "read_file", "tool_input_display": "README.md"}], "pending_questions": []}, [("web-session-1", "a1")], False),
             ({"current_prompt_id": "prompt-1", "in_flight_turn": {"turnId": "turn-1"}, "pending_approvals": [{"approval_id": "a1"}, {"approval_id": "a2"}], "pending_questions": []}, [], True),
             ({"current_prompt_id": "prompt-1", "in_flight_turn": {"turnId": "turn-1"}, "pending_approvals": [], "pending_questions": [{"id": "q1"}]}, [], True),
         ):
@@ -905,6 +1126,18 @@ class KimiWebChatRoutingTest(unittest.TestCase):
                 self.wait_idle(handler)
                 self.assertEqual(expected_approvals, web.approved)
                 self.assertEqual(expect_abort, any(row[0] == "abort" for row in web.calls))
+
+    def test_only_known_readonly_single_approval_is_auto_allowed(self):
+        self.assertTrue(PushHandler._kimi_is_routine_readonly_approval({
+            "approval_id": "a", "tool_name": "read_file", "tool_input_display": "notes.txt",
+        }))
+        for approval in (
+            {"approval_id": "a", "tool_name": "write_file", "tool_input_display": "notes.txt"},
+            {"approval_id": "a", "tool_name": "read_file", "tool_input_display": "curl https://example.com"},
+            {"approval_id": "a", "tool_name": "web_fetch", "tool_input_display": "https://example.com"},
+            {"approval_id": "a", "tool_name": "unknown_tool", "tool_input_display": "x"},
+        ):
+            self.assertFalse(PushHandler._kimi_is_routine_readonly_approval(approval))
 
     def test_empty_web_session_is_seeded_once_from_app_history(self):
         handler, chat, web = self.make_handler()
