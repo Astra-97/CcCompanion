@@ -713,6 +713,11 @@ class WebPwaContractTest(unittest.TestCase):
         handler = self.handler()
         handler.state = types.SimpleNamespace(contact_chats={
             "xiaoke": object(), "kairos": object(), "kimi": object(), "toolbot": object(),
+        }, contact_routes={
+            "xiaoke": {"send_handler": "xiaoke", "capabilities": ["chat", "history", "stop", "forward"]},
+            "kairos": {"send_handler": "kairos", "capabilities": ["chat", "history", "stop", "forward"]},
+            "kimi": {"send_handler": "kimi", "capabilities": ["chat", "history", "forward"]},
+            "toolbot": {"capabilities": ["history"]},
         })
         handler._handle_chat_contacts()
         status, payload, _kwargs = handler.responses[-1]
@@ -722,11 +727,89 @@ class WebPwaContractTest(unittest.TestCase):
         self.assertEqual(contacts["xiaoke"]["provider"], "claude-code")
         self.assertEqual(contacts["kairos"]["provider"], "codex-app-server")
         self.assertEqual(contacts["kairos"]["terminal_target"], KAIROS_TERMINAL_ALIAS)
+        self.assertIn("forward", contacts["kimi"]["capabilities"])
         self.assertEqual(contacts["xiaoke"]["stop"]["endpoint"], "/chat/stop")
         self.assertEqual(contacts["kairos"]["stop"]["endpoint"], "/chat/stop")
         self.assertEqual(payload["chat_endpoints"]["send"], "/chat/send")
         self.assertEqual(payload["chat_endpoints"]["status"], "/chat/status?contact_id={contact_id}")
         self.assertNotIn("typing", payload["chat_endpoints"])
+
+    def test_contact_directory_requires_registered_route_and_group_roster_reuses_it(self):
+        handler = self.handler()
+        handler.state = types.SimpleNamespace(
+            contact_chats={"xiaoke": object(), "kairos": object(), "kimi": object(), "apples": object(), "future": object()},
+            contact_catalog=[{
+                "id": "future",
+                "display_name": "Future Agent",
+                "provider": "future-provider",
+                "capabilities": ["chat", "history", "forward", "group_member"],
+                "group_mention": "@Future\n",
+                "group_color": "sage\u0000",
+                "terminal_target": "future-pane\n",
+                "stop_fields": "contact_id",
+            }],
+            contact_routes={
+                "future": {
+                    "send_handler": "future-provider",  # no dispatcher is wired
+                    "capabilities": ["chat", "history", "forward", "group_member", "group_reply"],
+                    "group_dispatcher": "future-provider",
+                },
+            },
+        )
+        directory = handler._chat_contact_directory()
+        future = next(item for item in directory if item["id"] == "future")
+        self.assertNotIn("chat", future["capabilities"])
+        self.assertNotIn("forward", future["capabilities"])
+        self.assertIn("group_member", future["capabilities"])
+        self.assertNotIn("group_reply", future["capabilities"])
+        self.assertEqual([], future["stop"]["required_fields"])
+        self.assertEqual("future-pane", future["terminal_target"])
+        roster = handler._apples_members()
+        future_member = next(item for item in roster if item["id"] == "future")
+        self.assertEqual("@Future", future_member["mention"])
+        self.assertEqual("sage", future_member["color"])
+        # A directory entry needs a server router opt-in before the picker can
+        # dispatch a turn to it.
+        self.assertFalse(future_member["can_reply"])
+
+    def test_contact_directory_rejects_malformed_registration_capabilities(self):
+        handler = self.handler()
+        handler.state = types.SimpleNamespace(
+            contact_chats={"xiaoke": object()},
+            contact_catalog=[],
+            contact_routes={"xiaoke": {"send_handler": "xiaoke", "capabilities": None}},
+        )
+        directory = handler._chat_contact_directory()
+        self.assertEqual(["xiaoke"], [item["id"] for item in directory])
+        self.assertNotIn("chat", directory[0]["capabilities"])
+        self.assertNotIn("forward", directory[0]["capabilities"])
+
+    def test_explicit_group_target_without_dispatcher_is_rejected_before_write(self):
+        handler = self.handler("/chat/send", "POST")
+        handler.state = types.SimpleNamespace(
+            contact_chats={"apples": object(), "future": object()},
+            contact_catalog=[{
+                "id": "future",
+                "display_name": "Future Agent",
+                "group_mention": "@Future",
+            }],
+            contact_routes={
+                "apples": {"send_handler": "apples", "capabilities": ["chat", "history", "group_chat"]},
+                # A real history/catalog entry with no supported group
+                # dispatcher must remain display-only and reject explicit
+                # picker intent before the user record is written.
+                "future": {"capabilities": ["history", "group_member", "group_reply"], "group_dispatcher": "future"},
+            },
+        )
+        handler._enrich_user_links = lambda _text: types.SimpleNamespace(previews=[])
+        handler._handle_apples_chat_send({
+            "text": "@Future hello",
+            "metadata": {"mentioned_member_ids": ["future"]},
+        }, "apples")
+        status, payload, _kwargs = handler.responses[-1]
+        self.assertEqual(400, status)
+        self.assertEqual("group_member_not_routable", payload["error"])
+        self.assertEqual(["future"], payload["invalid_member_ids"])
 
     def test_generic_stop_routes_kairos_to_fenced_codex_abort(self):
         handler = self.handler("/chat/stop", "POST")

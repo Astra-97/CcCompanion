@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 from kimi_acp import KimiACPCancelled, KimiACPError
 from link_preview import LinkPreviewBundle
+from kimi_web_client import KimiWebError
 from push import KimiTerminalBusy, PushHandler, _should_generate_chat_append_tts
 
 
@@ -17,8 +18,11 @@ class FakeChat:
         self.records.append(item)
         return item
 
+    def tail(self, limit):
+        return list(self.records[-limit:])
 
-class KimiChatRoutingTest(unittest.TestCase):
+
+class _LegacyKimiACPFixtures:
     def handler(self):
         kimi = FakeChat()
         xiaoke = FakeChat()
@@ -544,6 +548,473 @@ class KimiChatRoutingTest(unittest.TestCase):
         )
         self.assertEqual([], tts_calls)
         self.assertEqual([], kimi.records)
+
+
+class FakeWebChat:
+    def __init__(self, *, text="reply", wait_for_stop=False):
+        self.text = text
+        self.wait_for_stop = wait_for_stop
+        self.calls = []
+        self.stop = threading.Event()
+        self.message_count = 0
+
+    def ensure_active_session(self, *, model, thinking):
+        self.calls.append(("ensure", model, thinking))
+        return "web-session-1"
+
+    def stream_session(self, session_id, *, on_event, on_ready, stop_event, **_kwargs):
+        self.calls.append(("stream", session_id))
+        on_ready()
+        if self.wait_for_stop:
+            while not stop_event.wait(0.01):
+                pass
+            on_event({"type": "prompt.aborted", "session_id": session_id, "payload": {"turnId": "turn-1"}})
+            return
+        on_event({"type": "assistant.delta", "session_id": session_id, "payload": {"turnId": "turn-1", "delta": self.text}})
+        on_event({"type": "turn.ended", "session_id": session_id, "payload": {"turnId": "turn-1", "reason": "completed"}})
+
+    def submit_prompt(self, session_id, prompt, **_kwargs):
+        self.calls.append(("submit", session_id, prompt))
+        return {"prompt_id": "prompt-1"}
+
+    def get_snapshot(self, _session_id):
+        return {
+            # Real Kimi Web snapshots can nest the submitted identity rather
+            # than exposing a legacy flat current_prompt_id field.
+            "current_prompt": {"id": "prompt-1"}, "epoch": "test-epoch", "as_of_seq": 0,
+            "in_flight_turn": {"turnId": "turn-1"},
+        }
+    def get_session(self, _session_id): return {"message_count": self.message_count}
+    # A normal snapshot carries no interaction decision; the worker must not
+    # invent one.  Tests that exercise approvals override this explicitly.
+    def list_approvals(self, _session_id): raise KimiWebError("no pending approval")
+    def approve_once(self, *_args): raise AssertionError("unexpected approval")
+    def abort_prompt(self, session_id, prompt_id):
+        self.calls.append(("abort", session_id, prompt_id))
+        self.stop.set()
+
+
+class KimiWebChatRoutingTest(unittest.TestCase):
+    def make_handler(self, *, web=None, chat=None):
+        web = web or FakeWebChat()
+        chat = chat or FakeChat()
+        handler = object.__new__(PushHandler)
+        state = types.SimpleNamespace(
+            contact_chats={"kimi": chat}, kimi_web=web, kimi_acp=types.SimpleNamespace(),
+            kimi_turn_lock=threading.RLock(), kimi_active_turn={}, kimi_prepare_token="",
+            kimi_preferences=types.SimpleNamespace(snapshot=lambda: ("kimi-code/k3-256k", "low")),
+            kimi_terminal_observer=types.SimpleNamespace(begin=lambda *_: 1, record=lambda *_: True, finish=lambda *_: True, record_assistant_text=lambda *_: True),
+            kimi_semantic_memory_recall_enabled=False, chat_draft_lock=threading.Lock(), chat_drafts={},
+            chat_reply_states={}, chat_stream_revisions={}, sticker_catalog=types.SimpleNamespace(snapshot=lambda: {"stickers": []}),
+        )
+        handler.state = state; handler.headers = {}; handler.responses = []
+        handler._send_json = lambda status, payload: handler.responses.append((status, payload))
+        handler._chat_for_contact = lambda _contact: chat
+        handler._source_for_request = lambda suffix="": f"test:{suffix}"
+        handler._set_typing_for_contact = lambda *_args, **_kwargs: None
+        handler._kimi_semantic_recall = lambda *_args, **_kwargs: None
+        handler._kimi_link_bundle = lambda _text: LinkPreviewBundle(previews=(), prompt_context="")
+        return handler, chat, web
+
+    @staticmethod
+    def wait_idle(handler):
+        for _ in range(100):
+            if not handler.state.kimi_active_turn: return
+            __import__("time").sleep(0.01)
+        raise AssertionError("Kimi Web worker did not finish")
+
+    def test_private_web_turn_never_calls_acp_and_keeps_kimi_history_isolated(self):
+        handler, chat, web = self.make_handler()
+        handler.state.kimi_acp.prepare_session = Mock(side_effect=AssertionError("ACP fallback"))
+        handler._handle_kimi_chat_send({"text": "hello"}, "kimi")
+        self.wait_idle(handler)
+        self.assertEqual(["hello", "reply"], [row["text"] for row in chat.records])
+        self.assertEqual("kimi-web", handler.responses[-1][1]["turn"]["transport"])
+        self.assertEqual(["ensure", "stream", "submit"], [row[0] for row in web.calls[:3]])
+
+    def test_stream_subscription_is_ready_before_submit_and_exact_stop_is_fenced(self):
+        handler, chat, web = self.make_handler(web=FakeWebChat(wait_for_stop=True))
+        handler._handle_kimi_chat_send({"text": "hello"}, "kimi")
+        self.assertEqual(["ensure", "stream", "submit"], [row[0] for row in web.calls[:3]])
+        user_ts = handler.responses[-1][1]["turn"]["user_ts"]
+        handler._handle_kimi_chat_stop(user_ts)
+        self.wait_idle(handler)
+        self.assertIn(("abort", "web-session-1", "prompt-1"), web.calls)
+        self.assertTrue(any(row["role"] == "assistant" for row in chat.records))
+
+    def test_second_turn_and_history_failure_fail_before_web_submit(self):
+        handler, chat, web = self.make_handler()
+        handler.state.kimi_active_turn = {"user_ts": "old", "cancel_event": threading.Event(), "session_id": "s"}
+        handler._handle_kimi_chat_send({"text": "second"}, "kimi")
+        self.assertEqual(409, handler.responses[-1][0])
+        self.assertFalse(web.calls)
+
+        class BrokenChat(FakeChat):
+            def append(self, **_record): raise OSError("disk")
+        handler, _chat, web = self.make_handler(chat=BrokenChat())
+        handler._handle_kimi_chat_send({"text": "first"}, "kimi")
+        self.assertEqual(500, handler.responses[-1][0])
+        self.assertEqual(["ensure"], [row[0] for row in web.calls])
+
+    def test_xhs_marker_is_only_a_server_rendered_assistant_card(self):
+        handler, _chat, _web = self.make_handler()
+        visible, card = handler._kimi_extract_xhs_login_card("请先登录\n[[CCC_XHS_LOGIN_CARD:v1]]", allowed=True)
+        self.assertTrue(card)
+        self.assertNotIn("[[CCC_XHS_LOGIN_CARD:v1]]", visible)
+        visible, card = handler._kimi_extract_xhs_login_card("[[CCC_XHS_LOGIN_CARD:v1]]", allowed=False)
+        self.assertFalse(card)
+        self.assertIn("[[CCC_XHS_LOGIN_CARD:v1]]", visible)
+
+    def test_xhs_card_is_emitted_only_for_trusted_web_reply_marker(self):
+        marker = "[[CCC_XHS_LOGIN_CARD:v1]]"
+        handler, chat, _web = self.make_handler(web=FakeWebChat(text=f"请重新登录\n{marker}"))
+        handler._kimi_link_bundle = lambda _text: LinkPreviewBundle(
+            previews=({"comments_status": "login_required"},), prompt_context="xhs"
+        )
+        handler._handle_kimi_chat_send({"text": "https://www.xiaohongshu.com/explore/x"}, "kimi")
+        self.wait_idle(handler)
+        assistant = chat.records[-1]
+        self.assertTrue(assistant["metadata"]["xhs_login_card"])
+        self.assertNotIn(marker, assistant["text"])
+
+        handler, chat, _web = self.make_handler(web=FakeWebChat(text=marker))
+        handler._handle_kimi_chat_send({"text": "ordinary"}, "kimi")
+        self.wait_idle(handler)
+        self.assertNotIn("xhs_login_card", chat.records[-1]["metadata"])
+        self.assertEqual(marker, chat.records[-1]["text"])
+
+    def test_stop_after_completed_turn_is_idempotent_and_never_aborts_a_new_turn(self):
+        handler, _chat, web = self.make_handler()
+        handler._handle_kimi_chat_send({"text": "done"}, "kimi")
+        user_ts = handler.responses[-1][1]["turn"]["user_ts"]
+        self.wait_idle(handler)
+        handler._handle_kimi_chat_stop(user_ts)
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertFalse(handler.responses[-1][1]["stopped"])
+        self.assertFalse(any(row[0] == "abort" for row in web.calls))
+
+    def test_web_stop_identity_is_exact_and_abort_is_prompt_fenced(self):
+        handler, _chat, web = self.make_handler()
+        event = threading.Event()
+        handler.state.kimi_active_turn = {
+            "user_ts": "new", "cancel_event": event, "session_id": "web-session-1",
+            "prompt_id": "prompt-1", "transport": "kimi-web",
+        }
+        handler._handle_kimi_chat_stop("old")
+        self.assertEqual(409, handler.responses[-1][0])
+        self.assertFalse(event.is_set())
+        self.assertFalse(any(row[0] == "abort" for row in web.calls))
+
+        handler._handle_kimi_chat_stop("")
+        self.assertEqual(400, handler.responses[-1][0])
+        handler.state.kimi_active_turn["session_id"] = ""
+        handler._handle_kimi_chat_stop("new")
+        self.assertEqual(409, handler.responses[-1][0])
+
+        handler.state.kimi_active_turn["session_id"] = "web-session-1"
+        handler._handle_kimi_chat_stop("new")
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertTrue(event.is_set())
+        self.assertIn(("abort", "web-session-1", "prompt-1"), web.calls)
+
+    def test_web_kimi_is_text_only_across_append_card_and_voice_paths(self):
+        handler, kimi, _web = self.make_handler()
+        handler._contact_id_from_body = lambda body: str(body.get("contact_id") or "xiaoke")
+        handler._check_auth = lambda: True
+        tts_calls = []
+        handler._run_stackchan_voice_helper = lambda *_args, **_kwargs: tts_calls.append(True)
+        for invoke, body in (
+            (handler._handle_chat_card_action, {"contact_id": "kimi", "text": "action"}),
+            (handler._handle_chat_append, {"contact_id": "kimi", "text": "caption", "attachment_url": "/attachments/file.png"}),
+            (handler._handle_chat_append, {"contact_id": "kimi", "text": "card", "metadata": {"card_title": "Interactive"}}),
+            (handler._handle_chat_send, {"contact_id": "kimi", "text": "no", "metadata": {"xhs_login_card": True}}),
+            (handler._handle_voice_push, {"contact_id": "kimi", "text": "voice"}),
+        ):
+            invoke(body)
+            self.assertEqual(415, handler.responses[-1][0])
+        self.assertEqual([], kimi.records)
+        self.assertEqual([], tts_calls)
+        self.assertFalse(_should_generate_chat_append_tts("kimi", "assistant", "plain", None, True))
+
+    def test_web_turn_failure_cleans_lock_typing_and_draft_without_acp_fallback(self):
+        class FailingWeb(FakeWebChat):
+            def stream_session(self, session_id, *, on_event, on_ready, stop_event, **_kwargs):
+                self.calls.append(("stream", session_id))
+                on_ready()
+                on_event({"type": "assistant.delta", "session_id": session_id,
+                          "payload": {"turnId": "turn-1", "delta": "partial"}})
+                raise KimiWebError("stream lost")
+
+        handler, chat, web = self.make_handler(web=FailingWeb())
+        typing = []
+        handler._set_typing_for_contact = lambda *args, **_kwargs: typing.append(args)
+        handler._handle_kimi_chat_send({"text": "hello"}, "kimi")
+        self.wait_idle(handler)
+        self.assertEqual(["hello", "partial"], [r["text"] for r in chat.records])
+        self.assertEqual("kimi-web:failed", chat.records[-1]["source"])
+        self.assertEqual({}, handler.state.kimi_active_turn)
+        self.assertNotIn("kimi", handler.state.chat_drafts)
+        self.assertTrue(typing and typing[-1][1].get("is_typing") is False)
+        self.assertFalse(hasattr(handler.state.kimi_acp, "prepare_session"))
+        self.assertEqual(["ensure", "stream", "submit"], [row[0] for row in web.calls[:3]])
+
+    def test_private_web_rejects_wrong_current_prompt_and_unbound_events(self):
+        class ForeignPromptWeb(FakeWebChat):
+            def get_snapshot(self, _session_id):
+                return {
+                    "current_prompt": {"id": "old-prompt"}, "epoch": "test-epoch", "as_of_seq": 7,
+                    "in_flight_turn": {"turnId": "old-turn", "assistant_text": "SNAPSHOT LEAK"},
+                }
+
+            def stream_session(self, session_id, *, on_event, on_ready, stop_event, **_kwargs):
+                self.calls.append(("stream", session_id))
+                on_ready()
+                # A live session can emit old or unlabelled frames around a
+                # fast submit. Neither may append text or end this turn.
+                for payload, seq in (
+                    ({"delta": "MISSING LEAK"}, 8),
+                    ({"turnId": "old-turn", "delta": "OLD LEAK"}, 9),
+                    ({"turnId": "old-turn", "reason": "completed"}, 10),
+                ):
+                    on_event({
+                        "type": "assistant.delta" if "delta" in payload else "turn.ended",
+                        "session_id": session_id, "epoch": "test-epoch", "seq": seq,
+                        "payload": payload,
+                    })
+
+        handler, chat, _web = self.make_handler(web=ForeignPromptWeb())
+        handler._handle_kimi_chat_send({"text": "current question"}, "kimi")
+        self.wait_idle(handler)
+
+        assistant = chat.records[-1]
+        self.assertEqual("kimi-web:failed", assistant["source"])
+        self.assertEqual("Kimi 这次没有成功回复。请稍后重试；原消息已经保留。", assistant["text"])
+        self.assertNotIn("LEAK", assistant["text"])
+
+    def test_private_web_snapshot_floor_rejects_buffered_frames_then_allows_new_unbound_frame(self):
+        class SnapshotFloorWeb(FakeWebChat):
+            def get_snapshot(self, _session_id):
+                # Kimi has confirmed this submitted prompt, but has not yet
+                # assigned a turnId. Only frames newer than this exact
+                # snapshot's epoch/sequence floor may fill the response.
+                return {
+                    "current_prompt_id": "prompt-1", "epoch": "epoch-a", "as_of_seq": 10,
+                    "in_flight_turn": {"assistant_text": "snapshot "},
+                }
+
+            def stream_session(self, session_id, *, on_event, on_ready, stop_event, **_kwargs):
+                self.calls.append(("stream", session_id)); on_ready()
+                for event_type, payload, seq in (
+                    ("assistant.delta", {"delta": "OLD BUFFER"}, 10),
+                    ("assistant.delta", {"delta": "new"}, 11),
+                    ("turn.ended", {"reason": "completed"}, 12),
+                ):
+                    on_event({"type": event_type, "session_id": session_id,
+                              "epoch": "epoch-a", "seq": seq, "payload": payload})
+
+        handler, chat, _web = self.make_handler(web=SnapshotFloorWeb())
+        handler._handle_kimi_chat_send({"text": "current question"}, "kimi")
+        self.wait_idle(handler)
+
+        assistant = chat.records[-1]
+        self.assertEqual("kimi-web", assistant["source"])
+        self.assertEqual("snapshot new", assistant["text"])
+        self.assertNotIn("OLD BUFFER", assistant["text"])
+
+    def test_private_web_bound_turn_id_rejects_missing_and_wrong_turn_events(self):
+        class BoundTurnWeb(FakeWebChat):
+            def get_snapshot(self, _session_id):
+                return {
+                    "current_prompt_id": "prompt-1", "epoch": "epoch-b", "as_of_seq": 4,
+                    "in_flight_turn": {"turn_id": "turn-current", "assistant_text": "snapshot "},
+                }
+
+            def stream_session(self, session_id, *, on_event, on_ready, stop_event, **_kwargs):
+                self.calls.append(("stream", session_id)); on_ready()
+                for event_type, payload, seq in (
+                    ("assistant.delta", {"delta": "MISSING LEAK"}, 5),
+                    ("assistant.delta", {"turnId": "turn-old", "delta": "OLD LEAK"}, 6),
+                    ("turn.ended", {"turnId": "turn-old", "reason": "completed"}, 7),
+                    ("assistant.delta", {"turnId": "turn-current", "delta": "new"}, 8),
+                    ("turn.ended", {"turnId": "turn-current", "reason": "completed"}, 9),
+                ):
+                    on_event({"type": event_type, "session_id": session_id,
+                              "epoch": "epoch-b", "seq": seq, "payload": payload})
+
+        handler, chat, _web = self.make_handler(web=BoundTurnWeb())
+        handler._handle_kimi_chat_send({"text": "current question"}, "kimi")
+        self.wait_idle(handler)
+
+        assistant = chat.records[-1]
+        self.assertEqual("kimi-web", assistant["source"])
+        self.assertEqual("snapshot new", assistant["text"])
+        self.assertNotIn("LEAK", assistant["text"])
+
+    def test_private_web_failure_finally_clears_turn_and_typing_when_terminal_state_write_raises(self):
+        class ErrorWeb(FakeWebChat):
+            def stream_session(self, session_id, *, on_event, on_ready, stop_event, **_kwargs):
+                self.calls.append(("stream", session_id))
+                on_ready()
+                raise KimiWebError("stream lost")
+
+        handler, _chat, _web = self.make_handler(web=ErrorWeb())
+        typing = []
+        handler._set_typing_for_contact = lambda *args, **kwargs: typing.append((args, kwargs))
+
+        def fail_terminal_state(*_args, **_kwargs):
+            raise OSError("reply-state storage failed")
+
+        handler._set_chat_failed = fail_terminal_state
+        # The failure is deliberately allowed to escape the terminal-state
+        # write; suppress only the test process's default thread traceback so
+        # this assertion focuses on the worker's outer-finally cleanup.
+        with patch.object(threading, "excepthook") as thread_crash:
+            handler._handle_kimi_chat_send({"text": "hello"}, "kimi")
+            self.wait_idle(handler)
+            for _ in range(100):
+                if typing and len(typing[-1][0]) > 1 and typing[-1][0][1].get("is_typing") is False:
+                    break
+                __import__("time").sleep(0.01)
+
+        self.assertEqual({}, handler.state.kimi_active_turn)
+        self.assertNotIn("kimi", handler.state.chat_drafts)
+        self.assertTrue(typing and typing[-1][0][1].get("is_typing") is False)
+        thread_crash.assert_called_once()
+
+    def test_one_approval_is_allowed_once_but_questions_or_multiple_approvals_abort(self):
+        class ApprovalWeb(FakeWebChat):
+            def __init__(self, snapshot):
+                super().__init__()
+                self.snapshot = snapshot
+                self.approved = []
+            def get_snapshot(self, _session_id): return self.snapshot
+            def list_approvals(self, _session_id): return []
+            def approve_once(self, session_id, approval_id): self.approved.append((session_id, approval_id))
+            def stream_session(self, session_id, *, on_event, on_ready, stop_event, **_kwargs):
+                self.calls.append(("stream", session_id)); on_ready()
+                on_event({"type": "turn.ended", "session_id": session_id, "payload": {"turnId": "turn-1", "reason": "completed"}})
+
+        for snapshot, expected_approvals, expect_abort in (
+            ({"current_prompt_id": "prompt-1", "in_flight_turn": {"turnId": "turn-1"}, "pending_approvals": [{"approval_id": "a1"}], "pending_questions": []}, [("web-session-1", "a1")], False),
+            ({"current_prompt_id": "prompt-1", "in_flight_turn": {"turnId": "turn-1"}, "pending_approvals": [{"approval_id": "a1"}, {"approval_id": "a2"}], "pending_questions": []}, [], True),
+            ({"current_prompt_id": "prompt-1", "in_flight_turn": {"turnId": "turn-1"}, "pending_approvals": [], "pending_questions": [{"id": "q1"}]}, [], True),
+        ):
+            with self.subTest(snapshot=snapshot):
+                handler, _chat, web = self.make_handler(web=ApprovalWeb(snapshot))
+                handler._handle_kimi_chat_send({"text": "approval"}, "kimi")
+                self.wait_idle(handler)
+                self.assertEqual(expected_approvals, web.approved)
+                self.assertEqual(expect_abort, any(row[0] == "abort" for row in web.calls))
+
+    def test_empty_web_session_is_seeded_once_from_app_history(self):
+        handler, chat, web = self.make_handler()
+        chat.append(role="assistant", text="以前的 Kimi 回复", source="kimi-web")
+        handler._handle_kimi_chat_send({"text": "现在的问题"}, "kimi")
+        self.wait_idle(handler)
+        first_prompt = next(row[2] for row in web.calls if row[0] == "submit")
+        self.assertIn("以前的 Kimi 回复", first_prompt)
+        web.message_count = 2
+        handler._handle_kimi_chat_send({"text": "第二个问题"}, "kimi")
+        self.wait_idle(handler)
+        second_prompt = [row[2] for row in web.calls if row[0] == "submit"][-1]
+        self.assertNotIn("历史参考：仅首次接续", second_prompt)
+
+    def test_group_web_reply_does_not_duplicate_user_and_preserves_group_identity(self):
+        handler, chat, web = self.make_handler(web=FakeWebChat(text="@Kairos 群里好"))
+        user = chat.append(role="user", text="@Kimi 你好", source="android-app:apples", sender_id="astra", sender_name="方小南")
+        routed = []
+        typing = []
+        handler._kimi_selection = lambda: ("kimi-code/k3", "low")
+        handler._release_kimi_control = lambda _token: None
+        handler._detect_apples_mentions = lambda text: {"kairos"} if "@Kairos" in text else set()
+        handler._maybe_route_apples_assistant_mention = lambda *_args, **kwargs: routed.append(kwargs.get("hop_count"))
+        handler._has_pending_group_reply = lambda: False
+        handler._set_typing_for_contact = lambda *args, **_kwargs: typing.append(args)
+        handler._start_group_kimi_reply(chat, user["text"], sender_name="方小南", user_ts=user["ts"], hop_count=1)
+        self.wait_idle(handler)
+        self.assertEqual(1, len([row for row in chat.records if row["role"] == "user"]))
+        assistant = chat.records[-1]
+        self.assertEqual("assistant", assistant["role"])
+        self.assertEqual("kimi", assistant["sender_id"])
+        self.assertEqual("Kimi", assistant["sender_name"])
+        self.assertEqual("group:kimi-web", assistant["source"])
+        self.assertEqual(["kairos"], assistant["mentions"])
+        self.assertEqual([1], routed)
+        self.assertTrue(typing and typing[-1][1]["is_typing"] is False)
+
+    def test_group_web_bound_turn_id_rejects_missing_and_foreign_turn_events(self):
+        class ForeignPromptWeb(FakeWebChat):
+            def get_snapshot(self, _session_id):
+                return {
+                    # The camel spelling is also emitted by Kimi Web; it
+                    # binds exactly like current_prompt, never by turnId alone.
+                    "currentPrompt": {"id": "prompt-1"}, "epoch": "group-epoch", "as_of_seq": 3,
+                    "in_flight_turn": {"turnId": "group-current", "assistant_text": "snapshot "},
+                }
+
+            def stream_session(self, session_id, *, on_event, on_ready, stop_event, **_kwargs):
+                self.calls.append(("stream", session_id))
+                on_ready()
+                for event_type, payload, seq in (
+                    ("assistant.delta", {"delta": "GROUP MISSING LEAK"}, 4),
+                    ("assistant.delta", {"turnId": "group-old", "delta": "GROUP OLD LEAK"}, 5),
+                    ("turn.ended", {"turnId": "group-old", "reason": "completed"}, 6),
+                    ("assistant.delta", {"turnId": "group-current", "delta": "new"}, 7),
+                    ("turn.ended", {"turnId": "group-current", "reason": "completed"}, 8),
+                ):
+                    on_event({
+                        "type": event_type, "session_id": session_id,
+                        "epoch": "group-epoch", "seq": seq,
+                        "payload": payload,
+                    })
+
+        handler, chat, _web = self.make_handler(web=ForeignPromptWeb())
+        handler._kimi_selection = lambda: ("kimi-code/k3", "low")
+        handler._release_kimi_control = lambda _token: None
+        handler._detect_apples_mentions = lambda _text: set()
+        handler._maybe_route_apples_assistant_mention = lambda *_args, **_kwargs: None
+        handler._has_pending_group_reply = lambda: False
+        handler._set_typing_for_contact = lambda *_args, **_kwargs: None
+        user = chat.append(role="user", text="@Kimi current", source="android-app:apples")
+        handler._start_group_kimi_reply(
+            chat, user["text"], sender_name="Astra", user_ts=user["ts"], hop_count=0,
+        )
+        self.wait_idle(handler)
+
+        assistant = chat.records[-1]
+        self.assertEqual("group:kimi-web", assistant["source"])
+        self.assertEqual("snapshot new", assistant["text"])
+        self.assertNotIn("LEAK", assistant["text"])
+
+    def test_group_web_finally_clears_turn_and_typing_when_draft_cleanup_raises(self):
+        handler, chat, _web = self.make_handler(web=FakeWebChat())
+        handler._kimi_selection = lambda: ("kimi-code/k3", "low")
+        handler._release_kimi_control = lambda _token: None
+        handler._detect_apples_mentions = lambda _text: set()
+        handler._maybe_route_apples_assistant_mention = lambda *_args, **_kwargs: None
+        handler._has_pending_group_reply = lambda: False
+        typing = []
+        handler._set_typing_for_contact = lambda *args, **kwargs: typing.append((args, kwargs))
+
+        def fail_group_draft(contact_id):
+            self.assertEqual("apples", contact_id)
+            raise OSError("group draft storage failed")
+
+        handler._clear_chat_draft = fail_group_draft
+        user = chat.append(role="user", text="@Kimi current", source="android-app:apples")
+        with patch.object(threading, "excepthook") as thread_crash:
+            handler._start_group_kimi_reply(
+                chat, user["text"], sender_name="Astra", user_ts=user["ts"], hop_count=0,
+            )
+            self.wait_idle(handler)
+            for _ in range(100):
+                if typing and len(typing[-1][0]) > 1 and typing[-1][0][1].get("is_typing") is False:
+                    break
+                __import__("time").sleep(0.01)
+
+        self.assertEqual({}, handler.state.kimi_active_turn)
+        self.assertTrue(typing and typing[-1][0][1].get("is_typing") is False)
+        thread_crash.assert_not_called()
 
 
 if __name__ == "__main__":

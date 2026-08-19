@@ -94,6 +94,22 @@ class KimiTerminalObserverTest(unittest.TestCase):
         self.assertIn("正在使用工具（名称与参数已隐藏）", two["content"])
         self.assertNotIn("正在思考", two["content"])
 
+    def test_web_assistant_stream_is_bounded_and_redacted(self):
+        epoch = self.observer.begin("session-one", "turn-one")
+        self.assertTrue(self.observer.record_assistant_text(
+            "session-one", "turn-one", epoch,
+            "第一段。 token=never-show /root/private/project/file.py",
+        ))
+        self.assertTrue(self.observer.record_assistant_text("session-one", "turn-one", epoch, "第二段。"))
+
+        payload = self.observer.snapshot("session-one")
+
+        self.assertIn("助手回复（实时）：", payload["content"])
+        self.assertIn("第一段。", payload["content"])
+        self.assertIn("第二段。", payload["content"])
+        self.assertNotIn("never-show", str(payload))
+        self.assertNotIn("/root/private", str(payload))
+
     def test_unknown_activity_and_post_terminal_callbacks_are_ignored(self):
         epoch = self.observer.begin("session-one", "turn-one")
         self.assertFalse(self.observer.record_activity(
@@ -198,44 +214,35 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
 
     @mock.patch("push.subprocess.Popen")
     @mock.patch("push.subprocess.run")
-    def test_kimi_alias_uses_its_own_tui_for_capture_key_send_and_release(self, run, popen):
+    def test_kimi_legacy_terminal_entrypoints_are_disabled_before_acp_or_tmux(self, run, popen):
         handler = object.__new__(PushHandler)
         handler.path = "/tmux/capture?session=kimi"
-        lease = "a" * 43
-        bridge = types.SimpleNamespace(
-            ensure=lambda session_id: "%42" if session_id == "session-current" else "",
-            lease_for_pane=lambda pane: lease if pane == "%42" else "",
-            release=lambda candidate: candidate == lease,
-            input_transaction=lambda: nullcontext(),
-            touch=lambda: None,
-        )
+        acp = mock.Mock()
+        bridge = mock.Mock()
         handler.state = types.SimpleNamespace(
             default_session="cctg", active_session="cctg", kimi_terminal=bridge,
             kimi_turn_lock=threading.RLock(), kimi_active_turn={}, kimi_prepare_token="",
-            kimi_acp=types.SimpleNamespace(
-                busy=False, load_session_id=lambda: "session-current",
-                validated_local_session_id=lambda value: value,
-                close=lambda: None,
-            ),
+            kimi_acp=acp,
         )
         handler.responses = []
         handler._send_json = lambda status, payload: handler.responses.append((status, payload))
-        run.return_value = types.SimpleNamespace(returncode=0, stdout="Kimi ready\n", stderr="")
-        handler._handle_tmux_capture()
-        self.assertEqual(200, handler.responses[-1][0])
-        self.assertEqual("kimi", handler.responses[-1][1]["session"])
-        self.assertEqual(lease, handler.responses[-1][1]["lease"])
-        self.assertNotIn("%42", json.dumps(handler.responses[-1][1]))
+        handler._acquire_kimi_terminal = mock.Mock()
 
+        handler._handle_tmux_capture()
         handler._handle_terminal_key({"session": "kimi", "key": "Enter"})
-        self.assertEqual(200, handler.responses[-1][0])
-        self.assertEqual("kimi", handler.responses[-1][1]["session"])
-        handler._handle_terminal_release({"target": "kimi", "lease": lease})
-        self.assertEqual(200, handler.responses[-1][0])
-        self.assertTrue(handler.responses[-1][1]["released"])
+        handler._handle_tmux_send({"session": "kimi", "keys": "hello", "enter": True})
+        handler._handle_terminal_release({"target": "kimi"})
+
+        self.assertEqual([409, 409, 409, 409], [item[0] for item in handler.responses])
+        self.assertTrue(all(item[1]["error"] == "kimi_terminal_disabled" for item in handler.responses))
+        handler._acquire_kimi_terminal.assert_not_called()
+        self.assertEqual([], acp.mock_calls)
+        self.assertEqual([], bridge.mock_calls)
+        run.assert_not_called()
+        popen.assert_not_called()
 
     @mock.patch("push.subprocess.run")
-    def test_capture_holds_one_input_lock_across_acquire_lease_and_tmux_capture(self, run):
+    def test_kimi_capture_never_enters_legacy_terminal_transaction(self, run):
         handler = object.__new__(PushHandler)
         handler.path = "/tmux/capture?session=kimi"
         input_lock = threading.Lock()
@@ -268,12 +275,11 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         handler.responses = []
         handler._send_json = lambda status, payload: handler.responses.append((status, payload))
         handler._handle_tmux_capture()
-        self.assertEqual(200, handler.responses[-1][0])
-        self.assertEqual(
-            [("ensure", True, "session-current"), ("lease", True, "%42"), ("capture", True, "%42")],
-            observations,
-        )
-        acp.close.assert_called_once_with()
+        self.assertEqual(409, handler.responses[-1][0])
+        self.assertEqual("kimi_terminal_disabled", handler.responses[-1][1]["error"])
+        self.assertEqual([], observations)
+        acp.close.assert_not_called()
+        run.assert_not_called()
 
     def test_kimi_bridge_resumes_exact_durable_session_without_ambiguous_flags(self):
         calls = []
@@ -321,7 +327,7 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         self.assertIsNone(bridge._lease)
         self.assertIsNone(bridge._lease_pane)
 
-    def test_kimi_release_route_reports_stale_without_killing_current_pane(self):
+    def test_kimi_release_route_is_disabled_without_touching_legacy_bridge(self):
         lease = "a" * 43
         bridge = types.SimpleNamespace(
             input_transaction=lambda: nullcontext(),
@@ -334,8 +340,9 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
 
         handler._handle_terminal_release({"target": "kimi", "lease": lease})
 
-        bridge.release.assert_called_once_with(lease)
-        self.assertEqual((200, {"ok": True, "target": "kimi", "released": False}), handler.responses[-1])
+        bridge.release.assert_not_called()
+        self.assertEqual(409, handler.responses[-1][0])
+        self.assertEqual("kimi_terminal_disabled", handler.responses[-1][1]["error"])
 
     def test_kimi_release_targets_only_bound_pane_and_replacement_is_stale(self):
         calls = []
@@ -490,7 +497,7 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         self.assertIn(["tmux", "kill-pane", "-t", "%42"], calls)
         self.assertFalse(any(argv[1] == "kill-session" for argv in calls))
 
-    def test_terminal_busy_refuses_capture_without_closing_acp(self):
+    def test_busy_legacy_kimi_capture_is_disabled_without_closing_acp(self):
         handler = object.__new__(PushHandler)
         handler.path = "/tmux/capture?session=kimi"
         acp = types.SimpleNamespace(
@@ -512,12 +519,12 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         handler.responses = []
         handler._send_json = lambda status, payload: handler.responses.append((status, payload))
         handler._handle_tmux_capture()
-        self.assertEqual(423, handler.responses[-1][0])
-        self.assertEqual("kimi_busy", handler.responses[-1][1]["error"])
+        self.assertEqual(409, handler.responses[-1][0])
+        self.assertEqual("kimi_terminal_disabled", handler.responses[-1][1]["error"])
         acp.close.assert_not_called()
         bridge.ensure.assert_not_called()
 
-    def test_foreign_or_missing_durable_session_returns_safe_409_without_spawn(self):
+    def test_legacy_kimi_capture_does_not_read_or_spawn_from_acp_session(self):
         handler = object.__new__(PushHandler)
         handler.path = "/tmux/capture?session=kimi"
         acp = types.SimpleNamespace(
@@ -539,7 +546,7 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         handler._send_json = lambda status, payload: handler.responses.append((status, payload))
         handler._handle_tmux_capture()
         self.assertEqual(409, handler.responses[-1][0])
-        self.assertEqual("no_active_kimi_session", handler.responses[-1][1]["error"])
+        self.assertEqual("kimi_terminal_disabled", handler.responses[-1][1]["error"])
         self.assertNotIn("foreign-session", json.dumps(handler.responses[-1][1]))
         acp.close.assert_not_called()
         bridge.ensure.assert_not_called()
@@ -580,10 +587,10 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         worker.join(timeout=1)
         self.assertFalse(worker.is_alive(), "handoff lock order must not deadlock")
         self.assertTrue(result[0])
-        self.assertTrue(released.is_set())
+        self.assertFalse(released.is_set(), "Web controls must not touch ACP tmux ownership")
         acp.close.assert_not_called()
 
-    def test_new_switch_and_forge_control_reservations_all_handoff_terminal(self):
+    def test_web_control_reservations_never_handoff_an_acp_terminal(self):
         handler = object.__new__(PushHandler)
         releases = []
         handler.state = types.SimpleNamespace(
@@ -600,7 +607,7 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
             token = handler._reserve_kimi_control(action)
             self.assertTrue(token)
             handler._release_kimi_control(token)
-        self.assertEqual(["release", "release", "release"], releases)
+        self.assertEqual([], releases)
 
     def test_uncertain_tui_prompt_requires_explicit_release_before_acp_handoff(self):
         bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"))
@@ -661,6 +668,55 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
                 handler.do_POST()
                 self.assertEqual(401, handler.responses[-1][0])
                 handler._read_body.assert_not_called()
+
+    def test_authenticated_legacy_kimi_http_routes_fail_closed_without_acp_or_terminal(self):
+        def state():
+            return types.SimpleNamespace(
+                default_session="cctg", active_session="cctg", allow_remote_control=True,
+                kimi_acp=mock.Mock(), kimi_terminal=mock.Mock(),
+            )
+
+        capture = object.__new__(PushHandler)
+        capture.path = "/tmux/capture?session=kimi"
+        capture.command = "GET"
+        capture.state = state()
+        capture.responses = []
+        capture._is_public_get = lambda: False
+        capture._check_ip_allowed = lambda: True
+        capture._native_pairing_auth_matches = lambda: True
+        capture._require_auth = lambda: True
+        capture._send_json = lambda status, payload: capture.responses.append((status, payload))
+        capture._acquire_kimi_terminal = mock.Mock()
+        capture.do_GET()
+        self.assertEqual(409, capture.responses[-1][0])
+        self.assertEqual("kimi_terminal_disabled", capture.responses[-1][1]["error"])
+        capture._acquire_kimi_terminal.assert_not_called()
+        self.assertEqual([], capture.state.kimi_acp.mock_calls)
+        self.assertEqual([], capture.state.kimi_terminal.mock_calls)
+
+        for path, body in (
+            ("/terminal/key", {"session": "kimi", "key": "Enter"}),
+            ("/tmux/send", {"session": "kimi", "keys": "hello", "enter": True}),
+            ("/terminal/release", {"target": "kimi"}),
+        ):
+            with self.subTest(path=path):
+                handler = object.__new__(PushHandler)
+                handler.path = path
+                handler.command = "POST"
+                handler.state = state()
+                handler.responses = []
+                handler._check_ip_allowed = lambda: True
+                handler._native_pairing_auth_matches = lambda: True
+                handler._require_write_auth = lambda: True
+                handler._read_body = mock.Mock(return_value=body)
+                handler._send_json = lambda status, payload: handler.responses.append((status, payload))
+                handler._acquire_kimi_terminal = mock.Mock()
+                handler.do_POST()
+                self.assertEqual(409, handler.responses[-1][0])
+                self.assertEqual("kimi_terminal_disabled", handler.responses[-1][1]["error"])
+                handler._acquire_kimi_terminal.assert_not_called()
+                self.assertEqual([], handler.state.kimi_acp.mock_calls)
+                self.assertEqual([], handler.state.kimi_terminal.mock_calls)
 
     def test_http_tmux_alias_respects_remote_control_gate(self):
         capture = object.__new__(PushHandler)

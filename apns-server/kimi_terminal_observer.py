@@ -1,9 +1,9 @@
-"""Prompt-free, read-only activity observer for Kimi ACP chat turns.
+"""Prompt-free, read-only activity observer for Kimi Web chat turns.
 
-This is intentionally *not* a terminal bridge.  Kimi ACP is a stdio JSON-RPC
-client and its notifications can carry prompts, tool arguments, filesystem
+This is intentionally *not* a terminal bridge.  Kimi Web events can carry
+prompts, tool arguments, filesystem
 paths, reasoning and tool output.  The only public projection is a short list
-of labels selected by this module; no value from ACP is copied into the DTO or
+of labels selected by this module; no raw Web event value is copied into the DTO or
 the rendered terminal text.
 """
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 import json
+import re
 import threading
 import time
 from typing import Any, Callable
@@ -21,8 +22,9 @@ KIMI_TERMINAL_MAX_EVENTS = 40
 KIMI_TERMINAL_MAX_BYTES = 8 * 1024
 KIMI_TERMINAL_MAX_ELAPSED_SECONDS = 7 * 24 * 60 * 60
 KIMI_TERMINAL_MAX_SESSION_RECORDS = 8
+KIMI_TERMINAL_MAX_ASSISTANT_CHARS = 1_400
 
-# The exact display vocabulary.  Do not accept labels supplied by ACP or by a
+# The exact display vocabulary.  Do not accept labels supplied by Web or by a
 # caller: observer content is security-sensitive, not a generic activity log.
 _EVENT_LABELS = {
     "started": "已接收任务，正在准备",
@@ -43,6 +45,7 @@ class _Run:
     epoch: int
     started_at: float
     busy: bool = True
+    assistant_text: str = ""
     events: deque[tuple[int, str]] = field(
         default_factory=lambda: deque(maxlen=KIMI_TERMINAL_MAX_EVENTS)
     )
@@ -51,7 +54,7 @@ class _Run:
 class KimiTerminalObserver:
     """Keep a bounded, session-isolated observer history in memory.
 
-    The private ACP session ID and chat turn identity only fence callbacks and
+    The private Web session ID and chat turn identity only fence callbacks and
     select a record.  Neither becomes part of :meth:`snapshot`.
     """
 
@@ -113,13 +116,12 @@ class KimiTerminalObserver:
         epoch: Any,
         activity: Any,
     ) -> bool:
-        """Map the already-sanitized ACP event into one fixed observer label."""
+        """Map a fixed Web event category into one fixed observer label."""
         event_type = ""
         if isinstance(activity, dict):
             kind = str(activity.get("kind") or "")
             if kind == "activity":
-                # This repeats the allowlist even though kimi_acp already
-                # projects safely; a future caller cannot smuggle text here.
+                # A future caller cannot smuggle text into this display DTO.
                 label = str(activity.get("label") or "")
                 event_type = {
                     "正在思考": "thinking",
@@ -143,6 +145,18 @@ class KimiTerminalObserver:
             if run is None:
                 return False
             run.events.append((self._elapsed_seconds(run), label))
+            return True
+
+    def record_assistant_text(self, session_id: Any, turn_id: Any, epoch: Any, delta: Any) -> bool:
+        """Append only assistant-visible text; never thought/tool payloads."""
+        text = self._sanitize_assistant_text(delta)
+        if not text:
+            return False
+        with self._lock:
+            run = self._matching_run_locked(session_id, turn_id, epoch, require_busy=True)
+            if run is None:
+                return False
+            run.assistant_text = (run.assistant_text + text)[-KIMI_TERMINAL_MAX_ASSISTANT_CHARS:]
             return True
 
     def finish(self, session_id: Any, turn_id: Any, epoch: Any, outcome: str) -> bool:
@@ -177,17 +191,19 @@ class KimiTerminalObserver:
                     and 0 <= elapsed <= KIMI_TERMINAL_MAX_ELAPSED_SECONDS
                     and label in _EVENT_LABELS.values()
                 ]
+                assistant_text = run.assistant_text
             else:
                 state = "idle"
                 events = []
-        return self.project_snapshot({"state": state, "events": events})
+                assistant_text = ""
+        return self.project_snapshot({"state": state, "events": events, "assistant_text": assistant_text})
 
     @classmethod
     def project_snapshot(cls, value: Any) -> dict[str, Any]:
         """Rebuild a public DTO from only safe state/event primitives.
 
         HTTP uses this at its trust boundary too.  Even an accidental future
-        observer implementation cannot send pre-rendered ACP diagnostics,
+        observer implementation cannot send pre-rendered Web diagnostics,
         extra keys, or arbitrary event labels to an Android client.
         """
         if not isinstance(value, dict):
@@ -213,7 +229,7 @@ class KimiTerminalObserver:
                     and label in _EVENT_LABELS.values()
                 ):
                     safe_events.append({"elapsed_seconds": elapsed, "label": label})
-        return cls._bounded_snapshot(safe_state, safe_events)
+        return cls._bounded_snapshot(safe_state, safe_events, cls._sanitize_assistant_text(value.get("assistant_text")))
 
     def _matching_run_locked(
         self,
@@ -247,11 +263,12 @@ class KimiTerminalObserver:
         return min(elapsed, KIMI_TERMINAL_MAX_ELAPSED_SECONDS)
 
     @classmethod
-    def _bounded_snapshot(cls, state: str, events: list[dict[str, Any]]) -> dict[str, Any]:
+    def _bounded_snapshot(cls, state: str, events: list[dict[str, Any]], assistant_text: str = "") -> dict[str, Any]:
         safe_state = state if state in {"idle", "working"} else "unavailable"
         safe_events = list(events[-KIMI_TERMINAL_MAX_EVENTS:])
+        safe_assistant_text = assistant_text[-KIMI_TERMINAL_MAX_ASSISTANT_CHARS:]
         while True:
-            content = cls._render_content(safe_state, safe_events)
+            content = cls._render_content(safe_state, safe_events, safe_assistant_text)
             payload = {
                 "ok": True,
                 "target": KIMI_TERMINAL_TARGET,
@@ -263,13 +280,14 @@ class KimiTerminalObserver:
             if len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= KIMI_TERMINAL_MAX_BYTES:
                 return payload
             if not safe_events:
-                # The fixed empty response is much smaller than the cap; this
-                # is defensive against a future change to a fixed label.
+                if safe_assistant_text:
+                    safe_assistant_text = safe_assistant_text[len(safe_assistant_text) // 4:]
+                    continue
                 return cls.unavailable_snapshot()
             safe_events.pop(0)
 
     @staticmethod
-    def _render_content(state: str, events: list[dict[str, Any]]) -> str:
+    def _render_content(state: str, events: list[dict[str, Any]], assistant_text: str = "") -> str:
         phase = "正在处理" if state == "working" else "空闲"
         lines = [
             "Kimi 实时观察 · 只读",
@@ -281,6 +299,15 @@ class KimiTerminalObserver:
             elapsed = int(event["elapsed_seconds"])
             minutes, seconds = divmod(max(0, elapsed), 60)
             lines.append(f"[{minutes:02d}:{seconds:02d}] {event['label']}")
+        if assistant_text:
+            lines.extend(["", "助手回复（实时）：", assistant_text])
         if not events:
-            lines.append("等待安全活动事件…")
+            lines.append("等待安全活动事件…" if not assistant_text else "回复仍在生成…")
         return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _sanitize_assistant_text(value: Any) -> str:
+        text = "".join(char for char in str(value or "") if char in {"\n", "\r", "\t"} or (ord(char) >= 32 and ord(char) != 127))
+        text = re.sub(r"(?i)\b(?:authorization|bearer|token|api[_-]?key|password|secret)\b\s*[:=]\s*[^\s,;]+", "[已隐藏敏感内容]", text)
+        text = re.sub(r"/(?:root|home|etc|var|tmp|private|Users)(?:/[\w.\-]+)+", "[已隐藏路径]", text)
+        return text[-KIMI_TERMINAL_MAX_ASSISTANT_CHARS:]

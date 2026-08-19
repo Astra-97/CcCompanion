@@ -1,4 +1,8 @@
 import inspect
+import json
+import os
+import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -137,6 +141,115 @@ class KimiWebIsolationTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "programming bug"):
                 client.get_quota()
+
+    def test_web_pointer_is_private_atomic_and_never_reuses_acp_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pointer = os.path.join(directory, "kimi_web_session.json")
+            client = KimiWebClient(command="/unused/kimi", state_path=pointer, cwd="/tmp/kimi-cwd")
+            client.save_active_session_id("web_session-1")
+
+            self.assertEqual("web_session-1", client.load_active_session_id())
+            self.assertEqual(0o600, os.stat(pointer).st_mode & 0o777)
+            with open(pointer, encoding="utf-8") as saved:
+                payload = json.load(saved)
+            self.assertEqual(
+                {"version": 1, "session_id": "web_session-1", "cwd": "/tmp/kimi-cwd"},
+                payload,
+            )
+
+    def test_submit_resolves_exact_abort_prompt_id_from_active_prompt(self):
+        client = KimiWebClient(command="/unused/kimi")
+        calls = []
+
+        def fake_request(method, path, *, data=None, timeout=10.0):
+            calls.append((method, path, data))
+            if method == "POST":
+                return {"user_message_id": "user-1"}
+            return {"active": {"prompt_id": "prompt-1", "user_message_id": "user-1"}}
+
+        client._request = fake_request
+        result = client.submit_prompt("session-1", "hello")
+
+        self.assertEqual("prompt-1", result["prompt_id"])
+        self.assertEqual(("GET", "/api/v1/sessions/session-1/prompts", None), calls[-1])
+
+    def test_web_send_route_fails_closed_without_adapter_instead_of_calling_acp(self):
+        handler = object.__new__(PushHandler)
+        handler.state = types.SimpleNamespace(kimi_web=None)
+        responses = []
+        handler._send_json = lambda status, payload: responses.append((status, payload))
+        handler._handle_kimi_acp_chat_send = Mock()
+
+        handler._handle_kimi_chat_send({"text": "hello"}, "kimi")
+
+        self.assertEqual([(503, {"ok": False, "error": "kimi_web_unavailable"})], responses)
+        handler._handle_kimi_acp_chat_send.assert_not_called()
+
+    def test_stream_client_buffers_top_level_events_until_both_subscription_acks(self):
+        class Socket:
+            def __init__(self):
+                self.sent = []
+                self.step = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def send(self, raw):
+                self.sent.append(json.loads(raw))
+
+            def recv(self, *, timeout):
+                self.assertGreaterEqual(len(self.sent), 2)
+                hello, subscribe = self.sent[:2]
+                frames = (
+                    {"type": "assistant.delta", "session_id": "session-1", "payload": {"prompt_id": "p", "delta": "early"}},
+                    {"type": "ack", "id": hello["id"], "code": 0},
+                    {"type": "turn.ended", "session_id": "session-1", "payload": {"prompt_id": "p", "reason": "completed"}},
+                    {"type": "ack", "id": subscribe["id"], "code": 0},
+                )
+                if self.step >= len(frames):
+                    raise TimeoutError()
+                frame = frames[self.step]
+                self.step += 1
+                return json.dumps(frame)
+
+            def assertGreaterEqual(self, actual, expected):
+                if actual < expected:
+                    raise AssertionError(f"expected {actual} >= {expected}")
+
+        socket = Socket()
+        ready = []
+        delivered = []
+        stop = threading.Event()
+        client = KimiWebClient(command="/unused/kimi")
+        client._read_token = lambda: "test-token"
+
+        def on_ready():
+            # If either pre-ACK event were treated as readiness, this ordering
+            # would contain an event before ready and prompt submit could race.
+            ready.append("ready")
+
+        def on_event(frame):
+            delivered.append(frame["type"])
+            if len(delivered) == 2:
+                stop.set()
+
+        package = types.ModuleType("websockets")
+        sync = types.ModuleType("websockets.sync")
+        client_module = types.ModuleType("websockets.sync.client")
+        client_module.connect = lambda *_args, **_kwargs: socket
+        with patch.dict(sys.modules, {
+            "websockets": package,
+            "websockets.sync": sync,
+            "websockets.sync.client": client_module,
+        }):
+            client.stream_session("session-1", on_event=on_event, on_ready=on_ready, stop_event=stop)
+
+        self.assertEqual(["ready"], ready)
+        self.assertEqual(["assistant.delta", "turn.ended"], delivered)
+        self.assertEqual(["client_hello", "subscribe"], [frame["type"] for frame in socket.sent[:2]])
 
     def test_real_client_start_failure_cleans_up_and_returns(self):
         process = Mock(pid=12345)

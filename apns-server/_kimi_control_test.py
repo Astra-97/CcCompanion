@@ -85,43 +85,31 @@ class KimiACPPreferencePinTest(unittest.TestCase):
         )
 
 
-class FakeKimiACP:
+class FakeKimiWeb:
     def __init__(self):
         self.busy = False
-        self.new_calls = []
+        self.create_calls = []
         self.switch_calls = []
         self.prepare_calls = []
         self.local = [
-            {"session_id": "session-kimi-one", "updated_at": 1_700_000_000_000},
+            {"id": "session-kimi-one", "updated_at": "2026-08-19T00:00:00Z", "metadata": {"cwd": "/root/Karami-Workspace"}},
         ]
         self.current = "session-kimi-one"
-        self.confirmed = (KIMI_APP_DEFAULT_MODEL, KIMI_APP_DEFAULT_EFFORT)
+        self.cwd = "/root/Karami-Workspace"
 
-    def load_session_id(self):
+    def start(self): pass
+    def load_active_session_id(self):
         return self.current
-
-    def list_local_sessions(self, *, limit):
-        return self.local[:limit]
-
-    def new_session(self, *, model, reasoning_effort):
-        self.new_calls.append((model, reasoning_effort))
+    def list_sessions(self): return list(self.local)
+    def create_session(self, *, model, thinking):
+        self.create_calls.append((model, thinking))
         self.current = "session-kimi-new"
-        self.confirmed = (model, reasoning_effort)
         return self.current
-
-    def prepare_existing_session(self, session_id, *, model, reasoning_effort):
-        self.switch_calls.append((session_id, model, reasoning_effort))
+    def get_session_status(self, session_id):
+        return {"busy": False, "model": "kimi-code/k3", "thinking_level": "low"}
+    def save_active_session_id(self, session_id):
+        self.switch_calls.append(session_id)
         self.current = session_id
-        self.confirmed = (model, reasoning_effort)
-        return session_id
-
-    def prepare_session(self, *, model, reasoning_effort):
-        self.prepare_calls.append((model, reasoning_effort))
-        self.confirmed = (model, reasoning_effort)
-        return self.current
-
-    def prepared_selection(self, _session_id):
-        return self.confirmed
 
 
 class KimiControlRoutesTest(unittest.TestCase):
@@ -131,12 +119,13 @@ class KimiControlRoutesTest(unittest.TestCase):
             Path(self.tmp.name) / "prefs.json",
             allowed_models=(KIMI_APP_DEFAULT_MODEL, "kimi-code/k3"),
         )
-        self.acp = FakeKimiACP()
+        self.web = FakeKimiWeb()
         state = types.SimpleNamespace(
             kimi_turn_lock=threading.RLock(),
             kimi_active_turn={},
             kimi_prepare_token="",
-            kimi_acp=self.acp,
+            kimi_web=self.web,
+            kimi_acp=types.SimpleNamespace(),
             kimi_preferences=prefs,
         )
         self.handler = object.__new__(PushHandler)
@@ -151,27 +140,26 @@ class KimiControlRoutesTest(unittest.TestCase):
         self.handler.state.kimi_preferences.save_validated("kimi-code/k3", "low")
         self.handler._handle_kimi_new_session({})
         self.assertEqual(200, self.handler.responses[-1][0])
-        self.assertEqual([("kimi-code/k3", "low")], self.acp.new_calls)
+        self.assertEqual([("kimi-code/k3", "low")], self.web.create_calls)
         self.assertEqual("session-kimi-new", self.handler.responses[-1][1]["active_session_id"])
 
         self.handler._handle_kimi_switch_session({"session_id": "session-kimi-one"})
         self.assertEqual(200, self.handler.responses[-1][0])
         self.assertEqual(
-            [("session-kimi-one", "kimi-code/k3", "low")],
-            self.acp.switch_calls,
+            ["session-kimi-one"],
+            self.web.switch_calls,
         )
-        self.assertEqual([], self.acp.prepare_calls)
 
     def test_busy_and_unknown_session_fail_without_acp_mutation(self):
         self.handler.state.kimi_active_turn = {"user_ts": "turn"}
         self.handler._handle_kimi_new_session({})
         self.assertEqual(409, self.handler.responses[-1][0])
-        self.assertEqual([], self.acp.new_calls)
+        self.assertEqual([], self.web.create_calls)
         self.handler.state.kimi_active_turn = {}
 
         self.handler._handle_kimi_switch_session({"session_id": "session-not-listed"})
         self.assertEqual(404, self.handler.responses[-1][0])
-        self.assertEqual([], self.acp.switch_calls)
+        self.assertEqual([], self.web.switch_calls)
 
     def test_preferences_keep_primitive_compatibility_ids_separate_from_model_metadata(self):
         payload = self.handler._kimi_preferences_payload()
@@ -184,10 +172,10 @@ class KimiControlRoutesTest(unittest.TestCase):
         )
 
     def test_sessions_are_sanitized_and_never_echo_raw_provider_fields(self):
-        self.acp.local = [{
-            "session_id": "session-kimi-one",
-            "updated_at": 1_700_000_000_000,
-            "cwd": "/root/Karami-Workspace",
+        self.web.local = [{
+            "id": "session-kimi-one",
+            "updated_at": "2026-08-19T00:00:00Z",
+            "metadata": {"cwd": "/root/Karami-Workspace"},
             "token": "never-return",
             "lastPrompt": "never-return",
         }]
@@ -200,6 +188,19 @@ class KimiControlRoutesTest(unittest.TestCase):
         self.assertNotIn("cwd", row)
         self.assertNotIn("token", str(payload))
         self.assertNotIn("lastPrompt", str(payload))
+
+    def test_sessions_and_switch_are_limited_to_kimi_workspace(self):
+        self.web.local.append({
+            "id": "foreign-session",
+            "updated_at": "2026-08-19T00:00:00Z",
+            "metadata": {"cwd": "/tmp/not-kimi"},
+        })
+        self.handler._handle_kimi_sessions()
+        self.assertEqual(["session-kimi-one"], [row["id"] for row in self.handler.responses[-1][1]["sessions"]])
+
+        self.handler._handle_kimi_switch_session({"session_id": "foreign-session"})
+        self.assertEqual(404, self.handler.responses[-1][0])
+        self.assertEqual([], self.web.switch_calls)
 
     def test_kimi_routes_require_the_shared_secret_before_cookie_auth(self):
         for method, path in (("GET", "/kimi/status"), ("POST", "/kimi/preferences")):
@@ -296,7 +297,9 @@ class KimiIsolationAndActivityTest(unittest.TestCase):
                 payload = tomllib.loads((base / filename).read_text(encoding="utf-8"))
                 self.assertIn("kimi", payload["xhs_login"]["allowed_contacts"])
 
-    def test_worker_activity_history_is_safe_and_each_thought_or_tool_event_counts(self):
+    # ACP worker activity is retained below as a manual rollback fixture; the
+    # deployed Kimi path is Web-only and is covered in _kimi_chat_test.py.
+    def _legacy_acp_worker_activity_history_is_safe_and_each_thought_or_tool_event_counts(self):
         class Chat:
             def __init__(self): self.rows = []
             def append(self, **row):

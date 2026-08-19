@@ -9,6 +9,7 @@ import sys
 import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -33,6 +34,16 @@ def make_handler():
 
     stub = Stub()
     stub._test_chat = ChatHistory(TEST_CHAT_PATH)
+    stub.state = SimpleNamespace(
+        contact_chats={"xiaoke": stub._test_chat, "kairos": stub._test_chat, "kimi": stub._test_chat, "apples": stub._test_chat},
+        contact_catalog=[],
+        contact_routes={
+            "xiaoke": {"send_handler": "xiaoke", "capabilities": ["chat", "history", "group_member", "group_reply"], "group_dispatcher": "xiaoke"},
+            "kairos": {"send_handler": "kairos", "capabilities": ["chat", "history", "group_member", "group_reply"], "group_dispatcher": "kairos"},
+            "kimi": {"send_handler": "kimi", "capabilities": ["chat", "history", "group_member", "group_reply"], "group_dispatcher": "kimi"},
+            "apples": {"send_handler": "apples", "capabilities": ["chat", "history", "group_chat"]},
+        },
+    )
 
     # Bind unbound methods from push.PushHandler onto the stub via descriptors.
     H = push.PushHandler
@@ -51,9 +62,16 @@ def make_handler():
         # mock — pretend tmux inject ok, don't actually fire
         return True, None
 
-    def _start_group_kairos_reply(self, chat, text, sender_name="Astra", hop_count=0):
+    def _start_group_kairos_reply(self, chat, text, sender_name="Astra", hop_count=0, **kwargs):
         # mock — pretend codex inject ok
         return None
+
+    def _start_group_kimi_reply(self, chat, text, sender_name="Astra", hop_count=0, **kwargs):
+        self.kimi_group_calls = getattr(self, "kimi_group_calls", []) + [(text, sender_name, hop_count, kwargs)]
+        return None
+
+    def _link_context_from_record(self, rec):
+        return ""
 
     def _remember_group_reply(self, member_id, ts, source_member=None):
         return None
@@ -68,6 +86,8 @@ def make_handler():
         "_source_for_request": _source_for_request,
         "_inject_to_session": _inject_to_session,
         "_start_group_kairos_reply": _start_group_kairos_reply,
+        "_start_group_kimi_reply": _start_group_kimi_reply,
+        "_link_context_from_record": _link_context_from_record,
         "_remember_group_reply": _remember_group_reply,
         "_group_reply_marker": _group_reply_marker,
     }
@@ -84,6 +104,10 @@ def make_handler():
         "_apples_members",
         "_apples_self_id",
         "_apples_member_ids",
+        "_apples_replyable_member_ids",
+        "_invalid_explicit_apples_mentions",
+        "_normalize_mentioned_member_ids",
+        "_chat_contact_directory",
     ]:
         bound[name] = getattr(H, name)
 
@@ -128,6 +152,13 @@ def clear_pair_cache(handler):
     for tgt in (type(handler), push.PushHandler):
         if hasattr(tgt, "_apples_dispatch_rate"):
             getattr(tgt, "_apples_dispatch_rate").clear()
+
+
+def test_explicit_mentions_only_accept_registered_group_dispatchers():
+    handler = make_handler()
+    assert handler._normalize_mentioned_member_ids(["astra", "kimi", "Kairos", "xiaoke"]) == ["kairos", "kimi", "xiaoke"]
+    assert handler._invalid_explicit_apples_mentions(["kimi", "missing", "kairos"]) == ["missing"]
+    assert handler._invalid_explicit_apples_mentions(["hajiki"]) == ["hajiki"]
 
 
 def read_history():
@@ -327,13 +358,31 @@ def test_backward_compat():
     print("PASS")
 
 
+def test_kimi_group_dispatch_is_registered_and_human_safe():
+    reset_class_caches()
+    truncate_history()
+    handler = make_handler()
+    rec = make_rec("astra", "@Kimi 你好")
+    routed, errors = handler._dispatch_apples_mentions(
+        rec, "apples", {"kimi"}, "Astra", hop_count=0, sender_id="astra",
+    )
+    assert routed == ["kimi"], (routed, errors)
+    assert errors == {}
+    assert len(handler.kimi_group_calls) == 1
+    assert handler.kimi_group_calls[0][0] == "@Kimi 你好"
+    assert "kimi" in handler._apples_replyable_member_ids()
+    print("PASS")
+
+
 if __name__ == "__main__":
+    test_explicit_mentions_only_accept_registered_group_dispatchers()
     test_hop_limit()
     test_pair_rate_limit()
     test_sender_global()
     test_room_global()
     test_astra_exemption()
     test_backward_compat()
+    test_kimi_group_dispatch_is_registered_and_human_safe()
     print("\n=== ALL TESTS PASSED ===")
     print(f"\nConstants: HOP_LIMIT={push.PushHandler.APPLES_HOP_LIMIT}")
     print(f"PAIR_LIMIT_SEC={push.PushHandler.APPLES_PAIR_RATE_LIMIT_SEC}")
