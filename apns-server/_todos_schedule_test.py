@@ -101,6 +101,21 @@ class ScheduleTodosTest(unittest.TestCase):
         with self.assertRaises(todos.ScheduleTodoStoreError):
             todos.collect_all(self.path)
 
+    def test_present_non_boolean_rollover_is_rejected_fail_closed(self):
+        event = _event("evt1", "不可信标记", "2026-08-16", "19:00")
+        event["rollover"] = "true"
+        self.write([event])
+        before = self.path.read_bytes()
+
+        with self.assertRaises(todos.ScheduleTodoStoreError):
+            todos.collect_all(self.path)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(
+            todos.toggle("", "", "", event_id="evt1", expected_done=False, schedule_path=self.path),
+            {"ok": False, "error": "schedule_unavailable"},
+        )
+        self.assertEqual(self.path.read_bytes(), before)
+
 
 class ChannelTransportPostContractTest(unittest.TestCase):
     def setUp(self):

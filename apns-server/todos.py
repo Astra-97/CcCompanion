@@ -462,6 +462,11 @@ def _validate_schedule(events: Any) -> None:
             raise ScheduleTodoStoreError("schedule data invalid")
         if event.get("note") is not None and not isinstance(event.get("note"), str):
             raise ScheduleTodoStoreError("schedule data invalid")
+        # Legacy entries intentionally omit this opt-in field.  When present,
+        # it must be exact boolean data so only the schedule daemon can treat
+        # an item as an automatically rolling todo/DDL.
+        if not isinstance(event.get("rollover", False), bool):
+            raise ScheduleTodoStoreError("schedule data invalid")
 
 
 def _schedule_item(event: dict[str, Any]) -> dict:
