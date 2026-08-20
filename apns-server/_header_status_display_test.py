@@ -47,6 +47,17 @@ class HeaderStatusDisplayTest(unittest.TestCase):
         self.assertEqual("小克状态加载中", display["text"])
         self.assertEqual("小克状态加载中", display["loading_text"])
 
+    def test_saved_xiaoke_unicode_status_preserves_emoji(self):
+        handler = object.__new__(PushHandler)
+        import push
+        original = push._read_ai_status
+        push._read_ai_status = lambda _contact: "全世界都在为白昼的诞生送上祝福🍎"
+        try:
+            display = handler._chat_header_status_display("xiaoke")
+        finally:
+            push._read_ai_status = original
+        self.assertEqual("全世界都在为白昼的诞生送上祝福🍎", display["text"])
+
     def test_kimi_model_label_strips_provider_prefix(self):
         self.assertEqual("K3-256k", PushHandler._kimi_header_model("kimi-code/k3-256k"))
         self.assertEqual("K3", PushHandler._kimi_header_model("kimi-code/k3"))

@@ -318,6 +318,10 @@ class XiaokeStopTest(unittest.TestCase):
         handler._handle_chat_stop({"contact_id": "not-xiaoke", "user_ts": "turn-1", "session": "cctg"})
         run.assert_not_called()
         self.assertEqual(handler.responses[-1][0], 400)
+        self.assertEqual(
+            handler.responses[-1][1]["error"],
+            "Stop only supports the XiaoKe private chat",
+        )
 
         handler._handle_chat_stop({"contact_id": "XIAOKE", "user_ts": "turn-1", "session": "cctg"})
         run.assert_not_called()

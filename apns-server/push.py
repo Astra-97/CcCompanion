@@ -157,6 +157,15 @@ from kimi_preferences import (
 )
 from kimi_terminal_observer import KimiTerminalObserver
 from kimi_web_client import KimiWebClient, KimiWebError, KimiWebRecoveryConflict, KimiWebSessionBusy
+from contacts import (
+    chat_contact_directory,
+    clean_xiaoke_private_metadata,
+    default_contact_routes,
+    dispatch_contact_get,
+    dispatch_contact_post,
+    dispatch_contact_send,
+    dispatch_contact_stop,
+)
 import todos as todos_mod
 from studyroom import StudyroomDB
 from ai_chat import AIChatManager
@@ -3377,16 +3386,7 @@ class ServerState:
         # A contact becomes chat/forward-capable only after a concrete handler
         # is registered here.  Adding a JSON catalog entry or a history file
         # alone must never expose an unroutable UI target.
-        self.contact_routes: dict[str, dict[str, Any]] = {
-            "xiaoke": {"send_handler": "xiaoke", "capabilities": ["chat", "history", "draft", "busy", "stop", "attachments", "terminal", "forward", "group_member", "group_reply"], "group_dispatcher": "xiaoke"},
-            "kairos": {"send_handler": "kairos", "capabilities": ["chat", "history", "draft", "busy", "stop", "attachments", "terminal", "model_preferences", "session_control", "memory_recall", "forward", "group_member", "group_reply"], "group_dispatcher": "kairos"},
-            # The transport behind this registered handler is being migrated
-            # independently; this directory does not imply ACP group routing.
-            "kimi": {"send_handler": "kimi", "capabilities": ["chat", "history", "draft", "busy", "stop", "kimi_model_preferences", "kimi_session_control", "kimi_memory_recall", "forward", "group_member", "group_reply"], "group_dispatcher": "kimi"},
-            "hajiki": {"capabilities": ["history"]},
-            "apples": {"send_handler": "apples", "capabilities": ["chat", "history", "draft", "busy", "attachments", "forward", "group_chat"]},
-            "toolbot": {"capabilities": ["history"]},
-        }
+        self.contact_routes: dict[str, dict[str, Any]] = default_contact_routes()
         # Optional server-owned presentation extensions.  They can customize
         # labels for a registered route, but cannot grant any capability.
         raw_contact_catalog = server_cfg.get("contact_catalog", [])
@@ -6098,29 +6098,10 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/chat/stream"):
             self._handle_chat_stream()
             return
-        if self.path == "/codex/status":
-            self._handle_codex_status()
-            return
-        if self.path == "/codex/preferences" or self.path.startswith("/codex/preferences?"):
-            self._handle_codex_preferences_get()
-            return
-        if self.path == "/codex/sessions":
-            self._handle_codex_sessions()
+        if dispatch_contact_get(self, request_path):
             return
         if self.path == "/toolbot/capabilities":
             self._send_json(200, {"ok": True, "effort_levels": list(TOOLBOT_EFFORT_LEVELS)})
-            return
-        if self.path == "/kimi/status":
-            self._handle_kimi_status()
-            return
-        if self.path == "/kimi/terminal/observer":
-            self._handle_kimi_terminal_observer()
-            return
-        if self.path == "/kimi/preferences" or self.path.startswith("/kimi/preferences?"):
-            self._handle_kimi_preferences_get()
-            return
-        if self.path == "/kimi/sessions" or self.path.startswith("/kimi/sessions?"):
-            self._handle_kimi_sessions()
             return
         if self.path == "/settings":
             self._send_json(200, {"ok": True, "settings": self.state.settings.snapshot()})
@@ -6667,35 +6648,10 @@ class PushHandler(BaseHTTPRequestHandler):
         elif self.path == "/toolbot/command":
             self._handle_toolbot_command(body)
             return
-        elif self.path == "/codex/preferences":
-            self._handle_codex_preferences_post(body)
+        elif dispatch_contact_post(self, request_path, body):
             return
         elif request_path == "/mcp-services":
             self._handle_mcp_services_post(body)
-            return
-        elif self.path == "/codex/abort":
-            self._handle_codex_abort(body)
-            return
-        elif self.path == "/codex/new_session":
-            self._handle_codex_new_session(body)
-            return
-        elif self.path == "/codex/switch":
-            self._handle_codex_switch(body)
-            return
-        elif self.path == "/codex/forge":
-            self._handle_codex_forge(body)
-            return
-        elif self.path == "/kimi/preferences":
-            self._handle_kimi_preferences_post(body)
-            return
-        elif self.path == "/kimi/new_session":
-            self._handle_kimi_new_session(body)
-            return
-        elif self.path == "/kimi/switch_session":
-            self._handle_kimi_switch_session(body)
-            return
-        elif self.path == "/kimi/forge":
-            self._handle_kimi_forge(body)
             return
         elif self.path == "/ai-status":
             self._handle_ai_status_post(body)
@@ -9026,157 +8982,8 @@ class PushHandler(BaseHTTPRequestHandler):
         discoverable without a mobile-app update once its provider has a real
         server history binding; unbound config entries are not advertised.
         """
-        definitions: list[dict[str, Any]] = [
-            {
-                "id": "xiaoke",
-                "display_name": "小克",
-                "provider": "claude-code",
-                "terminal_target": "",  # default CC tmux session, never a browser path
-                "capabilities": ["chat", "history", "draft", "busy", "stop", "attachments", "terminal", "forward", "group_member", "group_reply"],
-                "group_display_name": "小克（螃蟹版）",
-                "group_mention": "@小克",
-                "group_color": "clay",
-                "stop_fields": ["contact_id", "user_ts", "session"],
-            },
-            {
-                "id": "kairos",
-                "display_name": "Kairos",
-                "provider": "codex-app-server",
-                "terminal_target": KAIROS_TERMINAL_ALIAS,
-                "capabilities": [
-                    "chat", "history", "draft", "busy", "stop", "attachments", "terminal",
-                    "model_preferences", "session_control", "memory_recall", "forward", "group_member", "group_reply",
-                ],
-                "group_mention": "@Kairos",
-                "group_color": "gold",
-                "stop_fields": ["contact_id", "user_ts"],
-            },
-            {
-                "id": "kimi",
-                "display_name": "Kimi",
-                "provider": "kimi-web",
-                "terminal_target": "",
-                "capabilities": [
-                    "chat", "history", "draft", "busy", "stop",
-                    "kimi_model_preferences", "kimi_session_control", "kimi_memory_recall", "forward", "group_member", "group_reply",
-                ],
-                "group_mention": "@Kimi",
-                "group_display_name": "Kimi",
-                "group_color": "sage",
-                "stop_fields": ["contact_id", "user_ts"],
-            },
-            {
-                "id": "hajiki",
-                "display_name": "哈基米",
-                "provider": "contact-local",
-                "terminal_target": "",
-                "capabilities": ["history"],
-                "stop_fields": [],
-            },
-            {
-                "id": "apples",
-                "display_name": "苹果幼稚园",
-                "provider": "group-router",
-                "terminal_target": "",
-                "capabilities": ["chat", "history", "draft", "busy", "attachments", "forward", "group_chat"],
-                "stop_fields": [],
-            },
-            {
-                "id": "toolbot",
-                "display_name": "小克·工具版",
-                "provider": "task-observer",
-                "terminal_target": "",
-                "capabilities": ["history"],
-                "stop_fields": [],
-            },
-        ]
-        configured = getattr(self.state, "contact_catalog", None)
-        if isinstance(configured, (list, tuple)):
-            definitions.extend(item for item in configured if isinstance(item, dict))
+        return chat_contact_directory(self.state)
 
-        routes = getattr(self.state, "contact_routes", None)
-        if not isinstance(routes, dict):
-            # Older focused test fixtures predate ServerState.contact_routes.
-            # Keep their built-in routes compatible, but intentionally do not
-            # infer anything for configured/future contact IDs.
-            routes = {
-                "xiaoke": {"send_handler": "xiaoke", "capabilities": ["chat", "history", "draft", "busy", "stop", "attachments", "terminal", "forward", "group_member", "group_reply"], "group_dispatcher": "xiaoke"},
-                "kairos": {"send_handler": "kairos", "capabilities": ["chat", "history", "draft", "busy", "stop", "attachments", "terminal", "forward", "group_member", "group_reply"], "group_dispatcher": "kairos"},
-                "kimi": {"send_handler": "kimi", "capabilities": ["chat", "history", "draft", "busy", "stop", "forward", "group_member", "group_reply"], "group_dispatcher": "kimi"},
-                "hajiki": {"capabilities": ["history"]},
-                "apples": {"send_handler": "apples", "capabilities": ["chat", "history", "draft", "busy", "attachments", "forward", "group_chat"]},
-                "toolbot": {"capabilities": ["history"]},
-            }
-        supported_send_handlers = {"xiaoke", "kairos", "kimi", "apples"}
-        supported_group_dispatchers = {"xiaoke", "kairos", "kimi"}
-
-        known_ids: set[str] = set()
-        contacts: list[dict[str, Any]] = []
-        for definition in definitions:
-            contact_id = str(definition.get("id") or "").strip().lower()
-            if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", contact_id) or contact_id in known_ids:
-                continue
-            route = routes.get(contact_id)
-            if not isinstance(route, dict):
-                continue
-            # Capabilities are owned by the route registration.  In
-            # particular, catalog JSON cannot promote an observer to a chat
-            # endpoint or a group member into a group-reply dispatcher.
-            route_capabilities = route.get("capabilities")
-            if not isinstance(route_capabilities, list):
-                route_capabilities = []
-            capabilities = [
-                str(value).strip().lower()
-                for value in route_capabilities
-                if isinstance(value, str)
-                and re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", value.strip().lower())
-            ]
-            capabilities = list(dict.fromkeys(capabilities))
-            contact_chats = getattr(self.state, "contact_chats", None)
-            if isinstance(contact_chats, dict) and contact_id not in contact_chats:
-                continue
-            handler = str(route.get("send_handler") or "").strip().lower()
-            routable_chat = handler in supported_send_handlers and handler == contact_id
-            if not routable_chat:
-                capabilities = [
-                    cap for cap in capabilities
-                    if cap not in {"chat", "draft", "busy", "stop", "attachments", "terminal", "forward", "group_chat"}
-                ]
-            group_dispatcher = str(route.get("group_dispatcher") or "").strip().lower()
-            if group_dispatcher not in supported_group_dispatchers or group_dispatcher != contact_id:
-                capabilities = [cap for cap in capabilities if cap != "group_reply"]
-            display_name = re.sub(r"[\x00-\x1f\x7f]", "", str(definition.get("display_name") or contact_id)).strip()[:80]
-            if not display_name:
-                continue
-            known_ids.add(contact_id)
-            contact = {
-                "id": contact_id,
-                "display_name": display_name,
-                "provider": re.sub(r"[\x00-\x1f\x7f]", "", str(definition.get("provider") or "contact")).strip()[:80],
-                "capabilities": capabilities,
-                "read_only": "chat" not in capabilities,
-                "terminal_target": re.sub(
-                    r"[\x00-\x1f\x7f]", "", str(definition.get("terminal_target") or "")
-                ).strip()[:80],
-                # One semantic stop request; the backend routes it to the
-                # exact provider-specific interrupt implementation.
-                "stop": {
-                    "supported": "stop" in capabilities,
-                    "endpoint": "/chat/stop" if "stop" in capabilities else "",
-                    "required_fields": [
-                        field.strip().lower()
-                        for field in (definition.get("stop_fields") if isinstance(definition.get("stop_fields"), list) else [])
-                        if isinstance(field, str)
-                        and re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", field.strip().lower())
-                    ],
-                },
-            }
-            for key in ("group_display_name", "group_mention", "group_color"):
-                value = re.sub(r"[\x00-\x1f\x7f]", "", str(definition.get(key) or "")).strip()
-                if value:
-                    contact[key] = value[:80]
-            contacts.append(contact)
-        return contacts
 
     def _handle_chat_contacts(self) -> None:
         """Versioned, server-owned contact/capability directory for all UIs."""
@@ -9818,33 +9625,30 @@ class PushHandler(BaseHTTPRequestHandler):
         if metadata_in is not None:
             metadata_clean = dict(metadata_in)
             if contact_id == "xiaoke":
-                normalized_health = normalize_health_context(metadata_clean.get("health_context"))
-                shared = is_explicit_health_share(body.get("text"), metadata_clean)
-                if normalized_health is None or not shared:
-                    if normalized_health is not None:
-                        logger.info("health_context dropped: message is not an explicit health share")
-                    metadata_clean.pop("health_context", None)
-                else:
-                    metadata_clean["health_context"] = normalized_health
+                metadata_clean, dropped_health_context = clean_xiaoke_private_metadata(
+                    metadata_clean,
+                    body.get("text"),
+                    normalize_health_context=normalize_health_context,
+                    is_explicit_health_share=is_explicit_health_share,
+                )
+                if dropped_health_context:
+                    logger.info("health_context dropped: message is not an explicit health share")
             else:
                 metadata_clean.pop("health_context", None)
             if metadata_clean:
                 body["metadata"] = metadata_clean
             else:
                 body.pop("metadata", None)
-        if contact_id == "kairos":
-            self._handle_kairos_chat_send(body, contact_id)
-            return
-        if contact_id == "kimi":
-            self._handle_kimi_chat_send(body, contact_id)
-            return
         if contact_id == "apples":
             self._handle_apples_chat_send(body, contact_id)
             return
-        if contact_id not in {"xiaoke"}:
+        if not dispatch_contact_send(self, contact_id, body):
             self._send_json(501, {"ok": False, "error": f"contact not wired yet: {contact_id}"})
             return
 
+    def _handle_xiaoke_chat_send(self, body: dict[str, Any]) -> None:
+        """Run XiaoKe's exact-turn pipeline after shared request preparation."""
+        contact_id = "xiaoke"
         text = body.get("text", "").strip()
         quoted_ts = body.get("quoted_ts") or None
         location = body.get("location") or None
@@ -10134,23 +9938,10 @@ class PushHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _kimi_inbound_not_text_only(body: dict[str, Any]) -> bool:
-        forbidden = (
-            "attachment_id", "attachment_ids", "attachments", "attachment_path",
-            "attachment_url", "attachment_type", "attachment_filename",
-            "upload_id", "staged_attachment_ids", "location", "voice_mode",
-            "voice_continuation", VOICE_REPLY_TOKEN_FIELD,
-        )
-        if any(body.get(field) for field in forbidden):
-            return True
-        metadata = body.get("metadata")
-        if not isinstance(metadata, dict):
-            return metadata is not None
-        return (
-            metadata.get("via") == "card"
-            or bool(metadata.get("card"))
-            or bool(metadata.get("card_title"))
-            or any("card" in str(key).lower() and bool(value) for key, value in metadata.items())
-        )
+        # Compatibility shim for focused tests and old call sites.  The
+        # policy itself is contact-owned in contacts/kimi.py.
+        from contacts.kimi import rejects_inbound
+        return rejects_inbound(body)
 
     def _kimi_link_bundle(self, text: str) -> LinkPreviewBundle:
         """Fail open while keeping Kimi's text ingress on the safe preview path."""
@@ -11875,43 +11666,14 @@ class PushHandler(BaseHTTPRequestHandler):
         self._handle_chat_send(forward)
 
     def _handle_chat_stop(self, body: dict[str, Any]) -> None:
-        """Stop exactly one active XiaoKe App turn in its dedicated Claude TUI.
+        """Route a semantic private-chat Stop to its contact adapter."""
+        if not dispatch_contact_stop(self, body):
+            self._send_json(400, {"ok": False, "error": "Stop only supports the XiaoKe private chat"})
 
-        The claim is consumed before Ctrl-C is sent, making retries idempotent.
-        A stale turn/session conflicts without touching tmux; completion racing
-        the request is a benign no-op.  The dedicated XiaoKe Claude session's
-        established interrupt is one literal terminal Ctrl-C.
-        """
-        # Stop targets are intentionally exact, stable contract IDs.  Do not
-        # normalize user-controlled variants here: XiaoKe's established stop
-        # fence treats `XIAOKE` as an unknown target rather than risking a
-        # Ctrl-C on a caller-selected terminal.
-        contact_id = str(body.get("contact_id") or "").strip()
+    def _handle_xiaoke_chat_stop(self, body: dict[str, Any]) -> None:
+        """Run XiaoKe's exact-turn stop state machine after route selection."""
         user_ts = str(body.get("user_ts") or "").strip()
         session = str(body.get("session") or "").strip()
-        # Provider-neutral desktop/mobile contract: Kairos uses the Codex
-        # app-server interrupt path, but clients should not need to know that
-        # or manufacture a separate `/codex/abort` request.  The cancel is
-        # still fenced by this contact and (when supplied) exact user turn.
-        if contact_id == "kairos":
-            if not user_ts:
-                self._send_json(400, {
-                    "ok": False,
-                    "error": "user_ts is required to stop a Kairos turn",
-                })
-                return
-            self._handle_codex_abort({
-                "contact_id": "kairos",
-                "user_ts": user_ts,
-                "cancel_pending": True,
-            })
-            return
-        if contact_id == "kimi":
-            self._handle_kimi_chat_stop(user_ts)
-            return
-        if contact_id != "xiaoke":
-            self._send_json(400, {"ok": False, "error": "Stop only supports the XiaoKe private chat"})
-            return
         if not user_ts or not session:
             self._send_json(400, {"ok": False, "error": "user_ts and session are required"})
             return
@@ -12084,7 +11846,6 @@ class PushHandler(BaseHTTPRequestHandler):
             "session": session,
             "message": "已停止小克生成。",
         })
-
     def _stop_orphaned_kimi_web_turn(self, user_ts: str) -> tuple[bool, str]:
         """Stop a restart-orphan only when its durable identity matches."""
         web = getattr(self.state, "kimi_web", None)
@@ -12552,14 +12313,12 @@ class PushHandler(BaseHTTPRequestHandler):
         lines, account data, and provider diagnostics.
         """
         candidate_text = str(text or "").strip()
-        # Header summaries add only a middle-dot separator and a percentage to
-        # the normal status-label alphabet.  Keep this stricter than arbitrary
-        # AI status text so this endpoint cannot become a raw-status channel.
-        safe_text = (
-            candidate_text
-            if re.fullmatch(r"[A-Za-z0-9\u4e00-\u9fff .:_+\-/()%\u00b7]{1,80}", candidate_text)
-            else ""
-        )
+        # Custom per-contact statuses are intentionally Unicode-capable (for
+        # example Astra's trailing apple emoji).  They already pass through
+        # the bounded status sanitizer at the write boundary; applying the
+        # narrow model-label regex here made one emoji invalidate the entire
+        # saved status and incorrectly exposed the loading fallback.
+        safe_text = _sanitize_ai_status(candidate_text) or ""
         safe_loading = cls._pwa_bounded_text(loading_text, maximum=40) or "状态加载中"
         safe_unavailable = cls._pwa_bounded_text(unavailable_text, maximum=40) or "状态暂不可用"
         safe_model = cls._pwa_bounded_text(model, maximum=48)
