@@ -833,6 +833,10 @@ KAIROS_TERMINAL_READY_VALUE = "cccompanion:qiaokairos:ready:v1"
 KIMI_TERMINAL_OWNER_OPTION = "@ccc_kimi_terminal_owner"
 KIMI_TERMINAL_OWNER_VALUE = "cccompanion:kimi-terminal:v1"
 KIMI_TERMINAL_SESSION_OPTION = "@ccc_kimi_terminal_session"
+# The Web status endpoint can lag immediately after a TUI Enter. Do not turn
+# one early idle read into authority to terminate the pane it just submitted.
+KIMI_TERMINAL_SUBMIT_GRACE_SECONDS = 3.0
+KIMI_TERMINAL_IDLE_CONFIRMATION_GAP_SECONDS = 0.5
 KAIROS_TERMINAL_COMPAT_LOCK_WAIT_TEXT = (
     "旧版 standalone 客户端占用兼容锁；等待它退出后自动连接…"
 )
@@ -1218,15 +1222,27 @@ class KimiTerminalBridge:
         self._lease: str | None = None
         self._lease_pane: str | None = None
         self._session_fingerprint: str | None = None
+        self._session_id: str | None = None
         # The TUI protocol has no trustworthy completion event. Once Enter
         # submits a prompt, automatic ACP takeover must fail closed until the
         # App explicitly releases this pane (normally when leaving the tab).
         self._prompt_active_uncertain = False
+        self._prompt_submitted_at = 0.0
+        self._prompt_epoch = 0
+        self._prompt_busy_observed = False
+        self._prompt_idle_confirmations = 0
+        self._prompt_first_idle_at = 0.0
+        self._status_probe: Callable[[str], bool | None] | None = None
         self._timer: threading.Timer | None = None
         self._last_activity = 0.0
 
     def input_transaction(self):
         return self._input_lock
+
+    def set_status_probe(self, probe: Callable[[str], bool | None]) -> None:
+        """Install the server-local exact-session status probe for reaping."""
+        with self._lock:
+            self._status_probe = probe
 
     def _run_tmux(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
         return self._run(argv, capture_output=True, text=True, timeout=5)
@@ -1305,7 +1321,49 @@ class KimiTerminalBridge:
         with self._lock:
             if self._lease is not None and self._lease_pane is not None:
                 self._prompt_active_uncertain = True
+                self._prompt_submitted_at = time.monotonic()
+                self._prompt_epoch += 1
+                self._prompt_busy_observed = False
+                self._prompt_idle_confirmations = 0
+                self._prompt_first_idle_at = 0.0
                 self._touch_locked()
+
+    def observe_session_status(
+        self,
+        session_id: str,
+        busy: Any,
+        *,
+        expected_pane: str | None = None,
+        expected_epoch: int | None = None,
+    ) -> bool:
+        """Record one exact-session status sample for the submitted epoch."""
+        expected = self._fingerprint_session(str(session_id))
+        with self._lock:
+            if (
+                not self._prompt_active_uncertain
+                or not self._session_fingerprint
+                or not hmac.compare_digest(self._session_fingerprint, expected)
+                or not isinstance(busy, bool)
+                or (expected_pane is not None and self._lease_pane != expected_pane)
+                or (expected_epoch is not None and self._prompt_epoch != expected_epoch)
+            ):
+                return False
+            if busy:
+                self._prompt_busy_observed = True
+                self._prompt_idle_confirmations = 0
+                self._prompt_first_idle_at = 0.0
+                return True
+            if time.monotonic() - self._prompt_submitted_at < KIMI_TERMINAL_SUBMIT_GRACE_SECONDS:
+                return False
+            now = time.monotonic()
+            if self._prompt_busy_observed:
+                self._prompt_idle_confirmations = 1
+            elif self._prompt_idle_confirmations == 0:
+                self._prompt_idle_confirmations = 1
+                self._prompt_first_idle_at = now
+            elif now - self._prompt_first_idle_at >= KIMI_TERMINAL_IDLE_CONFIRMATION_GAP_SECONDS:
+                self._prompt_idle_confirmations = 2
+            return True
 
     def owns_live_session(self, session_id: str) -> bool:
         """Whether this process still owns the exact live TUI for ``session_id``.
@@ -1335,6 +1393,112 @@ class KimiTerminalBridge:
                 return not pane_dead and hmac.compare_digest(pane_id, self._lease_pane)
             except Exception:
                 return False
+
+    def can_adopt_bound_session(self, session_id: str) -> bool:
+        """Whether a post-restart bridge may *readopt* one exact owned pane.
+
+        This is intentionally narrower than a generic tmux discovery: it is
+        available only before this process has issued a lease, and requires the
+        immutable session fingerprint written by the bridge itself.  It lets a
+        reconnect capture a prompt which was already running when the service
+        restarted; it never launches another TUI and the adopted pane remains
+        uncertain/read-only until Web reports the exact session idle.
+        """
+        expected = self._fingerprint_session(str(session_id))
+        with self._lock:
+            if self._lease is not None:
+                return False
+            try:
+                if not self._has_session_locked() or not self._owns_session_locked():
+                    return False
+                pane_id, pane_dead = self._pane_status_locked()
+                return (
+                    not pane_dead
+                    and bool(pane_id)
+                    and hmac.compare_digest(self._bound_session_locked(), expected)
+                )
+            except Exception:
+                return False
+
+    def terminal_state(self, expected_pane: str) -> str:
+        """Return a fenced Kimi input state without exposing pane identity.
+
+        A submitted (or restart-adopted) prompt has no trustworthy terminal
+        completion event, so its pane may be captured but cannot receive a
+        second input until the Web session has confirmed it idle.
+        """
+        if not re.fullmatch(r"%[0-9]+", str(expected_pane)):
+            raise KimiTerminalUnavailable("Kimi 终端 pane 身份异常")
+        with self._lock:
+            if not self._has_session_locked() or not self._owns_session_locked():
+                raise KimiTerminalUnavailable("Kimi 终端已切换")
+            pane_id, pane_dead = self._pane_status_locked()
+            if (
+                pane_dead
+                or not hmac.compare_digest(pane_id, expected_pane)
+                or self._lease is None
+                or self._lease_pane is None
+                or not hmac.compare_digest(self._lease_pane, expected_pane)
+            ):
+                raise KimiTerminalUnavailable("Kimi 终端已切换")
+            self._touch_locked()
+            return "waiting" if self._prompt_active_uncertain else "ready"
+
+    def reconcile_idle_session(self, session_id: str, *, stable_idle: bool = False) -> bool:
+        """Clear uncertainty only after the exact Web session reports idle.
+
+        The caller holds the terminal-acquire reservation while it made that
+        Web observation, so a new Web writer cannot appear between the check
+        and this transition.  Unknown panes and session mismatches remain
+        fail-closed.
+        """
+        expected = self._fingerprint_session(str(session_id))
+        with self._lock:
+            if (
+                not self._lease
+                or not self._lease_pane
+                or not self._session_fingerprint
+                or not hmac.compare_digest(self._session_fingerprint, expected)
+            ):
+                return False
+            try:
+                if not self._has_session_locked() or not self._owns_session_locked():
+                    return False
+                pane_id, pane_dead = self._pane_status_locked()
+                if (
+                    pane_dead
+                    or not hmac.compare_digest(pane_id, self._lease_pane)
+                    or not hmac.compare_digest(self._bound_session_locked(), expected)
+                ):
+                    return False
+            except Exception:
+                return False
+            # A just-submitted TUI turn can still look idle to Web for a
+            # moment. Never clear uncertainty from a caller's single idle
+            # sample: require a grace window plus this epoch's observed
+            # busy→idle transition, or two stable idle samples as fallback.
+            if self._prompt_active_uncertain and (
+                not stable_idle
+                or time.monotonic() - self._prompt_submitted_at < KIMI_TERMINAL_SUBMIT_GRACE_SECONDS
+                or (
+                    self._prompt_idle_confirmations < 1
+                    if self._prompt_busy_observed
+                    else self._prompt_idle_confirmations < 2
+                )
+            ):
+                return False
+            self._prompt_active_uncertain = False
+            self._prompt_submitted_at = 0.0
+            self._prompt_busy_observed = False
+            self._prompt_idle_confirmations = 0
+            self._touch_locked()
+            return True
+
+    def require_ready(self, expected_pane: str) -> str:
+        """Fence Kimi input behind the same state used by capture."""
+        if self.terminal_state(expected_pane) != "ready":
+            raise KimiTerminalBusy("Kimi 正在回复，终端暂时只读")
+        return expected_pane
 
     def _kill_exact_pane_locked(self, expected_pane: str) -> bool:
         """Kill one verified owned pane; never target the reusable session name."""
@@ -1412,19 +1576,29 @@ class KimiTerminalBridge:
                     self._lease = secrets.token_urlsafe(32)
                     self._lease_pane = pane_id
                     self._prompt_active_uncertain = True
+                    self._prompt_submitted_at = time.monotonic()
+                    self._prompt_epoch += 1
+                    self._prompt_busy_observed = False
+                    self._prompt_idle_confirmations = 0
                 elif self._lease_pane != pane_id:
                     # An owned pane replacement is a new generation even
                     # before Android sees it; old leases become stale.
                     self._lease = secrets.token_urlsafe(32)
                     self._lease_pane = pane_id
                     self._prompt_active_uncertain = True
+                    self._prompt_submitted_at = time.monotonic()
+                    self._prompt_epoch += 1
+                    self._prompt_busy_observed = False
+                    self._prompt_idle_confirmations = 0
                 self._touch_locked()
                 self._session_fingerprint = expected_fingerprint
+                self._session_id = session_id
                 return pane_id
             self._shutdown_exact_pane_locked(pane_id)
             self._lease = None
             self._lease_pane = None
             self._session_fingerprint = None
+            self._session_id = None
             self._prompt_active_uncertain = False
         if not self.command.is_file() or not os.access(self.command, os.X_OK):
             raise KimiTerminalUnavailable("Kimi Code 终端入口未安装")
@@ -1478,6 +1652,7 @@ class KimiTerminalBridge:
         self._lease = secrets.token_urlsafe(32)
         self._lease_pane = pane_id
         self._session_fingerprint = expected_fingerprint
+        self._session_id = session_id
         self._prompt_active_uncertain = False
         self._touch_locked()
         return pane_id
@@ -1617,6 +1792,7 @@ class KimiTerminalBridge:
         # Lock order matches HTTP operations: input transaction first, then
         # bridge metadata. This prevents the timer from killing a pane midway
         # through paste/Enter and avoids an input-lock/bridge-lock deadlock.
+        snapshot: tuple[Callable[[str], bool | None], str, str, int] | None = None
         with self._input_lock:
             with self._lock:
                 self._timer = None
@@ -1627,23 +1803,59 @@ class KimiTerminalBridge:
                     self._schedule_reaper_locked(remaining)
                     return
                 try:
-                    # Enter is the only transition that can start a Kimi turn.
-                    # Before it, an idle live TUI is safe to reap exactly; once
-                    # it has been submitted, retain it fail-closed because the
-                    # TUI has no trustworthy completion event.
                     pane_id, pane_dead = self._pane_status_locked()
                     if hmac.compare_digest(pane_id, self._lease_pane) and (
                         pane_dead or not self._prompt_active_uncertain
                     ):
                         if self._kill_exact_pane_locked(self._lease_pane):
-                            self._lease = None
-                            self._lease_pane = None
-                            self._session_fingerprint = None
+                            self._lease = self._lease_pane = self._session_fingerprint = self._session_id = None
                             self._prompt_active_uncertain = False
+                        return
+                    if callable(self._status_probe) and self._session_id:
+                        # Fence all state before releasing locks for Web I/O.
+                        snapshot = (self._status_probe, self._session_id, self._lease_pane, self._prompt_epoch)
                     else:
                         self._touch_locked()
+                        return
                 except Exception:
-                    logger.exception("failed to reap idle Kimi terminal")
+                    logger.exception("failed to prepare Kimi idle reaper")
+                    return
+        # Never perform network I/O while the input or bridge lock is held.
+        probe, session_id, expected_pane, expected_epoch = snapshot
+        samples: list[bool] = []
+        try:
+            for _ in range(2):
+                observed = probe(session_id)
+                if not isinstance(observed, bool):
+                    break
+                samples.append(observed)
+                if observed:
+                    break
+        except Exception:
+            samples = []
+        with self._input_lock:
+            with self._lock:
+                if (
+                    self._lease_pane != expected_pane
+                    or self._session_id != session_id
+                    or self._prompt_epoch != expected_epoch
+                    or not self._prompt_active_uncertain
+                ):
+                    return
+                if self.idle_seconds - (time.monotonic() - self._last_activity) > 0:
+                    self._schedule_reaper_locked()
+                    return
+                for observed in samples:
+                    self.observe_session_status(
+                        session_id, observed,
+                        expected_pane=expected_pane, expected_epoch=expected_epoch,
+                    )
+                if samples == [False, False] and self.reconcile_idle_session(session_id, stable_idle=True):
+                    if self._kill_exact_pane_locked(expected_pane):
+                        self._lease = self._lease_pane = self._session_fingerprint = self._session_id = None
+                        self._prompt_active_uncertain = False
+                else:
+                    self._touch_locked()
 
 
 def _should_expire_chat_typing(contact_id: str, state: dict[str, Any], age_seconds: float) -> bool:
@@ -3369,6 +3581,16 @@ class ServerState:
             state_path=contact_history_dir / "kimi_web_session.json",
             cwd=server_cfg.get("kimi_cwd", DEFAULT_KIMI_CWD),
         )
+        kimi_web_probe_client = self.kimi_web
+        def _kimi_terminal_status_probe(session_id: str) -> bool | None:
+            try:
+                kimi_web_probe_client.start()
+                status = kimi_web_probe_client.get_session_status(session_id, timeout=0.75)
+                busy = status.get("busy") if isinstance(status, dict) else None
+                return busy if isinstance(busy, bool) else None
+            except Exception:
+                return None
+        self.kimi_terminal.set_status_probe(_kimi_terminal_status_probe)
         self.kimi_auto_forge_context_threshold = float(
             server_cfg.get("kimi_auto_forge_context_threshold", 0.75)
         )
@@ -4212,15 +4434,37 @@ class PushHandler(BaseHTTPRequestHandler):
             return f"{base}:{contact_suffix}"
         return base
 
-    def _consume_pwa_staged_attachments(self, body: dict[str, Any], contact_id: str) -> list[dict[str, Any]]:
-        """Consume staged browser uploads exactly once for this send request."""
+    def _staged_attachment_owner(self) -> str | None:
+        """Return an opaque owner fence for a staged attachment batch.
+
+        Browser uploads remain scoped to their short-lived cookie.  Native
+        clients already authenticate every write with the private shared token;
+        bind their staged bytes to a one-way digest of that token rather than
+        putting the credential itself in the in-memory staging index.
+        """
+        if self._web_session_matches():
+            token = self._web_session_token()
+            return f"web:{token}" if token else None
+        if not self._auth_matches():
+            return None
+        nonce = str(self.headers.get("X-CC-Attachment-Owner", "") or "")
+        if not re.fullmatch(r"[a-f0-9]{32}", nonce):
+            return None
+        secret = str(getattr(self.state, "shared_secret", "") or "")
+        if not secret:
+            return None
+        return "native:" + hashlib.sha256(f"{secret}\0{nonce}".encode("utf-8")).hexdigest()
+
+    def _consume_staged_attachments(self, body: dict[str, Any], contact_id: str) -> list[dict[str, Any]]:
+        """Consume one browser/native attachment batch exactly once for a send."""
         if "attachment_ids" not in body:
             return []
         attachment_ids = body.pop("attachment_ids")
-        if not self._web_session_matches():
-            raise ValueError("attachment_ids require a PWA web session")
+        owner = self._staged_attachment_owner()
+        if owner is None:
+            raise ValueError("attachment_ids require an authenticated client")
         return self.state.staged_attachments.consume(
-            owner=self._web_session_token(),
+            owner=owner,
             contact_id=contact_id,
             attachment_ids=attachment_ids,
             destination=self.state.attachments_dir,
@@ -6155,7 +6399,16 @@ class PushHandler(BaseHTTPRequestHandler):
             contact_id = str(
                 qs.get("contact_id", qs.get("contactId", ["xiaoke"]))[0] or "xiaoke"
             ).strip().lower() or "xiaoke"
-            self._send_json(200, {"contact_id": contact_id, "text": _read_ai_status(contact_id)})
+            # ``text`` remains for already-released clients.  ``display`` is
+            # the versioned, server-owned contract used by current clients so
+            # model labels, loading copy, and context formatting can change
+            # without another Android release.
+            display = self._chat_header_status_display(contact_id)
+            self._send_json(200, {
+                "contact_id": contact_id,
+                "text": display["text"],
+                "display": display,
+            })
             return
         self._send_json(404, {"error": "not found"})
 
@@ -6327,7 +6580,7 @@ class PushHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json(400, {"ok": False, "error": f"bad json: {e}"})
                 return
-            self._handle_pwa_upload_cancel(body)
+            self._handle_staged_upload_cancel(body)
             return
         # /chat/upload 走 multipart 不解析 JSON 直接 handle raw (现在含 query string)
         if self.path.startswith("/ai-chat/upload"):
@@ -9523,8 +9776,18 @@ class PushHandler(BaseHTTPRequestHandler):
                 "reason": "Kimi 当前只接受直接发送的文字消息。",
             })
             return
+        # The group dispatcher has no batch attachment transport/recording
+        # contract yet.  Reject before staged bytes are consumed or moved: a
+        # later route-level 400 would otherwise orphan files without a message.
+        if contact_id == "apples" and "attachment_ids" in body:
+            self._send_json(415, {
+                "ok": False,
+                "error": "apples_attachments_unsupported",
+                "reason": "群聊暂不支持一次发送附件。",
+            })
+            return
         try:
-            staged_attachments = self._consume_pwa_staged_attachments(body, contact_id)
+            staged_attachments = self._consume_staged_attachments(body, contact_id)
         except ValueError as exc:
             self._send_json(409, {"ok": False, "error": str(exc)})
             return
@@ -10268,7 +10531,15 @@ class PushHandler(BaseHTTPRequestHandler):
         action = " ".join(str(approval.get(key) or "") for key in (
             "action", "tool_input_display", "input", "arguments", "command",
         )).lower()
-        safe_tools = {"read_file", "readfile", "list_dir", "list_directory", "glob", "grep", "search"}
+        # Kimi Code's native tool names are title-cased (Read/Glob/Grep),
+        # while the Web adapter has emitted snake_case aliases in other
+        # versions.  Both spellings are local inspection only.  In
+        # particular, do *not* add Bash here even if a particular command
+        # looks harmless: shell execution stays an explicit approval.
+        safe_tools = {
+            "read", "read_file", "readfile", "read_media_file",
+            "readmediafile", "list_dir", "list_directory", "glob", "grep", "search",
+        }
         dangerous = ("write", "edit", "delete", "remove", "rm ", "move", "rename", "chmod", "install", "exec", "shell", "bash", "curl", "upload", "send", "email", "post", "publish", "deploy", "payment", "external")
         return bool(tool in safe_tools and not any(word in action for word in dangerous))
 
@@ -12264,6 +12535,108 @@ class PushHandler(BaseHTTPRequestHandler):
             return None
         return round(number, 1) if 0.0 <= number <= 100.0 else None
 
+    @classmethod
+    def _header_status_display(
+        cls,
+        *,
+        text: str,
+        loading_text: str,
+        unavailable_text: str,
+        model: str = "",
+        context_percent: float | None = None,
+    ) -> dict[str, Any]:
+        """Return the narrow versioned chat-header display contract.
+
+        The mobile client receives only presentation-safe labels and a bounded
+        percentage.  This deliberately excludes session ids, paths, raw status
+        lines, account data, and provider diagnostics.
+        """
+        candidate_text = str(text or "").strip()
+        # Header summaries add only a middle-dot separator and a percentage to
+        # the normal status-label alphabet.  Keep this stricter than arbitrary
+        # AI status text so this endpoint cannot become a raw-status channel.
+        safe_text = (
+            candidate_text
+            if re.fullmatch(r"[A-Za-z0-9\u4e00-\u9fff .:_+\-/()%\u00b7]{1,80}", candidate_text)
+            else ""
+        )
+        safe_loading = cls._pwa_bounded_text(loading_text, maximum=40) or "状态加载中"
+        safe_unavailable = cls._pwa_bounded_text(unavailable_text, maximum=40) or "状态暂不可用"
+        safe_model = cls._pwa_bounded_text(model, maximum=48)
+        safe_percent = cls._pwa_bounded_percent(context_percent)
+        return {
+            "version": 1,
+            "text": safe_text or safe_loading,
+            "loading_text": safe_loading,
+            "unavailable_text": safe_unavailable,
+            "model": safe_model,
+            "context_percent": safe_percent,
+        }
+
+    @classmethod
+    def _header_text_from_instrument(cls, instrument: dict[str, Any], *, loading_text: str) -> tuple[str, str, float | None]:
+        """Project a pre-redacted instrument into a one-line header label."""
+        if not isinstance(instrument, dict) or not instrument.get("available"):
+            return loading_text, "", None
+        model = cls._pwa_bounded_text(instrument.get("model"), maximum=48)
+        context = instrument.get("context") if isinstance(instrument.get("context"), dict) else {}
+        percent = cls._pwa_bounded_percent(context.get("used_percent"))
+        pieces = [piece for piece in (model, f"{percent:.0f}%" if percent is not None else "") if piece]
+        return (" · ".join(pieces) if pieces else loading_text), model, percent
+
+    @staticmethod
+    def _kimi_header_model(value: Any) -> str:
+        """Use the concise model label in the phone header, never provider UI."""
+        raw = str(value or "").strip()
+        lowered = raw.lower()
+        if lowered.startswith("kimi-code/"):
+            raw = raw.split("/", 1)[1]
+        elif lowered.startswith("kimi code/"):
+            raw = raw.split("/", 1)[1]
+        aliases = {
+            "k3": "K3",
+            "k3-256k": "K3-256k",
+            "kimi-for-coding": "K2.7 Coding",
+            "kimi-for-coding-highspeed": "K2.7 Coding Highspeed",
+        }
+        return aliases.get(raw.lower(), raw)
+
+    def _chat_header_status_display(self, contact_id: str) -> dict[str, Any]:
+        """Return per-contact header state with safe legacy-placeholder handling."""
+        contact = str(contact_id or "xiaoke").strip().lower() or "xiaoke"
+        loading = "小克状态加载中" if contact == "xiaoke" else "状态加载中"
+        unavailable = "小克状态暂不可用" if contact == "xiaoke" else "状态暂不可用"
+        # A historical default literal is not meaningful status.  Treat it as
+        # absent so a cold load never flashes "ci" before the real projection.
+        saved = _read_ai_status(contact)
+        if saved.strip().lower() == "ci":
+            saved = ""
+        if saved:
+            return self._header_status_display(
+                text=saved,
+                loading_text=loading,
+                unavailable_text=unavailable,
+            )
+        if contact == "xiaoke":
+            try:
+                text, model, percent = self._header_text_from_instrument(
+                    self._pwa_xiaoke_instrument_snapshot(), loading_text=loading,
+                )
+                return self._header_status_display(
+                    text=text,
+                    loading_text=loading,
+                    unavailable_text=unavailable,
+                    model=model,
+                    context_percent=percent,
+                )
+            except Exception:
+                logger.debug("chat header Xiaoke display unavailable", exc_info=True)
+        return self._header_status_display(
+            text=loading,
+            loading_text=loading,
+            unavailable_text=unavailable,
+        )
+
     def _pwa_claude_status_cached(self) -> tuple[dict[str, Any], tuple[float, str] | None]:
         """Use only the existing bounded Claude status-bar sources for PWA."""
         now = time.time()
@@ -12953,11 +13326,53 @@ class PushHandler(BaseHTTPRequestHandler):
         input_transaction = getattr(terminal, "input_transaction", None)
         if not callable(release) or not callable(input_transaction):
             return True
+        # A detached terminal prompt may have naturally completed while the
+        # phone was offline.  Before treating its uncertainty as a permanent
+        # conflict, obtain one bounded confirmation from the exact durable Web
+        # session.  This is deliberately conditional on the bridge method so
+        # legacy/rollback terminal fixtures do not gain a new Web authority.
+        reconcile_idle = getattr(terminal, "reconcile_idle_session", None)
+        observe_status = getattr(terminal, "observe_session_status", None)
+        idle_session_id = ""
+        session_id = ""
+        if callable(reconcile_idle) and callable(observe_status):
+            web = getattr(self.state, "kimi_web", None)
+            try:
+                if web is not None:
+                    web.start()
+                    raw_session_id = str(web.load_active_session_id() or "")
+                    valid_session = getattr(web, "_valid_session_id", None)
+                    session_id = valid_session(raw_session_id) if callable(valid_session) else raw_session_id
+                    samples: list[bool] = []
+                    for _ in range(2):
+                        try:
+                            status = web.get_session_status(session_id, timeout=0.75)
+                        except TypeError:
+                            status = web.get_session_status(session_id)
+                        busy = status.get("busy") if isinstance(status, dict) else None
+                        if not isinstance(busy, bool):
+                            break
+                        observe_status(session_id, busy)
+                        samples.append(busy)
+                        if busy:
+                            break
+                    # Also fence a concurrent active-pointer change. Two
+                    # explicit idle samples are only a fallback after grace;
+                    # the bridge itself still requires this epoch's evidence.
+                    if samples == [False, False] and str(web.load_active_session_id() or "") == session_id:
+                        idle_session_id = session_id
+            except TypeError:
+                idle_session_id = ""
+            except Exception:
+                # Unknown/failed status is intentionally not an idle proof.
+                idle_session_id = ""
         try:
             with input_transaction():
                 with self.state.kimi_turn_lock:
                     if self.state.kimi_prepare_token != prepare_token:
                         return False
+                if idle_session_id:
+                    reconcile_idle(idle_session_id, stable_idle=True)
                 release()
             return True
         except KimiTerminalBusy:
@@ -13008,14 +13423,46 @@ class PushHandler(BaseHTTPRequestHandler):
             metadata = matched.get("metadata") if isinstance(matched, dict) and isinstance(matched.get("metadata"), dict) else {}
             if not matched or str(metadata.get("cwd") or "") != str(web.cwd):
                 raise KimiTerminalNoActiveSession("Kimi 当前没有可恢复的活跃会话")
-            if bool(web.get_session_status(session_id).get("busy")):
+            first_status = web.get_session_status(session_id)
+            first_busy = first_status.get("busy") if isinstance(first_status, dict) else None
+            if not isinstance(first_busy, bool):
+                raise KimiTerminalUnavailable("Kimi 终端会话状态不可用")
+            observe_status = getattr(self.state.kimi_terminal, "observe_session_status", None)
+            if callable(observe_status):
+                observe_status(session_id, first_busy)
+            session_busy = first_busy
+            stable_idle = False
+            if not session_busy:
+                # A terminal capture after Enter must not trust Web's first
+                # briefly-stale idle value. Require an exact second status and
+                # unchanged active pointer; the bridge additionally enforces
+                # its per-submission grace/evidence state.
+                try:
+                    second_status = web.get_session_status(session_id, timeout=0.75)
+                except TypeError:
+                    second_status = web.get_session_status(session_id)
+                second_busy = second_status.get("busy") if isinstance(second_status, dict) else None
+                if not isinstance(second_busy, bool):
+                    raise KimiTerminalUnavailable("Kimi 终端会话状态不可用")
+                if callable(observe_status):
+                    observe_status(session_id, second_busy)
+                session_busy = second_busy
+                stable_idle = (
+                    not second_busy
+                    and str(web.load_active_session_id() or "") == session_id
+                )
+            if session_busy:
                 # A busy status is normally an existing Web writer and must
                 # fail closed. The sole exception is the same process's
                 # already-leased TUI after its own Enter: capture/resize must
                 # remain able to show that real output without opening a
                 # second pane or reviving a post-restart writer.
                 owns_live = getattr(self.state.kimi_terminal, "owns_live_session", None)
-                if not callable(owns_live) or not owns_live(session_id):
+                can_adopt = getattr(self.state.kimi_terminal, "can_adopt_bound_session", None)
+                if (
+                    (not callable(owns_live) or not owns_live(session_id))
+                    and (not callable(can_adopt) or not can_adopt(session_id))
+                ):
                     raise KimiTerminalBusy("Kimi 正在回复，暂时不能接管终端")
             with self.state.kimi_turn_lock:
                 if (
@@ -13027,7 +13474,16 @@ class PushHandler(BaseHTTPRequestHandler):
                     raise KimiTerminalBusy("Kimi 正在回复，暂时不能接管终端")
                 # Holding the short lock across only local tmux setup fences
                 # the verified idle Web session until this TUI owns it.
-                return self.state.kimi_terminal.ensure(session_id)
+                pane_id = self.state.kimi_terminal.ensure(session_id)
+                # This exact Web status was sampled while the acquire token
+                # blocked a competing chat writer. It is the one trustworthy
+                # completion signal for a detached TUI prompt; without it an
+                # adopted/recently-submitted pane remains read-only.
+                if not session_busy and stable_idle:
+                    reconcile_idle = getattr(self.state.kimi_terminal, "reconcile_idle_session", None)
+                    if callable(reconcile_idle):
+                        reconcile_idle(session_id, stable_idle=True)
+                return pane_id
         except KimiTerminalUnavailable:
             raise
         except KimiWebError as exc:
@@ -13339,12 +13795,28 @@ class PushHandler(BaseHTTPRequestHandler):
             f"已使用 {round(context_usage * 100, 2)}%"
             if max_context_tokens else "上下文使用情况暂不可用"
         )
+        header_model = self._kimi_header_model(model)
+        header_percent = self._pwa_bounded_percent(context_usage * 100) if max_context_tokens else None
+        header_text = (
+            f"{header_model} · {header_percent:.0f}%"
+            if header_model and header_percent is not None
+            else (f"{header_model} · 上下文加载中" if header_model else "Kimi 状态加载中")
+        )
+        header_display = self._header_status_display(
+            text=header_text,
+            loading_text="Kimi 状态加载中",
+            unavailable_text="Kimi 状态暂不可用",
+            model=header_model,
+            context_percent=header_percent,
+        )
         self._send_json(200, {
             "ok": True,
             "session_id": session_id,
             "active_session_id": session_id or None,
             "provider": "Kimi Code",
-            "model": model,
+            # Old Android clients do not understand ``header_display`` yet;
+            # give them the concise alias too instead of the provider prefix.
+            "model": header_model or model,
             "reasoning_effort": effort,
             # Android's DTO consumes these boolean controls. Do not overload
             # this with the chat-contact capability list below.
@@ -13368,6 +13840,10 @@ class PushHandler(BaseHTTPRequestHandler):
             "context_tokens": context_tokens,
             "max_context_tokens": max_context_tokens,
             "context_usage_percent": round(context_usage * 100, 2),
+            # The compact header has its own stable contract.  Do not reuse
+            # ``provider`` here: "Kimi Code" is a runtime/provider label, not
+            # useful status-bar content.
+            "header_display": header_display,
             # The normalized quota DTO is deliberately bounded; raw provider
             # payloads can contain account/session metadata and never leave.
             "quota": {
@@ -17235,13 +17711,14 @@ class PushHandler(BaseHTTPRequestHandler):
         # ACK 之后再起异步线程做 APNs / notification 不影响 client 5s timeout
         threading.Thread(target=_async_side_effects, daemon=True).start()
 
-    def _handle_pwa_upload_cancel(self, body: dict[str, Any]) -> None:
-        if not self._web_session_matches():
-            self._send_json(403, {"ok": False, "error": "pwa_session_required"})
+    def _handle_staged_upload_cancel(self, body: dict[str, Any]) -> None:
+        owner = self._staged_attachment_owner()
+        if owner is None:
+            self._send_json(403, {"ok": False, "error": "authenticated_client_required"})
             return
         try:
             removed = self.state.staged_attachments.cancel(
-                owner=self._web_session_token(),
+                owner=owner,
                 attachment_ids=body.get("attachment_ids"),
             )
         except ValueError as exc:
@@ -17329,17 +17806,23 @@ class PushHandler(BaseHTTPRequestHandler):
         image_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
         atype = "image" if ext in image_exts else "file"
 
-        # Browser/PWA uploads are staging-only.  They never append history or
-        # wake an AI until one later `/chat/send` atomically consumes their
-        # attachment IDs for the same authenticated session and contact.
-        if self._web_session_matches():
+        # Browser/PWA uploads and an explicit authenticated native staging mode
+        # never append history or wake an AI until one later `/chat/send`
+        # atomically consumes the whole attachment batch.
+        native_stage_requested = qs.get("stage", [""])[0] == "1"
+        owner = self._staged_attachment_owner() if (self._web_session_matches() or native_stage_requested) else None
+        if native_stage_requested and owner is None:
+            self.close_connection = True
+            self._send_json(403, {"ok": False, "error": "native_attachment_owner_required"})
+            return
+        if owner is not None:
             if role != "user" or text or quoted_ts or location is not None:
-                self._send_json(400, {"error": "pwa upload only stages a user file; send caption with /chat/send"})
+                self._send_json(400, {"error": "staged upload only accepts a user file; send caption with /chat/send"})
                 return
             try:
                 with self._pwa_upload_read_timeout():
                     staged = self.state.staged_attachments.stage_stream(
-                        owner=self._web_session_token(),
+                        owner=owner,
                         contact_id=contact_id,
                         filename=filename,
                         attachment_type=atype,
@@ -19564,6 +20047,8 @@ class PushHandler(BaseHTTPRequestHandler):
             # Kimi history, and the caller's input transaction covers this
             # acquire through capture/paste/Enter.
             physical = self._acquire_kimi_terminal()
+            if require_ready:
+                physical = self.state.kimi_terminal.require_ready(physical)
             return physical, KIMI_TERMINAL_ALIAS, False
         # Selecting any regular tmux pane hands the shared Codex lock back to
         # the App before XiaoKe input/capture proceeds.  The release itself
@@ -19725,6 +20210,13 @@ class PushHandler(BaseHTTPRequestHandler):
                     self._send_json(404, {"error": result.stderr.strip() or "session not found"})
                 return
             content = _trim_terminal_capture(result.stdout)
+            if public_session == KIMI_TERMINAL_ALIAS:
+                # Keep the rendered output available after detach, while
+                # exposing only a fixed readiness state. An uncertain prompt
+                # is deliberately read-only until the exact Web session
+                # confirms completion on a later capture.
+                state_for_pane = getattr(self.state.kimi_terminal, "terminal_state", None)
+                terminal_state = state_for_pane(session) if callable(state_for_pane) else "ready"
             if is_kairos:
                 _same_pane, terminal_state = self.state.kairos_terminal.terminal_state(
                     expected_pane=capture_pane,

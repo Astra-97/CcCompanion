@@ -893,6 +893,7 @@ class WebPwaContractTest(unittest.TestCase):
                     owner="session-b", contact_id="kairos",
                     attachment_ids=[attachment_id], destination=root,
                 )
+
             consumed = store.consume(
                 owner="session-a", contact_id="kairos",
                 attachment_ids=[attachment_id], destination=root,
@@ -904,6 +905,69 @@ class WebPwaContractTest(unittest.TestCase):
                     owner="session-a", contact_id="kairos",
                     attachment_ids=[attachment_id], destination=root,
                 )
+
+    def test_native_staging_owner_is_opaque_and_different_from_web_cookie(self):
+        handler = self.handler("/chat/upload?stage=1", "POST")
+        handler.state = types.SimpleNamespace(
+            shared_secret="native-secret",
+            web_session_enabled=False,
+        )
+        handler.headers = {
+            "X-Auth-Token": "native-secret",
+            "X-CC-Attachment-Owner": "a" * 32,
+        }
+        native_owner = handler._staged_attachment_owner()
+        self.assertTrue(native_owner.startswith("native:"))
+        self.assertNotIn("native-secret", native_owner)
+
+        handler.headers = {"X-Auth-Token": "wrong", "X-CC-Attachment-Owner": "a" * 32}
+        self.assertIsNone(handler._staged_attachment_owner())
+
+    def test_native_staging_owner_cannot_cross_consume_or_cancel(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            store = StagedAttachmentStore(Path(raw_tmp) / "staging")
+            first = self.handler("/chat/upload?stage=1", "POST")
+            first.state = types.SimpleNamespace(shared_secret="native-secret", web_session_enabled=False)
+            first.headers = {"X-Auth-Token": "native-secret", "X-CC-Attachment-Owner": "a" * 32}
+            owner_a = first._staged_attachment_owner()
+            staged = store.stage_stream(
+                owner=owner_a, contact_id="kairos", filename="a.png", attachment_type="image",
+                extension=".png", length=1, stream=io.BytesIO(b"a"),
+            )
+            second = self.handler("/chat/send", "POST")
+            second.state = types.SimpleNamespace(shared_secret="native-secret", web_session_enabled=False)
+            second.headers = {"X-Auth-Token": "native-secret", "X-CC-Attachment-Owner": "b" * 32}
+            owner_b = second._staged_attachment_owner()
+            self.assertNotEqual(owner_a, owner_b)
+            with self.assertRaisesRegex(ValueError, "owner_or_contact"):
+                store.consume(owner=owner_b, contact_id="kairos", attachment_ids=[staged["attachment_id"]], destination=Path(raw_tmp))
+            self.assertEqual(store.cancel(owner=owner_b, attachment_ids=[staged["attachment_id"]]), 0)
+            self.assertEqual(store.cancel(owner=owner_a, attachment_ids=[staged["attachment_id"]]), 1)
+
+    def test_explicit_native_stage_without_owner_fails_closed_before_legacy_upload(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            store = StagedAttachmentStore(Path(raw_tmp) / "staging")
+            handler = self.handler("/chat/upload?stage=1&filename=a.png&role=user&contact_id=kairos", "POST")
+            handler.state = types.SimpleNamespace(
+                shared_secret="native-secret", web_session_enabled=False,
+                staged_attachments=store, attachments_dir=Path(raw_tmp), contact_chats={"kairos": object()},
+            )
+            handler.headers = {"X-Auth-Token": "native-secret", "Content-Length": "1"}
+            handler.rfile = io.BytesIO(b"a")
+            handler.close_connection = False
+            handler._handle_chat_upload()
+            self.assertEqual(handler.responses[-1][0], 403)
+            self.assertEqual(store._items, {})
+            self.assertFalse(list(Path(raw_tmp).glob("*.png")))
+
+    def test_apples_rejects_staged_attachments_before_consume(self):
+        handler = self.handler("/chat/send", "POST")
+        handler._contact_id_from_body = lambda _body: "apples"
+        handler._chat_contact_directory = lambda: [{"id": "apples", "capabilities": ["chat", "attachments"]}]
+        handler._consume_staged_attachments = lambda *_args, **_kwargs: self.fail("must not consume")
+        handler._handle_chat_send({"contact_id": "apples", "text": "", "attachment_ids": ["opaque"]})
+        self.assertEqual(handler.responses[-1][0], 415)
+        self.assertEqual(handler.responses[-1][1]["error"], "apples_attachments_unsupported")
 
     def test_staged_attachment_expiry_and_logout_style_cancel_remove_bytes(self):
         with tempfile.TemporaryDirectory() as raw_tmp:

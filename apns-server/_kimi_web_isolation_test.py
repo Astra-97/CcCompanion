@@ -124,6 +124,25 @@ class KimiWebIsolationTest(unittest.TestCase):
         self.assertNotIn("quota_windows", payload)
         self.assertNotIn("private", str(payload["quota"]))
 
+    def test_status_exposes_compact_provider_free_header_display(self):
+        web = FakeKimiWeb(status={
+            "model": "kimi-code/k3-256k",
+            "thinking_level": "high",
+            "context_tokens": 12,
+            "max_context_tokens": 100,
+            "context_usage": 0.12,
+        })
+        handler = self.handler(web)
+        web.load_active_session_id = lambda: "session-1"
+
+        handler._handle_kimi_status()
+
+        payload = handler.responses[-1][1]
+        self.assertEqual("K3-256k", payload["model"])
+        self.assertEqual("K3-256k · 12%", payload["header_display"]["text"])
+        self.assertEqual(1, payload["header_display"]["version"])
+        self.assertNotIn("Kimi Code", payload["header_display"]["text"])
+
     def test_real_client_normalizes_network_os_errors_only(self):
         client = KimiWebClient(command="/unused/kimi", start_timeout=5)
         client._read_token = lambda: "test-token"

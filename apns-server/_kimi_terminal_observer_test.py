@@ -503,6 +503,95 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
 
         self.assertFalse(bridge.owns_live_session("session-current"))
 
+    def test_restart_adoption_requires_exact_owned_bound_live_pane(self):
+        bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"))
+        fingerprint = bridge._fingerprint_session("session-current")
+        bridge._has_session_locked = mock.Mock(return_value=True)
+        bridge._owns_session_locked = mock.Mock(return_value=True)
+        bridge._pane_status_locked = mock.Mock(return_value=("%55", False))
+        bridge._bound_session_locked = mock.Mock(return_value=fingerprint)
+
+        self.assertTrue(bridge.can_adopt_bound_session("session-current"))
+        self.assertFalse(bridge.can_adopt_bound_session("session-other"))
+        bridge._lease = "a" * 43
+        self.assertFalse(bridge.can_adopt_bound_session("session-current"))
+
+    def test_uncertain_prompt_is_captureable_but_read_only_until_exact_idle_reconcile(self):
+        bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"))
+        bridge._lease, bridge._lease_pane = "a" * 43, "%55"
+        bridge._session_fingerprint = bridge._fingerprint_session("session-current")
+        bridge._prompt_active_uncertain = True
+        bridge._has_session_locked = mock.Mock(return_value=True)
+        bridge._owns_session_locked = mock.Mock(return_value=True)
+        bridge._pane_status_locked = mock.Mock(return_value=("%55", False))
+        bridge._bound_session_locked = mock.Mock(
+            return_value=bridge._fingerprint_session("session-current")
+        )
+
+        self.assertEqual("waiting", bridge.terminal_state("%55"))
+        with self.assertRaises(KimiTerminalBusy):
+            bridge.require_ready("%55")
+        bridge.observe_session_status("session-current", True)
+        bridge.observe_session_status("session-current", False)
+        self.assertTrue(bridge.reconcile_idle_session("session-current", stable_idle=True))
+        self.assertEqual("ready", bridge.terminal_state("%55"))
+        self.assertEqual("%55", bridge.require_ready("%55"))
+        if bridge._timer is not None:
+            bridge._timer.cancel()
+
+    def test_immediate_false_status_after_enter_cannot_make_prompt_ready_or_releasable(self):
+        bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"))
+        bridge._lease, bridge._lease_pane = "a" * 43, "%55"
+        bridge._session_fingerprint = bridge._fingerprint_session("session-current")
+        bridge._has_session_locked = mock.Mock(return_value=True)
+        bridge._owns_session_locked = mock.Mock(return_value=True)
+        bridge._pane_status_locked = mock.Mock(return_value=("%55", False))
+        bridge._bound_session_locked = mock.Mock(
+            return_value=bridge._fingerprint_session("session-current")
+        )
+        bridge._shutdown_exact_pane_locked = mock.Mock(return_value=True)
+        with mock.patch("push.time.monotonic", return_value=100.0):
+            bridge.mark_prompt_submitted()
+            bridge.observe_session_status("session-current", False)
+            bridge.observe_session_status("session-current", False)
+            self.assertFalse(bridge.reconcile_idle_session("session-current", stable_idle=True))
+            self.assertEqual("waiting", bridge.terminal_state("%55"))
+            with self.assertRaises(KimiTerminalBusy):
+                bridge.require_ready("%55")
+            with self.assertRaises(KimiTerminalBusy):
+                bridge.release_for_acp()
+        bridge._shutdown_exact_pane_locked.assert_not_called()
+        if bridge._timer is not None:
+            bridge._timer.cancel()
+
+    def test_idle_reaper_probes_web_without_holding_terminal_input_lock(self):
+        bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"), idle_seconds=1)
+        bridge._lease, bridge._lease_pane = "a" * 43, "%55"
+        bridge._session_fingerprint = bridge._fingerprint_session("session-current")
+        bridge._session_id = "session-current"
+        bridge._prompt_active_uncertain = True
+        bridge._prompt_submitted_at = 1.0
+        bridge._last_activity = 1.0
+        bridge._has_session_locked = mock.Mock(return_value=True)
+        bridge._owns_session_locked = mock.Mock(return_value=True)
+        bridge._pane_status_locked = mock.Mock(return_value=("%55", False))
+        bridge._bound_session_locked = mock.Mock(
+            return_value=bridge._fingerprint_session("session-current")
+        )
+        probe_calls = []
+        def probe(_session_id):
+            acquired = bridge._input_lock.acquire(blocking=False)
+            probe_calls.append(acquired)
+            if acquired:
+                bridge._input_lock.release()
+            return False
+        bridge.set_status_probe(probe)
+        with mock.patch("push.time.monotonic", return_value=10.0):
+            bridge._reap_if_idle()
+        self.assertEqual([True, True], probe_calls)
+        if bridge._timer is not None:
+            bridge._timer.cancel()
+
     def test_kimi_restart_adoption_binds_a_fresh_lease_to_existing_owned_pane(self):
         bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"))
         bridge._has_session_locked = mock.Mock(return_value=True)
@@ -815,6 +904,66 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         bridge._shutdown_exact_pane_locked.assert_not_called()
         self.assertTrue(bridge.release("a" * 43))
         self.assertFalse(bridge._prompt_active_uncertain)
+
+    def test_detached_terminal_completion_reconciles_before_web_writer_handoff(self):
+        order = []
+        outer = self
+
+        class Web:
+            def start(self): order.append("web-start")
+            def load_active_session_id(self): return "session-current"
+            _valid_session_id = staticmethod(lambda value: value)
+            def get_session_status(self, session_id, **_kwargs):
+                outer.assertEqual("session-current", session_id)
+                order.append("web-idle")
+                return {"busy": False}
+
+        class Bridge:
+            def input_transaction(self): return nullcontext()
+            def observe_session_status(self, session_id, busy):
+                outer.assertEqual("session-current", session_id)
+                outer.assertFalse(busy)
+                order.append("terminal-observe")
+            def reconcile_idle_session(self, session_id, **_kwargs):
+                outer.assertEqual("session-current", session_id)
+                order.append("terminal-reconcile")
+                return True
+            def release_for_acp(self):
+                order.append("terminal-release")
+                return True
+
+        handler = object.__new__(PushHandler)
+        handler.state = types.SimpleNamespace(
+            kimi_turn_lock=threading.RLock(), kimi_prepare_token="handoff-token",
+            kimi_web=Web(), kimi_terminal=Bridge(),
+        )
+        self.assertTrue(handler._handoff_kimi_terminal_to_writer("handoff-token"))
+        self.assertEqual(
+            ["web-start", "web-idle", "terminal-observe", "web-idle", "terminal-observe", "terminal-reconcile", "terminal-release"],
+            order,
+        )
+
+    def test_busy_detached_terminal_is_not_released_for_web_writer_handoff(self):
+        class Web:
+            def start(self): pass
+            def load_active_session_id(self): return "session-current"
+            _valid_session_id = staticmethod(lambda value: value)
+            def get_session_status(self, _session_id, **_kwargs): return {"busy": True}
+
+        bridge = types.SimpleNamespace(
+            input_transaction=lambda: nullcontext(),
+            reconcile_idle_session=mock.Mock(),
+            release_for_acp=mock.Mock(side_effect=KimiTerminalBusy("Kimi 终端可能仍在生成")),
+        )
+        handler = object.__new__(PushHandler)
+        handler.state = types.SimpleNamespace(
+            kimi_turn_lock=threading.RLock(), kimi_prepare_token="handoff-token",
+            kimi_web=Web(), kimi_terminal=bridge,
+        )
+        with self.assertRaises(KimiTerminalBusy):
+            handler._handoff_kimi_terminal_to_writer("handoff-token")
+        bridge.reconcile_idle_session.assert_not_called()
+        bridge.release_for_acp.assert_called_once_with()
 
     def test_identity_changing_kimi_commands_are_rejected_before_terminal_acquire(self):
         for command in ("/new", "/sessions", "/fork branch", "/resume abc"):
