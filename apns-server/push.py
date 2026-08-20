@@ -2379,6 +2379,10 @@ PWA_CLAUDE_STATUS_CACHE_TTL = 10.0
 PWA_CLAUDE_STATUS_CACHE_LOCK = threading.Lock()
 PWA_CLAUDE_STATUS_CACHE: dict[str, Any] = {"ts": 0.0, "status": None, "fable_week": None}
 PWA_CLAUDE_FABLE_USAGE_PATH = Path("/run/claude-fable-usage.txt")
+# This is intentionally independent of fable-quota's TTL: the PWA reads the
+# cache file directly, so it must never render a stranded value if that helper
+# stops refreshing (for example after an OAuth scope failure).
+PWA_CLAUDE_FABLE_USAGE_MAX_AGE_SECONDS = 15 * 60
 
 
 def _run_status_cmd(args: list[str], timeout: float = 1.5) -> str:
@@ -12502,7 +12506,14 @@ class PushHandler(BaseHTTPRequestHandler):
             fd = os.open(PWA_CLAUDE_FABLE_USAGE_PATH, flags)
             try:
                 metadata = os.fstat(fd)
-                raw_week = os.read(fd, 129) if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 128 else b""
+                age = time.time() - metadata.st_mtime
+                raw_week = (
+                    os.read(fd, 129)
+                    if stat.S_ISREG(metadata.st_mode)
+                    and metadata.st_size <= 128
+                    and 0 <= age <= PWA_CLAUDE_FABLE_USAGE_MAX_AGE_SECONDS
+                    else b""
+                )
             finally:
                 os.close(fd)
             if raw_week and len(raw_week) <= 128:

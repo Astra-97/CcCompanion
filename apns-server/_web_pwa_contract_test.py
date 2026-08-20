@@ -576,6 +576,24 @@ class WebPwaContractTest(unittest.TestCase):
             with patch("push.PWA_CLAUDE_FABLE_USAGE_PATH", link):
                 self.assertIsNone(PushHandler._pwa_read_fable_week_cache())
 
+    def test_pwa_fable_week_cache_hides_value_past_its_independent_max_age(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            source = Path(raw_tmp) / "fable-usage.txt"
+            source.write_text("49%@08-21 18:59", encoding="utf-8")
+            stale_at = time.time() - 16 * 60
+            os.utime(source, (stale_at, stale_at))
+            with patch("push.PWA_CLAUDE_FABLE_USAGE_PATH", source):
+                self.assertIsNone(PushHandler._pwa_read_fable_week_cache())
+
+    def test_pwa_fable_week_cache_hides_future_mtime(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            source = Path(raw_tmp) / "fable-usage.txt"
+            source.write_text("49%@08-21 18:59", encoding="utf-8")
+            future_at = time.time() + 60
+            os.utime(source, (future_at, future_at))
+            with patch("push.PWA_CLAUDE_FABLE_USAGE_PATH", source):
+                self.assertIsNone(PushHandler._pwa_read_fable_week_cache())
+
     def test_chat_status_keeps_xiaoke_and_kairos_instruments_contact_scoped(self):
         handler = self.handler("/chat/status?contact_id=xiaoke")
         handler._contact_id_from_query = lambda: "xiaoke"
