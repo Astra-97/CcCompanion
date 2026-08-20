@@ -11,7 +11,7 @@ from datetime import date, datetime
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 from zoneinfo import ZoneInfo
 
 VAULT = Path(os.path.expanduser("~/Documents/星原"))
@@ -56,6 +56,7 @@ _WRITE_LOCK = Lock()
 # second Markdown-backed task list.  The default and lock protocol match
 # /root/ccbot-lite/ops/scripts/schedule-ctl and schedule-remind.
 DEFAULT_SCHEDULE_PATH = Path("/root/schedule/events.json")
+MAX_SCHEDULE_TODO_RANGE_DAYS = 62
 
 
 class ScheduleTodoStoreError(RuntimeError):
@@ -66,13 +67,29 @@ def collect_all(
     schedule_path: str | Path | None = None,
     *,
     today: date | None = None,
+    from_date: date | None = None,
+    to_date: date | None = None,
 ) -> list[dict]:
-    """Return today's and future schedule events in the legacy todo shape."""
+    """Return a bounded schedule projection in the legacy todo shape.
+
+    Without a range this deliberately retains the historic today-and-future
+    behavior.  A caller that supplies both endpoints can request a small
+    calendar grid window, including completed events from previous days.
+    """
+    if (from_date is None) != (to_date is None):
+        raise ValueError("both from_date and to_date are required")
     path = _schedule_path(schedule_path)
     with _schedule_lock(path, create_parent=False):
         events = _load_schedule(path)
-    local_today = today or datetime.now(ZoneInfo("Asia/Shanghai")).date()
-    events = [event for event in events if date.fromisoformat(event["date"]) >= local_today]
+    if from_date is None:
+        local_today = today or datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        events = [event for event in events if date.fromisoformat(event["date"]) >= local_today]
+    else:
+        start, end = _validate_schedule_date_range(from_date, to_date)
+        events = [
+            event for event in events
+            if start <= date.fromisoformat(event["date"]) <= end
+        ]
     items = [_schedule_item(event) for event in sorted(events, key=_schedule_sort_key)]
     return [{
         "section": "日程",
@@ -81,6 +98,32 @@ def collect_all(
         "count": len(items),
         "pending": sum(1 for item in items if not item["done"]),
     }]
+
+
+def parse_schedule_date_range(query: Mapping[str, list[str]]) -> tuple[date, date] | None:
+    """Parse the optional /todos calendar window without accepting ambiguity."""
+    if not query:
+        return None
+    if set(query) != {"from", "to"}:
+        raise ValueError("unsupported todos query")
+    from_values = query.get("from")
+    to_values = query.get("to")
+    if from_values is None or to_values is None or len(from_values) != 1 or len(to_values) != 1:
+        raise ValueError("invalid todos date range")
+    if not all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", value or "") for value in (from_values[0], to_values[0])):
+        raise ValueError("invalid todos date range")
+    try:
+        start = date.fromisoformat(from_values[0])
+        end = date.fromisoformat(to_values[0])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid todos date range") from exc
+    return _validate_schedule_date_range(start, end)
+
+
+def _validate_schedule_date_range(start: date, end: date) -> tuple[date, date]:
+    if end < start or (end - start).days + 1 > MAX_SCHEDULE_TODO_RANGE_DAYS:
+        raise ValueError("invalid todos date range")
+    return start, end
 
 
 def parse_file(path: Path) -> list[dict]:

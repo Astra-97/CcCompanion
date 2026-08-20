@@ -6143,7 +6143,7 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path == "/settings":
             self._send_json(200, {"ok": True, "settings": self.state.settings.snapshot()})
             return
-        if self.path == "/todos":
+        if request_path == "/todos":
             self._handle_todos_list()
             return
         if self.path == "/drivers/state":
@@ -19576,9 +19576,22 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(401, {"error": "auth required"})
             return
         try:
+            from urllib.parse import parse_qs, urlparse
+            query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+            date_range = todos_mod.parse_schedule_date_range(query)
+        except ValueError:
+            # Do not silently broaden an invalid calendar request into the
+            # default future-only projection.
+            self._send_json(400, {"ok": False, "error": "invalid todos date range"})
+            return
+        try:
+            kwargs = {} if date_range is None else {
+                "from_date": date_range[0],
+                "to_date": date_range[1],
+            }
             self._send_json(200, {
                 "ok": True,
-                "sections": todos_mod.collect_all(self.state.todos_schedule_path),
+                "sections": todos_mod.collect_all(self.state.todos_schedule_path, **kwargs),
             })
         except todos_mod.ScheduleTodoStoreError:
             self._send_json(503, {"ok": False, "error": "schedule unavailable"})

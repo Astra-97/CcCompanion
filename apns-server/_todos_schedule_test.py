@@ -65,6 +65,47 @@ class ScheduleTodosTest(unittest.TestCase):
         self.assertEqual(section["items"][1]["note"], "十分钟")
         self.assertIsNone(section["items"][0]["lineIndex"])
 
+    def test_bounded_calendar_projection_includes_past_completed_events(self):
+        self.write([
+            _event("before", "范围前", "2026-07-26", "09:00"),
+            _event("past-done", "昨天已完成", "2026-07-27", "09:00", done=True),
+            _event("today", "今天未完成", "2026-08-16", "19:00"),
+            _event("after", "范围后", "2026-09-07", "09:00"),
+        ])
+
+        sections = todos.collect_all(
+            self.path,
+            from_date=date(2026, 7, 27),
+            to_date=date(2026, 9, 6),
+        )
+
+        self.assertEqual(
+            [item["event_id"] for item in sections[0]["items"]],
+            ["past-done", "today"],
+        )
+        self.assertEqual(sections[0]["pending"], 1)
+
+    def test_calendar_query_range_rejects_malformed_partial_and_oversized_values(self):
+        self.assertEqual(
+            todos.parse_schedule_date_range({
+                "from": ["2026-07-27"],
+                "to": ["2026-09-06"],
+            }),
+            (date(2026, 7, 27), date(2026, 9, 6)),
+        )
+        invalid_queries = (
+            {"from": ["2026-07-27"]},
+            {"from": ["2026-07-27"], "to": [""]},
+            {"from": ["20260727"], "to": ["2026-09-06"]},
+            {"from": ["2026-09-06"], "to": ["2026-07-27"]},
+            {"from": ["2026-07-01"], "to": ["2026-09-01"]},
+            {"from": ["2026-07-27", "2026-07-28"], "to": ["2026-09-06"]},
+            {"from": ["2026-07-27"], "to": ["2026-09-06"], "extra": ["1"]},
+        )
+        for query in invalid_queries:
+            with self.subTest(query=query), self.assertRaises(ValueError):
+                todos.parse_schedule_date_range(query)
+
     def test_toggle_uses_event_id_expected_done_and_same_atomic_schedule_file(self):
         self.write([_event("evt1", "私教课", "2026-08-16", "19:00")])
 
@@ -202,6 +243,7 @@ class TodosHandlerAuthTest(unittest.TestCase):
             contact_chats={"xiaoke": _History()},
         )
         handler.headers = {"X-Auth-Token": token}
+        handler.path = "/todos"
         handler.responses = []
         handler._send_json = lambda status, payload: handler.responses.append((status, payload))
         handler._channel_transport_enabled_for = lambda contact_id: contact_id == "xiaoke"
@@ -278,6 +320,45 @@ class TodosHandlerAuthTest(unittest.TestCase):
             undo_channel_post.call_args.kwargs["message_id"],
         )
         self.assertEqual(handler.notifications, [])
+
+    def test_get_calendar_range_rejects_bad_queries_without_falling_back(self):
+        handler = self.handler("test-secret")
+        handler.path = "/todos?from=2026-08-20"
+        with mock.patch("push.todos_mod.collect_all") as collect_all:
+            handler._handle_todos_list()
+        self.assertEqual(handler.responses, [(400, {"ok": False, "error": "invalid todos date range"})])
+        collect_all.assert_not_called()
+
+    def test_get_dispatches_todos_path_with_calendar_query(self):
+        handler = object.__new__(PushHandler)
+        handler.path = "/todos?from=2026-08-19&to=2026-08-20"
+        handler._MEMORY_SYNC_PATH = "/memory/sync"
+        handler._MEMORY_DATE_SYNC_PATH = "/memory/date-sync"
+        handler._is_public_get = lambda: False
+        handler._check_ip_allowed = lambda: True
+        handler._require_auth = lambda: True
+        handler._handle_todos_list = mock.Mock()
+
+        with mock.patch("push.dispatch_contact_get", return_value=False):
+            handler.do_GET()
+
+        handler._handle_todos_list.assert_called_once_with()
+
+    def test_get_calendar_range_returns_completed_past_schedule_items(self):
+        self.path.write_text(json.dumps([
+            _event("past-done", "昨天已完成", "2026-08-19", "09:00", done=True),
+            _event("today", "今天未完成", "2026-08-20", "19:00"),
+            _event("after", "范围外", "2026-08-21", "09:00"),
+        ]), encoding="utf-8")
+        handler = self.handler("test-secret")
+        handler.path = "/todos?from=2026-08-19&to=2026-08-20"
+
+        handler._handle_todos_list()
+
+        self.assertEqual(handler.responses[0][0], 200)
+        items = handler.responses[0][1]["sections"][0]["items"]
+        self.assertEqual([item["event_id"] for item in items], ["past-done", "today"])
+        self.assertTrue(items[0]["done"])
 
     def test_schedule_toggle_surfaces_channel_delivery_failure_without_legacy_fallback(self):
         handler = self.handler("test-secret")
