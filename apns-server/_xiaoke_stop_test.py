@@ -9,7 +9,13 @@ import types
 import unittest
 from unittest.mock import MagicMock, patch
 
-from push import PushHandler, TmuxInjectionResult, _direct_tmux_injection, _should_expire_chat_typing
+from push import (
+    PushHandler,
+    TmuxInjectionResult,
+    _direct_tmux_injection,
+    _inject_to_tmux_session,
+    _should_expire_chat_typing,
+)
 
 
 class XiaokeStopTest(unittest.TestCase):
@@ -562,6 +568,10 @@ class XiaokeStopTest(unittest.TestCase):
         self.assertEqual(len(injection_calls), 1)
         self.assertEqual(injection_calls[0][0][0], "cctg")
         self.assertTrue(injection_calls[0][1]["force_direct_tmux"])
+        self.assertEqual(
+            injection_calls[0][1]["paste_settle_seconds"],
+            1.2,
+        )
         self.assertRegex(injection_calls[0][0][1], r"^\[CCC_APP_TURN:[0-9a-f]{32}:cctg\]\n")
         self.assertEqual(handler.responses[-1][0], 200)
         turn = handler.responses[-1][1]["turn"]
@@ -633,6 +643,111 @@ class XiaokeStopTest(unittest.TestCase):
             if call.args[0][1] == "delete-buffer"
         ]
         self.assertEqual(delete_calls, [["tmux", "delete-buffer", "-b", load_args[3]]])
+
+    def test_scheduled_direct_fallback_submits_once_without_settle(self) -> None:
+        operations: list[str] = []
+        sent_keys: list[str] = []
+
+        class Loader:
+            returncode = 0
+
+            def communicate(self, *, input=None, timeout=None):
+                del input, timeout
+                operations.append("load")
+                return b"", b""
+
+        def run_tmux(args, **_kwargs):
+            operations.append(args[1])
+            if args[1] == "send-keys":
+                sent_keys.append(args[-1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with (
+            patch("push.subprocess.Popen", return_value=Loader()),
+            patch("push.subprocess.run", side_effect=run_tmux),
+            patch("push.time.sleep") as sleep,
+        ):
+            ok, error = _inject_to_tmux_session(types.SimpleNamespace(), "cctg", "scheduled prompt")
+
+        self.assertTrue(ok, error)
+        self.assertEqual(operations, [
+            "has-session", "load", "paste-buffer", "send-keys", "delete-buffer",
+        ])
+        self.assertEqual(sent_keys, ["Enter"])
+        sleep.assert_not_called()
+
+    def test_xiaoke_force_direct_settles_before_one_submit_for_text_and_attachments(self) -> None:
+        cases = {
+            "text": "plain terminal text",
+            "single-image": "[用户发了图片: cat.jpg]\n本地路径: /tmp/cat.jpg",
+            "multi-image-multiline": (
+                "[CCC_APP_TURN:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:cctg]\n"
+                "[Image #1]\n[Image #2]\n"
+                "第一行说明\n第二行说明"
+            ),
+        }
+
+        for name, text in cases.items():
+            with self.subTest(name=name):
+                operations: list[str] = []
+                loaded: list[bytes | None] = []
+                load_timeouts: list[float | None] = []
+                sent_keys: list[str] = []
+
+                class Loader:
+                    returncode = 0
+
+                    def communicate(self, *, input=None, timeout=None):
+                        loaded.append(input)
+                        load_timeouts.append(timeout)
+                        operations.append("load")
+                        return b"", b""
+
+                def run_tmux(args, **_kwargs):
+                    operations.append(args[1])
+                    if args[1] == "send-keys":
+                        sent_keys.append(args[-1])
+                    return subprocess.CompletedProcess(args, 0, "", "")
+
+                with (
+                    patch("push.subprocess.Popen", return_value=Loader()),
+                    patch("push.subprocess.run", side_effect=run_tmux),
+                    patch(
+                        "push.time.sleep",
+                        side_effect=lambda seconds: operations.append(f"settle:{seconds}"),
+                    ) as sleep,
+                ):
+                    handler = self.handler(active=False)
+                    handler.state.bus_send_path = ""
+                    result = handler._inject_to_session(
+                        "cctg",
+                        text,
+                        force_direct_tmux=True,
+                        paste_settle_seconds=1.2,
+                    )
+
+                self.assertTrue(result.success, result.error)
+                self.assertEqual(loaded, [text.encode("utf-8")])
+                self.assertEqual(load_timeouts, [3])
+                self.assertEqual(operations, [
+                    "has-session", "load", "paste-buffer", "settle:1.2", "send-keys", "delete-buffer",
+                ])
+                self.assertEqual(sent_keys, ["Enter"])
+                sleep.assert_called_once_with(1.2)
+
+    def test_empty_direct_tmux_injection_never_submits_enter(self) -> None:
+        with (
+            patch("push.subprocess.Popen") as popen,
+            patch("push.subprocess.run") as run,
+            patch("push.time.sleep") as sleep,
+        ):
+            result = _direct_tmux_injection("cctg", "\n \t")
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.phase, "validate")
+        popen.assert_not_called()
+        run.assert_not_called()
+        sleep.assert_not_called()
 
     def test_load_buffer_timeout_kills_reaps_deletes_and_releases_turn_lock(self) -> None:
         handler = self.send_handler()
