@@ -911,6 +911,7 @@ logger = logging.getLogger("cc-apns-server")
 
 
 XIAOKE_STALE_COMPLETION_GRACE_SECONDS = 120.0
+KIMI_WEB_ABORT_SETTLE_SECONDS = 3.0
 KAIROS_TERMINAL_ALIAS = "kairos"
 KIMI_TERMINAL_ALIAS = "kimi"
 KAIROS_TERMINAL_OWNER_OPTION = "@ccc_kairos_terminal_owner"
@@ -1964,6 +1965,17 @@ def _should_expire_chat_typing(contact_id: str, state: dict[str, Any], age_secon
         except (TypeError, ValueError):
             stale_at = 0.0
         return bool(stale_at) and time.time() - stale_at > XIAOKE_STALE_COMPLETION_GRACE_SECONDS
+    exact_kimi_web_turn = (
+        contact_id in {"kimi", "apples"}
+        and str(state.get("transport") or "") == "kimi-web"
+        and bool(state.get("exact_turn"))
+    )
+    if exact_kimi_web_turn:
+        # Kimi Web owns its busy lifecycle through an exact prompt fence.
+        # Its stop/terminal events, rather than a cosmetic typing TTL, clear
+        # this foreground turn; otherwise a long tool/subagent phase flickers
+        # to idle despite an active Stop-able draft.
+        return False
     return age_seconds > 120
 
 
@@ -4631,6 +4643,78 @@ class PushHandler(BaseHTTPRequestHandler):
                     self.state.contact_typing_states["xiaoke"] = resolved
         else:
             self.state.contact_typing_states[contact_id] = value
+
+    def _clear_typing_for_contact_if_turn(self, contact_id: str, user_ts: str) -> bool:
+        """Clear typing only when it still names this exact foreground turn."""
+        states = getattr(self.state, "contact_typing_states", None)
+        current = states.get(contact_id) if isinstance(states, dict) else None
+        if isinstance(current, dict):
+            current_ts = str(current.get("since") or "")
+            if current_ts and current_ts != str(user_ts or ""):
+                return False
+        self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
+        return True
+
+    def _schedule_kimi_web_abort_settlement(
+        self,
+        *,
+        web: Any,
+        session_id: str,
+        prompt_id: str,
+        user_ts: str,
+        cancel_event: threading.Event,
+    ) -> None:
+        """Bound a missing abort lifecycle without treating HTTP success as terminal."""
+        with self.state.kimi_turn_lock:
+            active = self.state.kimi_active_turn
+            if (
+                str(active.get("user_ts") or "") != str(user_ts or "")
+                or str(active.get("session_id") or "") != str(session_id or "")
+                or str(active.get("prompt_id") or "") != str(prompt_id or "")
+                or bool(active.get("abort_settlement_scheduled"))
+            ):
+                return
+            active["abort_settlement_scheduled"] = True
+
+        def settle() -> None:
+            try:
+                status = web.get_session_status(session_id, timeout=0.75)
+            except Exception:
+                return
+            # A status idle result alone says only that the *session* looks
+            # quiet.  Pair it with the Web snapshot: an in-flight prompt (in
+            # particular a different prompt) must retain this turn's lease.
+            # A missing/failed snapshot is likewise uncertain, never a local
+            # excuse to synthesize a terminal state.
+            if not isinstance(status, dict) or status.get("busy") is not False:
+                return
+            try:
+                snapshot = web.get_snapshot(session_id, timeout=0.75)
+            except Exception:
+                return
+            if not isinstance(snapshot, dict):
+                return
+            in_flight = snapshot.get("in_flight_turn")
+            current_prompt = self._kimi_web_prompt_id_from_payload(snapshot)
+            in_flight_prompt = self._kimi_web_prompt_id_from_payload(in_flight)
+            pending = snapshot.get("pending_questions") or snapshot.get("pending_approvals")
+            if current_prompt or in_flight_prompt or bool(in_flight) or bool(pending):
+                return
+            with self.state.kimi_turn_lock:
+                active = self.state.kimi_active_turn
+                if (
+                    str(active.get("user_ts") or "") != str(user_ts or "")
+                    or str(active.get("session_id") or "") != str(session_id or "")
+                    or str(active.get("prompt_id") or "") != str(prompt_id or "")
+                ):
+                    return
+                active["terminal_proven_idle"] = True
+                active["terminal_outcome"] = "interrupted"
+            cancel_event.set()
+
+        timer = threading.Timer(KIMI_WEB_ABORT_SETTLE_SECONDS, settle)
+        timer.daemon = True
+        timer.start()
 
     def _clear_xiaoke_typing_if_match(self, user_ts: str, session: str | None = None) -> bool:
         """Clear only the XiaoKe turn named by the caller.
@@ -10444,6 +10528,35 @@ class PushHandler(BaseHTTPRequestHandler):
         dangerous = ("write", "edit", "delete", "remove", "rm ", "move", "rename", "chmod", "install", "exec", "shell", "bash", "curl", "upload", "send", "email", "post", "publish", "deploy", "payment", "external")
         return bool(tool in safe_tools and not any(word in action for word in dangerous))
 
+    @staticmethod
+    def _kimi_web_prompt_id_from_payload(payload: Any) -> str:
+        """Read an abort-safe prompt id from a local Web API projection."""
+        if not isinstance(payload, dict):
+            return ""
+        current = payload.get("current_prompt")
+        if not isinstance(current, dict):
+            current = payload.get("currentPrompt")
+        nested = current if isinstance(current, dict) else {}
+        value = (
+            payload.get("prompt_id") or payload.get("promptId")
+            or payload.get("current_prompt_id") or payload.get("currentPromptId")
+            or nested.get("id") or nested.get("prompt_id") or nested.get("promptId")
+        )
+        result = str(value or "").strip()
+        return result[:200]
+
+    @staticmethod
+    def _kimi_web_activity_label(event_type: Any) -> str:
+        """Map Web event *types* to fixed activity labels, never payload text."""
+        kind = str(event_type or "").strip().lower()
+        if kind.startswith(("subagent.", "sub_agent.", "worker.", "collaboration.")):
+            return "正在协作"
+        if kind.startswith("tool."):
+            return "正在使用工具"
+        if kind in {"assistant.delta", "assistant.thought"} or kind.startswith(("assistant.thought.", "reasoning.", "thinking.")):
+            return "正在思考"
+        return ""
+
     def _handle_kimi_web_chat_send(self, body: dict[str, Any], contact_id: str, web: Any) -> None:
         text = str(body.get("text") or "").strip()
         quoted_ts = body.get("quoted_ts") or None
@@ -10642,7 +10755,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         logger.debug("Kimi Web active-turn cleanup failed", exc_info=True)
                     finally:
                         try:
-                            self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
+                            self._clear_typing_for_contact_if_turn(contact_id, str(rec.get("ts") or ""))
                         except Exception:
                             logger.debug("Kimi Web typing cleanup failed", exc_info=True)
 
@@ -10659,6 +10772,9 @@ class PushHandler(BaseHTTPRequestHandler):
             bound_turn_id = ""
             snapshot_epoch = ""
             snapshot_seq = -1
+            activity_count = 0
+            activity_items: list[str] = []
+            current_activity_label = ""
 
             def observer_record(event_type: str) -> None:
                 record = getattr(kimi_observer, "record", None)
@@ -10752,9 +10868,30 @@ class PushHandler(BaseHTTPRequestHandler):
                     session_id=session_id,
                     user_ts=rec["ts"],
                     queued_at=rec["ts"],
-                    activity_text="正在回复",
+                    activity_text=current_activity_label or "正在处理",
+                    activity_count=activity_count,
+                    activity_items=activity_items,
                 )
                 last_published = now
+
+            def note_activity(label: str) -> None:
+                """Publish bounded, monotonic Web work transitions only."""
+                nonlocal activity_count, current_activity_label
+                if label not in {"正在思考", "正在使用工具", "正在协作"}:
+                    return
+                if label == current_activity_label:
+                    return
+                current_activity_label = label
+                activity_count = min(999, max(1, activity_count + 1))
+                if label not in activity_items and len(activity_items) < 3:
+                    activity_items.append(label)
+                self._set_chat_activity(
+                    contact_id,
+                    activity_text=label,
+                    activity_count=activity_count,
+                    activity_items=activity_items,
+                    user_ts=rec["ts"],
+                )
 
             def prompt_id_from(payload: dict[str, Any], frame: dict[str, Any] | None = None) -> str:
                 current_prompt = payload.get("current_prompt")
@@ -10839,12 +10976,6 @@ class PushHandler(BaseHTTPRequestHandler):
                     if not approval_items and not question_items:
                         approval_items = web.list_approvals(session_id)
                 except KimiWebError:
-                    self._set_chat_activity(
-                        contact_id,
-                        activity_text="Kimi 需要确认，但确认状态暂不可读取",
-                        activity_count=0,
-                        user_ts=rec["ts"],
-                    )
                     return
                 if len(approval_items) == 1 and not question_items and self._kimi_is_routine_readonly_approval(approval_items[0]):
                     approval_id = str(approval_items[0].get("approval_id") or "").strip()
@@ -10852,12 +10983,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         approval_resolution_started = True
                         try:
                             web.approve_once(session_id, approval_id)
-                            self._set_chat_activity(
-                                contact_id,
-                                activity_text="已允许本轮单个工具操作",
-                                activity_count=0,
-                                user_ts=rec["ts"],
-                            )
+                            note_activity("正在使用工具")
                             return
                         except KimiWebError:
                             approval_resolution_started = False
@@ -10866,12 +10992,6 @@ class PushHandler(BaseHTTPRequestHandler):
                 # the App looking like it is still generating forever.
                 approval_resolution_started = True
                 terminal_reason = "blocked"
-                self._set_chat_activity(
-                    contact_id,
-                    activity_text="Kimi 需要你选择，已安全停止本轮",
-                    activity_count=0,
-                    user_ts=rec["ts"],
-                )
                 try:
                     web.abort_prompt(session_id, prompt_id)
                     # HTTP acceptance is not a terminal lifecycle event.  The
@@ -10880,9 +11000,14 @@ class PushHandler(BaseHTTPRequestHandler):
                     web.set_turn_lease_state(
                         session_id=session_id, prompt_id=prompt_id, state="stopping",
                     )
+                    self._schedule_kimi_web_abort_settlement(
+                        web=web, session_id=session_id, prompt_id=prompt_id,
+                        user_ts=str(rec.get("ts") or ""), cancel_event=cancel_event,
+                    )
                 except KimiWebError:
                     logger.warning("Kimi Web could not abort a blocked prompt")
-                cancel_event.set()
+                # A successful abort request is not terminal. Keep receiving
+                # this exact prompt until its lifecycle event arrives.
 
             def on_ready() -> None:
                 # Hold receive processing at the subscription boundary until
@@ -10926,6 +11051,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         if snapshot is not None:
                             resolve_pending_interaction(snapshot)
                     return
+                note_activity(self._kimi_web_activity_label(event_type))
                 if event_type == "assistant.delta":
                     delta = event_text(payload)
                     if not delta:
@@ -10942,12 +11068,7 @@ class PushHandler(BaseHTTPRequestHandler):
                             if snapshot is not None:
                                 resolve_pending_interaction(snapshot)
                         except KimiWebError:
-                            self._set_chat_activity(
-                                contact_id,
-                                activity_text="Kimi 正在等待确认",
-                                activity_count=0,
-                                user_ts=rec["ts"],
-                            )
+                            pass
                 elif event_type == "event.session.work_changed":
                     if str(payload.get("pending_interaction") or "") in {"approval", "question"}:
                         try:
@@ -10958,12 +11079,6 @@ class PushHandler(BaseHTTPRequestHandler):
                             pass
                 elif event_type.startswith("tool."):
                     observer_record("tool")
-                    self._set_chat_activity(
-                        contact_id,
-                        activity_text="Kimi 正在使用工具",
-                        activity_count=0,
-                        user_ts=rec["ts"],
-                    )
                 elif event_type == "prompt.completed":
                     lease_terminal_confirmed = True
                     incoming_reason = str(payload.get("reason") or "completed")
@@ -11044,6 +11159,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     and str(active.get("session_id") or "") == session_id
                     and str(active.get("prompt_id") or "") == prompt_id
                 ):
+                    lease_terminal_confirmed = bool(active.get("terminal_proven_idle"))
                     if bool(active.get("stop_requested")):
                         terminal_reason = "interrupted"
                     elif str(active.get("terminal_outcome") or "") == "completed":
@@ -11094,7 +11210,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 if str(self.state.kimi_active_turn.get("user_ts") or "") == str(rec.get("ts") or ""):
                     self.state.kimi_active_turn = {}
             self._clear_chat_draft(contact_id)
-            self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
+            self._clear_typing_for_contact_if_turn(contact_id, str(rec.get("ts") or ""))
             self._set_chat_failed(contact_id, user_ts=rec["ts"], source="kimi-web:stream", session_id=session_id)
             self._send_json(503, {"ok": False, "error": "kimi_web_unavailable"})
             return
@@ -11131,7 +11247,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 if str(self.state.kimi_active_turn.get("user_ts") or "") == str(rec.get("ts") or ""):
                     self.state.kimi_active_turn = {}
             self._clear_chat_draft(contact_id)
-            self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
+            self._clear_typing_for_contact_if_turn(contact_id, str(rec.get("ts") or ""))
             self._set_chat_failed(contact_id, user_ts=rec["ts"], source="kimi-web:error", session_id=session_id)
             self._send_json(503, {"ok": False, "error": "kimi_web_unavailable"})
             return
@@ -11139,6 +11255,10 @@ class PushHandler(BaseHTTPRequestHandler):
             active = self.state.kimi_active_turn
             if str(active.get("user_ts") or "") == str(rec.get("ts") or ""):
                 active["prompt_id"] = prompt_id
+                states = getattr(self.state, "contact_typing_states", None)
+                typing = states.get(contact_id) if isinstance(states, dict) else None
+                if isinstance(typing, dict) and str(typing.get("since") or "") == str(rec.get("ts") or ""):
+                    self._set_typing_for_contact(contact_id, {**typing, "exact_turn": True})
         submitted_event.set()
         self._send_json(200, {
             "ok": True,
@@ -12112,7 +12232,14 @@ class PushHandler(BaseHTTPRequestHandler):
                 )
             except Exception:
                 logger.warning("Kimi Web turn lease update after Stop failed")
-        if isinstance(cancel_event, threading.Event):
+            self._schedule_kimi_web_abort_settlement(
+                web=self.state.kimi_web, session_id=session_id, prompt_id=prompt_id,
+                user_ts=active_ts, cancel_event=cancel_event,
+            )
+        # Kimi Web's stream loop uses this event as an immediate disconnect.
+        # An accepted abort must instead wait for its exact lifecycle frame;
+        # ACP retains the legacy local cancellation signal.
+        if transport != "kimi-web" and isinstance(cancel_event, threading.Event):
             cancel_event.set()
         # Web abort is fenced by the exact prompt id. ACP compatibility keeps
         # the old one-worker cancellation event path during a rollback only.
@@ -15309,6 +15436,9 @@ class PushHandler(BaseHTTPRequestHandler):
                 return
             self.state.kimi_prepare_token = ""
             self.state.kimi_active_turn = {"user_ts": user_ts, "session_id": session_id, "prompt_id": "", "cancel_event": cancel_event, "transport": "kimi-web", "group": True}
+            self._set_typing_for_contact("apples", {
+                "is_typing": True, "since": user_ts, "transport": "kimi-web",
+            })
         # First Web use may happen from a group mention.  Seed only the
         # existing private Kimi conversation, never the whole apples room;
         # otherwise switching transport would make the private chat forget
@@ -15369,7 +15499,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     finally:
                         try:
                             if not self._has_pending_group_reply():
-                                self._set_typing_for_contact("apples", {"is_typing": False, "since": None})
+                                self._clear_typing_for_contact_if_turn("apples", user_ts)
                         except Exception:
                             logger.debug("group Kimi typing cleanup failed", exc_info=True)
 
@@ -15380,6 +15510,9 @@ class PushHandler(BaseHTTPRequestHandler):
             bound_turn_id = ""
             snapshot_epoch = ""
             snapshot_seq = -1
+            activity_count = 0
+            activity_items: list[str] = []
+            current_activity_label = ""
 
             def observer_record(activity: str) -> None:
                 record = getattr(observer, "record", None)
@@ -15425,11 +15558,28 @@ class PushHandler(BaseHTTPRequestHandler):
                                 if current[-size:] == value[:size]), 0)
                 chunks[:] = [current + value[overlap:]]
 
-            def publish_draft(activity: str = "Kimi 正在回复") -> None:
+            def publish_draft() -> None:
                 self._set_chat_draft(
                     "apples", "".join(chunks), source="group:kimi-web",
                     session_id=session_id, user_ts=user_ts, queued_at=user_ts,
-                    activity_text=activity,
+                    activity_text=current_activity_label or "正在处理",
+                    activity_count=activity_count,
+                    activity_items=activity_items,
+                )
+
+            def note_activity(label: str) -> None:
+                nonlocal activity_count, current_activity_label
+                if label not in {"正在思考", "正在使用工具", "正在协作"}:
+                    return
+                if label == current_activity_label:
+                    return
+                current_activity_label = label
+                activity_count = min(999, max(1, activity_count + 1))
+                if label not in activity_items and len(activity_items) < 3:
+                    activity_items.append(label)
+                self._set_chat_activity(
+                    "apples", activity_text=label, activity_count=activity_count,
+                    activity_items=activity_items, user_ts=user_ts,
                 )
 
             def prompt_id_from(payload: dict[str, Any], frame: dict[str, Any] | None = None) -> str:
@@ -15498,7 +15648,6 @@ class PushHandler(BaseHTTPRequestHandler):
                     if not approvals and not questions:
                         approvals = self.state.kimi_web.list_approvals(session_id)
                 except KimiWebError:
-                    self._set_chat_activity("apples", activity_text="Kimi 需要确认，但确认状态暂不可读取", activity_count=0, user_ts=user_ts)
                     return
                 if len(approvals) == 1 and not questions and self._kimi_is_routine_readonly_approval(approvals[0]):
                     approval_id = str(approvals[0].get("approval_id") or "").strip()
@@ -15506,7 +15655,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         approval_resolution_started = True
                         try:
                             self.state.kimi_web.approve_once(session_id, approval_id)
-                            self._set_chat_activity("apples", activity_text="已允许 Kimi 本轮单个工具操作", activity_count=0, user_ts=user_ts)
+                            note_activity("正在使用工具")
                             observer_record("tool")
                             return
                         except KimiWebError:
@@ -15515,12 +15664,16 @@ class PushHandler(BaseHTTPRequestHandler):
                 # guess a response or leave the shared room permanently busy.
                 approval_resolution_started = True
                 terminal_reason = "blocked"
-                self._set_chat_activity("apples", activity_text="Kimi 需要你选择，已安全停止本轮", activity_count=0, user_ts=user_ts)
                 try:
                     self.state.kimi_web.abort_prompt(session_id, prompt_id)
+                    self._schedule_kimi_web_abort_settlement(
+                        web=self.state.kimi_web, session_id=session_id, prompt_id=prompt_id,
+                        user_ts=user_ts, cancel_event=cancel_event,
+                    )
                 except KimiWebError:
                     logger.warning("group Kimi Web could not abort blocked prompt")
-                cancel_event.set()
+                # Abort acceptance is not a terminal event. Keep this turn's
+                # typing state until Web confirms its exact lifecycle.
 
             def on_ready() -> None:
                 ready.set()
@@ -15560,6 +15713,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         if snapshot is not None:
                             resolve_pending_interaction(snapshot)
                     return
+                note_activity(self._kimi_web_activity_label(event_type))
                 if event_type == "assistant.delta" and isinstance(payload.get("delta"), str):
                     merge_text(payload["delta"])
                     observer_record("thinking")
@@ -15572,7 +15726,7 @@ class PushHandler(BaseHTTPRequestHandler):
                             if snapshot is not None:
                                 resolve_pending_interaction(snapshot)
                         except KimiWebError:
-                            self._set_chat_activity("apples", activity_text="Kimi 正在等待确认", activity_count=0, user_ts=user_ts)
+                            pass
                 elif event_type == "event.session.work_changed":
                     if str(payload.get("pending_interaction") or "") in {"approval", "question"}:
                         try:
@@ -15583,7 +15737,6 @@ class PushHandler(BaseHTTPRequestHandler):
                             pass
                 elif event_type.startswith("tool."):
                     observer_record("tool")
-                    self._set_chat_activity("apples", activity_text="Kimi 正在使用工具", activity_count=0, user_ts=user_ts)
                 elif event_type == "prompt.completed":
                     incoming_reason = str(payload.get("reason") or "completed")
                     with self.state.kimi_turn_lock:
@@ -15696,7 +15849,12 @@ class PushHandler(BaseHTTPRequestHandler):
             prompt_id = str(result.get("prompt_id") or result.get("id") or "")
             if not prompt_id: raise KimiWebError("missing prompt id")
             with self.state.kimi_turn_lock:
-                if str(self.state.kimi_active_turn.get("user_ts") or "") == user_ts: self.state.kimi_active_turn["prompt_id"] = prompt_id
+                if str(self.state.kimi_active_turn.get("user_ts") or "") == user_ts:
+                    self.state.kimi_active_turn["prompt_id"] = prompt_id
+                    states = getattr(self.state, "contact_typing_states", None)
+                    typing = states.get("apples") if isinstance(states, dict) else None
+                    if isinstance(typing, dict) and str(typing.get("since") or "") == user_ts:
+                        self._set_typing_for_contact("apples", {**typing, "exact_turn": True})
             submitted.set()
         except Exception:
             cancel_event.set()

@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 from kimi_acp import KimiACPCancelled, KimiACPError
 from link_preview import LinkPreviewBundle
 from kimi_web_client import KimiWebError, KimiWebSessionBusy
-from push import KimiTerminalBusy, PushHandler, _should_generate_chat_append_tts
+from push import KimiTerminalBusy, PushHandler, _should_expire_chat_typing, _should_generate_chat_append_tts
 
 
 class FakeChat:
@@ -566,8 +566,7 @@ class FakeWebChat:
         self.calls.append(("stream", session_id))
         on_ready()
         if self.wait_for_stop:
-            while not stop_event.wait(0.01):
-                pass
+            self.stop.wait(1)
             on_event({"type": "prompt.aborted", "session_id": session_id, "payload": {"turnId": "turn-1"}})
             return
         on_event({"type": "assistant.delta", "session_id": session_id, "payload": {"turnId": "turn-1", "delta": self.text}})
@@ -681,6 +680,139 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.wait_idle(handler)
         self.assertIn(("abort", "web-session-1", "prompt-1"), web.calls)
         self.assertTrue(any(row["role"] == "assistant" for row in chat.records))
+
+    def test_web_interleaved_activity_keeps_typing_until_exact_terminal(self):
+        class InterleavedWeb(FakeWebChat):
+            def __init__(self):
+                super().__init__()
+                self.activity_ready = threading.Event()
+                self.release_terminal = threading.Event()
+
+            def stream_session(self, session_id, *, on_event, on_ready, stop_event, **_kwargs):
+                self.calls.append(("stream", session_id))
+                on_ready()
+                for event_type, payload in (
+                    ("assistant.delta", {"turnId": "turn-1", "delta": "draft"}),
+                    ("tool.started", {"turnId": "turn-1", "command": "rm -rf /", "output": "secret"}),
+                    ("subagent.started", {"turnId": "turn-1", "name": "private child", "arguments": {"token": "secret"}}),
+                ):
+                    on_event({"type": event_type, "session_id": session_id, "payload": payload})
+                self.activity_ready.set()
+                self.release_terminal.wait(1)
+                on_event({"type": "turn.ended", "session_id": session_id,
+                          "payload": {"turnId": "turn-1", "reason": "completed"}})
+
+        handler, _chat, web = self.make_handler(web=InterleavedWeb())
+        typing, activity_updates = [], []
+        handler._set_typing_for_contact = lambda contact_id, value: typing.append((contact_id, dict(value)))
+        original_set_activity = handler._set_chat_activity
+
+        def record_activity(*args, **kwargs):
+            activity_updates.append(dict(kwargs))
+            return original_set_activity(*args, **kwargs)
+
+        handler._set_chat_activity = record_activity
+        handler._handle_kimi_chat_send({"text": "interleaved"}, "kimi")
+        self.assertTrue(web.activity_ready.wait(1))
+        self.assertTrue(handler.state.kimi_active_turn)
+        self.assertTrue(typing and typing[0][1]["is_typing"])
+        self.assertFalse(any(not value["is_typing"] for _contact, value in typing))
+        self.assertEqual([1, 2, 3], [update["activity_count"] for update in activity_updates])
+        draft = handler.state.chat_drafts["kimi"]
+        self.assertEqual(3, draft["activity_count"])
+        self.assertEqual(["正在思考", "正在使用工具", "正在协作"], draft["activity_items"])
+        self.assertNotIn("rm -rf", str({"draft": draft, "updates": activity_updates}))
+        self.assertNotIn("secret", str({"draft": draft, "updates": activity_updates}))
+
+        web.release_terminal.set()
+        self.wait_idle(handler)
+        for _ in range(100):
+            if typing and typing[-1][1].get("is_typing") is False:
+                break
+            __import__("time").sleep(0.01)
+        self.assertFalse(typing[-1][1]["is_typing"])
+
+    def test_exact_kimi_web_typing_does_not_expire_during_long_tool_turn(self):
+        exact = {"transport": "kimi-web", "exact_turn": True}
+        self.assertFalse(_should_expire_chat_typing("kimi", exact, 3600))
+        self.assertFalse(_should_expire_chat_typing("apples", exact, 3600))
+        self.assertTrue(_should_expire_chat_typing("kimi", {"transport": "kimi-web"}, 121))
+
+    def test_private_abort_without_lifecycle_settles_only_after_exact_idle_proof(self):
+        class LostTerminalWeb(FakeWebChat):
+            def __init__(self):
+                super().__init__(); self.status_calls = 0
+            def stream_session(self, session_id, *, on_ready, stop_event, **_kwargs):
+                self.calls.append(("stream", session_id)); on_ready(); stop_event.wait(1)
+            def get_session_status(self, _session_id, **_kwargs):
+                self.status_calls += 1; return {"busy": False}
+            def get_snapshot(self, _session_id, **_kwargs):
+                return {}
+
+        handler, _chat, web = self.make_handler(web=LostTerminalWeb())
+        handler.state.contact_typing_states = {"kimi": {"is_typing": False, "since": None}}
+        handler._set_typing_for_contact = PushHandler._set_typing_for_contact.__get__(handler)
+        with patch("push.KIMI_WEB_ABORT_SETTLE_SECONDS", 0.01):
+            handler._handle_kimi_chat_send({"text": "settle"}, "kimi")
+            user_ts = handler.responses[-1][1]["turn"]["user_ts"]
+            self.assertTrue(handler.state.contact_typing_states["kimi"]["exact_turn"])
+            self.assertFalse(_should_expire_chat_typing("kimi", handler.state.contact_typing_states["kimi"], 3600))
+            handler._handle_kimi_chat_stop(user_ts)
+            self.assertTrue(handler.state.kimi_active_turn)
+            self.wait_idle(handler)
+        self.assertEqual(1, web.status_calls)
+        self.assertFalse(handler.state.contact_typing_states["kimi"]["is_typing"])
+
+    def test_abort_settlement_busy_or_stale_turn_never_clears_foreground(self):
+        handler, _chat, _web = self.make_handler()
+        handler.state.contact_typing_states = {"kimi": {"is_typing": True, "since": "new", "exact_turn": True}}
+        handler._set_typing_for_contact = PushHandler._set_typing_for_contact.__get__(handler)
+        cancel = threading.Event()
+        handler.state.kimi_active_turn = {"user_ts": "old", "session_id": "s", "prompt_id": "p"}
+        busy_web = types.SimpleNamespace(get_session_status=lambda *_args, **_kwargs: {"busy": True})
+        with patch("push.KIMI_WEB_ABORT_SETTLE_SECONDS", 0.01):
+            handler._schedule_kimi_web_abort_settlement(web=busy_web, session_id="s", prompt_id="p", user_ts="old", cancel_event=cancel)
+            __import__("time").sleep(0.05)
+        self.assertFalse(cancel.is_set())
+        self.assertTrue(handler.state.contact_typing_states["kimi"]["is_typing"])
+        self.assertFalse(handler._clear_typing_for_contact_if_turn("kimi", "old"))
+        handler.state.kimi_active_turn.pop("abort_settlement_scheduled", None)
+        foreign_web = types.SimpleNamespace(
+            get_session_status=lambda *_args, **_kwargs: {"busy": False},
+            get_snapshot=lambda *_args, **_kwargs: {"current_prompt_id": "p-new"},
+        )
+        with patch("push.KIMI_WEB_ABORT_SETTLE_SECONDS", 0.01):
+            handler._schedule_kimi_web_abort_settlement(web=foreign_web, session_id="s", prompt_id="p", user_ts="old", cancel_event=cancel)
+            __import__("time").sleep(0.05)
+        self.assertFalse(cancel.is_set())
+        self.assertTrue(handler.state.contact_typing_states["kimi"]["is_typing"])
+
+    def test_group_blocked_abort_without_lifecycle_settles_after_idle_proof(self):
+        class GroupLostTerminalWeb(FakeWebChat):
+            def __init__(self):
+                super().__init__(); self.status_calls = 0
+            def stream_session(self, session_id, *, on_ready, stop_event, **_kwargs):
+                self.calls.append(("stream", session_id)); on_ready(); stop_event.wait(1)
+            def get_session_status(self, _session_id, **_kwargs):
+                self.status_calls += 1; return {"busy": False}
+            def get_snapshot(self, _session_id, **_kwargs):
+                # The first snapshot drives the bounded blocked-abort path;
+                # the watchdog's later idle snapshot proves it is gone.
+                if self.status_calls:
+                    return {}
+                return {"current_prompt_id": "prompt-1", "in_flight_turn": {"turnId": "turn-1"}, "pending_questions": [{"id": "q"}]}
+
+        handler, chat, web = self.make_handler(web=GroupLostTerminalWeb())
+        handler.state.contact_typing_states = {"apples": {"is_typing": False, "since": None}}
+        handler._set_typing_for_contact = PushHandler._set_typing_for_contact.__get__(handler)
+        handler._release_kimi_control = lambda _token: None
+        handler._has_pending_group_reply = lambda: False
+        user = chat.append(role="user", text="@Kimi settle", source="android-app:apples")
+        with patch("push.KIMI_WEB_ABORT_SETTLE_SECONDS", 0.01):
+            handler._start_group_kimi_reply(chat, user["text"], sender_name="Astra", user_ts=user["ts"], hop_count=0)
+            self.wait_idle(handler)
+        self.assertEqual(1, web.status_calls)
+        self.assertFalse(handler.state.contact_typing_states["apples"]["is_typing"])
 
     def test_second_turn_and_history_failure_fail_before_web_submit(self):
         handler, chat, web = self.make_handler()
@@ -895,7 +1027,7 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         handler.state.kimi_active_turn["session_id"] = "web-session-1"
         handler._handle_kimi_chat_stop("new")
         self.assertEqual(200, handler.responses[-1][0])
-        self.assertTrue(event.is_set())
+        self.assertFalse(event.is_set())
         self.assertIn(("abort", "web-session-1", "prompt-1"), web.calls)
 
     def test_stop_http_acceptance_keeps_lease_until_provider_terminal_event(self):
@@ -912,7 +1044,7 @@ class KimiWebChatRoutingTest(unittest.TestCase):
             "prompt_id": "prompt-1", "transport": "kimi-web",
         }
         handler._handle_kimi_chat_stop("turn-1")
-        self.assertTrue(event.is_set())
+        self.assertFalse(event.is_set())
         self.assertEqual([], web.clears)
         self.assertEqual(
             [{"session_id": "web-session-1", "prompt_id": "prompt-1", "state": "stopping"}],
