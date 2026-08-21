@@ -495,7 +495,7 @@ class WebPwaContractTest(unittest.TestCase):
         for forbidden in ("private@example.test", "SECRET runtime", "/private/path", "session", "cwd", "email"):
             self.assertNotIn(forbidden, encoded)
 
-    def test_xiaoke_fable_instrument_projects_three_used_windows_without_raw_status_text(self):
+    def test_xiaoke_fable_instrument_derives_weekly_usage_from_claude_seven_day(self):
         handler = self.handler()
         handler._pwa_claude_status_cached = lambda: ({
             "model": {"id": "fable", "display_name": "SECRET MODEL"},
@@ -505,24 +505,24 @@ class WebPwaContractTest(unittest.TestCase):
                 "seven_day": {"used_percentage": 31, "resets_at": 1780100000},
             },
             "cwd": "/private/path", "email": "private@example.test",
-        }, (81.2, "08-14 18:59"))
+        })
         payload = handler._pwa_xiaoke_instrument_snapshot()
         self.assertEqual(payload["provider"], "Claude Code")
         self.assertEqual(payload["model"], "Fable 5")
         self.assertEqual(payload["context"]["used_percent"], 12.5)
-        self.assertEqual([(row["label"], row["mode"], row["used_percent"]) for row in payload["quota"]["windows"]], [("Claude 5h", "used", 14.5), ("Claude 7d", "used", 31.0), ("Fable weekly", "used", 81.2)])
+        self.assertEqual([(row["label"], row["mode"], row["used_percent"]) for row in payload["quota"]["windows"]], [("Claude 5h", "used", 14.5), ("Claude 7d", "used", 31.0), ("Fable weekly", "used", 62.0)])
         self.assertNotIn("SECRET MODEL", str(payload))
         self.assertNotIn("private@example.test", str(payload))
         self.assertNotIn("/private/path", str(payload))
 
     def test_xiaoke_instrument_skips_only_quota_row_with_extreme_reset_epoch(self):
         handler = self.handler()
-        handler._pwa_claude_status_cached = lambda: ({"rate_limits": {
+        handler._pwa_claude_status_cached = lambda: {"rate_limits": {
             "five_hour": {"used_percentage": 12, "resets_at": 10**100},
             "seven_day": {"used_percentage": 33, "resets_at": 1780100000},
-        }}, None)
+        }}
         rows = handler._pwa_xiaoke_instrument_snapshot()["quota"]["windows"]
-        self.assertEqual([(row["label"], row["used_percent"]) for row in rows], [("Claude 7d", 33.0)])
+        self.assertEqual([(row["label"], row["used_percent"]) for row in rows], [("Claude 7d", 33.0), ("Fable weekly", 66.0)])
 
     def test_pwa_claude_status_partial_writer_times_out_and_is_reaped(self):
         read_fd, write_fd = os.pipe()
@@ -553,46 +553,22 @@ class WebPwaContractTest(unittest.TestCase):
             calls.append("probe")
             time.sleep(0.02)
             return {"model": {"id": "fable"}}
-        with patch.dict("push.PWA_CLAUDE_STATUS_CACHE", {"ts": 0.0, "status": None, "fable_week": None}, clear=True), patch.object(handler, "_pwa_read_claude_status_option", side_effect=read_status), patch.object(handler, "_pwa_read_fable_week_cache", return_value=None):
+        with patch.dict("push.PWA_CLAUDE_STATUS_CACHE", {"ts": 0.0, "status": None}, clear=True), patch.object(handler, "_pwa_read_claude_status_option", side_effect=read_status):
             threads = [threading.Thread(target=handler._pwa_claude_status_cached) for _ in range(8)]
             for thread in threads: thread.start()
             for thread in threads: thread.join(1)
         self.assertEqual(calls, ["probe"])
 
-    def test_pwa_fable_week_cache_reads_only_bounded_regular_decimal_file(self):
-        with tempfile.TemporaryDirectory() as raw_tmp:
-            root = Path(raw_tmp)
-            source = root / "fable-usage.txt"
-            source.write_text("81.2%@08-14 18:59", encoding="utf-8")
-            with patch("push.PWA_CLAUDE_FABLE_USAGE_PATH", source):
-                self.assertEqual(PushHandler._pwa_read_fable_week_cache(), (81.2, "08-14 18:59"))
-            source.write_text("101%@08-14 18:59", encoding="utf-8")
-            with patch("push.PWA_CLAUDE_FABLE_USAGE_PATH", source):
-                self.assertIsNone(PushHandler._pwa_read_fable_week_cache())
-            target = root / "target.txt"
-            target.write_text("81%@08-14 18:59", encoding="utf-8")
-            link = root / "usage-link.txt"
-            link.symlink_to(target)
-            with patch("push.PWA_CLAUDE_FABLE_USAGE_PATH", link):
-                self.assertIsNone(PushHandler._pwa_read_fable_week_cache())
+    def test_xiaoke_fable_weekly_usage_caps_at_one_hundred_and_hides_without_seven_day(self):
+        handler = self.handler()
+        handler._pwa_claude_status_cached = lambda: {"rate_limits": {
+            "seven_day": {"used_percentage": 75, "resets_at": 1780100000},
+        }}
+        rows = handler._pwa_xiaoke_instrument_snapshot()["quota"]["windows"]
+        self.assertEqual([(row["label"], row["used_percent"]) for row in rows], [("Claude 7d", 75.0), ("Fable weekly", 100.0)])
 
-    def test_pwa_fable_week_cache_hides_value_past_its_independent_max_age(self):
-        with tempfile.TemporaryDirectory() as raw_tmp:
-            source = Path(raw_tmp) / "fable-usage.txt"
-            source.write_text("49%@08-21 18:59", encoding="utf-8")
-            stale_at = time.time() - 16 * 60
-            os.utime(source, (stale_at, stale_at))
-            with patch("push.PWA_CLAUDE_FABLE_USAGE_PATH", source):
-                self.assertIsNone(PushHandler._pwa_read_fable_week_cache())
-
-    def test_pwa_fable_week_cache_hides_future_mtime(self):
-        with tempfile.TemporaryDirectory() as raw_tmp:
-            source = Path(raw_tmp) / "fable-usage.txt"
-            source.write_text("49%@08-21 18:59", encoding="utf-8")
-            future_at = time.time() + 60
-            os.utime(source, (future_at, future_at))
-            with patch("push.PWA_CLAUDE_FABLE_USAGE_PATH", source):
-                self.assertIsNone(PushHandler._pwa_read_fable_week_cache())
+        handler._pwa_claude_status_cached = lambda: {"rate_limits": {}}
+        self.assertEqual(handler._pwa_xiaoke_instrument_snapshot()["quota"]["windows"], [])
 
     def test_chat_status_keeps_xiaoke_and_kairos_instruments_contact_scoped(self):
         handler = self.handler("/chat/status?contact_id=xiaoke")
