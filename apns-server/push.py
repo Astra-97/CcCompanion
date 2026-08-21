@@ -10345,6 +10345,12 @@ class PushHandler(BaseHTTPRequestHandler):
                         "recall_card": True,
                         "items": items,
                         "kimi_user_ts": user_ts,
+                        # A recall card is attached to the foreground turn for
+                        # ordering, but it is not that turn's final assistant
+                        # answer.  Clients must not use it as completion
+                        # evidence merely because the exact user_ts matches.
+                        "turn_terminal": False,
+                        "turn_message_kind": "auxiliary_recall",
                         "recall_session_id": session_id,
                         "recall_memory_keys": keys,
                     },
@@ -10490,7 +10496,12 @@ class PushHandler(BaseHTTPRequestHandler):
             text = "上一轮 Kimi 生成已在恢复时安全中断。" if outcome == "interrupted" else "上一轮 Kimi 生成未完成，已安全结束。"
             chat.append(
                 role="assistant", text=text, source=f"kimi-web:{outcome}",
-                metadata={"kimi_user_ts": user_ts, "orphan_recovery": True},
+                metadata={
+                    "kimi_user_ts": user_ts,
+                    "turn_terminal": True,
+                    "turn_message_kind": "terminal_recovery",
+                    "orphan_recovery": True,
+                },
             )
             if outcome == "interrupted":
                 self._set_chat_interrupted("kimi", user_ts=user_ts, final_ts="", source=f"kimi-web:{outcome}", session_id=session_id)
@@ -11180,6 +11191,8 @@ class PushHandler(BaseHTTPRequestHandler):
                     source=source,
                     metadata={
                         "kimi_user_ts": str(rec.get("ts") or ""),
+                        "turn_terminal": True,
+                        "turn_message_kind": "terminal_answer",
                         **({"xhs_login_card": True} if xhs_card else {}),
                     },
                 )
@@ -11231,6 +11244,14 @@ class PushHandler(BaseHTTPRequestHandler):
                 user_ts=str(rec.get("ts") or ""),
                 state="submitted",
             )
+            # The provider has accepted the exact prompt and its durable lease
+            # now exists.  Only at this point mark injected memories as seen;
+            # doing it before submit would suppress a recall the model never
+            # received, while omitting it makes the same card recur forever in
+            # a stable Kimi Web session.
+            if recall_result is not None:
+                if not self._commit_kimi_recall(recall_result, session_id):
+                    logger.warning("Kimi Web recall seen-index commit failed")
         except Exception:
             logger.warning("Kimi Web prompt submit failed", exc_info=True)
             # If the provider accepted a prompt but its ownership lease could
@@ -11484,7 +11505,11 @@ class PushHandler(BaseHTTPRequestHandler):
                         message,
                         allowed=allow_xhs_login_card,
                     )
-                    assistant_metadata = {"kimi_user_ts": str(rec.get("ts") or "")}
+                    assistant_metadata = {
+                        "kimi_user_ts": str(rec.get("ts") or ""),
+                        "turn_terminal": True,
+                        "turn_message_kind": "terminal_answer",
+                    }
                     if xhs_login_card:
                         assistant_metadata["xhs_login_card"] = True
                     final = chat.append(
@@ -14519,6 +14544,8 @@ class PushHandler(BaseHTTPRequestHandler):
                     "recall_card": True,
                     "items": items,
                     "kairos_user_ts": user_ts,
+                    "turn_terminal": False,
+                    "turn_message_kind": "auxiliary_recall",
                     "recall_session_id": session_id,
                     "recall_memory_keys": memory_keys,
                 },
@@ -14625,7 +14652,11 @@ class PushHandler(BaseHTTPRequestHandler):
                 role="assistant",
                 text=message,
                 source=append_source,
-                metadata={"kairos_user_ts": user_ts} if user_ts else None,
+                metadata={
+                    "kairos_user_ts": user_ts,
+                    "turn_terminal": True,
+                    "turn_message_kind": "terminal_answer",
+                } if user_ts else None,
             )
             assistant_appended = True
             terminal_setter = (
@@ -14664,7 +14695,11 @@ class PushHandler(BaseHTTPRequestHandler):
                 role="assistant",
                 text=message,
                 source=f"{source}:interrupted",
-                metadata={"kairos_user_ts": user_ts} if user_ts else None,
+                metadata={
+                    "kairos_user_ts": user_ts,
+                    "turn_terminal": True,
+                    "turn_message_kind": "terminal_answer",
+                } if user_ts else None,
             )
             assistant_appended = True
             self._set_chat_interrupted(
@@ -14690,7 +14725,11 @@ class PushHandler(BaseHTTPRequestHandler):
                 role="assistant",
                 text=message,
                 source=f"{source}:uncertain",
-                metadata={"kairos_user_ts": user_ts} if user_ts else None,
+                metadata={
+                    "kairos_user_ts": user_ts,
+                    "turn_terminal": True,
+                    "turn_message_kind": "terminal_answer",
+                } if user_ts else None,
             )
             assistant_appended = True
             self._set_chat_interrupted(

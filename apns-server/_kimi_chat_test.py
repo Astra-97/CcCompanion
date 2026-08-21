@@ -638,6 +638,81 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.assertEqual("kimi-web", handler.responses[-1][1]["turn"]["transport"])
         self.assertEqual(["ensure", "stream", "submit"], [row[0] for row in web.calls[:3]])
         self.assertEqual("auto", next(row[3]["permission_mode"] for row in web.calls if row[0] == "submit"))
+        self.assertTrue(chat.records[-1]["metadata"]["turn_terminal"])
+        self.assertEqual("terminal_answer", chat.records[-1]["metadata"]["turn_message_kind"])
+
+    def test_web_commits_recall_only_after_prompt_and_lease_are_accepted(self):
+        order = []
+
+        class OrderedWeb(FakeWebChat):
+            def submit_prompt(self, session_id, prompt, **kwargs):
+                order.append("submit")
+                return super().submit_prompt(session_id, prompt, **kwargs)
+
+            def save_turn_lease(self, **kwargs):
+                order.append("lease")
+                return super().save_turn_lease(**kwargs)
+
+        recall = types.SimpleNamespace(
+            context="safe recall",
+            items=({"date": "2026-08-20", "title": "memory", "snippet": "safe"},),
+            memory_keys=("v1:" + "c" * 64,),
+        )
+        handler, _chat, _web = self.make_handler(web=OrderedWeb())
+        handler._kimi_semantic_recall = Mock(return_value=recall)
+        handler._append_kimi_recall_card = Mock(return_value=True)
+        handler._commit_kimi_recall = Mock(
+            side_effect=lambda *_args: order.append("commit") or True,
+        )
+
+        handler._handle_kimi_chat_send({"text": "hello"}, "kimi")
+        self.wait_idle(handler)
+
+        handler._commit_kimi_recall.assert_called_once_with(recall, "web-session-1")
+        self.assertEqual(["submit", "lease", "commit"], order)
+
+    def test_web_does_not_commit_recall_when_turn_lease_cannot_be_saved(self):
+        class UnleasedWeb(FakeWebChat):
+            def save_turn_lease(self, **_kwargs):
+                raise KimiWebError("lease unavailable")
+
+        recall = types.SimpleNamespace(
+            context="safe recall",
+            items=({"date": "2026-08-20", "title": "memory", "snippet": "safe"},),
+            memory_keys=("v1:" + "e" * 64,),
+        )
+        handler, _chat, _web = self.make_handler(web=UnleasedWeb())
+        handler._kimi_semantic_recall = Mock(return_value=recall)
+        handler._append_kimi_recall_card = Mock(return_value=True)
+        handler._commit_kimi_recall = Mock(return_value=True)
+
+        handler._handle_kimi_chat_send({"text": "hello"}, "kimi")
+        self.wait_idle(handler)
+
+        handler._commit_kimi_recall.assert_not_called()
+        self.assertEqual(503, handler.responses[-1][0])
+
+    def test_web_does_not_commit_recall_when_prompt_is_not_accepted(self):
+        class RejectingWeb(FakeWebChat):
+            def submit_prompt(self, session_id, prompt, **_kwargs):
+                self.calls.append(("submit", session_id, prompt, dict(_kwargs)))
+                raise KimiWebError("rejected")
+
+        recall = types.SimpleNamespace(
+            context="safe recall",
+            items=({"date": "2026-08-20", "title": "memory", "snippet": "safe"},),
+            memory_keys=("v1:" + "d" * 64,),
+        )
+        handler, _chat, _web = self.make_handler(web=RejectingWeb())
+        handler._kimi_semantic_recall = Mock(return_value=recall)
+        handler._append_kimi_recall_card = Mock(return_value=True)
+        handler._commit_kimi_recall = Mock(return_value=True)
+
+        handler._handle_kimi_chat_send({"text": "hello"}, "kimi")
+        self.wait_idle(handler)
+
+        handler._commit_kimi_recall.assert_not_called()
+        self.assertEqual(503, handler.responses[-1][0])
 
     def test_web_chat_releases_an_idle_kimi_tui_before_session_prepare(self):
         handler, _chat, web = self.make_handler()

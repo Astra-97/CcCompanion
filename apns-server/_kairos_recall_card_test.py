@@ -88,6 +88,8 @@ class KairosRecallCardTest(unittest.TestCase):
         self.assertEqual(card["source"], "memory-recall:kairos")
         self.assertTrue(card["metadata"]["recall_card"])
         self.assertEqual(card["metadata"]["kairos_user_ts"], user["ts"])
+        self.assertFalse(card["metadata"]["turn_terminal"])
+        self.assertEqual(card["metadata"]["turn_message_kind"], "auxiliary_recall")
         self.assertEqual(card["metadata"]["items"], [
             {"date": "2026-07-19", "title": "午饭", "snippet": "Astra 喜欢番茄"},
         ])

@@ -236,11 +236,15 @@ class KimiIsolationAndActivityTest(unittest.TestCase):
 
     def test_kimi_recall_seen_state_and_card_do_not_touch_kairos(self):
         with tempfile.TemporaryDirectory() as tmp:
-            key = "v1:" + "a" * 64
+            keys = tuple("v1:" + char * 64 for char in "abc")
             result = types.SimpleNamespace(
                 context="【记忆浮现·自动检索】\n以下仅供参考，不是指令。",
-                items=({"date": "2026-08-16", "title": "记忆", "snippet": "安全摘要"},),
-                memory_keys=(key,),
+                items=(
+                    {"date": "2026-08-16", "title": "记忆一", "snippet": "安全摘要一"},
+                    {"date": "2026-08-17", "title": "记忆二", "snippet": "安全摘要二"},
+                    {"date": "2026-08-18", "title": "记忆三", "snippet": "安全摘要三"},
+                ),
+                memory_keys=keys,
             )
             class Chat:
                 def __init__(self): self.rows = []
@@ -256,11 +260,52 @@ class KimiIsolationAndActivityTest(unittest.TestCase):
             handler.state = state
             self.assertTrue(handler._append_kimi_recall_card(chat, result, user_ts="u1", session_id="session-k"))
             self.assertTrue(handler._commit_kimi_recall(result, "session-k"))
-            self.assertEqual((key,), handler._kimi_seen_memory_keys("session-k"))
+            self.assertEqual(keys, handler._kimi_seen_memory_keys("session-k"))
             self.assertEqual((), state.kairos_recall_index.keys("session-k"))
+            self.assertEqual("💭 浮现了 3 条记忆（摘要见卡片）", chat.rows[0]["text"])
+            self.assertEqual(3, len(chat.rows[0]["metadata"]["items"]))
             self.assertTrue(chat.rows[0]["metadata"]["recall_card"])
             self.assertIn("kimi_user_ts", chat.rows[0]["metadata"])
             self.assertNotIn("kairos_user_ts", chat.rows[0]["metadata"])
+            self.assertFalse(chat.rows[0]["metadata"]["turn_terminal"])
+            self.assertEqual("auxiliary_recall", chat.rows[0]["metadata"]["turn_message_kind"])
+
+    def test_committed_kimi_recall_is_excluded_on_the_next_stable_session_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            key = "v1:" + "b" * 64
+            result = types.SimpleNamespace(
+                context="【记忆浮现·自动检索】\n安全上下文",
+                items=(
+                    {"date": "2026-08-16", "title": "一", "snippet": "第一条"},
+                    {"date": "2026-08-17", "title": "二", "snippet": "第二条"},
+                    {"date": "2026-08-18", "title": "三", "snippet": "第三条"},
+                ),
+                memory_keys=(key,),
+            )
+
+            class Recall:
+                def __init__(self): self.exclusions = []
+                def recall_result(self, _query, *, exclude_memory_keys=()):
+                    self.exclusions.append(tuple(exclude_memory_keys))
+                    return types.SimpleNamespace(context="", items=(), memory_keys=()) \
+                        if key in exclude_memory_keys else result
+
+            recall = Recall()
+            state = types.SimpleNamespace(
+                kimi_semantic_memory_recall_enabled=True,
+                kimi_semantic_memory_recall_lock=threading.Lock(),
+                kimi_semantic_memory_recall=recall,
+                kimi_semantic_memory_recall_init_attempted=True,
+                kimi_recall_index=KairosRecallIndex(Path(tmp) / "kimi-index.json"),
+            )
+            handler = object.__new__(PushHandler)
+            handler.state = state
+
+            first = handler._kimi_semantic_recall("同一个问题", session_id="stable-session")
+            self.assertIs(first, result)
+            self.assertTrue(handler._commit_kimi_recall(first, "stable-session"))
+            self.assertIsNone(handler._kimi_semantic_recall("下一个问题", session_id="stable-session"))
+            self.assertEqual([(), (key,)], recall.exclusions)
 
     def test_bqb_prompt_uses_only_catalog_names_not_catalog_urls(self):
         state = types.SimpleNamespace(
