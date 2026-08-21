@@ -49,6 +49,12 @@ class KimiWebRecoveryConflict(KimiWebError):
 
 
 class KimiWebClient:
+    # CcCompanion's App/Web transport is unattended: manual and YOLO modes
+    # either stall without an approval UI or can still ask a question.  Keep
+    # the transport pinned to Kimi's fully autonomous mode for every new
+    # session and every prompt. Static Kimi `deny` rules are best-effort only;
+    # auto mode deliberately remains a user-authorized root risk.
+    APP_PERMISSION_MODE = "auto"
     def __init__(
         self,
         *,
@@ -465,7 +471,7 @@ class KimiWebClient:
         title: str = "CcCompanion Kimi",
         model: str = "",
         thinking: str = "",
-        permission_mode: str = "manual",
+        permission_mode: str = APP_PERMISSION_MODE,
     ) -> str:
         payload: dict[str, Any] = {
             "title": str(title or "CcCompanion Kimi").strip()[:120] or "CcCompanion Kimi",
@@ -476,8 +482,10 @@ class KimiWebClient:
             agent_config["model"] = model.strip()
         if thinking.strip():
             agent_config["thinking"] = thinking.strip()
-        if permission_mode in {"manual", "yolo", "auto"}:
-            agent_config["permission_mode"] = permission_mode
+        # Do not let a stale caller or deployment setting downgrade an App
+        # session to manual/YOLO.  The parameter remains for compatibility
+        # with callers while the wire contract is intentionally fixed.
+        agent_config["permission_mode"] = self.APP_PERMISSION_MODE
         if agent_config:
             payload["agent_config"] = agent_config
         data = self._request("POST", "/api/v1/sessions", data=payload)
@@ -507,7 +515,11 @@ class KimiWebClient:
                 if bool(status.get("busy")):
                     raise KimiWebSessionBusy(session_id)
                 return session_id
-        return self.create_session(model=model, thinking=thinking)
+        return self.create_session(
+            model=model,
+            thinking=thinking,
+            permission_mode=self.APP_PERMISSION_MODE,
+        )
 
     @staticmethod
     def _prompt_id_from(value: Any) -> str:
@@ -611,7 +623,7 @@ class KimiWebClient:
         *,
         model: str = "",
         thinking: str = "",
-        permission_mode: str = "manual",
+        permission_mode: str = APP_PERMISSION_MODE,
     ) -> dict[str, Any]:
         session_id = self._valid_session_id(session_id)
         clean_text = str(text or "").strip()
@@ -622,8 +634,9 @@ class KimiWebClient:
             payload["model"] = model.strip()
         if thinking.strip():
             payload["thinking"] = thinking.strip()
-        if permission_mode in {"manual", "yolo", "auto"}:
-            payload["permission_mode"] = permission_mode
+        # See create_session(): every App prompt is auto, including callers
+        # that still pass an obsolete value.
+        payload["permission_mode"] = self.APP_PERMISSION_MODE
         submitted = self._request("POST", f"/api/v1/sessions/{session_id}/prompts", data=payload)
         prompt_id = str(submitted.get("prompt_id") or submitted.get("id") or "").strip()
         if prompt_id:

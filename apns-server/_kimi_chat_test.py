@@ -574,7 +574,7 @@ class FakeWebChat:
         on_event({"type": "turn.ended", "session_id": session_id, "payload": {"turnId": "turn-1", "reason": "completed"}})
 
     def submit_prompt(self, session_id, prompt, **_kwargs):
-        self.calls.append(("submit", session_id, prompt))
+        self.calls.append(("submit", session_id, prompt, dict(_kwargs)))
         return {"prompt_id": "prompt-1"}
 
     def get_snapshot(self, _session_id):
@@ -608,6 +608,7 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         state = types.SimpleNamespace(
             contact_chats={"kimi": chat}, kimi_web=web, kimi_acp=types.SimpleNamespace(),
             kimi_turn_lock=threading.RLock(), kimi_active_turn={}, kimi_prepare_token="",
+            kimi_web_permission_mode="auto",
             kimi_preferences=types.SimpleNamespace(snapshot=lambda: ("kimi-code/k3-256k", "low")),
             kimi_terminal_observer=types.SimpleNamespace(begin=lambda *_: 1, record=lambda *_: True, finish=lambda *_: True, record_assistant_text=lambda *_: True),
             kimi_semantic_memory_recall_enabled=False, chat_draft_lock=threading.Lock(), chat_drafts={},
@@ -637,6 +638,7 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.assertEqual(["hello", "reply"], [row["text"] for row in chat.records])
         self.assertEqual("kimi-web", handler.responses[-1][1]["turn"]["transport"])
         self.assertEqual(["ensure", "stream", "submit"], [row[0] for row in web.calls[:3]])
+        self.assertEqual("auto", next(row[3]["permission_mode"] for row in web.calls if row[0] == "submit"))
 
     def test_web_chat_releases_an_idle_kimi_tui_before_session_prepare(self):
         handler, _chat, web = self.make_handler()
@@ -1172,6 +1174,7 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.assertEqual("Kimi", assistant["sender_name"])
         self.assertEqual("group:kimi-web", assistant["source"])
         self.assertEqual(["kairos"], assistant["mentions"])
+        self.assertEqual("auto", next(row[3]["permission_mode"] for row in web.calls if row[0] == "submit"))
         self.assertEqual([1], routed)
         self.assertTrue(typing and typing[-1][1]["is_typing"] is False)
 

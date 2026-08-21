@@ -124,6 +124,10 @@ allowed_ips = []
 # kimi_web_host = "127.0.0.1"
 # kimi_web_port = 58627
 # kimi_web_start_timeout_seconds = 30
+# Kimi App/Web is deliberately fixed to fully autonomous `auto` mode. Any
+# other value is ignored at runtime. Static Bash denies in Kimi's config.toml
+# are best effort only, not a sandbox.
+# kimi_web_permission_mode = "auto"
 # Auto-forge: when Kimi's context usage reaches this threshold, summarize the
 # current session and start a fresh one to save quota. 0 disables forging.
 # kimi_auto_forge_context_threshold = 0.75

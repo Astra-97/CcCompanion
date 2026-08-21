@@ -3674,6 +3674,15 @@ class ServerState:
             state_path=contact_history_dir / "kimi_web_session.json",
             cwd=server_cfg.get("kimi_cwd", DEFAULT_KIMI_CWD),
         )
+        configured_kimi_web_permission_mode = str(
+            server_cfg.get("kimi_web_permission_mode", KimiWebClient.APP_PERMISSION_MODE)
+        ).strip().lower()
+        if configured_kimi_web_permission_mode != KimiWebClient.APP_PERMISSION_MODE:
+            logger.warning(
+                "Ignoring unsupported Kimi Web permission mode %r; CcCompanion App/Web is fixed to auto",
+                configured_kimi_web_permission_mode or "(empty)",
+            )
+        self.kimi_web_permission_mode = KimiWebClient.APP_PERMISSION_MODE
         kimi_web_probe_client = self.kimi_web
         def _kimi_terminal_status_probe(session_id: str) -> bool | None:
             try:
@@ -11095,7 +11104,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 prompt,
                 model=model,
                 thinking=effort,
-                permission_mode="manual",
+                permission_mode=self.state.kimi_web_permission_mode,
             )
             prompt_id = str(submitted.get("id") or submitted.get("prompt_id") or "").strip()
             if not prompt_id:
@@ -13484,7 +13493,11 @@ class PushHandler(BaseHTTPRequestHandler):
         try:
             model, effort = self._kimi_selection()
             self.state.kimi_web.start()
-            session_id = self.state.kimi_web.create_session(model=model, thinking=effort)
+            session_id = self.state.kimi_web.create_session(
+                model=model,
+                thinking=effort,
+                permission_mode=self.state.kimi_web_permission_mode,
+            )
         except Exception:
             logger.warning("Kimi Web new session failed", exc_info=True)
             self._send_json(503, {"ok": False, "error": "kimi_web_unavailable"})
@@ -15673,7 +15686,13 @@ class PushHandler(BaseHTTPRequestHandler):
             chat.append(role="assistant", text="Kimi 连接失败。", source="group:kimi-web:error", sender_id="kimi", sender_name="Kimi")
             return
         try:
-            result = self.state.kimi_web.submit_prompt(session_id, prompt, model=model, thinking=effort, permission_mode="manual")
+            result = self.state.kimi_web.submit_prompt(
+                session_id,
+                prompt,
+                model=model,
+                thinking=effort,
+                permission_mode=self.state.kimi_web_permission_mode,
+            )
             prompt_id = str(result.get("prompt_id") or result.get("id") or "")
             if not prompt_id: raise KimiWebError("missing prompt id")
             with self.state.kimi_turn_lock:

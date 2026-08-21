@@ -217,6 +217,32 @@ class KimiWebIsolationTest(unittest.TestCase):
         self.assertEqual("prompt-1", result["prompt_id"])
         self.assertEqual(("GET", "/api/v1/sessions/session-1/prompts", None), calls[-1])
 
+    def test_app_web_permission_mode_is_always_auto(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = KimiWebClient(
+                command="/unused/kimi",
+                state_path=os.path.join(directory, "kimi_web_session.json"),
+            )
+            calls = []
+
+            def fake_request(method, path, *, data=None, timeout=10.0):
+                calls.append((method, path, data))
+                if path == "/api/v1/sessions":
+                    return {"id": "session-1"}
+                if path.endswith("/prompts") and method == "POST":
+                    return {"prompt_id": "prompt-1"}
+                raise AssertionError((method, path, data))
+
+            client._request = fake_request
+            client.create_session(permission_mode="unexpected")
+            client.submit_prompt("session-1", "hello", permission_mode="unexpected")
+
+            self.assertEqual(
+                "auto",
+                calls[0][2]["agent_config"]["permission_mode"],
+            )
+            self.assertEqual("auto", calls[1][2]["permission_mode"])
+
     def test_orphaned_pending_approval_is_aborted_by_exact_prompt_and_settles(self):
         client = KimiWebClient(command="/unused/kimi")
         calls, status_checks = [], 0

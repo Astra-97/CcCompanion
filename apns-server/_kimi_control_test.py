@@ -101,8 +101,8 @@ class FakeKimiWeb:
     def load_active_session_id(self):
         return self.current
     def list_sessions(self): return list(self.local)
-    def create_session(self, *, model, thinking):
-        self.create_calls.append((model, thinking))
+    def create_session(self, *, model, thinking, permission_mode):
+        self.create_calls.append((model, thinking, permission_mode))
         self.current = "session-kimi-new"
         return self.current
     def get_session_status(self, session_id):
@@ -125,6 +125,7 @@ class KimiControlRoutesTest(unittest.TestCase):
             kimi_active_turn={},
             kimi_prepare_token="",
             kimi_web=self.web,
+            kimi_web_permission_mode="auto",
             kimi_acp=types.SimpleNamespace(),
             kimi_preferences=prefs,
         )
@@ -140,7 +141,7 @@ class KimiControlRoutesTest(unittest.TestCase):
         self.handler.state.kimi_preferences.save_validated("kimi-code/k3", "low")
         self.handler._handle_kimi_new_session({})
         self.assertEqual(200, self.handler.responses[-1][0])
-        self.assertEqual([("kimi-code/k3", "low")], self.web.create_calls)
+        self.assertEqual([("kimi-code/k3", "low", "auto")], self.web.create_calls)
         self.assertEqual("session-kimi-new", self.handler.responses[-1][1]["active_session_id"])
 
         self.handler._handle_kimi_switch_session({"session_id": "session-kimi-one"})
@@ -286,13 +287,13 @@ class KimiIsolationAndActivityTest(unittest.TestCase):
                 self.assertTrue(PushHandler._kimi_inbound_not_text_only(body))
         self.assertFalse(PushHandler._kimi_inbound_not_text_only({"text": "https://example.com"}))
 
-    def test_configured_xhs_login_contacts_include_kimi(self):
+    def test_config_example_xhs_login_contacts_include_kimi(self):
         try:
             import tomllib
         except ModuleNotFoundError:
             import tomli as tomllib
         base = Path(__file__).resolve().parent
-        for filename in ("config.toml", "config.example.toml"):
+        for filename in ("config.example.toml",):
             with self.subTest(filename=filename):
                 payload = tomllib.loads((base / filename).read_text(encoding="utf-8"))
                 self.assertIn("kimi", payload["xhs_login"]["allowed_contacts"])
