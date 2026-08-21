@@ -221,6 +221,49 @@ class KimiControlRoutesTest(unittest.TestCase):
 
 
 class KimiIsolationAndActivityTest(unittest.TestCase):
+    def test_kimi_activity_summary_is_exact_turn_idempotent_and_status_explicit(self):
+        class Chat:
+            def __init__(self): self.rows = []
+            def tail(self, _limit): return list(self.rows)
+            def append(self, **row):
+                row = {**row, "ts": f"a{len(self.rows)}"}
+                self.rows.append(row)
+                return row
+
+        chat = Chat()
+        self.assertTrue(PushHandler._append_kimi_activity_summary(
+            chat,
+            user_ts="turn-new",
+            activity_count=7,
+            activity_items=["正在思考", "正在使用工具", "正在思考"],
+            outcome="completed",
+            source="kimi-web:activity",
+        ))
+        self.assertFalse(PushHandler._append_kimi_activity_summary(
+            chat,
+            user_ts="turn-new",
+            activity_count=99,
+            activity_items=["正在协作"],
+            outcome="failed",
+            source="kimi-web:activity",
+        ))
+        self.assertTrue(PushHandler._append_kimi_activity_summary(
+            chat,
+            user_ts="turn-old",
+            activity_count=2,
+            activity_items=["正在思考"],
+            outcome="interrupted",
+            source="kimi-web:activity",
+        ))
+
+        first, old = chat.rows
+        self.assertEqual(7, first["metadata"]["activity_count"])
+        self.assertEqual(["正在思考", "正在使用工具"], first["metadata"]["activity_items"])
+        self.assertEqual("completed", first["metadata"]["status"])
+        self.assertEqual("turn-new", first["metadata"]["kimi_user_ts"])
+        self.assertEqual("interrupted", old["metadata"]["status"])
+        self.assertEqual("turn-old", old["metadata"]["kimi_user_ts"])
+
     def test_activity_projection_drops_commands_paths_prompts_and_output(self):
         event = _activity_from_update({
             "update": {

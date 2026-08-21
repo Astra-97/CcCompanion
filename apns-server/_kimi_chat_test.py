@@ -634,7 +634,15 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         handler.state.kimi_acp.prepare_session = Mock(side_effect=AssertionError("ACP fallback"))
         handler._handle_kimi_chat_send({"text": "hello"}, "kimi")
         self.wait_idle(handler)
-        self.assertEqual(["hello", "reply"], [row["text"] for row in chat.records])
+        self.assertEqual(["hello", "正在思考", "reply"], [row["text"] for row in chat.records])
+        activity = chat.records[-2]
+        self.assertEqual("task", activity["role"])
+        self.assertEqual("kimi-web:activity", activity["source"])
+        self.assertEqual("completed", activity["metadata"]["status"])
+        self.assertEqual(1, activity["metadata"]["activity_count"])
+        self.assertEqual("auxiliary_activity", activity["metadata"]["turn_message_kind"])
+        self.assertFalse(activity["metadata"]["turn_terminal"])
+        self.assertEqual(chat.records[0]["ts"], activity["metadata"]["kimi_user_ts"])
         self.assertEqual("kimi-web", handler.responses[-1][1]["turn"]["transport"])
         self.assertEqual(["ensure", "stream", "submit"], [row[0] for row in web.calls[:3]])
         self.assertEqual("auto", next(row[3]["permission_mode"] for row in web.calls if row[0] == "submit"))
@@ -755,6 +763,9 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.wait_idle(handler)
         self.assertIn(("abort", "web-session-1", "prompt-1"), web.calls)
         self.assertTrue(any(row["role"] == "assistant" for row in chat.records))
+        activity = next(row for row in chat.records if (row.get("metadata") or {}).get("activity_summary"))
+        self.assertEqual("interrupted", activity["metadata"]["status"])
+        self.assertLess(chat.records.index(activity), len(chat.records) - 1)
 
     def test_web_interleaved_activity_keeps_typing_until_exact_terminal(self):
         class InterleavedWeb(FakeWebChat):
@@ -806,6 +817,15 @@ class KimiWebChatRoutingTest(unittest.TestCase):
                 break
             __import__("time").sleep(0.01)
         self.assertFalse(typing[-1][1]["is_typing"])
+        persisted = next(
+            row for row in _chat.records
+            if (row.get("metadata") or {}).get("activity_summary")
+        )
+        self.assertEqual(3, persisted["metadata"]["activity_count"])
+        self.assertEqual(
+            ["正在思考", "正在使用工具", "正在协作"],
+            persisted["metadata"]["activity_items"],
+        )
 
     def test_exact_kimi_web_typing_does_not_expire_during_long_tool_turn(self):
         exact = {"transport": "kimi-web", "exact_turn": True}
@@ -1159,7 +1179,8 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         handler._set_typing_for_contact = lambda *args, **_kwargs: typing.append(args)
         handler._handle_kimi_chat_send({"text": "hello"}, "kimi")
         self.wait_idle(handler)
-        self.assertEqual(["hello", "partial"], [r["text"] for r in chat.records])
+        self.assertEqual(["hello", "正在思考", "partial"], [r["text"] for r in chat.records])
+        self.assertEqual("failed", chat.records[-2]["metadata"]["status"])
         self.assertEqual("kimi-web:failed", chat.records[-1]["source"])
         self.assertEqual({}, handler.state.kimi_active_turn)
         self.assertNotIn("kimi", handler.state.chat_drafts)
@@ -1381,6 +1402,12 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.assertEqual("Kimi", assistant["sender_name"])
         self.assertEqual("group:kimi-web", assistant["source"])
         self.assertEqual(["kairos"], assistant["mentions"])
+        activity = chat.records[-2]
+        self.assertEqual("task", activity["role"])
+        self.assertEqual("group:kimi-web:activity", activity["source"])
+        self.assertEqual("kimi", activity["sender_id"])
+        self.assertEqual(user["ts"], activity["metadata"]["kimi_user_ts"])
+        self.assertEqual("completed", activity["metadata"]["status"])
         self.assertEqual("auto", next(row[3]["permission_mode"] for row in web.calls if row[0] == "submit"))
         self.assertEqual([1], routed)
         self.assertTrue(typing and typing[-1][1]["is_typing"] is False)

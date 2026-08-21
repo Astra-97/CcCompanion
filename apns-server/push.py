@@ -10359,6 +10359,71 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception:
             return False
 
+    @staticmethod
+    def _append_kimi_activity_summary(
+        chat: ChatHistory,
+        *,
+        user_ts: str,
+        activity_count: int,
+        activity_items: list[str] | tuple[str, ...],
+        outcome: str,
+        source: str,
+        group: bool = False,
+    ) -> bool:
+        """Persist one exact-turn activity card before Kimi's final answer.
+
+        Live draft activity expires by design, so terminal history needs its
+        own compact row.  The exact user_ts fence makes this idempotent and
+        prevents a delayed older turn from merging with a newer card.
+        """
+        user_ts = str(user_ts or "").strip()
+        if not user_ts:
+            return False
+        status = str(outcome or "").strip().lower()
+        if status not in {"completed", "interrupted", "failed"}:
+            status = "failed"
+        try:
+            for row in chat.tail(200):
+                metadata = row.get("metadata") if isinstance(row, dict) else None
+                if (
+                    isinstance(metadata, dict)
+                    and metadata.get("activity_summary") is True
+                    and str(metadata.get("kimi_user_ts") or "") == user_ts
+                ):
+                    return False
+            labels: list[str] = []
+            for raw_label in activity_items or ():
+                label = str(raw_label or "").strip()
+                if label in {"正在思考", "正在使用工具", "正在协作"} and label not in labels:
+                    labels.append(label)
+                if len(labels) >= 3:
+                    break
+            if not labels:
+                labels = ["正在思考"]
+            count = max(len(labels), min(999, max(1, int(activity_count or 0))))
+            kwargs: dict[str, Any] = {}
+            if group:
+                kwargs.update(sender_id="kimi", sender_name="Kimi")
+            chat.append(
+                role="task",
+                text=labels[-1],
+                source=source,
+                metadata={
+                    "activity_summary": True,
+                    "activity_count": count,
+                    "activity_items": labels,
+                    "status": status,
+                    "kimi_user_ts": user_ts,
+                    "turn_terminal": False,
+                    "turn_message_kind": "auxiliary_activity",
+                },
+                **kwargs,
+            )
+            return True
+        except Exception:
+            logger.exception("Kimi activity summary history append failed")
+            return False
+
     def _kimi_web_handoff_context(self, chat: ChatHistory, session_id: str, current_user_ts: str) -> str:
         """Seed an empty Web session once from bounded, App-visible Kimi history."""
         try:
@@ -11183,6 +11248,19 @@ class PushHandler(BaseHTTPRequestHandler):
             elif not answer:
                 answer = "Kimi 没有返回可展示内容。" if terminal_reason == "completed" else "Kimi 这次没有成功回复。请稍后重试；原消息已经保留。"
             source = "kimi-web" if terminal_reason == "completed" else f"kimi-web:{terminal_reason}"
+            activity_outcome = (
+                "completed" if terminal_reason == "completed" else
+                "interrupted" if terminal_reason in {"interrupted", "cancelled"} else
+                "failed"
+            )
+            self._append_kimi_activity_summary(
+                chat,
+                user_ts=str(rec.get("ts") or ""),
+                activity_count=activity_count,
+                activity_items=activity_items,
+                outcome=activity_outcome,
+                source="kimi-web:activity",
+            )
             try:
                 visible, xhs_card = self._kimi_extract_xhs_login_card(answer, allowed=xhs_login_card_allowed)
                 final = chat.append(
@@ -15846,6 +15924,20 @@ class PushHandler(BaseHTTPRequestHandler):
                     answer = (answer + "\n\n*[已停止生成]*").strip() if answer else "已中断当前生成。"
                 elif not answer:
                     answer = "Kimi 没有返回可展示内容。" if terminal_reason == "completed" else "Kimi 这次没有成功回复。"
+                activity_outcome = (
+                    "completed" if terminal_reason == "completed" else
+                    "interrupted" if terminal_reason in {"interrupted", "cancelled"} else
+                    "failed"
+                )
+                self._append_kimi_activity_summary(
+                    chat,
+                    user_ts=user_ts,
+                    activity_count=activity_count,
+                    activity_items=activity_items,
+                    outcome=activity_outcome,
+                    source="group:kimi-web:activity",
+                    group=True,
+                )
                 rec = chat.append(
                     role="assistant", text=answer,
                     source="group:kimi-web" if terminal_reason == "completed" else f"group:kimi-web:{terminal_reason}",
