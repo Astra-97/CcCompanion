@@ -814,6 +814,67 @@ class TmuxInjectionResult:
 
 DIRECT_TMUX_PASTE_SETTLE_SECONDS = 1.2
 
+# Claude Code's bracketed-paste TUI acknowledges a pasted attachment before
+# it has necessarily finished ingesting the image.  A fixed 1.2s settle is
+# enough for ordinary text, but a larger image can still be the active prompt
+# when the one (and only) Enter arrives.  Keep the adaptive window bounded
+# below the native client's normal request timeout while scaling only from
+# metadata that came back out of StagedAttachmentStore.consume().
+DIRECT_TMUX_IMAGE_PASTE_MIN_SETTLE_SECONDS = 4.0
+DIRECT_TMUX_IMAGE_PASTE_MAX_SETTLE_SECONDS = 20.0
+DIRECT_TMUX_IMAGE_PASTE_BYTES_PER_SECOND = 512 * 1024
+
+
+def _xiaoke_attachment_paste_settle_seconds(
+    staged_attachments: Any,
+    *,
+    has_user_text: bool,
+) -> float:
+    """Return the one pre-submit settle window for a XiaoKe attachment turn.
+
+    ``staged_attachments`` is the server-owned result of consuming opaque
+    upload IDs.  A user caption deliberately keeps the old text behavior;
+    only an attachment-only turn may use the adaptive window.  Within that
+    branch, do not use filenames, paths, or arbitrary metadata: only
+    canonical server type/size fields may extend the ordinary text window.
+    Non-image files keep the old behavior; an image batch gets a bounded
+    size-based window.  The caller still sends exactly one Enter after this
+    delay.
+    """
+
+    if has_user_text or not isinstance(staged_attachments, list):
+        return DIRECT_TMUX_PASTE_SETTLE_SECONDS
+
+    if not staged_attachments:
+        return DIRECT_TMUX_PASTE_SETTLE_SECONDS
+
+    image_bytes = 0
+    for item in staged_attachments:
+        # Attachment-only means the complete consumed batch is images.  A
+        # mixed image/file batch retains the ordinary window because the
+        # non-image payload has no image-ingest signal to size.
+        if not isinstance(item, dict) or item.get("type") != "image":
+            return DIRECT_TMUX_PASTE_SETTLE_SECONDS
+        size = item.get("size")
+        # StagedAttachmentStore emits a non-negative int.  Reject malformed
+        # values here instead of allowing an internal caller/test payload to
+        # turn the delay into an unbounded sleep.
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            return DIRECT_TMUX_PASTE_SETTLE_SECONDS
+        image_bytes += min(size, StagedAttachmentStore.MAX_FILE_BYTES)
+
+    if image_bytes <= 0:
+        return DIRECT_TMUX_PASTE_SETTLE_SECONDS
+
+    adaptive = (
+        DIRECT_TMUX_IMAGE_PASTE_MIN_SETTLE_SECONDS
+        + image_bytes / DIRECT_TMUX_IMAGE_PASTE_BYTES_PER_SECOND
+    )
+    return round(
+        min(DIRECT_TMUX_IMAGE_PASTE_MAX_SETTLE_SECONDS, adaptive),
+        1,
+    )
+
 
 def _settle_direct_tmux_paste(seconds: float) -> None:
     """Give the receiving bracketed-paste TUI a bounded chance to drain input.
@@ -9593,6 +9654,10 @@ class PushHandler(BaseHTTPRequestHandler):
     def _handle_chat_send(self, body: dict[str, Any]):
         """iPhone 发消息进来 → 写 user 条 + 调 bus_send.py 注入主 session"""
         body = dict(body)
+        # This is an internal hand-off field, never a client input.  Drop any
+        # caller-supplied copy before consuming opaque upload IDs, then attach
+        # only the authoritative records returned by the staging store below.
+        body.pop("_pwa_staged_attachments", None)
         clean_user_metadata = sanitize_voice_metadata(body.get("metadata"))
         if clean_user_metadata is None:
             body.pop("metadata", None)
@@ -9914,7 +9979,10 @@ class PushHandler(BaseHTTPRequestHandler):
                 source=source,
                 sender="iphone",
                 force_direct_tmux=True,
-                paste_settle_seconds=DIRECT_TMUX_PASTE_SETTLE_SECONDS,
+                paste_settle_seconds=_xiaoke_attachment_paste_settle_seconds(
+                    staged_attachments,
+                    has_user_text=bool(text.strip()),
+                ),
             )
             if isinstance(injection, TmuxInjectionResult):
                 injection_result = injection

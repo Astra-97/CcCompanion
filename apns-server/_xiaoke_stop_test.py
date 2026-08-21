@@ -14,6 +14,7 @@ from push import (
     TmuxInjectionResult,
     _direct_tmux_injection,
     _inject_to_tmux_session,
+    _xiaoke_attachment_paste_settle_seconds,
     _should_expire_chat_typing,
 )
 
@@ -643,6 +644,113 @@ class XiaokeStopTest(unittest.TestCase):
             if call.args[0][1] == "delete-buffer"
         ]
         self.assertEqual(delete_calls, [["tmux", "delete-buffer", "-b", load_args[3]]])
+
+    def test_attachment_settle_scales_only_server_image_type_and_size(self) -> None:
+        self.assertEqual(
+            _xiaoke_attachment_paste_settle_seconds([], has_user_text=False),
+            1.2,
+        )
+        self.assertEqual(
+            _xiaoke_attachment_paste_settle_seconds([
+                {"type": "file", "size": 50 * 1024 * 1024},
+            ], has_user_text=False),
+            1.2,
+        )
+        self.assertEqual(
+            _xiaoke_attachment_paste_settle_seconds([
+                {"type": "image", "size": 4 * 1024 * 1024},
+                {"type": "file", "size": 1 * 1024 * 1024},
+            ], has_user_text=False),
+            1.2,
+        )
+        self.assertEqual(
+            _xiaoke_attachment_paste_settle_seconds([
+                {"type": "image", "size": 4 * 1024 * 1024},
+            ], has_user_text=False),
+            12.0,
+        )
+        self.assertEqual(
+            _xiaoke_attachment_paste_settle_seconds([
+                {"type": "image", "size": 50 * 1024 * 1024},
+                {"type": "image", "size": 50 * 1024 * 1024},
+            ], has_user_text=False),
+            20.0,
+        )
+        # Untrusted/malformed internal values cannot turn the pause into an
+        # arbitrary sleep; the ordinary text window remains the fallback.
+        self.assertEqual(
+            _xiaoke_attachment_paste_settle_seconds([
+                {"type": "image", "size": "4194304"},
+                {"type": "image", "size": True},
+                {"type": "image", "size": -1},
+            ], has_user_text=False),
+            1.2,
+        )
+        self.assertEqual(
+            _xiaoke_attachment_paste_settle_seconds([
+                {"type": "image", "size": 4 * 1024 * 1024},
+            ], has_user_text=True),
+            1.2,
+        )
+
+    def test_image_only_turn_adapts_but_captioned_turn_keeps_one_enter_window(self) -> None:
+        image = {
+            "type": "image",
+            "size": 4 * 1024 * 1024,
+            "filename": "cat.jpg",
+            "stored_path": "/tmp/cat.jpg",
+        }
+        observed: list[tuple[str, float]] = []
+        for text in ("", "caption for the image"):
+            with self.subTest(text=text or "image-only"):
+                handler = self.send_handler()
+                handler._consume_staged_attachments = lambda *_args: [{
+                    "attachment_id": "server-owned-id",
+                    "attachment_url": "/attachments/server-owned.jpg",
+                    **image,
+                }]
+                handler._inject_to_session = lambda *args, **kwargs: (
+                    observed.append((args[1], kwargs["paste_settle_seconds"]))
+                    or TmuxInjectionResult(True)
+                )
+
+                handler._handle_chat_send({
+                    "contact_id": "xiaoke",
+                    "text": text,
+                    "attachment_ids": ["server-owned-id"],
+                    # Must not be trusted or reach the helper.  The patched
+                    # consume method above is the authoritative test source.
+                    "_pwa_staged_attachments": [{"type": "image", "size": 50 * 1024 * 1024}],
+                })
+
+                self.assertEqual(handler.responses[-1][0], 200)
+                self.assertEqual(handler.responses[-1][1]["turn"]["session"], "cctg")
+
+        self.assertEqual([entry[1] for entry in observed], [12.0, 1.2])
+        self.assertIn("[用户发了图片: cat.jpg]", observed[0][0])
+        self.assertIn("caption for the image", observed[1][0])
+
+    def test_client_cannot_supply_internal_staged_attachment_records(self) -> None:
+        handler = self.send_handler()
+        injection_calls: list[tuple[tuple, dict]] = []
+        handler._consume_staged_attachments = lambda *_args: []
+        handler._inject_to_session = lambda *args, **kwargs: (
+            injection_calls.append((args, kwargs)) or TmuxInjectionResult(True)
+        )
+
+        handler._handle_chat_send({
+            "contact_id": "xiaoke",
+            "text": "",
+            "_pwa_staged_attachments": [{
+                "type": "image",
+                "size": 4 * 1024 * 1024,
+                "filename": "attacker.jpg",
+                "stored_path": "/tmp/attacker.jpg",
+            }],
+        })
+
+        self.assertEqual(handler.responses[-1][0], 400)
+        self.assertEqual(injection_calls, [])
 
     def test_scheduled_direct_fallback_submits_once_without_settle(self) -> None:
         operations: list[str] = []
