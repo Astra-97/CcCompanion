@@ -46,6 +46,7 @@ class ContactRegistryTest(unittest.TestCase):
         self.assertEqual({"xiaoke", "kairos", "kimi"}, {
             key for key, route in first.items() if route.get("group_dispatcher")
         })
+        self.assertIn("attachments", first["kimi"]["capabilities"])
         first["kairos"]["send_handler"] = "changed"
         self.assertEqual("kairos", second["kairos"]["send_handler"])
         first["kairos"]["capabilities"].append("mutated")
@@ -75,9 +76,10 @@ class ContactRegistryTest(unittest.TestCase):
         self.assertFalse(dispatch_contact_get(handler, "/settings"))
         self.assertFalse(dispatch_contact_post(handler, "/chat/send", {}))
 
-    def test_kimi_ingress_policy_remains_before_attachment_staging(self):
+    def test_kimi_ingress_policy_allows_only_opaque_attachment_staging(self):
         self.assertFalse(rejects_inbound({"text": "plain text"}))
-        self.assertTrue(rejects_inbound({"text": "x", "attachment_ids": ["a"]}))
+        self.assertFalse(rejects_inbound({"text": "x", "attachment_ids": ["a"]}))
+        self.assertTrue(rejects_inbound({"text": "x", "attachment_url": "/attachments/a"}))
         self.assertTrue(rejects_inbound({"text": "x", "metadata": {"via": "card"}}))
 
     def test_xiaoke_health_context_is_contact_local(self):

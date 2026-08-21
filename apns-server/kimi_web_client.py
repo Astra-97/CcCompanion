@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import json
 import logging
+import http.client
+import mimetypes
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -36,6 +39,14 @@ class KimiWebError(RuntimeError):
     pass
 
 
+class KimiWebRequestRejected(KimiWebError):
+    """The upstream returned a definite HTTP/application-layer rejection."""
+
+
+class KimiWebTransportUncertain(KimiWebError):
+    """The request may have reached upstream, but its response was not proven."""
+
+
 class KimiWebSessionBusy(KimiWebError):
     """A typed busy result that keeps the affected Web session fenced."""
 
@@ -55,6 +66,8 @@ class KimiWebClient:
     # session and every prompt. Static Kimi `deny` rules are best-effort only;
     # auto mode deliberately remains a user-authorized root risk.
     APP_PERMISSION_MODE = "auto"
+    MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+    ATTACHMENT_TTL_SECONDS = 15 * 60
     def __init__(
         self,
         *,
@@ -129,20 +142,174 @@ class KimiWebClient:
                 detail = exc.read().decode("utf-8")
             except Exception:
                 detail = ""
-            raise KimiWebError(f"Kimi web {method} {path} failed ({exc.code}): {detail}") from exc
+            raise KimiWebRequestRejected(f"Kimi web {method} {path} failed ({exc.code}): {detail}") from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             reason = getattr(exc, "reason", exc)
-            raise KimiWebError(f"Kimi web {method} {path} unreachable: {reason}") from exc
+            raise KimiWebTransportUncertain(f"Kimi web {method} {path} response uncertain: {reason}") from exc
         try:
             payload = json.loads(raw)
         except ValueError as exc:
-            raise KimiWebError(f"Kimi web returned invalid JSON: {exc}") from exc
+            raise KimiWebTransportUncertain(f"Kimi web returned invalid JSON: {exc}") from exc
         if not isinstance(payload, dict):
-            raise KimiWebError("Kimi web returned non-object JSON")
+            raise KimiWebTransportUncertain("Kimi web returned non-object JSON")
         if payload.get("code") != 0:
             msg = payload.get("msg") or "unknown error"
-            raise KimiWebError(f"Kimi web {method} {path} error: {msg}")
+            raise KimiWebRequestRejected(f"Kimi web {method} {path} error: {msg}")
         return payload.get("data") if isinstance(payload.get("data"), dict) else {}
+
+    def _multipart_file_request(
+        self,
+        path: str,
+        *,
+        file_path: Path,
+        filename: str,
+        media_type: str,
+        expires_in_sec: int,
+        timeout: float = 60.0,
+    ) -> dict[str, Any]:
+        """Stream one file to Kimi Web's authenticated ``POST /files`` API."""
+        boundary = f"----CcCompanionKimi{uuid.uuid4().hex}"
+
+        def field(name: str, value: str) -> bytes:
+            return (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f"{value}\r\n"
+            ).encode("utf-8")
+
+        safe_filename = filename.replace('"', "_")
+        prefix = b"".join((
+            field("name", filename),
+            field("expires_in_sec", str(expires_in_sec)),
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="file"; filename="{safe_filename}"\r\n'
+                f"Content-Type: {media_type}\r\n\r\n"
+            ).encode("utf-8"),
+        ))
+        suffix = f"\r\n--{boundary}--\r\n".encode("ascii")
+        content_length = len(prefix) + file_path.stat().st_size + len(suffix)
+        connection = http.client.HTTPConnection(self.host, self.port, timeout=max(1.0, min(float(timeout), 120.0)))
+        try:
+            connection.putrequest("POST", path)
+            connection.putheader("Authorization", f"Bearer {self._read_token()}")
+            connection.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
+            connection.putheader("Content-Length", str(content_length))
+            connection.endheaders()
+            connection.send(prefix)
+            with file_path.open("rb") as handle:
+                while chunk := handle.read(65536):
+                    connection.send(chunk)
+            connection.send(suffix)
+            response = connection.getresponse()
+            raw = response.read().decode("utf-8", errors="replace")
+            if response.status < 200 or response.status >= 300:
+                raise KimiWebRequestRejected(f"Kimi web POST {path} failed ({response.status}): {raw[:500]}")
+        except KimiWebError:
+            raise
+        except (OSError, TimeoutError, http.client.HTTPException) as exc:
+            raise KimiWebTransportUncertain(f"Kimi web POST {path} response uncertain: {exc}") from exc
+        finally:
+            connection.close()
+        try:
+            payload = json.loads(raw)
+        except ValueError as exc:
+            raise KimiWebTransportUncertain(f"Kimi web returned invalid JSON: {exc}") from exc
+        if not isinstance(payload, dict) or payload.get("code") != 0:
+            detail = payload.get("msg") if isinstance(payload, dict) else "invalid response"
+            if not isinstance(payload, dict):
+                raise KimiWebTransportUncertain(f"Kimi web POST {path} returned an invalid response")
+            raise KimiWebRequestRejected(f"Kimi web POST {path} error: {detail}")
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise KimiWebTransportUncertain("Kimi web file upload returned invalid metadata")
+        return data
+
+    @staticmethod
+    def _safe_attachment_name(value: Any) -> str:
+        name = str(value or "").strip()
+        if (
+            not name
+            or Path(name).name != name
+            or "\\" in name
+            or len(name.encode("utf-8", errors="ignore")) > 240
+            or any(ord(char) < 32 or ord(char) == 127 for char in name)
+        ):
+            raise KimiWebError("invalid attachment filename")
+        return name
+
+    @staticmethod
+    def _safe_media_type(value: Any, filename: str) -> str:
+        media_type = str(value or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+", media_type):
+            media_type = (mimetypes.guess_type(filename)[0] or "application/octet-stream").lower()
+        return media_type
+
+    def _upload_prompt_attachments(self, attachments: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+        if len(attachments) > 10:
+            raise KimiWebError("too many prompt attachments")
+        content: list[dict[str, Any]] = []
+        uploaded_ids: list[str] = []
+        try:
+            for item in attachments:
+                if not isinstance(item, dict):
+                    raise KimiWebError("invalid prompt attachment")
+                kind = str(item.get("type") or "").strip().lower()
+                if kind not in {"image", "file"}:
+                    raise KimiWebError("unsupported prompt attachment type")
+                filename = self._safe_attachment_name(item.get("filename"))
+                raw_path = Path(str(item.get("stored_path") or ""))
+                try:
+                    info = raw_path.lstat()
+                    file_path = raw_path.resolve(strict=True)
+                except OSError as exc:
+                    raise KimiWebError("prompt attachment is unavailable") from exc
+                if raw_path.is_symlink() or not file_path.is_file() or info.st_size <= 0 or info.st_size > self.MAX_ATTACHMENT_BYTES:
+                    raise KimiWebError("prompt attachment size or file type is invalid")
+                expected_size = int(item.get("size") or 0)
+                if expected_size and expected_size != info.st_size:
+                    raise KimiWebError("prompt attachment size changed")
+                media_type = self._safe_media_type(item.get("media_type"), filename)
+                if kind == "image" and not media_type.startswith("image/"):
+                    guessed = (mimetypes.guess_type(filename)[0] or "").lower()
+                    if not guessed.startswith("image/"):
+                        raise KimiWebError("image attachment has an unsupported media type")
+                    media_type = guessed
+                meta = self._multipart_file_request(
+                    "/api/v1/files",
+                    file_path=file_path,
+                    filename=filename,
+                    media_type=media_type,
+                    expires_in_sec=self.ATTACHMENT_TTL_SECONDS,
+                )
+                file_id = str(meta.get("id") or meta.get("file_id") or "").strip()
+                if not file_id or len(file_id) > 200:
+                    raise KimiWebError("Kimi Web file upload returned no file id")
+                uploaded_ids.append(file_id)
+                if kind == "image":
+                    content.append({"type": "image", "source": {"kind": "file", "file_id": file_id}})
+                else:
+                    content.append({
+                        "type": "file",
+                        "file_id": file_id,
+                        "name": filename,
+                        "media_type": media_type,
+                        "size": info.st_size,
+                    })
+        except Exception:
+            for file_id in uploaded_ids:
+                try:
+                    self.delete_file(file_id)
+                except KimiWebError:
+                    self.logger.warning("Could not roll back Kimi Web file upload %s", file_id)
+            raise
+        return content, uploaded_ids
+
+    def delete_file(self, file_id: str) -> None:
+        value = str(file_id or "").strip()
+        if not value or len(value) > 200:
+            return
+        self._request("DELETE", f"/api/v1/files/{urllib.parse.quote(value, safe='')}")
 
     def _is_server_responsive(self) -> bool:
         try:
@@ -624,12 +791,21 @@ class KimiWebClient:
         model: str = "",
         thinking: str = "",
         permission_mode: str = APP_PERMISSION_MODE,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         session_id = self._valid_session_id(session_id)
         clean_text = str(text or "").strip()
-        if not session_id or not clean_text:
-            raise KimiWebError("session id and prompt text are required")
-        payload: dict[str, Any] = {"content": [{"type": "text", "text": clean_text}]}
+        attachment_items = list(attachments or [])
+        if not session_id or (not clean_text and not attachment_items):
+            raise KimiWebError("session id and prompt content are required")
+        uploaded_ids: list[str] = []
+        content: list[dict[str, Any]] = []
+        if clean_text:
+            content.append({"type": "text", "text": clean_text})
+        if attachment_items:
+            uploaded_content, uploaded_ids = self._upload_prompt_attachments(attachment_items)
+            content.extend(uploaded_content)
+        payload: dict[str, Any] = {"content": content}
         if model.strip():
             payload["model"] = model.strip()
         if thinking.strip():
@@ -637,7 +813,17 @@ class KimiWebClient:
         # See create_session(): every App prompt is auto, including callers
         # that still pass an obsolete value.
         payload["permission_mode"] = self.APP_PERMISSION_MODE
-        submitted = self._request("POST", f"/api/v1/sessions/{session_id}/prompts", data=payload)
+        try:
+            submitted = self._request("POST", f"/api/v1/sessions/{session_id}/prompts", data=payload)
+        except KimiWebRequestRejected:
+            # No prompt was accepted, so its temporary Kimi uploads have no
+            # legitimate consumer. Uploaded IDs are one-shot and never replayed.
+            for file_id in uploaded_ids:
+                try:
+                    self.delete_file(file_id)
+                except KimiWebError:
+                    self.logger.warning("Could not roll back rejected Kimi Web file upload %s", file_id)
+            raise
         prompt_id = str(submitted.get("prompt_id") or submitted.get("id") or "").strip()
         if prompt_id:
             return submitted

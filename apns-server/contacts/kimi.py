@@ -10,7 +10,7 @@ CONTACT = {
     "provider": "kimi-web",
     "terminal_target": "",
     "capabilities": [
-        "chat", "history", "draft", "busy", "stop", "kimi_model_preferences",
+        "chat", "history", "draft", "busy", "stop", "attachments", "kimi_model_preferences",
         "kimi_session_control", "kimi_memory_recall", "forward", "group_member",
         "group_reply",
     ],
@@ -24,9 +24,9 @@ ROUTE = {"send_handler": "kimi", "capabilities": CONTACT["capabilities"], "group
 
 
 def rejects_inbound(body: dict[str, Any]) -> bool:
-    """Kimi is a plain-text Web contact; do this before attachment staging."""
+    """Allow opaque staged IDs, while rejecting every legacy attachment shape."""
     forbidden = (
-        "attachment_id", "attachment_ids", "attachments", "attachment_path",
+        "attachment_id", "attachments", "attachment_path",
         "attachment_url", "attachment_type", "attachment_filename", "upload_id",
         "staged_attachment_ids", "location", "voice_mode", "voice_continuation",
         "voice_reply_token",

@@ -1,3 +1,5 @@
+import os
+import tempfile
 import threading
 import types
 import unittest
@@ -649,6 +651,57 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.assertTrue(chat.records[-1]["metadata"]["turn_terminal"])
         self.assertEqual("terminal_answer", chat.records[-1]["metadata"]["turn_message_kind"])
 
+    def test_private_web_turn_passes_consumed_attachment_records_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = os.path.join(directory, "stored.png")
+            with open(image_path, "wb") as handle:
+                handle.write(b"image")
+            attachment = {
+                "attachment_id": "opaque-1",
+                "attachment_url": "/attachments/stored.png",
+                "filename": "photo.png",
+                "type": "image",
+                "media_type": "image/png",
+                "size": 5,
+                "stored_path": image_path,
+            }
+            handler, chat, web = self.make_handler()
+            handler._handle_kimi_chat_send({
+                "text": "看看",
+                "metadata": {"attachments": [{"attachment_id": "opaque-1"}]},
+                "_pwa_staged_attachments": [attachment],
+            }, "kimi")
+            self.wait_idle(handler)
+
+            submit = next(call for call in web.calls if call[0] == "submit")
+            self.assertEqual([attachment], submit[3]["attachments"])
+            self.assertEqual("/attachments/stored.png", chat.records[0]["attachment_url"])
+            self.assertEqual("image", chat.records[0]["attachment_type"])
+            self.assertEqual("photo.png", chat.records[0]["attachment_filename"])
+            self.assertEqual(1, len([call for call in web.calls if call[0] == "submit"]))
+
+    def test_private_attachment_only_turn_uses_safe_caption_without_local_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            file_path = os.path.join(directory, "stored.pdf")
+            with open(file_path, "wb") as handle:
+                handle.write(b"pdf")
+            attachment = {
+                "attachment_id": "opaque-2",
+                "attachment_url": "/attachments/stored.pdf",
+                "filename": "report.pdf",
+                "type": "file",
+                "media_type": "application/pdf",
+                "size": 3,
+                "stored_path": file_path,
+            }
+            handler, _chat, web = self.make_handler()
+            handler._handle_kimi_chat_send({"text": "", "_pwa_staged_attachments": [attachment]}, "kimi")
+            self.wait_idle(handler)
+
+            prompt = next(call[2] for call in web.calls if call[0] == "submit")
+            self.assertIn("[用户发送了附件]", prompt)
+            self.assertNotIn(directory, prompt)
+
     def test_web_commits_recall_only_after_prompt_and_lease_are_accepted(self):
         order = []
 
@@ -721,6 +774,53 @@ class KimiWebChatRoutingTest(unittest.TestCase):
 
         handler._commit_kimi_recall.assert_not_called()
         self.assertEqual(503, handler.responses[-1][0])
+
+    def test_consumed_attachment_is_deleted_when_busy_rejects_before_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stored_path = os.path.join(directory, "consumed.pdf")
+            with open(stored_path, "wb") as handle:
+                handle.write(b"pdf")
+            handler, chat, _web = self.make_handler()
+            handler.state.attachments_dir = directory
+            handler.state.kimi_active_turn = {"user_ts": "old-turn"}
+            handler._handle_kimi_chat_send({
+                "text": "new",
+                "_pwa_staged_attachments": [{
+                    "attachment_id": "consumed", "attachment_url": "/attachments/consumed.pdf",
+                    "filename": "report.pdf", "type": "file", "media_type": "application/pdf",
+                    "size": 3, "stored_path": stored_path,
+                }],
+            }, "kimi")
+
+            self.assertEqual(409, handler.responses[-1][0])
+            self.assertEqual([], chat.records)
+            self.assertFalse(os.path.exists(stored_path))
+
+    def test_prompt_rejection_preserves_attachment_already_committed_to_history(self):
+        class RejectingWeb(FakeWebChat):
+            def submit_prompt(self, session_id, prompt, **_kwargs):
+                self.calls.append(("submit", session_id, prompt, dict(_kwargs)))
+                raise KimiWebError("rejected")
+
+        with tempfile.TemporaryDirectory() as directory:
+            stored_path = os.path.join(directory, "committed.pdf")
+            with open(stored_path, "wb") as handle:
+                handle.write(b"pdf")
+            handler, chat, _web = self.make_handler(web=RejectingWeb())
+            handler.state.attachments_dir = directory
+            handler._handle_kimi_chat_send({
+                "text": "read",
+                "_pwa_staged_attachments": [{
+                    "attachment_id": "committed", "attachment_url": "/attachments/committed.pdf",
+                    "filename": "report.pdf", "type": "file", "media_type": "application/pdf",
+                    "size": 3, "stored_path": stored_path,
+                }],
+            }, "kimi")
+            self.wait_idle(handler)
+
+            self.assertEqual(503, handler.responses[-1][0])
+            self.assertEqual("/attachments/committed.pdf", chat.records[0]["attachment_url"])
+            self.assertTrue(os.path.isfile(stored_path))
 
     def test_web_chat_releases_an_idle_kimi_tui_before_session_prepare(self):
         handler, _chat, web = self.make_handler()
@@ -1411,6 +1511,39 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.assertEqual("auto", next(row[3]["permission_mode"] for row in web.calls if row[0] == "submit"))
         self.assertEqual([1], routed)
         self.assertTrue(typing and typing[-1][1]["is_typing"] is False)
+
+    def test_group_web_reply_passes_attachment_batch_only_in_prompt_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stored_path = os.path.join(directory, "stored.pdf")
+            with open(stored_path, "wb") as handle:
+                handle.write(b"pdf")
+            attachment = {
+                "attachment_id": "opaque-group",
+                "attachment_url": "/attachments/stored.pdf",
+                "filename": "report.pdf",
+                "type": "file",
+                "media_type": "application/pdf",
+                "size": 3,
+                "stored_path": stored_path,
+            }
+            handler, chat, web = self.make_handler()
+            user = chat.append(
+                role="user", text="", source="android-app:apples",
+                sender_id="astra", sender_name="方小南",
+            )
+            handler._release_kimi_control = lambda _token: None
+            handler._has_pending_group_reply = lambda: False
+            handler._start_group_kimi_reply(
+                chat, "", sender_name="方小南", user_ts=user["ts"], hop_count=0,
+                attachments=[attachment],
+            )
+            self.wait_idle(handler)
+
+            submit = next(row for row in web.calls if row[0] == "submit")
+            self.assertEqual([attachment], submit[3]["attachments"])
+            self.assertIn("[用户发送了附件]", submit[2])
+            self.assertNotIn(directory, submit[2])
+            self.assertEqual(1, len([row for row in web.calls if row[0] == "submit"]))
 
     def test_group_web_bound_turn_id_rejects_missing_and_foreign_turn_events(self):
         class ForeignPromptWeb(FakeWebChat):

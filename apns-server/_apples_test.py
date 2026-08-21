@@ -161,6 +161,25 @@ def test_explicit_mentions_only_accept_registered_group_dispatchers():
     assert handler._invalid_explicit_apples_mentions(["hajiki"]) == ["hajiki"]
 
 
+def test_human_kimi_only_group_dispatch_preserves_authoritative_attachment_batch():
+    handler = make_handler()
+    reset_class_caches(handler)
+    rec = make_rec("astra", "", mentions=["kimi"])
+    attachment = {
+        "attachment_id": "opaque-group", "filename": "report.pdf",
+        "type": "file", "size": 3, "stored_path": "/server/owned/report.pdf",
+    }
+
+    routed, errors = handler._dispatch_apples_mentions(
+        rec, "apples", {"kimi"}, "Astra", sender_id="astra",
+        staged_attachments=[attachment],
+    )
+
+    assert routed == ["kimi"]
+    assert errors == {}
+    assert handler.kimi_group_calls[0][3]["attachments"] == [attachment]
+
+
 def read_history():
     if not TEST_CHAT_PATH.exists():
         return []

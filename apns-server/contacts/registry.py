@@ -35,7 +35,7 @@ _LEGACY_FALLBACK_ROUTES = {
     # was upgraded.
     "xiaoke": {"send_handler": "xiaoke", "capabilities": ["chat", "history", "draft", "busy", "stop", "attachments", "terminal", "forward", "group_member", "group_reply"], "group_dispatcher": "xiaoke"},
     "kairos": {"send_handler": "kairos", "capabilities": ["chat", "history", "draft", "busy", "stop", "attachments", "terminal", "forward", "group_member", "group_reply"], "group_dispatcher": "kairos"},
-    "kimi": {"send_handler": "kimi", "capabilities": ["chat", "history", "draft", "busy", "stop", "forward", "group_member", "group_reply"], "group_dispatcher": "kimi"},
+    "kimi": {"send_handler": "kimi", "capabilities": ["chat", "history", "draft", "busy", "stop", "attachments", "forward", "group_member", "group_reply"], "group_dispatcher": "kimi"},
     "hajiki": {"capabilities": ["history"]},
     "apples": {"send_handler": "apples", "capabilities": ["chat", "history", "draft", "busy", "attachments", "forward", "group_chat"]},
     "toolbot": {"capabilities": ["history"]},

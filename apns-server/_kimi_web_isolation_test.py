@@ -8,7 +8,14 @@ import types
 import unittest
 from unittest.mock import Mock, patch
 
-from kimi_web_client import KimiWebClient, KimiWebError, KimiWebRecoveryConflict, KimiWebSessionBusy
+from kimi_web_client import (
+    KimiWebClient,
+    KimiWebError,
+    KimiWebRecoveryConflict,
+    KimiWebRequestRejected,
+    KimiWebSessionBusy,
+    KimiWebTransportUncertain,
+)
 from push import PushHandler, ServerState
 
 
@@ -151,7 +158,7 @@ class KimiWebIsolationTest(unittest.TestCase):
             with self.subTest(failure=type(failure).__name__), patch(
                 "kimi_web_client.urllib.request.urlopen", side_effect=failure
             ):
-                with self.assertRaises(KimiWebError):
+                with self.assertRaises(KimiWebTransportUncertain):
                     client.get_quota()
 
         with patch(
@@ -242,6 +249,118 @@ class KimiWebIsolationTest(unittest.TestCase):
                 calls[0][2]["agent_config"]["permission_mode"],
             )
             self.assertEqual("auto", calls[1][2]["permission_mode"])
+
+    def test_submit_uploads_image_and_file_through_kimi_web_content_parts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = os.path.join(directory, "photo.png")
+            file_path = os.path.join(directory, "notes.txt")
+            with open(image_path, "wb") as handle:
+                handle.write(b"png-bytes")
+            with open(file_path, "wb") as handle:
+                handle.write(b"hello")
+            client = KimiWebClient(command="/unused/kimi")
+            uploads, calls = [], []
+
+            def upload(path, **kwargs):
+                uploads.append((path, kwargs))
+                return {"id": f"file-{len(uploads)}"}
+
+            def request(method, path, *, data=None, timeout=10.0):
+                calls.append((method, path, data))
+                return {"prompt_id": "prompt-1"}
+
+            client._multipart_file_request = upload
+            client._request = request
+            result = client.submit_prompt("session-1", "look", attachments=[
+                {"type": "image", "filename": "photo.png", "media_type": "image/png", "size": 9, "stored_path": image_path},
+                {"type": "file", "filename": "notes.txt", "media_type": "text/plain", "size": 5, "stored_path": file_path},
+            ])
+
+            self.assertEqual("prompt-1", result["prompt_id"])
+            self.assertEqual(["/api/v1/files", "/api/v1/files"], [item[0] for item in uploads])
+            self.assertEqual(KimiWebClient.ATTACHMENT_TTL_SECONDS, uploads[0][1]["expires_in_sec"])
+            content = calls[-1][2]["content"]
+            self.assertEqual({"type": "text", "text": "look"}, content[0])
+            self.assertEqual({"type": "image", "source": {"kind": "file", "file_id": "file-1"}}, content[1])
+            self.assertEqual({
+                "type": "file", "file_id": "file-2", "name": "notes.txt",
+                "media_type": "text/plain", "size": 5,
+            }, content[2])
+            self.assertNotIn(directory, str(content))
+
+    def test_partial_attachment_upload_rolls_back_and_never_submits_prompt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for name in ("one.txt", "two.txt"):
+                path = os.path.join(directory, name)
+                with open(path, "wb") as handle:
+                    handle.write(b"x")
+                paths.append(path)
+            client = KimiWebClient(command="/unused/kimi")
+            uploaded, deleted, submitted = [], [], []
+
+            def upload(_path, **_kwargs):
+                if uploaded:
+                    raise KimiWebError("second upload failed")
+                uploaded.append("file-1")
+                return {"id": "file-1"}
+
+            client._multipart_file_request = upload
+            client.delete_file = lambda file_id: deleted.append(file_id)
+            client._request = lambda *_args, **_kwargs: submitted.append(True) or {"prompt_id": "unexpected"}
+
+            with self.assertRaisesRegex(KimiWebError, "second upload failed"):
+                client.submit_prompt("session-1", "look", attachments=[
+                    {"type": "file", "filename": "one.txt", "size": 1, "stored_path": paths[0]},
+                    {"type": "file", "filename": "two.txt", "size": 1, "stored_path": paths[1]},
+                ])
+            self.assertEqual(["file-1"], deleted)
+            self.assertEqual([], submitted)
+
+    def test_rejected_prompt_deletes_uploaded_file_and_symlink_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "notes.txt")
+            link = os.path.join(directory, "link.txt")
+            with open(path, "wb") as handle:
+                handle.write(b"hello")
+            os.symlink(path, link)
+            client = KimiWebClient(command="/unused/kimi")
+            deleted = []
+            client._multipart_file_request = lambda *_args, **_kwargs: {"id": "file-1"}
+            client.delete_file = lambda file_id: deleted.append(file_id)
+            client._request = Mock(side_effect=KimiWebRequestRejected("prompt rejected"))
+
+            with self.assertRaisesRegex(KimiWebError, "prompt rejected"):
+                client.submit_prompt("session-1", "look", attachments=[
+                    {"type": "file", "filename": "notes.txt", "size": 5, "stored_path": path},
+                ])
+            self.assertEqual(["file-1"], deleted)
+
+            client._request.reset_mock()
+            with self.assertRaisesRegex(KimiWebError, "size or file type"):
+                client.submit_prompt("session-1", "look", attachments=[
+                    {"type": "file", "filename": "link.txt", "size": 5, "stored_path": link},
+                ])
+            client._request.assert_not_called()
+
+    def test_uncertain_prompt_response_keeps_uploaded_file_for_upstream_ttl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "notes.txt")
+            with open(path, "wb") as handle:
+                handle.write(b"hello")
+            client = KimiWebClient(command="/unused/kimi")
+            deleted = []
+            client._multipart_file_request = lambda *_args, **_kwargs: {"id": "file-1"}
+            client.delete_file = lambda file_id: deleted.append(file_id)
+            client._request = Mock(side_effect=KimiWebTransportUncertain("response lost"))
+
+            with self.assertRaisesRegex(KimiWebTransportUncertain, "response lost"):
+                client.submit_prompt("session-1", "look", attachments=[
+                    {"type": "file", "filename": "notes.txt", "size": 5, "stored_path": path},
+                ])
+
+            self.assertEqual([], deleted)
+            self.assertEqual(1, client._request.call_count)
 
     def test_orphaned_pending_approval_is_aborted_by_exact_prompt_and_settles(self):
         client = KimiWebClient(command="/unused/kimi")

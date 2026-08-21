@@ -364,7 +364,7 @@ class KimiIsolationAndActivityTest(unittest.TestCase):
         self.assertNotIn("https://", protocol)
         self.assertIn("绝不把 URL", protocol)
 
-    def test_kimi_text_only_rejects_upload_card_and_location_shapes(self):
+    def test_kimi_ingress_allows_only_opaque_staged_ids_for_attachments(self):
         for body in (
             {"attachment_url": "/attachments/a.png"},
             {"location": {"lat": 1}},
@@ -373,6 +373,7 @@ class KimiIsolationAndActivityTest(unittest.TestCase):
         ):
             with self.subTest(body=body):
                 self.assertTrue(PushHandler._kimi_inbound_not_text_only(body))
+        self.assertFalse(PushHandler._kimi_inbound_not_text_only({"attachment_ids": ["opaque-id"]}))
         self.assertFalse(PushHandler._kimi_inbound_not_text_only({"text": "https://example.com"}))
 
     def test_config_example_xhs_login_contacts_include_kimi(self):

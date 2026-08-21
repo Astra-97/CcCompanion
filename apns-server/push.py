@@ -462,6 +462,7 @@ class StagedAttachmentStore:
         extension: str,
         length: int,
         stream: Any,
+        media_type: str = "application/octet-stream",
     ) -> dict[str, Any]:
         attachment_id = secrets.token_urlsafe(24)
         created_at = time.time()
@@ -528,6 +529,7 @@ class StagedAttachmentStore:
             "contact_id": contact_id,
             "filename": filename,
             "attachment_type": attachment_type,
+            "media_type": media_type,
             "extension": extension,
             "size": int(length),
             "path": stage_path,
@@ -671,6 +673,7 @@ class StagedAttachmentStore:
             "attachment_id": str(item["id"]),
             "filename": str(item["filename"]),
             "type": str(item["attachment_type"]),
+            "media_type": str(item.get("media_type") or "application/octet-stream"),
             "size": int(item["size"]),
             "consumed": consumed,
         }
@@ -4583,6 +4586,30 @@ class PushHandler(BaseHTTPRequestHandler):
             attachment_ids=attachment_ids,
             destination=self.state.attachments_dir,
         )
+
+    def _discard_uncommitted_staged_attachments(self, attachments: Any) -> None:
+        """Delete only authoritative consumed files that never reached history."""
+        if not isinstance(attachments, list) or not attachments:
+            return
+        try:
+            root = Path(getattr(self.state, "attachments_dir")).resolve(strict=True)
+        except (AttributeError, OSError, TypeError):
+            return
+        for item in attachments:
+            if not isinstance(item, dict):
+                continue
+            try:
+                target = Path(str(item.get("stored_path") or ""))
+                info = target.lstat()
+                resolved = target.resolve(strict=True)
+                if (
+                    resolved.parent == root
+                    and not stat.S_ISLNK(info.st_mode)
+                    and stat.S_ISREG(info.st_mode)
+                ):
+                    resolved.unlink()
+            except (OSError, ValueError):
+                continue
 
     @staticmethod
     def _client_log_value(value: Any, *, limit: int = CLIENT_LOG_MAX_FIELD) -> Any:
@@ -9746,6 +9773,27 @@ class PushHandler(BaseHTTPRequestHandler):
         # caller-supplied copy before consuming opaque upload IDs, then attach
         # only the authoritative records returned by the staging store below.
         body.pop("_pwa_staged_attachments", None)
+        # Attachment history is a server-owned projection of an opaque staged
+        # batch.  A caller may carry unrelated metadata (for example stable
+        # group mention IDs), but must never inject attachment URLs which the
+        # Android client could later render as if they were authenticated
+        # server records.
+        raw_metadata = body.get("metadata")
+        if isinstance(raw_metadata, dict):
+            raw_metadata = dict(raw_metadata)
+            for reserved_key in (
+                "attachments",
+                "attachment_id",
+                "attachment_ids",
+                "attachment_url",
+                "attachment_type",
+                "attachment_filename",
+            ):
+                raw_metadata.pop(reserved_key, None)
+            if raw_metadata:
+                body["metadata"] = raw_metadata
+            else:
+                body.pop("metadata", None)
         clean_user_metadata = sanitize_voice_metadata(body.get("metadata"))
         if clean_user_metadata is None:
             body.pop("metadata", None)
@@ -9762,10 +9810,9 @@ class PushHandler(BaseHTTPRequestHandler):
         if "chat" not in advertised.get(contact_id, set()):
             self._send_json(501, {"ok": False, "error": f"contact not wired yet: {contact_id}"})
             return
-        # Kimi is deliberately a plain-text Web contact.  Reject attachment,
-        # location, voice and interactive-card shapes before the shared upload
-        # staging code can consume them; link previews are generated later by
-        # the server from the text itself, never accepted from caller metadata.
+        # Kimi accepts only opaque staged attachment IDs. Reject legacy file
+        # paths/URLs, location, voice and interactive-card shapes before the
+        # shared staging code can consume anything.
         if contact_id == "kimi" and self._kimi_inbound_not_text_only(body):
             self._send_json(415, {
                 "ok": False,
@@ -9773,16 +9820,32 @@ class PushHandler(BaseHTTPRequestHandler):
                 "reason": "Kimi 当前只接受直接发送的文字消息。",
             })
             return
-        # The group dispatcher has no batch attachment transport/recording
-        # contract yet.  Reject before staged bytes are consumed or moved: a
-        # later route-level 400 would otherwise orphan files without a message.
+        # Group attachment ownership is deliberately narrow: one human turn
+        # may attach a batch only when Kimi is its sole routed member. Other
+        # agents still lack a shared multi-recipient attachment contract.
         if contact_id == "apples" and "attachment_ids" in body:
-            self._send_json(415, {
-                "ok": False,
-                "error": "apples_attachments_unsupported",
-                "reason": "群聊暂不支持一次发送附件。",
-            })
-            return
+            metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+            raw_explicit = metadata.get("mentioned_member_ids")
+            invalid_explicit = self._invalid_explicit_apples_mentions(raw_explicit)
+            if invalid_explicit:
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "invalid_mentioned_member_ids",
+                    "invalid_member_ids": invalid_explicit,
+                })
+                return
+            explicit = self._normalize_mentioned_member_ids(raw_explicit)
+            targets = (
+                {member for member in explicit if member != self._apples_self_id()}
+                if explicit else self._detect_apples_mentions(str(body.get("text") or ""))
+            )
+            if targets != {"kimi"}:
+                self._send_json(415, {
+                    "ok": False,
+                    "error": "apples_attachments_require_kimi_only",
+                    "reason": "群附件目前仅支持单独 @卡拉米。",
+                })
+                return
         try:
             staged_attachments = self._consume_staged_attachments(body, contact_id)
         except ValueError as exc:
@@ -9799,6 +9862,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         "attachment_url": item["attachment_url"],
                         "filename": item["filename"],
                         "type": item["type"],
+                        "media_type": item.get("media_type") or "application/octet-stream",
                         "size": item["size"],
                     }
                     for item in staged_attachments
@@ -10636,12 +10700,19 @@ class PushHandler(BaseHTTPRequestHandler):
     def _handle_kimi_web_chat_send(self, body: dict[str, Any], contact_id: str, web: Any) -> None:
         text = str(body.get("text") or "").strip()
         quoted_ts = body.get("quoted_ts") or None
-        if not text:
-            self._send_json(400, {"ok": False, "error": "text required"})
+        staged_attachments = list(body.get("_pwa_staged_attachments") or [])
+        attachments_committed = False
+
+        def discard_uncommitted_attachments() -> None:
+            if not attachments_committed:
+                self._discard_uncommitted_staged_attachments(staged_attachments)
+
+        if not text and not staged_attachments:
+            self._send_json(400, {"ok": False, "error": "text or attachment required"})
             return
         link_bundle = self._kimi_link_bundle(text)
         xhs_login_card_allowed = self._kimi_xhs_login_card_allowed(link_bundle)
-        metadata = merge_preview_metadata(None, link_bundle)
+        metadata = merge_preview_metadata(body.get("metadata"), link_bundle)
         with self.state.kimi_turn_lock:
             if (
                 self.state.kimi_active_turn
@@ -10649,6 +10720,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 or getattr(self.state, "kimi_recovery_token", "")
                 or getattr(self.state, "kimi_terminal_acquire_token", "")
             ):
+                discard_uncommitted_attachments()
                 self._send_json(409, {
                     "ok": False,
                     "error": "kimi_turn_active",
@@ -10661,6 +10733,7 @@ class PushHandler(BaseHTTPRequestHandler):
             handed_off = self._handoff_kimi_terminal_to_writer(prepare_token)
         except KimiTerminalBusy:
             self._release_kimi_control(prepare_token)
+            discard_uncommitted_attachments()
             self._send_json(409, {
                 "ok": False,
                 "error": "kimi_terminal_busy",
@@ -10669,6 +10742,7 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         if not handed_off:
             self._release_kimi_control(prepare_token)
+            discard_uncommitted_attachments()
             self._send_json(503, {"ok": False, "error": "kimi_terminal_handoff_failed"})
             return
         reconcile_idle = getattr(web, "reconcile_owned_idle_lease", None)
@@ -10683,6 +10757,7 @@ class PushHandler(BaseHTTPRequestHandler):
             if isinstance(idle_lease, dict) and idle_lease:
                 self._mark_kimi_orphan_terminal(idle_lease, outcome="failed")
                 self._release_kimi_control(prepare_token)
+                discard_uncommitted_attachments()
                 self._send_json(409, {
                     "ok": False, "error": "kimi_web_orphan_recovered_retry",
                     "reason": "已整理上一轮 Kimi 的残留状态；请重新发送这条消息。",
@@ -10696,6 +10771,7 @@ class PushHandler(BaseHTTPRequestHandler):
             if recovery == "recovered":
                 self._mark_kimi_orphan_terminal(recovered_lease, outcome="interrupted")
                 self._release_kimi_control(prepare_token)
+                discard_uncommitted_attachments()
                 self._send_json(409, {
                     "ok": False, "error": "kimi_web_orphan_recovered_retry",
                     "reason": "上一轮 Kimi 已安全回收；请重新发送这条消息。",
@@ -10703,6 +10779,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 return
             else:
                 self._release_kimi_control(prepare_token)
+                discard_uncommitted_attachments()
                 status, error = (
                     (409, "kimi_turn_active") if recovery == "local_conflict" else
                     (409, "kimi_web_busy_recovery_pending") if recovery == "pending" else
@@ -10718,10 +10795,12 @@ class PushHandler(BaseHTTPRequestHandler):
                 return
         except KimiWebError:
             self._release_kimi_control(prepare_token)
+            discard_uncommitted_attachments()
             self._send_json(503, {"ok": False, "error": "kimi_web_unavailable"})
             return
         except Exception:
             self._release_kimi_control(prepare_token)
+            discard_uncommitted_attachments()
             logger.exception("Kimi Web session preparation crashed")
             self._send_json(503, {"ok": False, "error": "kimi_web_unavailable"})
             return
@@ -10729,9 +10808,11 @@ class PushHandler(BaseHTTPRequestHandler):
         with self.state.kimi_turn_lock:
             if self.state.kimi_prepare_token != prepare_token or self.state.kimi_active_turn:
                 self._release_kimi_control(prepare_token)
+                discard_uncommitted_attachments()
                 self._send_json(409, {"ok": False, "error": "kimi_turn_active"})
                 return
             chat = self._chat_for_contact(contact_id)
+            primary_attachment = staged_attachments[0] if staged_attachments else {}
             try:
                 rec = chat.append(
                     role="user",
@@ -10739,12 +10820,17 @@ class PushHandler(BaseHTTPRequestHandler):
                     source=self._source_for_request("kimi-web"),
                     quoted_ts=quoted_ts,
                     metadata=metadata,
+                    attachment_url=primary_attachment.get("attachment_url") or None,
+                    attachment_type=primary_attachment.get("type") or None,
+                    attachment_filename=primary_attachment.get("filename") or None,
                 )
             except Exception:
                 logger.exception("Kimi Web history append failed")
                 self._release_kimi_control(prepare_token)
+                discard_uncommitted_attachments()
                 self._send_json(500, {"ok": False, "error": "kimi_history_unavailable"})
                 return
+            attachments_committed = True
             cancel_event = threading.Event()
             self.state.kimi_active_turn = {
                 "user_ts": str(rec.get("ts") or ""),
@@ -10769,11 +10855,12 @@ class PushHandler(BaseHTTPRequestHandler):
                 session_id=session_id,
             )
 
+        prompt_text = text or "[用户发送了附件]"
         recall_result = self._kimi_semantic_recall(text, session_id=session_id)
         if recall_result is not None:
             self._append_kimi_recall_card(chat, recall_result, user_ts=str(rec.get("ts") or ""), session_id=session_id)
         prompt = self._kimi_prompt(
-            text,
+            prompt_text,
             link_context=link_bundle.prompt_context,
             recall_context="\n\n".join(value for value in (
                 self._kimi_web_handoff_context(chat, session_id, str(rec.get("ts") or "")),
@@ -11312,6 +11399,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 model=model,
                 thinking=effort,
                 permission_mode=self.state.kimi_web_permission_mode,
+                attachments=staged_attachments,
             )
             prompt_id = str(submitted.get("id") or submitted.get("prompt_id") or "").strip()
             if not prompt_id:
@@ -15529,8 +15617,10 @@ class PushHandler(BaseHTTPRequestHandler):
         sender_name: str,
         user_ts: str,
         hop_count: int,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> None:
         """Reply in apples through the same Web session without re-appending its user row."""
+        attachments = list(attachments or [])
         with self.state.kimi_turn_lock:
             if self.state.kimi_active_turn or self.state.kimi_prepare_token:
                 chat.append(role="system", text="Kimi 正在处理另一条消息。", source="system:group:kimi", sender_id="system", sender_name="系统")
@@ -15564,7 +15654,7 @@ class PushHandler(BaseHTTPRequestHandler):
             self._chat_for_contact("kimi"), session_id, ""
         )
         prompt = self._kimi_group_prompt(
-            text, sender_name=sender_name, handoff_context=handoff_context,
+            text or "[用户发送了附件]", sender_name=sender_name, handoff_context=handoff_context,
         )
         ready, submitted = threading.Event(), threading.Event()
         chunks: list[str] = []
@@ -15976,6 +16066,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 model=model,
                 thinking=effort,
                 permission_mode=self.state.kimi_web_permission_mode,
+                attachments=attachments,
             )
             prompt_id = str(result.get("prompt_id") or result.get("id") or "")
             if not prompt_id: raise KimiWebError("missing prompt id")
@@ -16130,6 +16221,7 @@ class PushHandler(BaseHTTPRequestHandler):
         sender_name: str,
         hop_count: int = 0,
         sender_id: str = "",
+        staged_attachments: list[dict[str, Any]] | None = None,
     ) -> tuple[list[str], dict[str, str]]:
         """Shared dispatch for apples group @mentions.
 
@@ -16149,6 +16241,7 @@ class PushHandler(BaseHTTPRequestHandler):
             return routed, errors
 
         sender_id_norm = (sender_id or "").strip().lower()
+        staged_attachments = list(staged_attachments or [])
         text = str(rec.get("text") or "")
         link_context = self._link_context_from_record(rec)
         text_for_agent = f"{text}\n\n{link_context}" if link_context else text
@@ -16283,6 +16376,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._start_group_kimi_reply(
                     chat, text_for_agent, sender_name=sender_name,
                     user_ts=str(rec.get("ts") or ""), hop_count=next_hop,
+                    attachments=staged_attachments,
                 )
                 self._apples_record_global(sender_id_norm or "unknown")
                 routed.append("kimi")
@@ -16350,8 +16444,9 @@ class PushHandler(BaseHTTPRequestHandler):
         text = body.get("text", "").strip()
         quoted_ts = body.get("quoted_ts") or None
         location = body.get("location") or None
-        if not text and not location:
-            self._send_json(400, {"error": "text or location required"})
+        staged_attachments = list(body.get("_pwa_staged_attachments") or [])
+        if not text and not location and not staged_attachments:
+            self._send_json(400, {"error": "text, location or attachment required"})
             return
 
         chat = self._chat_for_contact(contact_id)
@@ -16362,6 +16457,7 @@ class PushHandler(BaseHTTPRequestHandler):
         meta = merge_preview_metadata(meta, link_bundle) or {}
         invalid_explicit = self._invalid_explicit_apples_mentions(meta.get("mentioned_member_ids"))
         if invalid_explicit:
+            self._discard_uncommitted_staged_attachments(staged_attachments)
             self._send_json(400, {
                 "ok": False,
                 "error": "group_member_not_routable",
@@ -16374,17 +16470,27 @@ class PushHandler(BaseHTTPRequestHandler):
             targets = {mid for mid in explicit if mid != self._apples_self_id()}
         else:
             targets = self._detect_apples_mentions(text)
-        rec = chat.append(
-            role="user",
-            text=text,
-            source=self._source_for_request("apples"),
-            quoted_ts=quoted_ts,
-            location=location,
-            sender_id="astra",
-            sender_name=self._apples_member_name("astra"),
-            mentions=sorted(targets),
-            metadata=meta or None,
-        )
+        primary_attachment = staged_attachments[0] if staged_attachments else {}
+        try:
+            rec = chat.append(
+                role="user",
+                text=text,
+                source=self._source_for_request("apples"),
+                quoted_ts=quoted_ts,
+                location=location,
+                sender_id="astra",
+                sender_name=self._apples_member_name("astra"),
+                mentions=sorted(targets),
+                metadata=meta or None,
+                attachment_url=primary_attachment.get("attachment_url") or None,
+                attachment_type=primary_attachment.get("type") or None,
+                attachment_filename=primary_attachment.get("filename") or None,
+            )
+        except Exception as exc:
+            self._discard_uncommitted_staged_attachments(staged_attachments)
+            logger.exception("apples history append failed")
+            self._send_json(500, {"ok": False, "error": f"history append failed: {exc}"})
+            return
         if not targets:
             self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec, "routed": []})
             return
@@ -16407,6 +16513,7 @@ class PushHandler(BaseHTTPRequestHandler):
             sender_name=self._apples_member_name("astra"),
             hop_count=0,
             sender_id="astra",
+            staged_attachments=staged_attachments,
         )
 
         if errors and not routed:
@@ -17891,13 +17998,6 @@ class PushHandler(BaseHTTPRequestHandler):
 
         qs = parse_qs(urlparse(self.path).query)
         contact_id = self._clean_contact_id(qs.get("contact_id", qs.get("contactId", ["xiaoke"]))[0])
-        if contact_id == "kimi":
-            self.close_connection = True
-            self._send_json(415, {
-                "ok": False,
-                "error": "Kimi Web contact currently supports text messages only",
-            })
-            return
         filename = (qs.get("filename", [None])[0]
                     or self.headers.get("X-Filename")
                     or "upload.bin")
@@ -17958,6 +18058,12 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         image_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
         atype = "image" if ext in image_exts else "file"
+        import mimetypes
+        media_type = str(self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if not re.fullmatch(r"[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+", media_type):
+            media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        if atype == "image" and not media_type.startswith("image/"):
+            media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
         # Browser/PWA uploads and an explicit authenticated native staging mode
         # never append history or wake an AI until one later `/chat/send`
@@ -17982,6 +18088,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         extension=ext,
                         length=length,
                         stream=self.rfile,
+                        media_type=media_type,
                     )
             except TimeoutError:
                 # Remaining raw bytes cannot safely be treated as a later HTTP
@@ -18001,6 +18108,15 @@ class PushHandler(BaseHTTPRequestHandler):
                 "contact_id": contact_id,
                 "attachments": [staged],
                 "upload_limits": self._pwa_upload_limits(),
+            })
+            return
+
+        if contact_id == "kimi":
+            self.close_connection = True
+            self._send_json(415, {
+                "ok": False,
+                "error": "kimi_staged_attachment_required",
+                "reason": "Kimi 附件必须先上传，再随 /chat/send 原子提交。",
             })
             return
 

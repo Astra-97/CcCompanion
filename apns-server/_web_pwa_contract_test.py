@@ -879,6 +879,7 @@ class WebPwaContractTest(unittest.TestCase):
                 extension=".png",
                 length=3,
                 stream=io.BytesIO(b"png"),
+                media_type="image/png",
             )
             self.assertNotIn("stored_path", staged)
             attachment_id = staged["attachment_id"]
@@ -893,6 +894,7 @@ class WebPwaContractTest(unittest.TestCase):
                 attachment_ids=[attachment_id], destination=root,
             )
             self.assertTrue(Path(consumed[0]["stored_path"]).is_file())
+            self.assertEqual("image/png", consumed[0]["media_type"])
             self.assertTrue(consumed[0]["attachment_url"].startswith("/attachments/"))
             with self.assertRaisesRegex(ValueError, "missing_or_expired"):
                 store.consume(
@@ -954,14 +956,97 @@ class WebPwaContractTest(unittest.TestCase):
             self.assertEqual(store._items, {})
             self.assertFalse(list(Path(raw_tmp).glob("*.png")))
 
-    def test_apples_rejects_staged_attachments_before_consume(self):
+    def test_apples_rejects_non_kimi_staged_attachments_before_consume(self):
         handler = self.handler("/chat/send", "POST")
         handler._contact_id_from_body = lambda _body: "apples"
         handler._chat_contact_directory = lambda: [{"id": "apples", "capabilities": ["chat", "attachments"]}]
         handler._consume_staged_attachments = lambda *_args, **_kwargs: self.fail("must not consume")
         handler._handle_chat_send({"contact_id": "apples", "text": "", "attachment_ids": ["opaque"]})
         self.assertEqual(handler.responses[-1][0], 415)
-        self.assertEqual(handler.responses[-1][1]["error"], "apples_attachments_unsupported")
+        self.assertEqual(handler.responses[-1][1]["error"], "apples_attachments_require_kimi_only")
+
+    def test_private_kimi_strips_forged_attachment_metadata_without_staged_ids(self):
+        handler = self.handler("/chat/send", "POST")
+        handler._contact_id_from_body = lambda _body: "kimi"
+        handler._chat_contact_directory = lambda: [{"id": "kimi", "capabilities": ["chat", "attachments"]}]
+        handler._consume_staged_attachments = lambda *_args, **_kwargs: []
+        captured = []
+
+        with patch("push.dispatch_contact_send", side_effect=lambda _handler, _contact, body: captured.append(dict(body)) or True):
+            handler._handle_chat_send({
+                "contact_id": "kimi",
+                "text": "hello",
+                "metadata": {
+                    "attachments": [{"attachment_url": "https://evil.invalid/pixel"}],
+                    "attachment_url": "https://evil.invalid/single",
+                },
+            })
+
+        self.assertEqual(1, len(captured))
+        self.assertNotIn("metadata", captured[0])
+        self.assertNotIn("_pwa_staged_attachments", captured[0])
+
+    def test_apples_rebuilds_forged_attachment_metadata_from_authoritative_batch(self):
+        handler = self.handler("/chat/send", "POST")
+        handler._contact_id_from_body = lambda _body: "apples"
+        handler._chat_contact_directory = lambda: [{"id": "apples", "capabilities": ["chat", "attachments"]}]
+        handler._invalid_explicit_apples_mentions = lambda _raw: []
+        handler._normalize_mentioned_member_ids = lambda _raw: ["kimi"]
+        handler._apples_self_id = lambda: "astra"
+        handler._detect_apples_mentions = lambda _text: set()
+        handler._consume_staged_attachments = lambda *_args, **_kwargs: [{
+            "attachment_id": "real-id",
+            "attachment_url": "/attachments/real-id.pdf",
+            "filename": "report.pdf",
+            "type": "file",
+            "media_type": "application/pdf",
+            "size": 12,
+            "stored_path": "/private/server/path/report.pdf",
+        }]
+        captured = []
+        handler._handle_apples_chat_send = lambda body, _contact: captured.append(dict(body))
+
+        handler._handle_chat_send({
+            "contact_id": "apples",
+            "text": "@卡拉米 看附件",
+            "attachment_ids": ["opaque-stage-id"],
+            "metadata": {
+                "mentioned_member_ids": ["kimi"],
+                "attachments": [{"attachment_url": "https://evil.invalid/pixel"}],
+                "attachment_url": "https://evil.invalid/single",
+            },
+        })
+
+        self.assertEqual(1, len(captured))
+        self.assertEqual(["kimi"], captured[0]["metadata"]["mentioned_member_ids"])
+        self.assertEqual([{
+            "attachment_id": "real-id",
+            "attachment_url": "/attachments/real-id.pdf",
+            "filename": "report.pdf",
+            "type": "file",
+            "media_type": "application/pdf",
+            "size": 12,
+        }], captured[0]["metadata"]["attachments"])
+        self.assertNotIn("stored_path", captured[0]["metadata"]["attachments"][0])
+
+    def test_apples_rejects_invalid_raw_attachment_mentions_before_consume(self):
+        for mentioned_ids in (["kimi", "evil"], ["kimi", "astra"]):
+            with self.subTest(mentioned_ids=mentioned_ids):
+                handler = self.handler("/chat/send", "POST")
+                handler._contact_id_from_body = lambda _body: "apples"
+                handler._chat_contact_directory = lambda: [{"id": "apples", "capabilities": ["chat", "attachments"]}]
+                handler._apples_member_ids = lambda: {"astra", "kimi"}
+                handler._apples_replyable_member_ids = lambda: {"kimi"}
+                handler._consume_staged_attachments = lambda *_args, **_kwargs: self.fail("must not consume")
+                handler._handle_chat_send({
+                    "contact_id": "apples",
+                    "text": "",
+                    "attachment_ids": ["opaque"],
+                    "metadata": {"mentioned_member_ids": mentioned_ids},
+                })
+                self.assertEqual(400, handler.responses[-1][0])
+                self.assertEqual("invalid_mentioned_member_ids", handler.responses[-1][1]["error"])
+                self.assertEqual([mentioned_ids[1]], handler.responses[-1][1]["invalid_member_ids"])
 
     def test_staged_attachment_expiry_and_logout_style_cancel_remove_bytes(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
