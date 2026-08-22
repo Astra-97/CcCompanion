@@ -11379,7 +11379,7 @@ class PushHandler(BaseHTTPRequestHandler):
             if terminal_reason == "blocked":
                 answer = answer or "Kimi 这轮需要你作选择，已安全停止；不会替你自动决定。"
             elif terminal_reason in {"interrupted", "cancelled"}:
-                answer = (answer + "\n\n*[已停止生成]*").strip() if answer else "已中断当前生成。"
+                answer = (answer + "\n\n**[已停止生成]**").strip() if answer else "已中断当前生成。"
             elif not answer:
                 answer = "Kimi 没有返回可展示内容。" if terminal_reason == "completed" else "Kimi 这次没有成功回复。请稍后重试；原消息已经保留。"
             source = "kimi-web" if terminal_reason == "completed" else f"kimi-web:{terminal_reason}"
@@ -11863,7 +11863,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 append_worker_history()
                 partial = "".join(chunks).strip()
                 final_ts = append_assistant_safely(
-                    partial + "\n\n*[已停止生成]*" if partial else "已中断当前生成。",
+                    partial + "\n\n**[已停止生成]**" if partial else "已中断当前生成。",
                     "kimi-acp:interrupted",
                 )
                 self._set_chat_interrupted(
@@ -16059,7 +16059,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 if terminal_reason == "blocked":
                     answer = answer or "Kimi 这轮需要你作选择，已安全停止；不会替你自动决定。"
                 elif terminal_reason in {"interrupted", "cancelled"}:
-                    answer = (answer + "\n\n*[已停止生成]*").strip() if answer else "已中断当前生成。"
+                    answer = (answer + "\n\n**[已停止生成]**").strip() if answer else "已中断当前生成。"
                 elif not answer:
                     answer = "Kimi 没有返回可展示内容。" if terminal_reason == "completed" else "Kimi 这次没有成功回复。"
                 activity_outcome = (
