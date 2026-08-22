@@ -2011,6 +2011,117 @@ def _should_auto_forge(
 
 KIMI_TASK_TERMINAL_STATUSES = frozenset({"completed", "failed", "stopped"})
 KIMI_FORGE_TASK_LIST_LIMIT = 12
+# Forge seed verbatim tail: the last N user/assistant text messages of the old
+# session are injected verbatim after the summary (product decision
+# 2026-08-22).  0 disables the tail; values are clamped to [0, 160].  The
+# whole tail section is additionally byte-capped, dropping oldest first.
+KIMI_FORGE_SEED_RETAIN_DEFAULT = 80
+KIMI_FORGE_SEED_RETAIN_MAX = 160
+KIMI_FORGE_SEED_TAIL_MAX_BYTES = 64 * 1024
+
+
+def _clamp_kimi_forge_seed_retain(value: Any) -> int:
+    """Clamp the retain-messages config into [0, KIMI_FORGE_SEED_RETAIN_MAX]."""
+    try:
+        retain = int(value)
+    except (TypeError, ValueError):
+        return KIMI_FORGE_SEED_RETAIN_DEFAULT
+    return max(0, min(KIMI_FORGE_SEED_RETAIN_MAX, retain))
+
+
+def _load_kimi_session_recent_messages(
+    session_id: str,
+    *,
+    limit: int,
+    max_bytes: int | None = None,
+    sessions_root: str | Path | None = None,
+) -> dict[str, Any] | None:
+    """Read the last ``limit`` user/assistant text messages from a session archive.
+
+    Returns ``{"messages": [(role, text), ...], "dropped": int, "truncated":
+    bool}`` in chronological order, or ``None`` when the archive is missing or
+    unreadable — a forge must never fail because of this best-effort read.
+    System/injected messages, tool calls/results and thinking parts are
+    skipped; only verbatim text survives.
+    """
+    clean = str(session_id or "").strip()
+    if not clean or not all(char.isalnum() or char in {"-", "_"} for char in clean):
+        return None
+    if limit <= 0:
+        return {"messages": [], "dropped": 0, "truncated": False}
+    if max_bytes is None:
+        max_bytes = KIMI_FORGE_SEED_TAIL_MAX_BYTES
+    root = (
+        Path(sessions_root).expanduser()
+        if sessions_root
+        else Path.home() / ".kimi-code" / "sessions"
+    )
+    try:
+        wires = sorted(
+            root.glob(f"wd_*/{clean}/agents/main/wire.jsonl"),
+            key=lambda path: path.stat().st_mtime,
+        )
+    except OSError:
+        return None
+    if not wires:
+        return None
+    try:
+        lines = wires[-1].read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    messages: list[tuple[str, str]] = []
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        kind = record.get("type")
+        if kind == "context.append_message":
+            message = record.get("message")
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            origin = message.get("origin")
+            # Only genuine user turns; injections/system triggers/task
+            # notifications are noise for a verbatim continuation tail.
+            if isinstance(origin, dict) and origin.get("kind") not in (None, "user"):
+                continue
+            texts = [
+                str(part.get("text") or "")
+                for part in message.get("content") or []
+                if isinstance(part, dict) and part.get("type") == "text"
+            ]
+            text = "\n".join(chunk for chunk in texts if chunk).strip()
+            if text:
+                messages.append(("user", text))
+        elif kind == "context.append_loop_event":
+            event = record.get("event")
+            if not isinstance(event, dict) or event.get("type") != "content.part":
+                continue
+            part = event.get("part")
+            if not isinstance(part, dict) or part.get("type") != "text":
+                continue
+            text = str(part.get("text") or "").strip()
+            if text:
+                messages.append(("assistant", text))
+    tail = messages[-limit:]
+    sizes = [len(text.encode("utf-8")) for _role, text in tail]
+    total = sum(sizes)
+    dropped = 0
+    while len(tail) > 1 and total > max_bytes:
+        total -= sizes.pop(0)
+        tail.pop(0)
+        dropped += 1
+    truncated = False
+    if tail and total > max_bytes:
+        # A single message larger than the cap is byte-truncated instead of
+        # dropping the entire tail.
+        role, text = tail[0]
+        encoded = text.encode("utf-8")[:max_bytes]
+        tail[0] = (role, encoded.decode("utf-8", errors="ignore") + " …[截断]")
+        truncated = True
+    return {"messages": tail, "dropped": dropped, "truncated": truncated}
 
 
 def _scan_kimi_session_tasks(
@@ -3788,6 +3899,14 @@ class ServerState:
         # 存在，阈值 forge 是在它之前先把任务移交干净的受控换会话。
         self.kimi_auto_forge_context_threshold = float(
             server_cfg.get("kimi_auto_forge_context_threshold", 0.8)
+        )
+        # 2026-08-22 产品决策：forge seed 从纯摘要升级为"摘要 + 旧会话最近
+        # N 条对话原文 verbatim"混合模式。默认 80（对齐 Kairos 滑块手感），
+        # 钳位到 [0, 160]；0 表示关闭原文 tail、退回纯摘要 seed。原文节整体
+        # 另有 64 KB 字节上限（超出从最老的开始丢），读取存档失败时降级为
+        # 纯摘要，绝不让 forge 因此失败。
+        self.kimi_forge_seed_retain_messages = _clamp_kimi_forge_seed_retain(
+            server_cfg.get("kimi_forge_seed_retain_messages", KIMI_FORGE_SEED_RETAIN_DEFAULT)
         )
         self.kairos_queue_lock = threading.Lock()
         self.kairos_queue_path = contact_history_dir / "kairos_queue.json"
@@ -14125,7 +14244,7 @@ class PushHandler(BaseHTTPRequestHandler):
         new_session_id = ctx["new_session_id"]
         tasks = ctx["tasks"]
         handoff_path = self._write_kimi_forge_handoff(old_session_id, new_session_id, tasks)
-        seed_ok = self._seed_kimi_forged_session(
+        seed_ok, retained_messages = self._seed_kimi_forged_session(
             web, new_session_id, old_session_id, tasks, handoff_path, ctx["model"], ctx["effort"],
         )
         notice = self._kimi_forge_notice_text(old_session_id, new_session_id, tasks, seed_ok, trigger=trigger)
@@ -14155,6 +14274,7 @@ class PushHandler(BaseHTTPRequestHandler):
             "pending_tasks": len(tasks["pending"]),
             "handoff_record": handoff_path,
             "seed_submitted": seed_ok,
+            "retained_messages": retained_messages,
         }
 
     def _write_kimi_forge_handoff(
@@ -14234,8 +14354,13 @@ class PushHandler(BaseHTTPRequestHandler):
         handoff_path: str,
         model: str,
         effort: str,
-    ) -> bool:
-        """Submit the task-handoff seed prompt into the freshly forged session."""
+    ) -> tuple[bool, int]:
+        """Submit the task-handoff seed prompt into the freshly forged session.
+
+        Returns ``(submitted, retained_messages)`` — the second element is the
+        number of verbatim old-session messages actually injected (0 when the
+        tail is disabled or the archive read degraded to a pure summary).
+        """
         lines = [
             "【CcCompanion 受控 forge · 上下文交接】这是一条系统交接消息，不是用户指令。",
             f"你从旧会话 {old_session_id} 切换而来；旧会话完整历史仍在磁盘上"
@@ -14261,6 +14386,35 @@ class PushHandler(BaseHTTPRequestHandler):
             lines.append(f"本次交接的机器可读登记在 {handoff_path}。")
         if len(lines) <= 2:
             lines.append("旧会话没有需要移交的后台任务。")
+        retained_messages = 0
+        retain = _clamp_kimi_forge_seed_retain(
+            getattr(self.state, "kimi_forge_seed_retain_messages", KIMI_FORGE_SEED_RETAIN_DEFAULT)
+        )
+        if retain > 0:
+            tail = _load_kimi_session_recent_messages(
+                old_session_id,
+                limit=retain,
+                sessions_root=getattr(self.state, "kimi_sessions_root", None),
+            )
+            if tail is None:
+                logger.warning(
+                    "Kimi forge seed tail degraded to summary: no readable archive for %s",
+                    old_session_id,
+                )
+            elif tail["messages"]:
+                retained_messages = len(tail["messages"])
+                caveats = []
+                if tail["dropped"]:
+                    caveats.append(f"因总量上限丢弃了最老的 {tail['dropped']} 条")
+                if tail["truncated"]:
+                    caveats.append("最新一条因超长被截断")
+                suffix = f"（{'，'.join(caveats)}）" if caveats else ""
+                lines.append(
+                    f"以下为旧会话最近 {retained_messages} 条对话原文，供延续上下文{suffix}："
+                )
+                for role, text in tail["messages"]:
+                    speaker = "用户" if role == "user" else "助手"
+                    lines.append(f"[{speaker}] {text}")
         try:
             web.submit_prompt(
                 new_session_id,
@@ -14269,10 +14423,10 @@ class PushHandler(BaseHTTPRequestHandler):
                 thinking=effort,
                 permission_mode=self.state.kimi_web_permission_mode,
             )
-            return True
+            return True, retained_messages
         except Exception:
             logger.warning("Kimi forge seed prompt failed", exc_info=True)
-            return False
+            return False, 0
 
     def _handle_kimi_terminal_observer(self) -> None:
         """Return Kimi's narrow observer DTO, never ACP/stdout diagnostics."""

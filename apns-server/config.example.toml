@@ -134,6 +134,13 @@ allowed_ips = []
 # 新会话 seed 注入 + 聊天系统消息与推送通知，绝不做无声 forge。显式设为
 # 0 可禁用；(0,1) 区间生效。Kimi 正忙时自动 forge 跳过本轮，下一轮再触发。
 # kimi_auto_forge_context_threshold = 0.8
+# forge seed 混合模式：新会话的交接 seed 在任务盘点/移交登记等摘要内容之后，
+# 追加旧会话最近 N 条对话原文 verbatim（只取 user/assistant 文本，跳过系统
+# 消息、工具调用、工具结果等噪音）。默认 80（对齐 Kairos 的
+# codex_auto_forge_retain_messages = 80），钳位到 0–160；0 表示关闭原文
+# tail、退回纯摘要 seed。原文节整体另有 64 KB 字节上限（超出从最老的开始
+# 丢，保最新）；读取会话存档失败时降级为纯摘要，不会让 forge 失败。
+# kimi_forge_seed_retain_messages = 80
 # Kairos App turns auto-forge after the completed reply has been persisted.
 # The old session is claimed at most once across service restarts.
 # codex_auto_forge_enabled = true

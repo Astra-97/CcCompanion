@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from push import PushHandler, _scan_kimi_session_tasks
+from push import PushHandler, _load_kimi_session_recent_messages, _scan_kimi_session_tasks
 
 
 class ScanKimiSessionTasksTest(unittest.TestCase):
@@ -89,6 +89,10 @@ def _make_handler(tmp: Path, web: object) -> PushHandler:
         kimi_web=web,
         kimi_web_permission_mode="auto",
         kimi_auto_forge_context_threshold=0.0,
+        # Keep existing forge tests hermetic: no verbatim tail unless a test
+        # opts in and points kimi_sessions_root at a tmp archive.
+        kimi_forge_seed_retain_messages=0,
+        kimi_sessions_root=None,
         token_store_path=str(tmp / "tokens" / "device_tokens.json"),
         contact_chats={"kimi": chat},
     )
@@ -321,6 +325,208 @@ class AutoForgePipelineTest(unittest.TestCase):
             scan.assert_not_called()
             self.assertEqual([], web.created)
             self.assertEqual("session_old", web.active)
+
+
+def _wire_user(text: str, *, kind: str = "user") -> dict:
+    return {
+        "type": "context.append_message",
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": text}],
+            "origin": {"kind": kind},
+        },
+    }
+
+
+def _wire_assistant(text: str) -> dict:
+    return {
+        "type": "context.append_loop_event",
+        "event": {"type": "content.part", "part": {"type": "text", "text": text}},
+    }
+
+
+def _write_wire_archive(root: Path, session_id: str, records: list) -> Path:
+    wire = root / "wd_test" / session_id / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    wire.write_text(
+        "\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    return wire
+
+
+class ForgeSeedRetainMessagesTest(unittest.TestCase):
+    """Hybrid forge seed: summary plus the old session's verbatim tail."""
+
+    def _forge_with_archive(
+        self,
+        tmp: Path,
+        records: list,
+        *,
+        retain: int,
+    ) -> tuple:
+        root = Path(tmp) / "sessions"
+        _write_wire_archive(root, "session_old", records)
+        web = FakeWeb()
+        handler = _make_handler(Path(tmp), web)
+        handler.state.kimi_forge_seed_retain_messages = retain
+        handler.state.kimi_sessions_root = root
+        tasks = {"finished": [], "pending": []}
+        with patch("push._scan_kimi_session_tasks", lambda _sid: tasks):
+            handler._handle_kimi_forge({})
+        return handler, web
+
+    def test_seed_tail_injects_recent_verbatim_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            handler, web = self._forge_with_archive(Path(tmp), [
+                _wire_user("第一句用户消息"),
+                _wire_assistant("第一句助手回复"),
+                _wire_user("最近的用户消息"),
+                _wire_assistant("最近的助手回复"),
+            ], retain=80)
+            status, payload = handler.responses[-1]
+            self.assertEqual(200, status)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(4, payload["retained_messages"])
+            _session, seed = web.seeds[0]
+            self.assertIn("以下为旧会话最近 4 条对话原文，供延续上下文", seed)
+            self.assertIn("[用户] 第一句用户消息", seed)
+            self.assertIn("[助手] 最近的助手回复", seed)
+            # Chronological order is preserved in the seed.
+            self.assertLess(seed.index("第一句用户消息"), seed.index("最近的助手回复"))
+
+    def test_retain_zero_keeps_summary_only_seed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            handler, web = self._forge_with_archive(Path(tmp), [
+                _wire_user("不该出现"),
+                _wire_assistant("也不该出现"),
+            ], retain=0)
+            status, payload = handler.responses[-1]
+            self.assertEqual(200, status)
+            self.assertEqual(0, payload["retained_messages"])
+            _session, seed = web.seeds[0]
+            self.assertIn("受控 forge", seed)
+            self.assertNotIn("对话原文", seed)
+            self.assertNotIn("不该出现", seed)
+
+    def test_only_last_n_messages_in_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            records = []
+            for index in range(6):
+                records.append(_wire_user(f"用户消息{index}"))
+                records.append(_wire_assistant(f"助手回复{index}"))
+            handler, web = self._forge_with_archive(Path(tmp), records, retain=3)
+            status, payload = handler.responses[-1]
+            self.assertEqual(200, status)
+            self.assertEqual(3, payload["retained_messages"])
+            _session, seed = web.seeds[0]
+            self.assertNotIn("用户消息3", seed)
+            self.assertNotIn("助手回复3", seed)
+            self.assertNotIn("用户消息4", seed)
+            i_asst4 = seed.index("助手回复4")
+            i_user5 = seed.index("用户消息5")
+            i_asst5 = seed.index("助手回复5")
+            self.assertTrue(i_asst4 < i_user5 < i_asst5)
+
+    def test_byte_cap_drops_oldest_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            _write_wire_archive(root, "session_old", [
+                _wire_user("老消息" + "长" * 200),
+                _wire_user("次老消息"),
+                _wire_assistant("新消息"),
+            ])
+            result = _load_kimi_session_recent_messages(
+                "session_old", limit=80, max_bytes=10, sessions_root=root,
+            )
+            texts = [text for _role, text in result["messages"]]
+            self.assertEqual(["新消息"], texts)
+            self.assertEqual(2, result["dropped"])
+            self.assertFalse(result["truncated"])
+            # A single oversized latest message is truncated, not dropped.
+            _write_wire_archive(root, "session_big", [
+                _wire_assistant("巨" * 200),
+            ])
+            result = _load_kimi_session_recent_messages(
+                "session_big", limit=80, max_bytes=60, sessions_root=root,
+            )
+            self.assertEqual(1, len(result["messages"]))
+            self.assertTrue(result["truncated"])
+            self.assertTrue(result["messages"][0][1].endswith("…[截断]"))
+            self.assertLessEqual(
+                len(result["messages"][0][1].encode("utf-8")), 60 + len(" …[截断]".encode("utf-8"))
+            )
+
+    def test_missing_or_broken_archive_degrades_to_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # No archive at all.
+            root = Path(tmp) / "sessions"
+            web = FakeWeb()
+            handler = _make_handler(Path(tmp), web)
+            handler.state.kimi_forge_seed_retain_messages = 80
+            handler.state.kimi_sessions_root = root
+            with patch("push._scan_kimi_session_tasks", lambda _sid: {"finished": [], "pending": []}):
+                handler._handle_kimi_forge({})
+            status, payload = handler.responses[-1]
+            self.assertEqual(200, status)
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["seed_submitted"])
+            self.assertEqual(0, payload["retained_messages"])
+            _session, seed = web.seeds[0]
+            self.assertNotIn("对话原文", seed)
+            # A wire file full of broken lines degrades the same way.
+            wire = _write_wire_archive(root, "session_old", [])
+            wire.write_text("{broken\n{\"type\": 42}\n", encoding="utf-8")
+            web2 = FakeWeb()
+            handler2 = _make_handler(Path(tmp) / "second", web2)
+            handler2.state.kimi_forge_seed_retain_messages = 80
+            handler2.state.kimi_sessions_root = root
+            with patch("push._scan_kimi_session_tasks", lambda _sid: {"finished": [], "pending": []}):
+                handler2._handle_kimi_forge({})
+            status2, payload2 = handler2.responses[-1]
+            self.assertEqual(200, status2)
+            self.assertTrue(payload2["seed_submitted"])
+            self.assertEqual(0, payload2["retained_messages"])
+
+    def test_filters_system_and_tool_noise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            handler, web = self._forge_with_archive(Path(tmp), [
+                {"type": "metadata", "protocol_version": "1.5"},
+                {"type": "config.update", "systemPrompt": "系统提示词不该进 seed"},
+                _wire_user("注入消息不该进", kind="injection"),
+                _wire_user("系统触发不该进", kind="system_trigger"),
+                _wire_user("任务通知不该进", kind="task"),
+                {
+                    "type": "context.append_message",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "image_url", "image_url": {"url": "x"}}],
+                        "origin": {"kind": "user"},
+                    },
+                },
+                {
+                    "type": "context.append_loop_event",
+                    "event": {"type": "tool.call", "name": "Bash", "arguments": {}},
+                },
+                {
+                    "type": "context.append_loop_event",
+                    "event": {"type": "tool.result", "output": "工具结果不该进"},
+                },
+                {
+                    "type": "context.append_loop_event",
+                    "event": {"type": "content.part", "part": {"type": "think", "think": "思考不该进"}},
+                },
+                _wire_user("真正的用户消息"),
+                _wire_assistant("真正的助手回复"),
+            ], retain=80)
+            status, payload = handler.responses[-1]
+            self.assertEqual(200, status)
+            self.assertEqual(2, payload["retained_messages"])
+            _session, seed = web.seeds[0]
+            self.assertIn("[用户] 真正的用户消息", seed)
+            self.assertIn("[助手] 真正的助手回复", seed)
+            for noise in ("注入消息", "系统触发", "任务通知", "工具结果", "思考不该进", "系统提示词"):
+                self.assertNotIn(noise, seed)
 
 
 if __name__ == "__main__":
