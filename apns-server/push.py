@@ -3779,12 +3779,15 @@ class ServerState:
             except Exception:
                 return None
         self.kimi_terminal.set_status_probe(_kimi_terminal_status_probe)
-        # 2026-08-22 常驻固定会话：Kimi CLI 在接近上下文窗口时会自动
-        # compaction（agent-core 内置，ACP/Web 同一引擎），不再按阈值自动
-        # forge。阈值默认 0（禁用）；仅 ACP 回滚通道还读这个配置，显式设为
-        # (0,1) 区间才会恢复旧的自动 forge。受控换会话走 POST /kimi/forge。
+        # 2026-08-22 常驻固定会话 + 产品决策更新：保留上下文阈值自动
+        # forge，默认 0.8（80%，对齐 Kairos 的 codex_auto_forge_threshold_
+        # percent = 80）。自动 forge 挂在 Web 聊天路径上，且与 POST
+        # /kimi/forge 走同一套移交管线（任务盘点 + handoff 登记 + seed
+        # 注入 + 用户通知），绝不做无声 forge。显式设为 0 禁用；(0,1)
+        # 区间生效。Kimi CLI 接近上下文窗口时的自动 compaction 依然
+        # 存在，阈值 forge 是在它之前先把任务移交干净的受控换会话。
         self.kimi_auto_forge_context_threshold = float(
-            server_cfg.get("kimi_auto_forge_context_threshold", 0.0)
+            server_cfg.get("kimi_auto_forge_context_threshold", 0.8)
         )
         self.kairos_queue_lock = threading.Lock()
         self.kairos_queue_path = contact_history_dir / "kairos_queue.json"
@@ -10928,6 +10931,15 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(503, {"ok": False, "error": "kimi_web_unavailable"})
             return
 
+        # 上下文阈值自动 forge（默认 80%）：与 POST /kimi/forge 同一套
+        # 移交管线，换的是本通道（kimi_web）的活跃会话指针。此时仍持有
+        # prepare 预约，管线不会另行加锁。失败或 Kimi 正忙时沿用旧会话，
+        # 绝不影响本条消息发送。
+        try:
+            session_id, _forged = self._maybe_forge_kimi_session(session_id)
+        except Exception:
+            logger.warning("Kimi auto-forge failed, continuing with existing session", exc_info=True)
+
         with self.state.kimi_turn_lock:
             if self.state.kimi_prepare_token != prepare_token or self.state.kimi_active_turn:
                 self._release_kimi_control(prepare_token)
@@ -11632,14 +11644,10 @@ class PushHandler(BaseHTTPRequestHandler):
         try:
             model, effort = self._kimi_selection()
             session_id = self._prepare_kimi_selected_session(model, effort)
-            try:
-                session_id, _forged = self._maybe_forge_kimi_session(
-                    session_id,
-                    model=model,
-                    reasoning_effort=effort,
-                )
-            except Exception as exc:
-                logger.warning("Kimi auto-forge failed, continuing with existing session: %s", type(exc).__name__)
+            # ACP 回滚通道不做阈值自动 forge：移交管线操作的是 Web 通道的
+            # 活跃会话指针（kimi_web_session.json，与 ACP 的
+            # kimi_acp_session.json 分离），在这里换指针会换错家。自动
+            # forge 只挂在 Web 聊天路径（_handle_kimi_web_chat_send）上。
         except KimiACPAuthRequired:
             self._release_kimi_control(prepare_token)
             self.state.kimi_acp.close()
@@ -12140,17 +12148,16 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.warning("Kimi web quota query failed: %s", exc)
             return {}
 
-    def _maybe_forge_kimi_session(
-        self,
-        session_id: str,
-        *,
-        model: str = KIMI_APP_DEFAULT_MODEL,
-        reasoning_effort: str = KIMI_APP_DEFAULT_EFFORT,
-        cancel_event: threading.Event | None = None,
-    ) -> tuple[str, bool]:
-        """Auto-forge if context usage is above the configured threshold.
+    def _maybe_forge_kimi_session(self, session_id: str) -> tuple[str, bool]:
+        """Threshold auto-forge on the live Web channel.
 
-        Returns ``(session_id, forged)``.
+        Runs the exact same handoff pipeline as POST /kimi/forge
+        (``_kimi_forge_swap_session`` + ``_kimi_forge_finish_handoff``:
+        task inventory, handoff record, seed prompt, chat notice + push)
+        instead of the old silent ACP summarize-and-swap.  Returns
+        ``(session_id, forged)``; any failure — including a busy Kimi —
+        keeps the current session so the in-flight send just proceeds and
+        the next turn can retry the forge.
         """
         threshold = self.state.kimi_auto_forge_context_threshold
         if threshold <= 0 or threshold >= 1:
@@ -12163,12 +12170,18 @@ class PushHandler(BaseHTTPRequestHandler):
             usage * 100,
             threshold * 100,
         )
-        new_session_id, _summary = self.state.kimi_acp.forge_new_session(
-            model=model,
-            reasoning_effort=reasoning_effort,
-            cancel_event=cancel_event,
-        )
-        logger.info("Kimi forged new session %s", new_session_id)
+        error, ctx = self._kimi_forge_swap_session(expected_old_session_id=session_id)
+        if error is not None:
+            if error.get("error") == "kimi_busy":
+                logger.info("Kimi is busy; auto-forge skipped this round")
+            else:
+                logger.warning("Kimi auto-forge skipped: %s", error.get("error"))
+            return session_id, False
+        result = self._kimi_forge_finish_handoff(ctx, trigger="auto")
+        new_session_id = str(result.get("active_session_id") or "")
+        if not new_session_id:
+            return session_id, False
+        logger.info("Kimi auto-forged new session %s", new_session_id)
         return new_session_id, True
 
     def _handle_chat_card_action(self, body: dict[str, Any]) -> None:
@@ -14019,34 +14032,64 @@ class PushHandler(BaseHTTPRequestHandler):
     def _handle_kimi_forge(self, body: dict[str, Any]) -> None:
         """POST /kimi/forge — 显式受控 forge（常驻会话的逃生门）。
 
-        默认路径是常驻固定会话：Kimi CLI 接近上下文窗口时自动 compaction，
-        服务端不再按阈值自动 forge。只有显式调用本端点才换会话，且换之前
-        先盘点旧会话的后台任务：终态任务的报告路径随通知推给用户，未完成
-        任务写入 handoff 登记并注入新会话的 seed prompt。绝不做无声 forge。
+        与 80% 阈值自动 forge 共用同一套移交管线
+        （``_kimi_forge_swap_session`` + ``_kimi_forge_finish_handoff``）：
+        换会话前先盘点旧会话的后台任务，终态任务的报告路径随通知推给
+        用户，未完成任务写入 handoff 登记并注入新会话的 seed prompt。
+        绝不做无声 forge。
         """
         token = self._reserve_kimi_control("forge")
         if token is None:
             return
         try:
+            error, ctx = self._kimi_forge_swap_session()
+        finally:
+            self._release_kimi_control(token)
+        if error is not None:
+            self._send_json(self._kimi_forge_error_status(error), error)
+            return
+        self._send_json(200, self._kimi_forge_finish_handoff(ctx, trigger="manual"))
+
+    @staticmethod
+    def _kimi_forge_error_status(error: dict[str, Any]) -> int:
+        if error.get("error") in {"no_active_kimi_session", "kimi_busy", "kimi_session_changed"}:
+            return 409
+        return 503
+
+    def _kimi_forge_swap_session(
+        self,
+        *,
+        expected_old_session_id: str = "",
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Shared first half of the forge pipeline on the live Web channel.
+
+        The caller must already hold the Kimi concurrency guard (a control
+        reservation from ``_reserve_kimi_control`` or the chat-send prepare
+        token).  Returns ``(None, ctx)`` once the active-session pointer has
+        moved to a freshly created session, or ``(error_payload, None)``
+        when nothing was forged; ``error_payload["error"]`` maps to an HTTP
+        status through ``_kimi_forge_error_status``.  A busy session is a
+        ``kimi_busy`` error — automatic callers treat it as "skip this
+        round", never as a reason to interrupt an in-flight reply.
+        """
+        try:
             web = self.state.kimi_web
             web.start()
             old_session_id = str(web.load_active_session_id() or "")
             if not old_session_id:
-                self._send_json(409, {"ok": False, "error": "no_active_kimi_session"})
-                return
+                return {"ok": False, "error": "no_active_kimi_session"}, None
+            if expected_old_session_id and old_session_id != expected_old_session_id:
+                # The pointer changed since the caller measured context usage;
+                # forging now would swap a session nobody evaluated.
+                return {"ok": False, "error": "kimi_session_changed"}, None
             try:
                 status = web.get_session_status(old_session_id)
             except Exception:
                 logger.warning("Kimi forge status check failed", exc_info=True)
-                self._send_json(503, {"ok": False, "error": "kimi_web_unavailable"})
-                return
+                return {"ok": False, "error": "kimi_web_unavailable"}, None
             if isinstance(status, dict) and bool(status.get("busy")):
-                self._send_json(409, {
-                    "ok": False,
-                    "error": "kimi_busy",
-                    "reason": "Kimi 正在回复中，等这一轮结束后再 forge。",
-                })
-                return
+                return {"ok": False, "error": "kimi_busy",
+                        "reason": "Kimi 正在回复中，等这一轮结束后再 forge。"}, None
             tasks = _scan_kimi_session_tasks(old_session_id)
             model, effort = self._kimi_selection()
             new_session_id = str(web.create_session(
@@ -14056,21 +14099,36 @@ class PushHandler(BaseHTTPRequestHandler):
                 permission_mode=self.state.kimi_web_permission_mode,
             ) or "")
             if not new_session_id:
-                self._send_json(503, {"ok": False, "error": "kimi_web_unavailable"})
-                return
+                return {"ok": False, "error": "kimi_web_unavailable"}, None
         except Exception:
-            logger.warning("Kimi controlled forge failed", exc_info=True)
-            self._send_json(503, {"ok": False, "error": "kimi_web_unavailable"})
-            return
-        finally:
-            self._release_kimi_control(token)
-        # The pointer has moved; from here a failure only degrades the
-        # handoff, never the forge itself.
+            logger.warning("Kimi forge session swap failed", exc_info=True)
+            return {"ok": False, "error": "kimi_web_unavailable"}, None
+        return None, {
+            "web": web,
+            "old_session_id": old_session_id,
+            "new_session_id": new_session_id,
+            "tasks": tasks,
+            "model": model,
+            "effort": effort,
+        }
+
+    def _kimi_forge_finish_handoff(self, ctx: dict[str, Any], *, trigger: str) -> dict[str, Any]:
+        """Shared second half: handoff record, seed prompt, user notice.
+
+        Runs after the pointer has moved, so a failure here only degrades
+        the handoff, never the forge itself.  ``trigger`` is ``"manual"``
+        (POST /kimi/forge) or ``"auto"`` (context threshold) and only
+        changes the user-facing wording.
+        """
+        web = ctx["web"]
+        old_session_id = ctx["old_session_id"]
+        new_session_id = ctx["new_session_id"]
+        tasks = ctx["tasks"]
         handoff_path = self._write_kimi_forge_handoff(old_session_id, new_session_id, tasks)
         seed_ok = self._seed_kimi_forged_session(
-            web, new_session_id, old_session_id, tasks, handoff_path, model, effort,
+            web, new_session_id, old_session_id, tasks, handoff_path, ctx["model"], ctx["effort"],
         )
-        notice = self._kimi_forge_notice_text(old_session_id, new_session_id, tasks, seed_ok)
+        notice = self._kimi_forge_notice_text(old_session_id, new_session_id, tasks, seed_ok, trigger=trigger)
         try:
             self._chat_for_contact("kimi").append(
                 role="system",
@@ -14079,21 +14137,25 @@ class PushHandler(BaseHTTPRequestHandler):
             )
         except Exception:
             logger.exception("Kimi forge notice history append failed")
+        title = (
+            "Kimi 上下文将满，已自动切换新会话" if trigger == "auto"
+            else "Kimi 已按你的要求切换新会话"
+        )
         try:
-            self._send_chat_notification("Kimi 已按你的要求切换新会话", notice[:80])
+            self._send_chat_notification(title, notice[:80])
         except Exception:
             logger.warning("Kimi forge notification failed", exc_info=True)
-        self._send_json(200, {
+        return {
             "ok": True,
             "previous_session_id": old_session_id,
             "active_session_id": new_session_id,
-            "model": model,
-            "reasoning_effort": effort,
+            "model": ctx["model"],
+            "reasoning_effort": ctx["effort"],
             "finished_tasks": len(tasks["finished"]),
             "pending_tasks": len(tasks["pending"]),
             "handoff_record": handoff_path,
             "seed_submitted": seed_ok,
-        })
+        }
 
     def _write_kimi_forge_handoff(
         self,
@@ -14131,11 +14193,20 @@ class PushHandler(BaseHTTPRequestHandler):
         new_session_id: str,
         tasks: dict[str, list[dict[str, Any]]],
         seed_ok: bool,
+        *,
+        trigger: str = "manual",
     ) -> str:
-        lines = [
-            f"已按你的要求 forge 新会话（旧 {old_session_id} → 新 {new_session_id}）。"
-            "旧会话历史仍完整保留在磁盘上。",
-        ]
+        if trigger == "auto":
+            lines = [
+                f"上下文使用率超过自动 forge 阈值，已自动 forge 新会话"
+                f"（旧 {old_session_id} → 新 {new_session_id}）。"
+                "旧会话历史仍完整保留在磁盘上。",
+            ]
+        else:
+            lines = [
+                f"已按你的要求 forge 新会话（旧 {old_session_id} → 新 {new_session_id}）。"
+                "旧会话历史仍完整保留在磁盘上。",
+            ]
         finished = tasks["finished"]
         if finished:
             lines.append(f"旧会话有 {len(finished)} 个已结束的后台任务：")

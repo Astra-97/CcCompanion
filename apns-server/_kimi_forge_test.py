@@ -88,6 +88,7 @@ def _make_handler(tmp: Path, web: object) -> PushHandler:
         kimi_terminal_acquire_token="",
         kimi_web=web,
         kimi_web_permission_mode="auto",
+        kimi_auto_forge_context_threshold=0.0,
         token_store_path=str(tmp / "tokens" / "device_tokens.json"),
         contact_chats={"kimi": chat},
     )
@@ -215,34 +216,111 @@ class HandleKimiForgeTest(unittest.TestCase):
             self.assertEqual([], web.created)
 
 
-class AutoForgeDefaultOffTest(unittest.TestCase):
-    def test_threshold_zero_never_forges(self):
-        acp = types.SimpleNamespace(
-            forge_new_session=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("forge called")),
-        )
-        handler = object.__new__(PushHandler)
-        handler.state = types.SimpleNamespace(
-            kimi_auto_forge_context_threshold=0.0,
-            kimi_acp=acp,
-        )
-        handler._kimi_context_usage = lambda _session: 0.99
-        session_id, forged = handler._maybe_forge_kimi_session("session_x")
-        self.assertEqual(("session_x", False), (session_id, forged))
+class AutoForgePipelineTest(unittest.TestCase):
+    """Threshold auto-forge reuses the controlled-forge handoff pipeline."""
 
-    def test_explicit_threshold_still_forges_for_rollback_operators(self):
-        calls = []
-        acp = types.SimpleNamespace(
-            forge_new_session=lambda **kwargs: calls.append(kwargs) or ("session_new", "summary"),
-        )
-        handler = object.__new__(PushHandler)
-        handler.state = types.SimpleNamespace(
-            kimi_auto_forge_context_threshold=0.75,
-            kimi_acp=acp,
-        )
-        handler._kimi_context_usage = lambda _session: 0.9
-        session_id, forged = handler._maybe_forge_kimi_session("session_x")
-        self.assertEqual(("session_new", True), (session_id, forged))
-        self.assertEqual(1, len(calls))
+    TASKS = {
+        "finished": [{
+            "task_id": "done-1", "description": "查案",
+            "status": "completed", "kind": "agent",
+            "report_path": "/root/.kimi-code/task-reports/done-1.md",
+        }],
+        "pending": [{
+            "task_id": "run-1", "description": "长跑",
+            "status": "running", "kind": "bash",
+        }],
+    }
+
+    def _auto_handler(self, tmp: str, web: "FakeWeb", *, threshold: float, usage: float) -> PushHandler:
+        handler = _make_handler(Path(tmp), web)
+        handler.state.kimi_auto_forge_context_threshold = threshold
+        handler._kimi_context_usage = lambda _session: usage
+        return handler
+
+    def test_threshold_zero_never_forges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            web = FakeWeb()
+            handler = self._auto_handler(tmp, web, threshold=0.0, usage=0.99)
+            session_id, forged = handler._maybe_forge_kimi_session("session_old")
+            self.assertEqual(("session_old", False), (session_id, forged))
+            self.assertEqual([], web.created)
+            self.assertEqual([], web.seeds)
+
+    def test_usage_below_threshold_keeps_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            web = FakeWeb()
+            handler = self._auto_handler(tmp, web, threshold=0.8, usage=0.5)
+            session_id, forged = handler._maybe_forge_kimi_session("session_old")
+            self.assertEqual(("session_old", False), (session_id, forged))
+            self.assertEqual([], web.created)
+
+    def test_auto_forge_runs_full_handoff_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            web = FakeWeb()
+            handler = self._auto_handler(tmp, web, threshold=0.8, usage=0.9)
+            with patch("push._scan_kimi_session_tasks", return_value=dict(self.TASKS)) as scan:
+                session_id, forged = handler._maybe_forge_kimi_session("session_old")
+            self.assertEqual(("session_new", True), (session_id, forged))
+            # Same pipeline as the controlled forge: inventory of the old
+            # session, pointer swap, handoff record, seed, chat + push notice.
+            scan.assert_called_once_with("session_old")
+            self.assertEqual("session_new", web.active)
+            handoff = Path(handler.state.token_store_path).parent / "kimi_forge_handoff.json"
+            record = json.loads(handoff.read_text(encoding="utf-8"))
+            self.assertEqual("session_old", record["old_session_id"])
+            self.assertEqual("session_new", record["new_session_id"])
+            self.assertEqual("run-1", record["pending_tasks"][0]["task_id"])
+            self.assertEqual(0o600, handoff.stat().st_mode & 0o777)
+            self.assertEqual(1, len(web.seeds))
+            seed_session, seed_text = web.seeds[0]
+            self.assertEqual("session_new", seed_session)
+            self.assertIn("run-1", seed_text)
+            # No silent forge: the notice names the automatic trigger.
+            chat = handler.state.contact_chats["kimi"]
+            self.assertEqual(1, len(chat.rows))
+            self.assertEqual("system", chat.rows[0]["role"])
+            self.assertEqual("system:kimi-forge", chat.rows[0]["source"])
+            self.assertIn("自动 forge", chat.rows[0]["text"])
+            self.assertIn("session_new", chat.rows[0]["text"])
+            self.assertEqual(1, len(handler.notifications))
+            self.assertIn("自动", handler.notifications[0][0])
+
+    def test_busy_session_skips_this_round(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            web = FakeWeb(busy=True)
+            handler = self._auto_handler(tmp, web, threshold=0.8, usage=0.95)
+            with patch("push._scan_kimi_session_tasks") as scan:
+                session_id, forged = handler._maybe_forge_kimi_session("session_old")
+            self.assertEqual(("session_old", False), (session_id, forged))
+            scan.assert_not_called()
+            self.assertEqual([], web.created)
+            self.assertEqual([], web.seeds)
+            self.assertEqual("session_old", web.active)
+            chat = handler.state.contact_chats["kimi"]
+            self.assertEqual([], chat.rows)
+            self.assertEqual([], handler.notifications)
+
+    def test_failed_swap_keeps_current_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            web = FakeWeb()
+            web.create_session = lambda **_kwargs: ""
+            handler = self._auto_handler(tmp, web, threshold=0.8, usage=0.95)
+            with patch("push._scan_kimi_session_tasks", return_value={"finished": [], "pending": []}):
+                session_id, forged = handler._maybe_forge_kimi_session("session_old")
+            self.assertEqual(("session_old", False), (session_id, forged))
+            self.assertEqual([], web.seeds)
+            self.assertEqual([], handler.notifications)
+
+    def test_pointer_changed_since_measurement_aborts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            web = FakeWeb()
+            handler = self._auto_handler(tmp, web, threshold=0.8, usage=0.95)
+            with patch("push._scan_kimi_session_tasks") as scan:
+                session_id, forged = handler._maybe_forge_kimi_session("session_other")
+            self.assertEqual(("session_other", False), (session_id, forged))
+            scan.assert_not_called()
+            self.assertEqual([], web.created)
+            self.assertEqual("session_old", web.active)
 
 
 if __name__ == "__main__":
