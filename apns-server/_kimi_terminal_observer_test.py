@@ -711,27 +711,123 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         self.assertIn(["tmux", "kill-pane", "-t", "%42"], calls)
         self.assertFalse(any(argv[1] == "kill-session" for argv in calls))
 
-    def test_busy_kimi_capture_does_not_touch_web_or_terminal(self):
+    @mock.patch("push.subprocess.run")
+    def test_active_web_turn_allows_kimi_capture_on_the_same_session(self, run):
         handler = object.__new__(PushHandler)
         handler.path = "/tmux/capture?session=kimi"
-        web = mock.Mock()
+        web = types.SimpleNamespace(
+            cwd="/workspace", start=lambda: None,
+            load_active_session_id=lambda: "session-current",
+            _valid_session_id=lambda value: value,
+            list_sessions=lambda: [{"id": "session-current", "metadata": {"cwd": "/workspace"}}],
+            get_session_status=lambda _session, **_kwargs: {"busy": True},
+        )
         bridge = types.SimpleNamespace(
             input_transaction=lambda: nullcontext(),
             ensure=mock.Mock(return_value="%42"),
+            lease_for_pane=mock.Mock(return_value="a" * 43),
+            terminal_state=mock.Mock(return_value="ready"),
+            touch=lambda: None,
         )
         handler.state = types.SimpleNamespace(
             default_session="cctg", active_session="cctg",
             kimi_turn_lock=threading.RLock(),
-            kimi_active_turn={"user_ts": "busy"}, kimi_prepare_token="", kimi_recovery_token="",
+            kimi_active_turn={"user_ts": "u1", "session_id": "session-current", "transport": "kimi-web"},
+            kimi_prepare_token="", kimi_recovery_token="",
             kimi_web=web, kimi_terminal=bridge,
         )
+        run.return_value = types.SimpleNamespace(returncode=0, stdout="live turn output\n", stderr="")
         handler.responses = []
         handler._send_json = lambda status, payload: handler.responses.append((status, payload))
         handler._handle_tmux_capture()
-        self.assertEqual(423, handler.responses[-1][0])
-        self.assertEqual("kimi_busy", handler.responses[-1][1]["error"])
-        self.assertEqual([], web.mock_calls)
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertEqual("live turn output\n", handler.responses[-1][1]["content"])
+        self.assertEqual("ready", handler.responses[-1][1]["state"])
+        self.assertEqual("a" * 43, handler.responses[-1][1]["lease"])
+        bridge.ensure.assert_called_once_with("session-current")
+        self.assertEqual("", handler.state.kimi_terminal_acquire_token)
+
+    def test_busy_web_session_with_an_unrelated_active_turn_fails_closed(self):
+        web = types.SimpleNamespace(
+            cwd="/workspace", start=lambda: None,
+            load_active_session_id=lambda: "session-current",
+            _valid_session_id=lambda value: value,
+            list_sessions=lambda: [{"id": "session-current", "metadata": {"cwd": "/workspace"}}],
+            get_session_status=lambda _session, **_kwargs: {"busy": True},
+        )
+        for active_turn in (
+            # A Web turn on another session explains nothing about this one.
+            {"user_ts": "u1", "session_id": "session-other", "transport": "kimi-web"},
+            # The ACP rollback path never authorizes a Web-session attach:
+            # its session pointer lives in a separate state file.
+            {"user_ts": "u1", "session_id": "session-current"},
+        ):
+            with self.subTest(active_turn=active_turn):
+                bridge = types.SimpleNamespace(ensure=mock.Mock(return_value="%42"))
+                handler = object.__new__(PushHandler)
+                handler.state = types.SimpleNamespace(
+                    kimi_turn_lock=threading.RLock(),
+                    kimi_active_turn=active_turn,
+                    kimi_prepare_token="", kimi_recovery_token="",
+                    kimi_terminal_acquire_token="", kimi_web=web, kimi_terminal=bridge,
+                )
+                with self.assertRaises(KimiTerminalBusy):
+                    handler._acquire_kimi_terminal()
+                bridge.ensure.assert_not_called()
+                self.assertEqual("", handler.state.kimi_terminal_acquire_token)
+
+    @mock.patch("push.subprocess.Popen")
+    @mock.patch("push.subprocess.run")
+    def test_kimi_input_is_accepted_during_active_web_turn(self, run, popen):
+        handler = object.__new__(PushHandler)
+        web = types.SimpleNamespace(
+            cwd="/workspace", start=lambda: None,
+            load_active_session_id=lambda: "session-current",
+            _valid_session_id=lambda value: value,
+            list_sessions=lambda: [{"id": "session-current", "metadata": {"cwd": "/workspace"}}],
+            get_session_status=lambda _session, **_kwargs: {"busy": True},
+        )
+        bridge = types.SimpleNamespace(
+            tmux_session="ccc-kimi-terminal",
+            input_transaction=lambda: nullcontext(),
+            ensure=mock.Mock(return_value="%42"),
+            require_ready=mock.Mock(return_value="%42"),
+            mark_prompt_submitted=mock.Mock(),
+            touch=lambda: None,
+        )
+        handler.state = types.SimpleNamespace(
+            default_session="cctg", active_session="cctg",
+            kimi_turn_lock=threading.RLock(),
+            kimi_active_turn={"user_ts": "u1", "session_id": "session-current", "transport": "kimi-web"},
+            kimi_prepare_token="", kimi_recovery_token="",
+            kimi_web=web, kimi_terminal=bridge,
+        )
+        run.return_value = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        proc = mock.Mock()
+        proc.returncode = 0
+        popen.return_value = proc
+        handler.responses = []
+        handler._send_json = lambda status, payload: handler.responses.append((status, payload))
+        handler._handle_tmux_send({"session": "kimi", "keys": "queued while busy", "enter": True})
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertEqual("kimi", handler.responses[-1][1]["session"])
+        bridge.ensure.assert_called_once_with("session-current")
+        bridge.require_ready.assert_called_once_with("%42")
+        bridge.mark_prompt_submitted.assert_called_once_with()
+
+    def test_recovery_reservation_still_blocks_terminal_acquire(self):
+        handler = object.__new__(PushHandler)
+        web = mock.Mock()
+        bridge = types.SimpleNamespace(ensure=mock.Mock(return_value="%42"))
+        handler.state = types.SimpleNamespace(
+            kimi_turn_lock=threading.RLock(), kimi_active_turn={},
+            kimi_prepare_token="", kimi_recovery_token="recovery:abc",
+            kimi_terminal_acquire_token="", kimi_web=web, kimi_terminal=bridge,
+        )
+        with self.assertRaises(KimiTerminalBusy):
+            handler._acquire_kimi_terminal()
         bridge.ensure.assert_not_called()
+        self.assertEqual([], web.mock_calls)
 
     def test_terminal_web_validation_does_not_hold_turn_lock_or_allow_chat_race(self):
         entered, release = threading.Event(), threading.Event()
@@ -834,6 +930,49 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         self.assertEqual("no_active_kimi_session", handler.responses[-1][1]["error"])
         self.assertNotIn("foreign-session", json.dumps(handler.responses[-1][1]))
         bridge.ensure.assert_not_called()
+
+    def test_prepare_reservation_during_web_validation_is_caught_before_ensure(self):
+        entered, allow = threading.Event(), threading.Event()
+
+        class Web:
+            cwd = "/workspace"
+            _valid_session_id = staticmethod(lambda value: value)
+            def start(self):
+                entered.set()
+                if not allow.wait(1):
+                    raise AssertionError("test did not release Web validation")
+            def load_active_session_id(self): return "session-current"
+            def list_sessions(self): return [{"id": "session-current", "metadata": {"cwd": self.cwd}}]
+            def get_session_status(self, _session): return {"busy": False}
+
+        bridge = types.SimpleNamespace(ensure=mock.Mock(return_value="%42"))
+        handler = object.__new__(PushHandler)
+        handler.state = types.SimpleNamespace(
+            kimi_turn_lock=threading.RLock(), kimi_active_turn={}, kimi_prepare_token="",
+            kimi_recovery_token="", kimi_terminal_acquire_token="", kimi_web=Web(), kimi_terminal=bridge,
+        )
+        result = []
+
+        def acquire():
+            try:
+                handler._acquire_kimi_terminal()
+            except Exception as exc:
+                result.append(type(exc).__name__)
+
+        worker = threading.Thread(target=acquire)
+        worker.start()
+        self.assertTrue(entered.wait(1))
+        # A group reply does not consult the acquire token, so its prepare
+        # reservation can appear while terminal Web validation is in flight.
+        # The second fence, immediately before ensure(), must still stop it.
+        with handler.state.kimi_turn_lock:
+            handler.state.kimi_prepare_token = "prepare:group"
+        allow.set()
+        worker.join(1)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(["KimiTerminalBusy"], result)
+        bridge.ensure.assert_not_called()
+        self.assertEqual("", handler.state.kimi_terminal_acquire_token)
 
     def test_prepare_reservation_beats_terminal_acquire_without_deadlock(self):
         handler = object.__new__(PushHandler)

@@ -13608,20 +13608,27 @@ class PushHandler(BaseHTTPRequestHandler):
 
         Terminal routes hold ``input_transaction`` before calling this method.
         The turn lock then makes the Web-to-TUI handoff atomic with future chat
-        reservations, leaving no two-writer window.
+        reservations.  An already-running Web turn no longer excludes the
+        terminal: the TUI attaches to the same session, renders its live
+        output, and the CLI itself queues any input until the turn finishes.
+        Only transitional writer states (a prepare reservation whose handoff
+        is about to kill the pane, or a recovery that may replace the session
+        pointer) still fail closed.
         """
         web = getattr(self.state, "kimi_web", None)
         if web is None:
             raise KimiTerminalNoActiveSession("Kimi 当前没有可恢复的活跃会话")
         acquire_token = f"terminal:{secrets.token_hex(16)}"
         with self.state.kimi_turn_lock:
+            # A running Web turn is not a conflict (see docstring).  A pending
+            # prepare/recovery reservation is: its handoff will kill or replace
+            # the pane beneath a freshly launched TUI, so fail closed there.
             if (
-                self.state.kimi_active_turn
-                or self.state.kimi_prepare_token
+                self.state.kimi_prepare_token
                 or getattr(self.state, "kimi_recovery_token", "")
                 or getattr(self.state, "kimi_terminal_acquire_token", "")
             ):
-                raise KimiTerminalBusy("Kimi 正在回复，暂时不能接管终端")
+                raise KimiTerminalBusy("Kimi 终端正在切换状态，请稍候")
             self.state.kimi_terminal_acquire_token = acquire_token
         try:
             # These loopback calls can block on a Web restart. They must never
@@ -13668,27 +13675,47 @@ class PushHandler(BaseHTTPRequestHandler):
                 )
             if session_busy:
                 # A busy status is normally an existing Web writer and must
-                # fail closed. The sole exception is the same process's
+                # fail closed. The first exception is the same process's
                 # already-leased TUI after its own Enter: capture/resize must
                 # remain able to show that real output without opening a
-                # second pane or reviving a post-restart writer.
+                # second pane or reviving a post-restart writer.  The second
+                # is this server's own active Web turn on the exact sampled
+                # session: attaching the TUI to it is the supported
+                # full-duplex path, with input queued by the CLI itself.
+                # The ACP rollback path is deliberately excluded: its session
+                # pointer lives in a separate state file, so a busy Web status
+                # during an ACP turn is never ours to explain away.
                 owns_live = getattr(self.state.kimi_terminal, "owns_live_session", None)
                 can_adopt = getattr(self.state.kimi_terminal, "can_adopt_bound_session", None)
+                with self.state.kimi_turn_lock:
+                    active_turn = dict(self.state.kimi_active_turn or {})
+                active_turn_owns_session = (
+                    bool(active_turn)
+                    and str(active_turn.get("transport") or "") == "kimi-web"
+                    and str(active_turn.get("session_id") or "") == session_id
+                )
                 if (
-                    (not callable(owns_live) or not owns_live(session_id))
+                    not active_turn_owns_session
+                    and (not callable(owns_live) or not owns_live(session_id))
                     and (not callable(can_adopt) or not can_adopt(session_id))
                 ):
                     raise KimiTerminalBusy("Kimi 正在回复，暂时不能接管终端")
             with self.state.kimi_turn_lock:
+                # Group replies and orphan recovery do not consult the acquire
+                # token, so a prepare/recovery reservation can still appear
+                # while the Web validation above was in flight.  Keep failing
+                # closed for those; an active turn itself is no longer a
+                # conflict.
                 if (
                     self.state.kimi_terminal_acquire_token != acquire_token
-                    or self.state.kimi_active_turn
                     or self.state.kimi_prepare_token
                     or getattr(self.state, "kimi_recovery_token", "")
                 ):
-                    raise KimiTerminalBusy("Kimi 正在回复，暂时不能接管终端")
-                # Holding the short lock across only local tmux setup fences
-                # the verified idle Web session until this TUI owns it.
+                    raise KimiTerminalBusy("Kimi 终端正在切换状态，请稍候")
+                # Holding the short lock across only local tmux setup keeps a
+                # concurrent reservation holder from observing a half-launched
+                # TUI; for an idle session it also fences the verified idle
+                # Web session until this TUI owns it.
                 pane_id = self.state.kimi_terminal.ensure(session_id)
                 # This exact Web status was sampled while the acquire token
                 # blocked a competing chat writer. It is the one trustworthy
