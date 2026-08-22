@@ -2009,6 +2009,77 @@ def _should_auto_forge(
     return usage_percent is not None and usage_percent >= threshold_percent
 
 
+KIMI_TASK_TERMINAL_STATUSES = frozenset({"completed", "failed", "stopped"})
+KIMI_FORGE_TASK_LIST_LIMIT = 12
+
+
+def _scan_kimi_session_tasks(
+    session_id: str,
+    *,
+    sessions_root: str | Path | None = None,
+    reports_dir: str | Path | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Inventory one Kimi session's background tasks before a controlled forge.
+
+    Returns ``{"finished": [...], "pending": [...]}`` with bounded, prompt-safe
+    fields only (id, short description, status, kind, report path).  A corrupt
+    or unreadable task file is skipped: task bookkeeping must never block or
+    break a forge the operator explicitly asked for.
+    """
+    root = (
+        Path(sessions_root).expanduser()
+        if sessions_root
+        else Path.home() / ".kimi-code" / "sessions"
+    )
+    reports = (
+        Path(reports_dir).expanduser()
+        if reports_dir
+        else Path.home() / ".kimi-code" / "task-reports"
+    )
+    clean = str(session_id or "").strip()
+    result: dict[str, list[dict[str, Any]]] = {"finished": [], "pending": []}
+    if not clean or not all(char.isalnum() or char in {"-", "_"} for char in clean):
+        return result
+    try:
+        candidates = sorted(root.glob(f"wd_*/{clean}/agents/*/tasks/*.json"))
+    except OSError:
+        return result
+    for task_file in candidates[:256]:
+        try:
+            if not task_file.is_file() or task_file.stat().st_size > 256 * 1024:
+                continue
+            raw = json.loads(task_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        task_id = str(raw.get("taskId") or task_file.stem).strip()
+        # The id is joined into a report path below and echoed into prompts,
+        # so it gets the same whitelist as the session id (real ids are
+        # "agent-…"/"bash-…"); anything else is treated as corrupt.
+        if not task_id or not all(
+            char.isalnum() or char in {"-", "_"} for char in task_id
+        ):
+            continue
+        entry: dict[str, Any] = {
+            "task_id": task_id[:120],
+            "description": str(raw.get("description") or "")[:120],
+            "status": str(raw.get("status") or "unknown")[:40],
+            "kind": str(raw.get("kind") or "")[:40],
+        }
+        try:
+            report = reports / f"{task_id}.md"
+            if report.is_file():
+                entry["report_path"] = str(report)
+        except OSError:
+            pass
+        if entry["status"] in KIMI_TASK_TERMINAL_STATUSES:
+            result["finished"].append(entry)
+        else:
+            result["pending"].append(entry)
+    return result
+
+
 class AutoForgeClaimStore:
     """Cross-process once-only claims without persisting session IDs or prompts."""
 
@@ -3708,8 +3779,12 @@ class ServerState:
             except Exception:
                 return None
         self.kimi_terminal.set_status_probe(_kimi_terminal_status_probe)
+        # 2026-08-22 常驻固定会话：Kimi CLI 在接近上下文窗口时会自动
+        # compaction（agent-core 内置，ACP/Web 同一引擎），不再按阈值自动
+        # forge。阈值默认 0（禁用）；仅 ACP 回滚通道还读这个配置，显式设为
+        # (0,1) 区间才会恢复旧的自动 forge。受控换会话走 POST /kimi/forge。
         self.kimi_auto_forge_context_threshold = float(
-            server_cfg.get("kimi_auto_forge_context_threshold", 0.75)
+            server_cfg.get("kimi_auto_forge_context_threshold", 0.0)
         )
         self.kairos_queue_lock = threading.Lock()
         self.kairos_queue_path = contact_history_dir / "kairos_queue.json"
@@ -13941,11 +14016,192 @@ class PushHandler(BaseHTTPRequestHandler):
             "reasoning_effort": effort,
         })
 
-    def _handle_kimi_forge(self, _body: dict[str, Any]) -> None:
-        # Kimi Web exposes create/switch but no documented atomic
-        # compact/fork operation.  Keep forge unavailable rather than claim a
-        # control whose old-session summary and pointer swap are not safe yet.
-        self._send_json(501, {"ok": False, "error": "kimi_web_forge_unavailable"})
+    def _handle_kimi_forge(self, body: dict[str, Any]) -> None:
+        """POST /kimi/forge — 显式受控 forge（常驻会话的逃生门）。
+
+        默认路径是常驻固定会话：Kimi CLI 接近上下文窗口时自动 compaction，
+        服务端不再按阈值自动 forge。只有显式调用本端点才换会话，且换之前
+        先盘点旧会话的后台任务：终态任务的报告路径随通知推给用户，未完成
+        任务写入 handoff 登记并注入新会话的 seed prompt。绝不做无声 forge。
+        """
+        token = self._reserve_kimi_control("forge")
+        if token is None:
+            return
+        try:
+            web = self.state.kimi_web
+            web.start()
+            old_session_id = str(web.load_active_session_id() or "")
+            if not old_session_id:
+                self._send_json(409, {"ok": False, "error": "no_active_kimi_session"})
+                return
+            try:
+                status = web.get_session_status(old_session_id)
+            except Exception:
+                logger.warning("Kimi forge status check failed", exc_info=True)
+                self._send_json(503, {"ok": False, "error": "kimi_web_unavailable"})
+                return
+            if isinstance(status, dict) and bool(status.get("busy")):
+                self._send_json(409, {
+                    "ok": False,
+                    "error": "kimi_busy",
+                    "reason": "Kimi 正在回复中，等这一轮结束后再 forge。",
+                })
+                return
+            tasks = _scan_kimi_session_tasks(old_session_id)
+            model, effort = self._kimi_selection()
+            new_session_id = str(web.create_session(
+                title="CcCompanion Kimi",
+                model=model,
+                thinking=effort,
+                permission_mode=self.state.kimi_web_permission_mode,
+            ) or "")
+            if not new_session_id:
+                self._send_json(503, {"ok": False, "error": "kimi_web_unavailable"})
+                return
+        except Exception:
+            logger.warning("Kimi controlled forge failed", exc_info=True)
+            self._send_json(503, {"ok": False, "error": "kimi_web_unavailable"})
+            return
+        finally:
+            self._release_kimi_control(token)
+        # The pointer has moved; from here a failure only degrades the
+        # handoff, never the forge itself.
+        handoff_path = self._write_kimi_forge_handoff(old_session_id, new_session_id, tasks)
+        seed_ok = self._seed_kimi_forged_session(
+            web, new_session_id, old_session_id, tasks, handoff_path, model, effort,
+        )
+        notice = self._kimi_forge_notice_text(old_session_id, new_session_id, tasks, seed_ok)
+        try:
+            self._chat_for_contact("kimi").append(
+                role="system",
+                text=notice,
+                source="system:kimi-forge",
+            )
+        except Exception:
+            logger.exception("Kimi forge notice history append failed")
+        try:
+            self._send_chat_notification("Kimi 已按你的要求切换新会话", notice[:80])
+        except Exception:
+            logger.warning("Kimi forge notification failed", exc_info=True)
+        self._send_json(200, {
+            "ok": True,
+            "previous_session_id": old_session_id,
+            "active_session_id": new_session_id,
+            "model": model,
+            "reasoning_effort": effort,
+            "finished_tasks": len(tasks["finished"]),
+            "pending_tasks": len(tasks["pending"]),
+            "handoff_record": handoff_path,
+            "seed_submitted": seed_ok,
+        })
+
+    def _write_kimi_forge_handoff(
+        self,
+        old_session_id: str,
+        new_session_id: str,
+        tasks: dict[str, list[dict[str, Any]]],
+    ) -> str:
+        """Persist the unfinished-task registry for one controlled forge."""
+        payload = {
+            "version": 1,
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "old_session_id": old_session_id,
+            "new_session_id": new_session_id,
+            "pending_tasks": tasks["pending"],
+            "finished_tasks": tasks["finished"],
+        }
+        path = Path(self.state.token_store_path).expanduser().parent / "kimi_forge_handoff.json"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+            return str(path)
+        except Exception:
+            logger.exception("Kimi forge handoff record could not be written")
+            return ""
+
+    def _kimi_forge_notice_text(
+        self,
+        old_session_id: str,
+        new_session_id: str,
+        tasks: dict[str, list[dict[str, Any]]],
+        seed_ok: bool,
+    ) -> str:
+        lines = [
+            f"已按你的要求 forge 新会话（旧 {old_session_id} → 新 {new_session_id}）。"
+            "旧会话历史仍完整保留在磁盘上。",
+        ]
+        finished = tasks["finished"]
+        if finished:
+            lines.append(f"旧会话有 {len(finished)} 个已结束的后台任务：")
+            for entry in finished[:KIMI_FORGE_TASK_LIST_LIMIT]:
+                report = entry.get("report_path")
+                suffix = f"，报告：{report}" if report else ""
+                lines.append(f"· [{entry['status']}] {entry['description'] or entry['task_id']}{suffix}")
+            if len(finished) > KIMI_FORGE_TASK_LIST_LIMIT:
+                lines.append(f"· ……另有 {len(finished) - KIMI_FORGE_TASK_LIST_LIMIT} 个，详见 handoff 登记。")
+        pending = tasks["pending"]
+        if pending:
+            lines.append(f"仍有 {len(pending)} 个任务未结束，已登记跟踪并交代给新会话：")
+            for entry in pending[:KIMI_FORGE_TASK_LIST_LIMIT]:
+                lines.append(f"· [{entry['status']}] {entry['description'] or entry['task_id']}")
+        if not seed_ok:
+            lines.append("注意：新会话的交接 seed 未能提交，以上任务信息仅以本条消息为准。")
+        return "\n".join(lines)
+
+    def _seed_kimi_forged_session(
+        self,
+        web: Any,
+        new_session_id: str,
+        old_session_id: str,
+        tasks: dict[str, list[dict[str, Any]]],
+        handoff_path: str,
+        model: str,
+        effort: str,
+    ) -> bool:
+        """Submit the task-handoff seed prompt into the freshly forged session."""
+        lines = [
+            "【CcCompanion 受控 forge · 上下文交接】这是一条系统交接消息，不是用户指令。",
+            f"你从旧会话 {old_session_id} 切换而来；旧会话完整历史仍在磁盘上"
+            "（~/.kimi-code/sessions 下同名目录），需要细节时可以用只读方式回去查。",
+        ]
+        pending = tasks["pending"]
+        if pending:
+            lines.append("旧会话还有以下后台任务未结束，它们的完成通知通道已随旧会话失效：")
+            for entry in pending[:KIMI_FORGE_TASK_LIST_LIMIT]:
+                lines.append(
+                    f"· {entry['task_id']}（{entry['status']}）：{entry['description']}"
+                )
+            lines.append(
+                "请用 Bash 读取这些任务在旧会话目录下的 tasks/<taskId>.json 与 "
+                "tasks/<taskId>/output.log 跟踪它们，完成后主动向用户汇报结果。"
+            )
+        finished_with_reports = [entry for entry in tasks["finished"] if entry.get("report_path")]
+        if finished_with_reports:
+            lines.append("以下后台任务已结束且有报告，若与用户当前诉求相关请提炼汇报：")
+            for entry in finished_with_reports[:KIMI_FORGE_TASK_LIST_LIMIT]:
+                lines.append(f"· {entry['task_id']}：{entry.get('report_path')}")
+        if handoff_path:
+            lines.append(f"本次交接的机器可读登记在 {handoff_path}。")
+        if len(lines) <= 2:
+            lines.append("旧会话没有需要移交的后台任务。")
+        try:
+            web.submit_prompt(
+                new_session_id,
+                "\n".join(lines),
+                model=model,
+                thinking=effort,
+                permission_mode=self.state.kimi_web_permission_mode,
+            )
+            return True
+        except Exception:
+            logger.warning("Kimi forge seed prompt failed", exc_info=True)
+            return False
 
     def _handle_kimi_terminal_observer(self) -> None:
         """Return Kimi's narrow observer DTO, never ACP/stdout diagnostics."""

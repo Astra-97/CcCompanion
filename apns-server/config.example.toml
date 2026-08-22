@@ -128,9 +128,11 @@ allowed_ips = []
 # other value is ignored at runtime. Static Bash denies in Kimi's config.toml
 # are best effort only, not a sandbox.
 # kimi_web_permission_mode = "auto"
-# Auto-forge: when Kimi's context usage reaches this threshold, summarize the
-# current session and start a fresh one to save quota. 0 disables forging.
-# kimi_auto_forge_context_threshold = 0.75
+# Kimi 常驻固定会话：Kimi CLI 接近上下文窗口时会自动 compaction，默认不再
+# 按阈值自动 forge（0 = 禁用，也是默认值）。受控换会话走 POST /kimi/forge
+# （会做旧会话后台任务盘点 + 移交 + 用户通知）。下面的阈值只对 ACP 回滚
+# 通道生效；显式设为 (0,1) 区间才会恢复旧的"总结并开新会话"自动 forge。
+# kimi_auto_forge_context_threshold = 0
 # Kairos App turns auto-forge after the completed reply has been persisted.
 # The old session is claimed at most once across service restarts.
 # codex_auto_forge_enabled = true
