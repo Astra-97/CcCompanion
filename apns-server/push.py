@@ -10467,6 +10467,7 @@ class PushHandler(BaseHTTPRequestHandler):
         return (
             "\n\n[表情协议]\n"
             "如需表达情绪，可以输出一个或少量完全匹配的 [bqb:名字] 文字 token。"
+            "冒号必须是半角冒号（:）；全角冒号（：）会导致 token 无法识别、原样显示为文字。"
             "只能使用下列已验证目录名；绝不把 URL、Markdown 图片、文件路径或模型生成的链接当作表情。"
             + (f"\n已验证名字：{catalog}" if catalog else "\n当前没有可用表情目录，不要猜测 token。")
         )
