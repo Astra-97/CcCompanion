@@ -175,13 +175,140 @@ class KimiWebIsolationTest(unittest.TestCase):
             client.save_active_session_id("web_session-1")
 
             self.assertEqual("web_session-1", client.load_active_session_id())
+            self.assertTrue(client.compare_and_swap_active_session_id("web_session-1", "web_session-2"))
+            self.assertFalse(client.compare_and_swap_active_session_id("web_session-1", "web_session-3"))
+            self.assertEqual("web_session-2", client.load_active_session_id())
             self.assertEqual(0o600, os.stat(pointer).st_mode & 0o777)
             with open(pointer, encoding="utf-8") as saved:
                 payload = json.load(saved)
             self.assertEqual(
-                {"version": 1, "session_id": "web_session-1", "cwd": "/tmp/kimi-cwd"},
+                {"version": 1, "session_id": "web_session-2", "cwd": "/tmp/kimi-cwd"},
                 payload,
             )
+
+    def test_stuck_busy_without_any_prompt_creates_a_new_pointer_without_touching_old_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pointer = os.path.join(directory, "kimi_web_session.json")
+            client = KimiWebClient(command="/unused/kimi", state_path=pointer, cwd="/tmp/kimi-cwd")
+            client.save_active_session_id("session-old")
+            calls = []
+
+            def fake_request(method, path, *, data=None, timeout=10.0):
+                calls.append((method, path, data))
+                if path.endswith("/status"):
+                    return {"busy": path.endswith("session-old/status")}
+                if path.endswith("/snapshot"):
+                    return {
+                        "in_flight_turn": None,
+                        "pending_approvals": [],
+                        "pending_questions": [],
+                    }
+                if path.endswith("/prompts"):
+                    return {"active": None, "queued": []}
+                if method == "POST" and path == "/api/v1/sessions":
+                    return {"id": "session-new"}
+                if path.endswith("/sessions/session-new"):
+                    return {"metadata": {"cwd": "/tmp/kimi-cwd"}}
+                raise AssertionError((method, path, data))
+
+            client._request = fake_request
+            self.assertEqual(
+                "session-new",
+                client.replace_stuck_busy_session(
+                    "session-old", model="kimi-code/k3", thinking="low",
+                ),
+            )
+            self.assertEqual("session-new", client.load_active_session_id())
+            self.assertEqual(1, sum(path == "/api/v1/sessions" for _method, path, _data in calls))
+            self.assertFalse(any(":abort" in path for _method, path, _data in calls))
+
+    def test_stuck_busy_replacement_fails_closed_for_prompt_queue_or_matching_lease(self):
+        for case, snapshot, prompts, lease in (
+            ("active", {"in_flight_turn": None, "pending_approvals": [], "pending_questions": [], "current_prompt_id": "prompt-live"}, {"active": None, "queued": []}, {}),
+            ("queued", {"in_flight_turn": None, "pending_approvals": [], "pending_questions": []}, {"active": None, "queued": [{"prompt_id": "prompt-queued"}]}, {}),
+            ("missing_snapshot_empty_state", {}, {"active": None, "queued": []}, {}),
+            ("missing_active", {"in_flight_turn": None, "pending_approvals": [], "pending_questions": []}, {"queued": []}, {}),
+            ("missing_queued", {"in_flight_turn": None, "pending_approvals": [], "pending_questions": []}, {"active": None}, {}),
+            ("foreign_lease", {"in_flight_turn": None, "pending_approvals": [], "pending_questions": []}, {"active": None, "queued": []}, {
+                "session_id": "session-other", "prompt_id": "prompt-owned", "user_ts": "old", "state": "submitted", "created_at": "1",
+            }),
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                pointer = os.path.join(directory, "kimi_web_session.json")
+                client = KimiWebClient(command="/unused/kimi", state_path=pointer, cwd="/tmp/kimi-cwd")
+                client.save_active_session_id("session-old")
+                calls = []
+
+                def fake_request(method, path, *, data=None, timeout=10.0):
+                    calls.append((method, path, data))
+                    if path.endswith("/status"):
+                        return {"busy": True}
+                    if path.endswith("/snapshot"):
+                        return snapshot
+                    if path.endswith("/prompts"):
+                        return prompts
+                    raise AssertionError((method, path, data))
+
+                client._request = fake_request
+                client.load_turn_lease = lambda: lease
+                with self.assertRaises(KimiWebRecoveryConflict):
+                    client.replace_stuck_busy_session("session-old")
+                self.assertEqual("session-old", client.load_active_session_id())
+                self.assertFalse(any(path == "/api/v1/sessions" for _method, path, _data in calls))
+
+    def test_stuck_busy_replacement_propagates_transport_uncertainty_without_moving_pointer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pointer = os.path.join(directory, "kimi_web_session.json")
+            client = KimiWebClient(command="/unused/kimi", state_path=pointer, cwd="/tmp/kimi-cwd")
+            client.save_active_session_id("session-old")
+            calls = []
+
+            def fake_request(method, path, *, data=None, timeout=10.0):
+                calls.append((method, path, data))
+                raise KimiWebTransportUncertain("status response uncertain")
+
+            client._request = fake_request
+            with self.assertRaises(KimiWebTransportUncertain):
+                client.replace_stuck_busy_session("session-old")
+            self.assertEqual("session-old", client.load_active_session_id())
+            self.assertFalse(any(path == "/api/v1/sessions" for _method, path, _data in calls))
+
+    def test_stuck_busy_replacement_rejects_unverified_new_session_before_cas(self):
+        for case, created_id, session_data, new_status in (
+            ("same_id", "session-old", {"metadata": {"cwd": "/tmp/kimi-cwd"}}, {"busy": False}),
+            ("wrong_workspace", "session-new", {"metadata": {"cwd": "/tmp/foreign"}}, {"busy": False}),
+            ("new_busy", "session-new", {"metadata": {"cwd": "/tmp/kimi-cwd"}}, {"busy": True}),
+            ("new_unknown_busy", "session-new", {"metadata": {"cwd": "/tmp/kimi-cwd"}}, {}),
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                pointer = os.path.join(directory, "kimi_web_session.json")
+                client = KimiWebClient(command="/unused/kimi", state_path=pointer, cwd="/tmp/kimi-cwd")
+                client.save_active_session_id("session-old")
+                calls = []
+
+                def fake_request(method, path, *, data=None, timeout=10.0):
+                    calls.append((method, path, data))
+                    if path.endswith("/status"):
+                        return {"busy": True} if path.endswith("session-old/status") else new_status
+                    if path.endswith("/snapshot"):
+                        return {
+                            "in_flight_turn": None,
+                            "pending_approvals": [],
+                            "pending_questions": [],
+                        }
+                    if path.endswith("/prompts"):
+                        return {"active": None, "queued": []}
+                    if method == "POST" and path == "/api/v1/sessions":
+                        return {"id": created_id}
+                    if path.endswith(f"/sessions/{created_id}"):
+                        return session_data
+                    raise AssertionError((method, path, data))
+
+                client._request = fake_request
+                with self.assertRaises(KimiWebError):
+                    client.replace_stuck_busy_session("session-old")
+                self.assertEqual("session-old", client.load_active_session_id())
+                self.assertEqual(1, sum(path == "/api/v1/sessions" for _method, path, _data in calls))
 
     def test_turn_lease_is_private_atomic_and_clears_only_the_exact_prompt(self):
         with tempfile.TemporaryDirectory() as directory:

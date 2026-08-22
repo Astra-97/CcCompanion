@@ -1118,6 +1118,33 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.assertEqual("kimi_web_busy_recovery_conflict", handler.responses[-1][1]["error"])
         self.assertEqual([], chat.records)
 
+    def test_proven_stuck_busy_switches_session_inside_prepare_reservation_then_sends_once(self):
+        class StuckBusyWeb(FakeWebChat):
+            def ensure_active_session(self, *, model, thinking, **_kwargs):
+                self.calls.append(("ensure", model, thinking))
+                raise KimiWebSessionBusy("web-session-old")
+            def recover_owned_orphaned_prompt(self, _lease):
+                raise AssertionError("no durable lease means the old session must not be aborted")
+            def replace_stuck_busy_session(self, session_id, **kwargs):
+                self.calls.append(("replace-stuck", session_id, dict(kwargs)))
+                self.assert_prepare_reservation()
+                return "web-session-new"
+
+        handler, chat, web = self.make_handler(web=StuckBusyWeb())
+        web.assert_prepare_reservation = lambda: self.assertTrue(
+            bool(handler.state.kimi_prepare_token), "replacement must remain inside prepare reservation",
+        )
+        handler._handle_kimi_chat_send({"text": "continue after false busy"}, "kimi")
+        self.wait_idle(handler)
+
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertEqual("web-session-new", handler.responses[-1][1]["turn"]["session_id"])
+        self.assertEqual(1, [row["text"] for row in chat.records].count("continue after false busy"))
+        self.assertEqual(
+            [("replace-stuck", "web-session-old")],
+            [(row[0], row[1]) for row in web.calls if row[0] == "replace-stuck"],
+        )
+
     def test_recovery_network_wait_does_not_hold_kimi_turn_lock(self):
         entered, release = threading.Event(), threading.Event()
 

@@ -438,9 +438,24 @@ class KimiWebClient:
             char.isalnum() or char in {"-", "_"} for char in session_id
         ) else ""
 
-    def load_active_session_id(self) -> str:
+    @contextmanager
+    def _active_session_lock(self, *, exclusive: bool):
+        """Serialize active-pointer reads and CAS writes across processes."""
         if self.state_path is None:
-            return ""
+            raise KimiWebError("Kimi Web state path is required")
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.state_path.with_suffix(self.state_path.suffix + ".lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def _load_active_session_id_unlocked(self) -> str:
+        assert self.state_path is not None
         try:
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict) or payload.get("version") != 1:
@@ -451,11 +466,14 @@ class KimiWebClient:
         except (FileNotFoundError, OSError, ValueError):
             return ""
 
-    def save_active_session_id(self, session_id: str) -> None:
-        session_id = self._valid_session_id(session_id)
-        if not session_id or self.state_path is None:
-            raise KimiWebError("valid Kimi Web session and state path are required")
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+    def load_active_session_id(self) -> str:
+        if self.state_path is None:
+            return ""
+        with self._active_session_lock(exclusive=False):
+            return self._load_active_session_id_unlocked()
+
+    def _save_active_session_id_unlocked(self, session_id: str) -> None:
+        assert self.state_path is not None
         temporary = self.state_path.with_name(f".{self.state_path.name}.tmp.{os.getpid()}")
         temporary.write_text(json.dumps({
             "version": 1,
@@ -464,6 +482,25 @@ class KimiWebClient:
         }, separators=(",", ":")), encoding="utf-8")
         os.chmod(temporary, 0o600)
         os.replace(temporary, self.state_path)
+
+    def save_active_session_id(self, session_id: str) -> None:
+        session_id = self._valid_session_id(session_id)
+        if not session_id or self.state_path is None:
+            raise KimiWebError("valid Kimi Web session and state path are required")
+        with self._active_session_lock(exclusive=True):
+            self._save_active_session_id_unlocked(session_id)
+
+    def compare_and_swap_active_session_id(self, expected_session_id: str, replacement_session_id: str) -> bool:
+        """Move the pointer only if no other writer has changed it."""
+        expected_session_id = self._valid_session_id(expected_session_id)
+        replacement_session_id = self._valid_session_id(replacement_session_id)
+        if not expected_session_id or not replacement_session_id or self.state_path is None:
+            return False
+        with self._active_session_lock(exclusive=True):
+            if self._load_active_session_id_unlocked() != expected_session_id:
+                return False
+            self._save_active_session_id_unlocked(replacement_session_id)
+            return True
 
     @staticmethod
     def _valid_prompt_id(value: Any) -> str:
@@ -687,6 +724,137 @@ class KimiWebClient:
             thinking=thinking,
             permission_mode=self.APP_PERMISSION_MODE,
         )
+
+    @classmethod
+    def _busy_session_has_no_prompt_evidence(
+        cls,
+        snapshot: dict[str, Any],
+        prompts: dict[str, Any],
+    ) -> bool:
+        """Return true only for Kimi Web's explicit empty-prompt shape.
+
+        ``busy`` by itself is never an idle signal.  This narrow predicate is
+        used only for the Web server bug where it reports busy after losing all
+        active and queued prompt state.  New or unfamiliar response shapes
+        deliberately remain conflicts rather than becoming permission to move
+        the App pointer away from a possibly live session.
+        """
+        if not isinstance(snapshot, dict) or not isinstance(prompts, dict):
+            return False
+        # Do not infer an empty state from omitted fields.  Kimi has changed
+        # snapshot projections before; only its explicit null/empty shape is
+        # sufficient authority to move the App pointer.
+        if (
+            any(key not in snapshot for key in ("in_flight_turn", "pending_approvals", "pending_questions"))
+            or "active" not in prompts
+            or "queued" not in prompts
+        ):
+            return False
+        if cls._prompt_id_from(snapshot):
+            return False
+        in_flight = snapshot.get("in_flight_turn")
+        if in_flight not in (None, {}):
+            return False
+        # A prompt awaiting an approval/question is still active even if a
+        # particular Web build failed to project its current_prompt_id.
+        for key in ("pending_approvals", "pending_questions"):
+            value = snapshot.get(key)
+            if value not in (None, []):
+                return False
+        # This is the documented /prompts response: nullable active and a
+        # required queued array.  Empty dict is accepted for older local Kimi
+        # builds which used it as their null active representation.
+        if prompts.get("active") not in (None, {}):
+            return False
+        return prompts.get("queued") == []
+
+    def _confirm_stuck_busy_without_prompt(
+        self,
+        session_id: str,
+        *,
+        timeout: float,
+    ) -> bool:
+        """Prove one still-busy session has neither active nor queued work.
+
+        The status read and exact prompt listing are intentionally repeated.
+        A completion or a new external prompt between samples is not a reason
+        to move the pointer; it is an ambiguous race and must fail closed.
+        """
+        for _ in range(2):
+            status = self.get_session_status(session_id, timeout=timeout)
+            if status.get("busy") is not True:
+                return False
+            snapshot = self.get_snapshot(session_id, timeout=timeout)
+            prompts = self.list_prompts(session_id, timeout=timeout)
+            if not self._busy_session_has_no_prompt_evidence(snapshot, prompts):
+                return False
+        return True
+
+    def replace_stuck_busy_session(
+        self,
+        session_id: str,
+        *,
+        model: str = "",
+        thinking: str = "",
+        status_timeout: float = 0.75,
+    ) -> str:
+        """Create and switch to a fresh App session for a proven false busy.
+
+        This never aborts or mutates the old session.  It is deliberately
+        stricter than ordinary session creation: the old pointer must remain
+        current, the server must report ``busy`` twice, both snapshots must
+        name no active/queued prompt, and no durable App lease may exist.
+        Callers additionally hold their in-memory prepare reservation, which
+        is the writer fence for a live CcCompanion process.
+        """
+        session_id = self._valid_session_id(session_id)
+        if not session_id:
+            raise KimiWebRecoveryConflict("Kimi Web busy session id is invalid")
+        timeout = max(0.1, min(float(status_timeout), 5.0))
+        if self.load_active_session_id() != session_id:
+            raise KimiWebRecoveryConflict("Kimi Web active session changed before stale-busy recovery")
+        lease = self.load_turn_lease()
+        # This App has a single durable-turn slot.  A lease for a different
+        # session is still evidence of an owned turn whose lifecycle is not
+        # fully known, so never replace any pointer while it exists.
+        if lease:
+            raise KimiWebRecoveryConflict("Kimi Web has a durable App lease")
+        if not self._confirm_stuck_busy_without_prompt(session_id, timeout=timeout):
+            raise KimiWebRecoveryConflict("Kimi Web busy session still has prompt work or changed state")
+        # Creating a session is harmless to the old session, but do not switch
+        # its pointer if another writer acquired work while that request was
+        # in flight.  The unused new session is intentionally retained.
+        payload: dict[str, Any] = {
+            "title": "CcCompanion Kimi",
+            "metadata": {"cwd": self.cwd},
+            "agent_config": {
+                "permission_mode": self.APP_PERMISSION_MODE,
+                **({"model": model.strip()} if model.strip() else {}),
+                **({"thinking": thinking.strip()} if thinking.strip() else {}),
+            },
+        }
+        # Session creation can take longer than the short state probes while
+        # Kimi initializes its workspace.  Keep the probe deadline strict but
+        # give this non-destructive POST a bounded, independent window.
+        create_timeout = max(2.0, min(10.0, timeout * 4.0))
+        data = self._request("POST", "/api/v1/sessions", data=payload, timeout=create_timeout)
+        replacement_id = self._valid_session_id(data.get("id") or data.get("session_id"))
+        if not replacement_id or replacement_id == session_id:
+            raise KimiWebError("Kimi Web did not return a replacement session id")
+        if self.load_active_session_id() != session_id:
+            raise KimiWebRecoveryConflict("Kimi Web active session changed during stale-busy recovery")
+        if not self._confirm_stuck_busy_without_prompt(session_id, timeout=timeout):
+            raise KimiWebRecoveryConflict("Kimi Web busy session changed during stale-busy recovery")
+        replacement = self.get_session(replacement_id)
+        metadata = replacement.get("metadata") if isinstance(replacement, dict) else None
+        if not isinstance(metadata, dict) or str(metadata.get("cwd") or "") != self.cwd:
+            raise KimiWebRecoveryConflict("Kimi Web replacement session is outside the App workspace")
+        replacement_status = self.get_session_status(replacement_id, timeout=timeout)
+        if replacement_status.get("busy") is not False:
+            raise KimiWebRecoveryConflict("Kimi Web replacement session is not proven idle")
+        if not self.compare_and_swap_active_session_id(session_id, replacement_id):
+            raise KimiWebRecoveryConflict("Kimi Web active session changed before stale-busy pointer switch")
+        return replacement_id
 
     @staticmethod
     def _prompt_id_from(value: Any) -> str:

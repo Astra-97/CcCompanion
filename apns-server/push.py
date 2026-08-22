@@ -10777,7 +10777,55 @@ class PushHandler(BaseHTTPRequestHandler):
                     "reason": "上一轮 Kimi 已安全回收；请重新发送这条消息。",
                 })
                 return
-            else:
+            # Kimi Web can retain a false ``busy`` flag after the process that
+            # started a background wait is gone.  Only the prepare reservation
+            # holder may replace that *specific* session, and the adapter
+            # re-proves there is no active/queued prompt or durable
+            # App lease before it moves the pointer.  A genuine prompt,
+            # transport uncertainty, or a changed pointer stays fail-closed.
+            replacement = getattr(web, "replace_stuck_busy_session", None)
+            if recovery == "upstream_conflict" and callable(replacement):
+                with self.state.kimi_turn_lock:
+                    owns_reservation = (
+                        self.state.kimi_prepare_token == prepare_token
+                        and not self.state.kimi_active_turn
+                        and not getattr(self.state, "kimi_recovery_token", "")
+                    )
+                if owns_reservation:
+                    try:
+                        session_id = replacement(
+                            exc.session_id,
+                            model=model,
+                            thinking=effort,
+                            status_timeout=0.75,
+                        )
+                    except KimiWebRecoveryConflict:
+                        pass
+                    except KimiWebError:
+                        self._release_kimi_control(prepare_token)
+                        discard_uncommitted_attachments()
+                        self._send_json(503, {
+                            "ok": False,
+                            "error": "kimi_web_recovery_failed",
+                            "reason": "Kimi 状态检查暂时失败，未提交这条消息。",
+                        })
+                        return
+                    except Exception:
+                        logger.exception("Kimi Web stale-busy session replacement crashed")
+                        self._release_kimi_control(prepare_token)
+                        discard_uncommitted_attachments()
+                        self._send_json(503, {
+                            "ok": False,
+                            "error": "kimi_web_recovery_failed",
+                            "reason": "Kimi 状态检查暂时失败，未提交这条消息。",
+                        })
+                        return
+                    else:
+                        # The reservation is still checked again immediately
+                        # below, before App history becomes visible or a new
+                        # prompt can be submitted.
+                        recovery = "replacement_created"
+            if recovery != "replacement_created":
                 self._release_kimi_control(prepare_token)
                 discard_uncommitted_attachments()
                 status, error = (
