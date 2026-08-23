@@ -63,9 +63,9 @@ XIACHUFANG_HOSTS = {
 }
 MAX_TITLE = 300
 MAX_DESCRIPTION = 800
-MAX_PAGE_IMAGES = 6
+MAX_PAGE_IMAGES = 18
 GENERIC_CACHE_SCHEMA_VERSION = 3
-XHS_CACHE_SCHEMA_VERSION = 7
+XHS_CACHE_SCHEMA_VERSION = 8
 WECHAT_CACHE_SCHEMA_VERSION = 1
 # Recipe extraction deliberately has its own schema: unlike generic previews,
 # its body is constructed only from a trusted Recipe JSON-LD node.
@@ -1787,7 +1787,7 @@ class LinkPreviewService:
         attachments_dir: str | Path,
         *,
         enabled: bool = True,
-        total_timeout: float = 15.0,
+        total_timeout: float = 30.0,
         max_urls: int = 3,
         max_download_bytes: int = 2_000_000,
         max_text_chars: int = 120_000,
@@ -1806,7 +1806,7 @@ class LinkPreviewService:
         self.attachments_dir = Path(attachments_dir).expanduser().resolve()
         self.attachments_dir.mkdir(parents=True, exist_ok=True)
         self.enabled = bool(enabled)
-        self.total_timeout = max(0.5, min(15.0, float(total_timeout)))
+        self.total_timeout = max(0.5, min(30.0, float(total_timeout)))
         self.max_urls = max(1, min(3, int(max_urls)))
         self.max_download_bytes = max(16_384, min(8_000_000, int(max_download_bytes)))
         self.max_text_chars = max(2_000, min(500_000, int(max_text_chars)))

@@ -214,7 +214,7 @@ tool_dispatcher_tick_seconds = 20
 [link_preview]
 # 一期服务端链接预览：纯 HTTP 抓 OG/正文并把全文写进 attachments；不启动浏览器。
 enabled = true
-total_timeout_seconds = 15
+total_timeout_seconds = 30
 max_urls = 3
 max_download_bytes = 2000000
 max_text_chars = 120000

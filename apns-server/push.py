@@ -3964,9 +3964,9 @@ class ServerState:
             link_cfg = {}
         xhs_token_env = str(link_cfg.get("xhs_api_token_env") or "").strip()
         try:
-            link_total_timeout = float(link_cfg.get("total_timeout_seconds", 15.0))
+            link_total_timeout = float(link_cfg.get("total_timeout_seconds", 30.0))
         except (TypeError, ValueError):
-            link_total_timeout = 15.0
+            link_total_timeout = 30.0
         try:
             link_max_urls = int(link_cfg.get("max_urls", 3))
         except (TypeError, ValueError):
@@ -3998,7 +3998,7 @@ class ServerState:
         self.link_preview = LinkPreviewService(
             attachments_dir,
             enabled=bool(link_cfg.get("enabled", True)),
-            total_timeout=min(15.0, link_total_timeout),
+            total_timeout=min(30.0, link_total_timeout),
             max_urls=link_max_urls,
             max_download_bytes=link_max_download,
             max_text_chars=link_max_text,

@@ -86,6 +86,13 @@ class LinkPreviewTests(unittest.TestCase):
             service = link_preview.LinkPreviewService(td, max_urls=999)
             self.assertEqual(service.max_urls, 3)
 
+    def test_total_timeout_supports_complete_multi_image_notes_but_stays_bounded(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(
+                link_preview.LinkPreviewService(td, total_timeout=999).total_timeout,
+                30.0,
+            )
+
     def test_ssrf_blocks_literal_and_resolved_private_addresses(self):
         resolver = lambda host, port, type: [
             (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))
@@ -621,7 +628,7 @@ class LinkPreviewTests(unittest.TestCase):
     def test_xhs_initial_state_known_note_path_is_bounded_fallback(self):
         images = [
             {"urlDefault": f"https://sns-webpic-qc.xhscdn.com/{index}.jpg"}
-            for index in range(8)
+            for index in range(20)
         ]
         state = json.dumps({"note": {"noteDetailMap": {"id": {"note": {"imageList": images}}}}})
         # Include XHS's real-world non-JSON undefined token outside a string.
@@ -633,8 +640,9 @@ class LinkPreviewTests(unittest.TestCase):
             "https://www.xiaohongshu.com/explore/note", 200, {"content-type": "text/html"}, html
         )
         page = link_preview.extract_html_page("https://xhslink.com/o/note", payload, max_text_chars=1000)
-        self.assertEqual(len(page.image_urls), 6)
+        self.assertEqual(len(page.image_urls), link_preview.MAX_PAGE_IMAGES)
         self.assertTrue(page.image_urls[0].endswith("/0.jpg"))
+        self.assertTrue(page.image_urls[-1].endswith("/17.jpg"))
 
     def test_xhs_initial_state_note_description_replaces_platform_slogan(self):
         state = json.dumps({
@@ -2633,13 +2641,13 @@ class LinkPreviewTests(unittest.TestCase):
             text_path, meta_path = service._paths(url)
             text_path.write_text("old")
             meta_path.write_text(json.dumps({
-                "schema_version": 6,
+                "schema_version": 7,
                 "cache_key": service._url_key(url),
                 "lease_until": int(time.time() + 60),
                 "image_paths": [],
             }))
             self.assertIsNone(service._load_cache(url, time.monotonic() + 1))
-        self.assertEqual(link_preview.XHS_CACHE_SCHEMA_VERSION, 7)
+        self.assertEqual(link_preview.XHS_CACHE_SCHEMA_VERSION, 8)
 
     def test_xiachufang_recipe_url_validation_and_mobile_rewrite(self):
         allowed = (
