@@ -138,6 +138,11 @@ from health_records import (
     validate_period_payload,
     HealthRecordValidationError,
 )
+from tampon_records import (
+    TamponRecordConflictError,
+    TamponRecordStore,
+    TamponRecordValidationError,
+)
 from xhs_login import XhsLoginError, XhsLoginManager
 from mcp_services import McpServiceError, McpServiceStore
 from kimi_acp import (
@@ -6481,6 +6486,14 @@ class PushHandler(BaseHTTPRequestHandler):
             else:
                 self._handle_memory_sync_get()
             return
+        # Tampon records are a native-App private data surface.  Do not let a
+        # browser session or strict_auth=false legacy mode reach it.
+        if request_path == "/tampon-records":
+            if not self._native_pairing_auth_matches():
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            self._handle_tampon_records_get()
+            return
         # PWA bootstrap has to answer without an X-Auth-Token header.  It
         # validates only the HttpOnly session cookie itself and never emits a
         # server or memory credential.
@@ -7099,6 +7112,27 @@ class PushHandler(BaseHTTPRequestHandler):
         # strict_auth=false would let an unauthenticated request reach Kimi.
         if request_path in {"/terminal/key", "/terminal/resize", "/tmux/send", "/terminal/release"} and not self._native_pairing_auth_matches():
             self._send_json(401, {"error": "unauthorized"})
+            return
+        if request_path == "/tampon-records/action":
+            if not self._native_pairing_auth_matches():
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except (TypeError, ValueError):
+                length = -1
+            if length <= 0 or length > 16 * 1024:
+                self.close_connection = True
+                self._send_json(413, {"ok": False, "error": "request_too_large"})
+                return
+            try:
+                body = self._read_body()
+                if not isinstance(body, dict):
+                    raise ValueError("JSON object required")
+            except Exception as exc:
+                self._send_json(400, {"ok": False, "error": f"bad json: {exc}"})
+                return
+            self._handle_tampon_records_action(body)
             return
         if self.path == "/login":
             try:
@@ -19341,6 +19375,66 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.debug("voice-ambience client disconnected err=%s", e)
         except Exception:
             logger.exception("voice-ambience stream fail")
+
+    # ------------------------------------------------------------------
+    # Tampon Records API (native App only)
+    # ------------------------------------------------------------------
+
+    _TAMPON_RECORDS_PATH = HERE / "state" / "tampon_records.json"
+
+    def _tampon_records_store(self) -> TamponRecordStore:
+        return TamponRecordStore(self._TAMPON_RECORDS_PATH)
+
+    def _handle_tampon_records_action(self, body: dict[str, Any]) -> None:
+        """POST /tampon-records/action with one atomic start/replace/remove."""
+        store = self._tampon_records_store()
+        try:
+            _response, deduplicated = store.apply(body)
+        except TamponRecordValidationError as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        except TamponRecordConflictError as exc:
+            try:
+                snapshot = store.snapshot()
+            except Exception:
+                logger.exception("tampon conflict snapshot failed")
+                snapshot = {"schema": "tampon_records.v1", "records": []}
+            self._send_json(409, {"ok": False, "reason": "stale", "error": str(exc), "snapshot": snapshot})
+            return
+        except Exception:
+            logger.exception("tampon record action failed")
+            self._send_json(500, {"ok": False, "error": "无法保存棉条记录"})
+            return
+        try:
+            snapshot = store.snapshot()
+        except Exception:
+            logger.exception("tampon action snapshot failed")
+            self._send_json(500, {"ok": False, "error": "无法读取棉条记录"})
+            return
+        if deduplicated:
+            snapshot["deduplicated"] = True
+        self._send_json(200, snapshot)
+
+    def _handle_tampon_records_get(self) -> None:
+        """GET /tampon-records?limit=100, newest first, native token required."""
+        from urllib.parse import parse_qs, urlparse
+
+        raw_limit = parse_qs(urlparse(self.path).query).get("limit", ["100"])[0]
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            self._send_json(400, {"ok": False, "error": "limit must be an integer from 1 to 100"})
+            return
+        if limit < 1 or limit > 100:
+            self._send_json(400, {"ok": False, "error": "limit must be an integer from 1 to 100"})
+            return
+        try:
+            snapshot = self._tampon_records_store().snapshot(limit=limit)
+        except Exception:
+            logger.exception("tampon records get failed")
+            self._send_json(500, {"ok": False, "error": "无法读取棉条记录"})
+            return
+        self._send_json(200, snapshot)
 
     # ------------------------------------------------------------------
     # Health Records API
