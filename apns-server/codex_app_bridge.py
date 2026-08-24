@@ -36,6 +36,9 @@ ThreadCallback = Callable[[str], None]
 TurnAcceptedCallback = Callable[[str], None]
 MarkerProvider = Callable[[str], tuple[str, int, int] | None]
 
+MAX_GENERATED_IMAGE_COUNT = 10
+MAX_GENERATED_IMAGE_BYTES = 50 * 1024 * 1024
+
 OBSERVER_PHASE_LABELS = {
     "preparing": "正在准备",
     "starting": "正在启动",
@@ -204,6 +207,7 @@ class CodexTurnResult:
     error: str | None = None
     token_usage: CodexThreadTokenUsage | None = None
     context_compacted: bool = False
+    generated_image_paths: tuple[Path, ...] = ()
 
 
 @dataclass
@@ -232,6 +236,7 @@ class _ActiveTurn:
     interrupt_sent: bool = False
     agent_deltas: OrderedDict[str, str] = field(default_factory=OrderedDict)
     final_messages: OrderedDict[str, str] = field(default_factory=OrderedDict)
+    generated_image_paths: OrderedDict[str, Path] = field(default_factory=OrderedDict)
     completed_items: set[str] = field(default_factory=set)
     activity_items: set[str] = field(default_factory=set)
     worker_items: dict[str, tuple[str, str]] = field(default_factory=dict)
@@ -2671,6 +2676,21 @@ class CodexAppBridge:
                 if summary:
                     self._safe_callback(active.on_activity, f"思考摘要：{summary}")
             return
+        if item_type == "imageGeneration":
+            if completed:
+                image_path = self._validated_generated_image_path(
+                    item,
+                    thread_id=active.thread_id,
+                )
+                if image_path is not None:
+                    with active.condition:
+                        if len(active.generated_image_paths) < MAX_GENERATED_IMAGE_COUNT:
+                            # A completed item can be replayed in a turn snapshot
+                            # under a different item id.  The path is the stable,
+                            # payload-free identity and preserves generation order.
+                            active.generated_image_paths.setdefault(str(image_path), image_path)
+                return
+            # A started image item must still reach the generic activity path.
         if item_type in {"collabAgentToolCall", "subAgentActivity"}:
             worker_activity = self._collaboration_activity(item, completed=completed)
             if worker_activity is not None:
@@ -2705,6 +2725,61 @@ class CodexAppBridge:
                 return
             active.activity_items.add(activity_key)
         self._safe_callback(active.on_activity, label)
+
+    def _validated_generated_image_path(
+        self,
+        item: dict[str, Any],
+        *,
+        thread_id: str | None,
+    ) -> Path | None:
+        """Accept only completed images inside Codex's generated-image store.
+
+        ``savedPath`` is an app-server display-item field, not a client-owned
+        attachment URL.  Keeping this boundary here prevents an unexpected or
+        compromised notification from turning an arbitrary local file into a
+        CcCompanion attachment.
+        """
+        status = str(item.get("status") or "").strip().lower()
+        if status != "completed" or item.get("failure"):
+            return None
+        raw_path = str(item.get("savedPath") or "").strip()
+        if not raw_path:
+            return None
+        candidate = Path(raw_path).expanduser()
+        clean_thread_id = str(thread_id or "").strip()
+        if (
+            not candidate.is_absolute()
+            or not clean_thread_id
+            or Path(clean_thread_id).name != clean_thread_id
+        ):
+            return None
+        try:
+            generated_root = (Path(self.codex_home) / "generated_images").resolve(strict=True)
+            thread_root = generated_root / clean_thread_id
+            if thread_root.is_symlink():
+                return None
+            thread_root = thread_root.resolve(strict=True)
+            thread_root.relative_to(generated_root)
+            lexical_relative = candidate.relative_to(thread_root)
+            if not lexical_relative.parts or any(part in {"", ".", ".."} for part in lexical_relative.parts):
+                return None
+            cursor = thread_root
+            for part in lexical_relative.parts:
+                cursor = cursor / part
+                if stat.S_ISLNK(cursor.lstat().st_mode):
+                    return None
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(thread_root)
+            info = resolved.lstat()
+        except (OSError, RuntimeError, ValueError):
+            return None
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_size <= 0
+            or info.st_size > MAX_GENERATED_IMAGE_BYTES
+        ):
+            return None
+        return resolved
 
     @staticmethod
     def _activity_label(item: dict[str, Any]) -> str:
@@ -2848,6 +2923,7 @@ class CodexAppBridge:
                 error=active.error,
                 token_usage=active.token_usage,
                 context_compacted=active.context_compacted,
+                generated_image_paths=tuple(active.generated_image_paths.values()),
             )
 
     @staticmethod
@@ -2876,4 +2952,5 @@ class CodexAppBridge:
                 error=detail,
                 token_usage=active.token_usage,
                 context_compacted=active.context_compacted,
+                generated_image_paths=tuple(active.generated_image_paths.values()),
             )

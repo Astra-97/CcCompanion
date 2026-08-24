@@ -1,10 +1,13 @@
 from collections import deque
 from pathlib import Path
+import tempfile
 import threading
 import types
 import unittest
+from unittest import mock
 
 import push
+from codex_app_bridge import CodexTurnResult
 from push import PushHandler, _CodexRunRegistry
 
 
@@ -236,6 +239,190 @@ class KairosCancelTest(unittest.TestCase):
         self.assertEqual(final["role"], "assistant")
         self.assertEqual(final["metadata"]["kairos_user_ts"], "u-pre")
         self.assertTrue(handler.interrupted)
+
+    def test_generated_images_are_atomically_staged_with_android_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_dir = root / "codex" / "generated_images" / "thread-image"
+            attachments_dir = root / "attachments"
+            image_dir.mkdir(parents=True)
+            attachments_dir.mkdir()
+            png = image_dir / "one.png"
+            gif = image_dir / "two.gif"
+            png.write_bytes(b"\x89PNG\r\n\x1a\nfirst")
+            gif.write_bytes(b"GIF89asecond")
+
+            staged = push._stage_kairos_generated_images(
+                [png, gif],
+                codex_home=root / "codex",
+                thread_id="thread-image",
+                attachments_dir=attachments_dir,
+            )
+
+            self.assertEqual([item["type"] for item in staged], ["image", "image"])
+            self.assertEqual([item["filename"] for item in staged], [
+                "generated-image-1.png", "generated-image-2.gif",
+            ])
+            self.assertTrue(all(item["attachment_url"].startswith("/attachments/") for item in staged))
+            self.assertTrue(all(Path(item["stored_path"]).is_file() for item in staged))
+            self.assertTrue(png.is_file())
+            self.assertTrue(gif.is_file())
+            self.assertFalse(list(attachments_dir.glob("*.part")))
+
+    def test_generated_image_invalid_or_copy_failure_degrades_to_no_attachments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_dir = root / "codex" / "generated_images" / "thread-image"
+            attachments_dir = root / "attachments"
+            image_dir.mkdir(parents=True)
+            attachments_dir.mkdir()
+            valid = image_dir / "valid.png"
+            invalid = image_dir / "invalid.png"
+            valid.write_bytes(b"\x89PNG\r\n\x1a\nvalid")
+            invalid.write_bytes(b"not-an-image")
+
+            rejected = push._stage_kairos_generated_images(
+                [valid, invalid],
+                codex_home=root / "codex",
+                thread_id="thread-image",
+                attachments_dir=attachments_dir,
+            )
+            self.assertEqual(rejected, [])
+            self.assertEqual(list(attachments_dir.iterdir()), [])
+
+            with mock.patch("push.os.replace", side_effect=OSError("copy failed")):
+                failed = push._stage_kairos_generated_images(
+                    [valid],
+                    codex_home=root / "codex",
+                    thread_id="thread-image",
+                    attachments_dir=attachments_dir,
+                )
+            self.assertEqual(failed, [])
+            self.assertEqual(list(attachments_dir.iterdir()), [])
+            self.assertTrue(valid.is_file())
+
+    def test_completed_app_server_turn_appends_generated_images_to_final_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_dir = root / "codex" / "generated_images" / "thread-image"
+            attachments_dir = root / "attachments"
+            image_dir.mkdir(parents=True)
+            attachments_dir.mkdir()
+            first = image_dir / "first.png"
+            second = image_dir / "second.webp"
+            invalid = image_dir / "invalid.png"
+            first.write_bytes(b"\x89PNG\r\n\x1a\nfirst")
+            second.write_bytes(b"RIFF\x04\x00\x00\x00WEBPsecond")
+            invalid.write_bytes(b"not-an-image")
+
+            class CompletedBridge:
+                def __init__(self, result):
+                    self.result = result
+
+                def run_turn(self, **_kwargs):
+                    return self.result
+
+            image_result = CodexTurnResult(
+                thread_id="thread-image",
+                turn_id="turn-image",
+                text="两张都好了",
+                status="completed",
+                generated_image_paths=(first, second),
+            )
+
+            chat = FakeChat()
+            state = types.SimpleNamespace(
+                chat_draft_lock=threading.Lock(),
+                chat_drafts={},
+                chat_reply_states={},
+                contact_chats={"kairos": chat},
+                codex_home=str(root / "codex"),
+                codex_bin="codex",
+                codex_kairos_backend="app-server",
+                codex_app_bridge=CompletedBridge(image_result),
+                codex_app_server_fallback_to_exec=False,
+                codex_auto_forge_enabled=False,
+                codex_auto_forge_threshold_percent=90.0,
+                attachments_dir=attachments_dir,
+            )
+            state.mark_kairos_pending_run = lambda *_args: None
+            state.clear_kairos_pending_run = lambda *_args: None
+            state.update_kairos_pending_draft = lambda *_args: None
+            handler = object.__new__(PushHandler)
+            handler.state = state
+            handler._chat_for_contact = lambda contact: state.contact_chats[contact]
+            handler._load_codex_target = lambda: ("thread-image", root)
+            handler._codex_session_busy = lambda _session: False
+            handler._codex_preference_snapshot = lambda: ("gpt-test", "high")
+            handler._kairos_semantic_recall = lambda *_args, **_kwargs: None
+            handler._save_codex_target = lambda *_args, **_kwargs: True
+            handler._codex_rollout_marker = lambda *_args, **_kwargs: None
+            handler._set_chat_generating = lambda *_args, **_kwargs: "started"
+            handler._set_chat_draft = lambda *_args, **_kwargs: None
+            handler._set_chat_activity = lambda *_args, **_kwargs: None
+            handler._set_chat_completed = lambda *_args, **_kwargs: None
+            handler._set_chat_failed = lambda *_args, **_kwargs: None
+            handler._set_chat_interrupted = lambda *_args, **_kwargs: None
+            handler._set_chat_queued = lambda *_args, **_kwargs: None
+            handler._set_typing_for_contact = lambda *_args, **_kwargs: None
+
+            handler._process_kairos_task({
+                "contact_id": "kairos",
+                "user_ts": "user-image",
+                "queued_at": "user-image",
+                "text": "生成两张",
+            })
+
+            final = next(item for item in chat.records if item.get("role") == "assistant")
+            self.assertEqual(final["text"], "两张都好了")
+            self.assertEqual(final["attachment_type"], "image")
+            self.assertEqual(final["attachment_url"], final["metadata"]["attachments"][0]["attachment_url"])
+            self.assertEqual(len(final["metadata"]["attachments"]), 2)
+            self.assertNotIn("stored_path", final["metadata"]["attachments"][0])
+            self.assertTrue(first.is_file())
+            self.assertTrue(second.is_file())
+
+            plain_chat = FakeChat()
+            state.contact_chats["kairos"] = plain_chat
+            state.codex_app_bridge = CompletedBridge(CodexTurnResult(
+                thread_id="thread-image",
+                turn_id="turn-plain",
+                text="纯文字回复",
+                status="completed",
+            ))
+            handler._process_kairos_task({
+                "contact_id": "kairos",
+                "user_ts": "user-plain",
+                "queued_at": "user-plain",
+                "text": "普通问题",
+            })
+            plain_final = next(item for item in plain_chat.records if item.get("role") == "assistant")
+            self.assertEqual(plain_final["text"], "纯文字回复")
+            self.assertNotIn("attachment_url", plain_final)
+            self.assertNotIn("attachment_type", plain_final)
+            self.assertNotIn("attachments", plain_final["metadata"])
+
+            failed_chat = FakeChat()
+            state.contact_chats["kairos"] = failed_chat
+            state.codex_app_bridge = CompletedBridge(CodexTurnResult(
+                thread_id="thread-image",
+                turn_id="turn-invalid-image",
+                text="画好了",
+                status="completed",
+                generated_image_paths=(invalid,),
+            ))
+            with self.assertLogs("cc-apns-server", level="WARNING"):
+                handler._process_kairos_task({
+                    "contact_id": "kairos",
+                    "user_ts": "user-invalid-image",
+                    "queued_at": "user-invalid-image",
+                    "text": "生成图片",
+                })
+            failed_final = next(item for item in failed_chat.records if item.get("role") == "assistant")
+            self.assertEqual(failed_final["text"], "画好了\n\n[图片附件写入失败，图片未发送。]")
+            self.assertNotIn("attachment_url", failed_final)
+            self.assertNotIn("attachment_type", failed_final)
+            self.assertNotIn("attachments", failed_final["metadata"])
 
     def test_interrupted_snapshot_freezes_draft_until_short_expiry(self):
         handler = object.__new__(PushHandler)

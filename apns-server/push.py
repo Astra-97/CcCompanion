@@ -172,6 +172,187 @@ from ai_chat import AIChatManager
 import subprocess
 import threading
 
+
+KAIROS_GENERATED_IMAGE_MAX_COUNT = 10
+KAIROS_GENERATED_IMAGE_MAX_BYTES = 50 * 1024 * 1024
+KAIROS_GENERATED_IMAGE_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+_KAIROS_GENERATED_IMAGE_EXTENSIONS = {
+    "png": frozenset({".png"}),
+    "jpeg": frozenset({".jpg", ".jpeg"}),
+    "gif": frozenset({".gif"}),
+    "webp": frozenset({".webp"}),
+}
+
+
+def _kairos_generated_image_format(header: bytes) -> str | None:
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if header.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if header.startswith((b"GIF87a", b"GIF89a")):
+        return "gif"
+    if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def _stage_kairos_generated_images(
+    generated_paths: Any,
+    *,
+    codex_home: str | Path,
+    thread_id: str | None,
+    attachments_dir: str | Path,
+) -> list[dict[str, Any]]:
+    """Copy one completed image batch into the public attachment store.
+
+    The bridge paths are treated as untrusted again here.  Failures roll back
+    the batch, and every individual file becomes visible only after an atomic
+    rename inside ``attachments_dir``.
+    """
+    raw_paths = list(generated_paths or [])
+    clean_thread_id = str(thread_id or "").strip()
+    staged: list[dict[str, Any]] = []
+    temporary: Path | None = None
+    root_fds: list[int] = []
+    try:
+        if (
+            not raw_paths
+            or len(raw_paths) > KAIROS_GENERATED_IMAGE_MAX_COUNT
+            or not clean_thread_id
+            or Path(clean_thread_id).name != clean_thread_id
+            or not hasattr(os, "O_NOFOLLOW")
+        ):
+            if raw_paths:
+                raise ValueError("invalid generated image batch")
+            return []
+        codex_root_path = Path(codex_home).expanduser()
+        if not codex_root_path.is_absolute() or codex_root_path.is_symlink():
+            raise ValueError("invalid Codex home")
+        codex_root = codex_root_path.resolve(strict=True)
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | os.O_NOFOLLOW
+            | getattr(os, "O_DIRECTORY", 0)
+        )
+        codex_fd = os.open(codex_root, directory_flags)
+        root_fds.append(codex_fd)
+        generated_fd = os.open("generated_images", directory_flags, dir_fd=codex_fd)
+        root_fds.append(generated_fd)
+        thread_fd = os.open(clean_thread_id, directory_flags, dir_fd=generated_fd)
+        root_fds.append(thread_fd)
+        thread_root = codex_root / "generated_images" / clean_thread_id
+        destination = Path(attachments_dir).expanduser().resolve(strict=True)
+        if not destination.is_dir():
+            raise ValueError("attachment destination is not a directory")
+
+        total_bytes = 0
+        seen: set[Path] = set()
+        for index, raw_path in enumerate(raw_paths, start=1):
+            candidate = Path(raw_path).expanduser()
+            if not candidate.is_absolute():
+                raise ValueError("generated image path is not absolute")
+            lexical_relative = candidate.relative_to(thread_root)
+            if not lexical_relative.parts or any(part in {"", ".", ".."} for part in lexical_relative.parts):
+                raise ValueError("generated image path escapes thread directory")
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+
+            walk_fd = os.dup(thread_fd)
+            try:
+                for part in lexical_relative.parts[:-1]:
+                    next_fd = os.open(part, directory_flags, dir_fd=walk_fd)
+                    os.close(walk_fd)
+                    walk_fd = next_fd
+                source_fd = os.open(
+                    lexical_relative.parts[-1],
+                    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW,
+                    dir_fd=walk_fd,
+                )
+            finally:
+                os.close(walk_fd)
+            try:
+                source_info = os.fstat(source_fd)
+                if (
+                    not stat.S_ISREG(source_info.st_mode)
+                    or source_info.st_nlink != 1
+                    or source_info.st_size <= 0
+                    or source_info.st_size > KAIROS_GENERATED_IMAGE_MAX_BYTES
+                ):
+                    raise ValueError("invalid generated image file")
+                total_bytes += source_info.st_size
+                if total_bytes > KAIROS_GENERATED_IMAGE_MAX_TOTAL_BYTES:
+                    raise ValueError("generated image batch is too large")
+                header = os.read(source_fd, 32)
+                image_format = _kairos_generated_image_format(header)
+                source_suffix = candidate.suffix.lower()
+                if (
+                    image_format is None
+                    or source_suffix not in _KAIROS_GENERATED_IMAGE_EXTENSIONS[image_format]
+                ):
+                    raise ValueError("unsupported generated image format")
+                os.lseek(source_fd, 0, os.SEEK_SET)
+
+                extension = ".jpg" if image_format == "jpeg" else f".{image_format}"
+                stored_name = f"{secrets.token_hex(16)}{extension}"
+                target = destination / stored_name
+                temporary = destination / f".{stored_name}.{secrets.token_hex(8)}.part"
+                target_fd = os.open(
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW,
+                    0o600,
+                )
+                copied = 0
+                try:
+                    while True:
+                        chunk = os.read(source_fd, 64 * 1024)
+                        if not chunk:
+                            break
+                        copied += len(chunk)
+                        if copied > source_info.st_size or copied > KAIROS_GENERATED_IMAGE_MAX_BYTES:
+                            raise ValueError("generated image changed during copy")
+                        view = memoryview(chunk)
+                        while view:
+                            written = os.write(target_fd, view)
+                            if written <= 0:
+                                raise OSError("short generated image write")
+                            view = view[written:]
+                    if copied != source_info.st_size:
+                        raise ValueError("generated image changed during copy")
+                    os.fsync(target_fd)
+                finally:
+                    os.close(target_fd)
+                os.replace(temporary, target)
+                temporary = None
+                staged.append({
+                    "attachment_url": f"/attachments/{stored_name}",
+                    "type": "image",
+                    "filename": f"generated-image-{index}{extension}",
+                    "size": copied,
+                    "stored_path": str(target),
+                })
+            finally:
+                os.close(source_fd)
+        return staged
+    except Exception as exc:
+        if temporary is not None:
+            with suppress(OSError):
+                temporary.unlink()
+        for item in staged:
+            with suppress(OSError, TypeError, ValueError):
+                Path(item.get("stored_path") or "").unlink()
+        logger.warning(
+            "kairos generated image staging failed count=%d error=%s",
+            len(raw_paths),
+            type(exc).__name__,
+        )
+        return []
+    finally:
+        for descriptor in reversed(root_fds):
+            with suppress(OSError):
+                os.close(descriptor)
+
 try:
     import rp_session_manager
 except ImportError:
@@ -15367,20 +15548,50 @@ class PushHandler(BaseHTTPRequestHandler):
             append_source: str = source,
             *,
             worker_terminal_status: str = "completed",
+            attachments: list[dict[str, Any]] | None = None,
         ) -> None:
             nonlocal assistant_appended
             _terminalize_workers(worker_terminal_status)
             _append_activity_card()
-            assistant_rec = chat.append(
-                role="assistant",
-                text=message,
-                source=append_source,
-                metadata={
+            attachment_batch = list(attachments or [])
+            assistant_metadata = {
                     "kairos_user_ts": user_ts,
                     "turn_terminal": True,
                     "turn_message_kind": "terminal_answer",
-                } if user_ts else None,
-            )
+                } if user_ts else {}
+            if attachment_batch:
+                assistant_metadata["attachments"] = [
+                    {
+                        "attachment_url": str(item["attachment_url"]),
+                        "type": "image",
+                        "filename": str(item["filename"]),
+                        "size": int(item["size"]),
+                    }
+                    for item in attachment_batch
+                ]
+            primary_attachment = attachment_batch[0] if attachment_batch else {}
+            attachment_kwargs: dict[str, Any] = {}
+            if primary_attachment:
+                attachment_kwargs = {
+                    "attachment_url": primary_attachment["attachment_url"],
+                    "attachment_type": primary_attachment["type"],
+                    "attachment_filename": primary_attachment["filename"],
+                }
+            try:
+                assistant_rec = chat.append(
+                    role="assistant",
+                    text=message,
+                    source=append_source,
+                    metadata=assistant_metadata or None,
+                    **attachment_kwargs,
+                )
+            except Exception:
+                # A failed history append must not leave unreferenced public
+                # copies behind. The originals remain in Codex's image store.
+                for item in attachment_batch:
+                    with suppress(OSError, TypeError, ValueError):
+                        Path(item.get("stored_path") or "").unlink()
+                raise
             assistant_appended = True
             terminal_setter = (
                 self._set_chat_failed
@@ -15729,6 +15940,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 bridge_status: str | None = None
                 bridge_token_usage: CodexThreadTokenUsage | None = None
                 bridge_context_compacted = False
+                bridge_generated_image_paths: tuple[Path, ...] = ()
                 while True:
                     if time.monotonic() - wait_started_at >= max_queue_wait_sec:
                         _append_assistant("这条消息排队超过 15 分钟还没轮到，我先标记失败。你可以直接重发。")
@@ -15762,6 +15974,7 @@ class PushHandler(BaseHTTPRequestHandler):
                             bridge_status = bridge_result.status
                             bridge_token_usage = bridge_result.token_usage
                             bridge_context_compacted = bridge_result.context_compacted
+                            bridge_generated_image_paths = bridge_result.generated_image_paths
                             return_code = 0 if bridge_status == "completed" else 1
                         except CodexPromptLockBusy:
                             thread_id = session_id
@@ -15804,6 +16017,7 @@ class PushHandler(BaseHTTPRequestHandler):
                             )
                             _harvest_mcp_session_activities(session_marker, thread_id or session_id)
                             bridge_status = None
+                            bridge_generated_image_paths = ()
                     else:
                         if run_id:
                             CODEX_RUNS.set_observer_phase(run_id, "running")
@@ -15821,6 +16035,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         )
                         _harvest_mcp_session_activities(session_marker, thread_id or session_id)
                         bridge_status = None
+                        bridge_generated_image_paths = ()
                     if not self._is_codex_prompt_busy_answer(answer):
                         break
                     if run_id:
@@ -15885,7 +16100,19 @@ class PushHandler(BaseHTTPRequestHandler):
                 if return_code != 0 and stderr_text:
                     logger.warning("kairos codex return_code=%s stderr=%s", return_code, stderr_text[-800:])
                 answer = (answer or "").strip() or _current_draft_text() or "Kairos 没有返回可展示内容。"
-                _append_assistant(answer)
+                generated_attachments = (
+                    _stage_kairos_generated_images(
+                        bridge_generated_image_paths,
+                        codex_home=self.state.codex_home,
+                        thread_id=thread_id,
+                        attachments_dir=self.state.attachments_dir,
+                    )
+                    if bridge_status == "completed" and bridge_generated_image_paths
+                    else []
+                )
+                if bridge_generated_image_paths and not generated_attachments:
+                    answer = f"{answer}\n\n[图片附件写入失败，图片未发送。]"
+                _append_assistant(answer, attachments=generated_attachments)
                 if (
                     contact_id == "kairos"
                     and self.state.codex_auto_forge_enabled

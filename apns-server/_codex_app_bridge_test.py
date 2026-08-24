@@ -670,6 +670,92 @@ class CodexAppBridgeTest(unittest.TestCase):
         self.assertEqual(len(activities), 1)
         self.assertEqual(activities[0]["count_delta"], 1)
 
+    def test_completed_image_is_returned_once_without_base64_and_started_activity_survives(self):
+        image_dir = self.root / "codex-home" / "generated_images" / "thread-test"
+        image_dir.mkdir(parents=True)
+        image_path = image_dir / "generated.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nimage")
+        activities = []
+        active = bridge_module._ActiveTurn(
+            thread_id="thread-test",
+            turn_id="turn-image",
+            on_update=None,
+            on_activity=activities.append,
+        )
+        started = {
+            "id": "image-start",
+            "type": "imageGeneration",
+            "status": "inProgress",
+            "result": "private-start-payload",
+        }
+        completed = {
+            **started,
+            "status": "completed",
+            "savedPath": str(image_path),
+            "result": "A" * 1_000_000,
+        }
+
+        self.bridge._handle_item(active, started, completed=False)
+        self.bridge._handle_item(active, completed, completed=True)
+        self.bridge._handle_item(active, {**completed, "id": "snapshot-replay"}, completed=True)
+
+        result = self.bridge._result_from_active(active)
+        self.assertEqual(activities, ["生成图片"])
+        self.assertEqual(result.generated_image_paths, (image_path,))
+        self.assertNotIn("A" * 100, repr(active))
+        self.assertNotIn("private-start-payload", repr(result))
+
+    def test_image_collection_rejects_wrong_turn_failed_outside_symlink_and_over_limit(self):
+        image_dir = self.root / "codex-home" / "generated_images" / "thread-test"
+        image_dir.mkdir(parents=True)
+        valid = image_dir / "valid.png"
+        valid.write_bytes(b"\x89PNG\r\n\x1a\nimage")
+        outside = self.root / "outside.png"
+        outside.write_bytes(b"\x89PNG\r\n\x1a\nimage")
+        linked = image_dir / "linked.png"
+        linked.symlink_to(valid)
+        active = bridge_module._ActiveTurn(
+            thread_id="thread-test",
+            turn_id="turn-image",
+            phase="running",
+            on_update=None,
+            on_activity=None,
+        )
+        with self.bridge._state_lock:
+            self.bridge._active = active
+        try:
+            for turn_id, item_id, path, status in (
+                ("wrong-turn", "wrong", valid, "completed"),
+                ("turn-image", "failed", valid, "failed"),
+                ("turn-image", "outside", outside, "completed"),
+                ("turn-image", "linked", linked, "completed"),
+            ):
+                self.bridge._handle_notification("item/completed", {
+                    "threadId": "thread-test",
+                    "turnId": turn_id,
+                    "item": {
+                        "id": item_id,
+                        "type": "imageGeneration",
+                        "status": status,
+                        "failure": {"message": "no"} if status == "failed" else None,
+                        "savedPath": str(path),
+                        "result": "private-base64",
+                    },
+                })
+        finally:
+            with self.bridge._state_lock:
+                self.bridge._active = None
+
+        with mock.patch.object(bridge_module, "MAX_GENERATED_IMAGE_BYTES", 4):
+            self.bridge._handle_item(active, {
+                "id": "too-large",
+                "type": "imageGeneration",
+                "status": "completed",
+                "savedPath": str(valid),
+                "result": "private-base64",
+            }, completed=True)
+        self.assertEqual(active.generated_image_paths, {})
+
     def test_sparse_completed_item_reuses_started_worker_identity(self):
         activities = []
         active = bridge_module._ActiveTurn(
