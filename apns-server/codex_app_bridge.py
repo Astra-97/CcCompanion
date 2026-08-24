@@ -2049,6 +2049,13 @@ class CodexAppBridge:
                 path=str(self.daemon_socket_path),
                 uri="ws://localhost/",
                 compression=None,
+                # ``thread/resume`` returns the persisted thread snapshot in
+                # one frame. Long-lived Kairos sessions can legitimately
+                # exceed websockets' 1 MiB default even while their model
+                # context remains healthy. Keep a finite local-transport
+                # ceiling so oversized snapshots don't masquerade as daemon
+                # disconnects, while still bounding memory use.
+                max_size=64 * 1024 * 1024,
                 # The listener is local. Keep the handshake slice short so a
                 # half-open socket cannot make cancel/close wait for seconds;
                 # the outer recovery loop can safely try again.

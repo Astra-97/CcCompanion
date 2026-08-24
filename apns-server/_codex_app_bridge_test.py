@@ -797,6 +797,7 @@ class CodexAppBridgeTest(unittest.TestCase):
             self.assertIsNone(daemon_bridge.snapshot()["pid"])
             starter.assert_not_called()
             self.assertIs(connector.call_args.kwargs["compression"], None)
+            self.assertEqual(connector.call_args.kwargs["max_size"], 64 * 1024 * 1024)
             self.assertEqual(methods.count("initialize"), 1)
             self.assertIn("initialized", methods)
             self.assertEqual(len(turn_start_params), 1)
@@ -805,6 +806,98 @@ class CodexAppBridgeTest(unittest.TestCase):
             daemon_bridge.close()
             # Closing a bridge connection must not stop the shared daemon.
             self.assertTrue(server_thread.is_alive())
+            server.shutdown()
+            server_thread.join(timeout=2.0)
+
+    def test_daemon_resume_accepts_multi_megabyte_thread_snapshot(self):
+        socket_path = self.root / "large-resume.sock"
+        thread_id = "thread-large-resume"
+        large_text = "x" * (2 * 1024 * 1024)
+
+        def handler(websocket):
+            for raw in websocket:
+                message = json.loads(raw)
+                method = message.get("method")
+                request_id = message.get("id")
+                if method == "initialize":
+                    websocket.send(json.dumps({
+                        "id": request_id,
+                        "result": {"userAgent": "fake-daemon"},
+                    }))
+                elif method == "thread/resume":
+                    websocket.send(json.dumps({
+                        "id": request_id,
+                        "result": {
+                            "thread": {
+                                "id": thread_id,
+                                "turns": [{
+                                    "id": "prior-turn",
+                                    "status": "completed",
+                                    "items": [{
+                                        "id": "prior-message",
+                                        "type": "agentMessage",
+                                        "text": large_text,
+                                    }],
+                                }],
+                            },
+                        },
+                    }))
+                elif method == "turn/start":
+                    websocket.send(json.dumps({
+                        "id": request_id,
+                        "result": {
+                            "turn": {
+                                "id": "turn-after-large-resume",
+                                "status": "inProgress",
+                                "items": [],
+                            },
+                        },
+                    }))
+                    websocket.send(json.dumps({
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": thread_id,
+                            "turnId": "turn-after-large-resume",
+                            "item": {
+                                "id": "answer-after-large-resume",
+                                "type": "agentMessage",
+                                "text": "large-resume-ok",
+                            },
+                        },
+                    }))
+                    websocket.send(json.dumps({
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": thread_id,
+                            "turn": {
+                                "id": "turn-after-large-resume",
+                                "status": "completed",
+                                "items": [],
+                            },
+                        },
+                    }))
+
+        server = unix_serve(handler, path=str(socket_path), compression=None)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        bridge = CodexAppBridge(
+            codex_home=str(self.root / "large-resume-home"),
+            daemon_socket_path=str(socket_path),
+            daemon_autostart=False,
+            request_timeout_sec=3.0,
+        )
+        try:
+            result = bridge.run_turn(
+                thread_id=thread_id,
+                cwd=self.root,
+                prompt="continue after a large snapshot",
+                model="gpt-test",
+                effort="high",
+            )
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.text, "large-resume-ok")
+        finally:
+            bridge.close()
             server.shutdown()
             server_thread.join(timeout=2.0)
 
