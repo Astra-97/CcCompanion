@@ -6,7 +6,7 @@ Endpoint: ws://0.0.0.0:8765/voice-call/stream
 Wire protocol — see README in the parent project. JSON text frames + binary PCM
 mixed on the same WS connection. Pipeline is batch ASR/TTS with fast handoff:
 
-    PCM in -> VAD -> utterance-end -> stackchan ASR -> AIChatManager.send_message
+    PCM in -> VAD -> utterance-end -> stackchan ASR -> live contact chat
         -> stackchan TTS -> stream WAV back as 20ms PCM chunks
         -> watch for {"type":"interrupt"} mid-stream -> cancel cleanly
 
@@ -27,7 +27,6 @@ import logging
 import os
 import functools
 import struct
-import sys
 import time
 import unicodedata
 import urllib.error
@@ -278,24 +277,7 @@ def _load_auth_token() -> tuple[str, str]:
 AUTH_TOKEN, AUTH_SOURCE = _load_auth_token()
 
 
-# ---------------------------------------------------------------------------
-# AI chat manager (lazy import to keep startup fast and avoid hard dependency
-# during smoke tests when ai_chat config might be incomplete).
-# ---------------------------------------------------------------------------
-
-_ai_mgr: Any = None
 _background_tasks: set[asyncio.Task[Any]] = set()
-
-
-def get_ai_manager() -> Any:
-    global _ai_mgr
-    if _ai_mgr is None:
-        if str(HERE) not in sys.path:
-            sys.path.insert(0, str(HERE))
-        from ai_chat import AIChatManager  # type: ignore
-
-        _ai_mgr = AIChatManager(STATE_DIR)
-    return _ai_mgr
 
 
 def _request_json(
@@ -1703,29 +1685,7 @@ async def handle_utterance(
         # The LLM leg is the long one (a Claude Code turn is routinely 30-60s).
         # Keep a `thinking` drip going for clients that asked for it so neither
         # the phone nor the human has to guess whether the call is still alive.
-        if contact_id == "ai-custom":
-            try:
-                mgr = get_ai_manager()
-            except Exception as e:
-                await turn_error(f"ai_chat init failed: {e}", fatal=True)
-                return
-
-            loop = asyncio.get_running_loop()
-            try:
-                async with thinking_ticker(ws, capabilities, interrupt_event):
-                    result = await loop.run_in_executor(None, mgr.send_message, transcript)
-            except Exception as e:
-                await turn_error(f"llm failed: {e}")
-                return
-            if interrupt_event.is_set():
-                release_reason = "interrupted_pre_tts"
-                return
-            if not isinstance(result, dict) or not result.get("ok"):
-                err = (result or {}).get("error") if isinstance(result, dict) else "llm error"
-                await turn_error(f"llm: {err}")
-                return
-            reply_text = str(result.get("reply") or "").strip()
-        elif contact_id in {"xiaoke", "kairos"}:
+        if contact_id in {"xiaoke", "kairos"}:
             try:
                 async with thinking_ticker(ws, capabilities, interrupt_event):
                     reply_text = await send_live_contact_and_wait_reply(

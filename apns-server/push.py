@@ -173,7 +173,6 @@ from contacts import (
 )
 import todos as todos_mod
 from studyroom import StudyroomDB
-from ai_chat import AIChatManager
 import subprocess
 import threading
 
@@ -3984,7 +3983,6 @@ class ServerState:
         calendar_path = Path(self.token_store_path).parent / "calendar_events.jsonl"
         self.calendar = CalendarStore(calendar_path)
         self.rp_history = RPHistory("/tmp")
-        self.ai_chat = AIChatManager(HERE / "state")
         self.task_buffer = EphemeralTaskBuffer(capacity=100)
         # 流式回复广播 (2026-07-12): channel reply_chunk → /chat/stream_chunk → SSE
         self.chat_stream_bus = ChatStreamBus()
@@ -6461,6 +6459,9 @@ class PushHandler(BaseHTTPRequestHandler):
         from urllib.parse import parse_qs, urlparse
 
         request_path = urlparse(self.path).path
+        if request_path == "/ai-chat" or request_path.startswith("/ai-chat/"):
+            self._send_json(404, {"error": "not found"})
+            return
         if not self._is_public_get() and not self._check_ip_allowed():
             return
         # Kimi control is native-App control, not a PWA capability.  Keep it
@@ -6615,18 +6616,6 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/rp/list":
             self._handle_rp_list()
-            return
-        if self.path == "/ai-chat/provider":
-            self._handle_ai_chat_provider_get()
-            return
-        if self.path.startswith("/ai-chat/relay-model"):
-            self._handle_ai_chat_relay_model_get()
-            return
-        if self.path == "/ai-chat/persona":
-            self._handle_ai_chat_persona_get()
-            return
-        if self.path.startswith("/ai-chat/history"):
-            self._handle_ai_chat_history()
             return
         if self.path.startswith("/chat/poll"):
             self._handle_chat_poll()
@@ -7069,6 +7058,9 @@ class PushHandler(BaseHTTPRequestHandler):
         from urllib.parse import urlparse
 
         request_path = urlparse(self.path).path
+        if request_path == "/ai-chat" or request_path.startswith("/ai-chat/"):
+            self._send_json(404, {"error": "not found"})
+            return
         if request_path == "/web/pairing/create":
             if not self._check_ip_allowed():
                 return
@@ -7189,9 +7181,6 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_staged_upload_cancel(body)
             return
         # /chat/upload 走 multipart 不解析 JSON 直接 handle raw (现在含 query string)
-        if self.path.startswith("/ai-chat/upload"):
-            self._handle_ai_chat_upload()
-            return
         if self.path.startswith("/chat/upload"):
             self._handle_chat_upload()
             return
@@ -7231,15 +7220,6 @@ class PushHandler(BaseHTTPRequestHandler):
             if xhs_length <= 0 or xhs_length > xhs_body_limits[self.path]:
                 self.close_connection = True
                 self._send_json(413, {"ok": False, "error": "request_too_large"})
-                return
-
-        if self.path == "/ai-chat/persona":
-            try:
-                persona_length = int(self.headers.get("Content-Length", "0"))
-            except ValueError:
-                persona_length = 0
-            if persona_length <= 0 or persona_length > 16 * 1024 * 1024:
-                self._send_json(413, {"ok": False, "error": "persona request is too large"})
                 return
 
         try:
@@ -7498,16 +7478,6 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_notion_append(body)
         elif self.path == "/notion/search":
             self._handle_notion_search(body)
-        elif self.path == "/ai-chat/provider":
-            self._handle_ai_chat_provider_post(body)
-        elif self.path == "/ai-chat/relay-model":
-            self._handle_ai_chat_relay_model_post(body)
-        elif self.path == "/ai-chat/persona":
-            self._handle_ai_chat_persona_post(body)
-        elif self.path == "/ai-chat/send":
-            self._handle_ai_chat_send(body)
-        elif self.path == "/ai-chat/stream":
-            self._handle_ai_chat_stream(body)
         elif self.path == "/voice-call/tts":
             self._handle_voice_call_tts(body)
         elif self.path == "/voice/push":
@@ -8719,201 +8689,6 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.exception("rp list fail")
             self._send_json(500, {"error": str(e)})
 
-    # ---------- AI chat handlers ----------
-
-    def _handle_ai_chat_provider_get(self):
-        if not self._check_auth():
-            self._send_json(401, {"error": "auth required"})
-            return
-        try:
-            result = self.state.ai_chat.relay_provider_status()
-            status = 200 if result.get("ok") else 503
-            self._send_json(status, result)
-        except Exception as e:
-            logger.exception("ai_chat provider status fail")
-            self._send_json(503, {"ok": False, "error": str(e)})
-
-    def _handle_ai_chat_provider_post(self, body: dict[str, Any]):
-        if not self._check_auth():
-            self._send_json(401, {"error": "auth required"})
-            return
-        provider = str(body.get("provider") or "").strip()
-        try:
-            result = self.state.ai_chat.switch_relay_provider(provider)
-            self._send_json(200, result)
-        except ValueError as e:
-            self._send_json(400, {"ok": False, "error": str(e)})
-        except Exception as e:
-            # Do not import relay implementation into the HTTP surface. Busy
-            # is deliberately recognized by its stable manager message.
-            message = str(e)
-            status = 409 if "while a turn is active" in message else 503
-            if status != 409:
-                logger.exception("ai_chat provider switch fail")
-            self._send_json(status, {"ok": False, "error": message})
-
-    def _handle_ai_chat_relay_model_get(self):
-        if not self._check_auth():
-            self._send_json(401, {"error": "auth required"})
-            return
-        provider = self._query_params().get("provider", [None])[0]
-        try:
-            self._send_json(200, self.state.ai_chat.relay_model_status(provider))
-        except ValueError as e:
-            self._send_json(400, {"ok": False, "error": str(e)})
-        except Exception as e:
-            logger.exception("ai_chat relay model status fail")
-            self._send_json(503, {"ok": False, "error": str(e)})
-
-    def _handle_ai_chat_relay_model_post(self, body: dict[str, Any]):
-        if not self._check_auth():
-            self._send_json(401, {"error": "auth required"})
-            return
-        try:
-            result = self.state.ai_chat.select_relay_model(
-                str(body.get("provider") or ""), str(body.get("model") or "")
-            )
-            self._send_json(200, result)
-        except ValueError as e:
-            self._send_json(400, {"ok": False, "error": str(e)})
-        except Exception as e:
-            message = str(e)
-            status = 409 if "while a turn is active" in message else 503
-            if status != 409:
-                logger.exception("ai_chat relay model update fail")
-            self._send_json(status, {"ok": False, "error": message})
-
-    def _handle_ai_chat_persona_get(self):
-        if not self._check_auth():
-            self._send_json(401, {"error": "auth required"})
-            return
-        try:
-            self._send_json(200, self.state.ai_chat.persona_status())
-        except Exception as e:
-            logger.exception("ai_chat persona status fail")
-            self._send_json(500, {"ok": False, "error": str(e)})
-
-    def _handle_ai_chat_persona_post(self, body: dict[str, Any]):
-        if not self._check_auth():
-            self._send_json(401, {"error": "auth required"})
-            return
-        try:
-            result = self.state.ai_chat.apply_persona_composition(
-                body.get("files"), body.get("custom_text", "")
-            )
-            self._send_json(200, result)
-        except ValueError as e:
-            self._send_json(400, {"ok": False, "error": str(e)})
-        except Exception as e:
-            message = str(e)
-            status = 409 if "while a turn is active" in message else 500
-            if status != 409:
-                logger.exception("ai_chat persona apply fail")
-            self._send_json(status, {"ok": False, "error": message})
-
-    def _handle_ai_chat_send(self, body: dict[str, Any]):
-        if not self._check_auth():
-            self._send_json(401, {"error": "auth required"})
-            return
-        text = str(body.get("text") or "").strip()[:50000]
-        if not text:
-            self._send_json(400, {"error": "text required"})
-            return
-        client_message_id = str(body.get("client_message_id") or "").strip()[:200]
-        try:
-            result = self.state.ai_chat.send_message(text, client_message_id=client_message_id)
-            status = 200 if result.get("ok") else 400
-            self._send_json(status, result)
-        except Exception as e:
-            logger.exception("ai_chat send fail")
-            self._send_json(500, {"ok": False, "error": str(e)})
-
-    def _handle_ai_chat_stream(self, body: dict[str, Any]):
-        if not self._check_auth():
-            self._send_json(401, {"error": "auth required"})
-            return
-        text = str(body.get("text") or "").strip()[:50000]
-        if not text:
-            self._send_json(400, {"error": "text required"})
-            return
-        client_message_id = str(body.get("client_message_id") or "").strip()[:200]
-
-        self.send_response(200)
-        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
-
-        client_connected = True
-
-        def emit(event: dict[str, Any]) -> None:
-            nonlocal client_connected
-            if not client_connected:
-                return
-            data = json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n"
-            try:
-                self.wfile.write(data)
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                # Keep consuming the authoritative upstream turn and persist
-                # its final result even if the phone disconnects mid-stream.
-                client_connected = False
-
-        try:
-            result = self.state.ai_chat.send_message_stream(text, emit, client_message_id=client_message_id)
-            if result.get("ok"):
-                done = {
-                    "type": "done",
-                    "ok": True,
-                    "reply": result.get("reply", ""),
-                    "ts": result.get("ts", ""),
-                }
-                if result.get("thinking"):
-                    done["thinking"] = result.get("thinking", "")
-                if result.get("provider"):
-                    done["provider"] = result.get("provider", "")
-                if result.get("activities"):
-                    done["activities"] = result.get("activities", [])
-                if result.get("warning"):
-                    done["warning"] = result.get("warning", "")
-                emit(done)
-            else:
-                error_event = {
-                    "type": "error",
-                    "ok": False,
-                    "error": result.get("error", "AI回复失败"),
-                }
-                for key in ("code", "terminal", "retryable"):
-                    if key in result:
-                        error_event[key] = result[key]
-                emit(error_event)
-        except (BrokenPipeError, ConnectionResetError):
-            logger.info("ai_chat stream client disconnected")
-        except Exception as e:
-            logger.exception("ai_chat stream fail")
-            try:
-                emit({"type": "error", "ok": False, "error": str(e)})
-            except Exception:
-                pass
-
-    def _handle_ai_chat_history(self):
-        if not self._check_auth():
-            self._send_json(401, {"error": "auth required"})
-            return
-        from urllib.parse import urlparse, parse_qs
-        qs = parse_qs(urlparse(self.path).query)
-        since = qs.get("since", [None])[0]
-        try:
-            limit = int(qs.get("limit", ["200"])[0])
-        except Exception:
-            limit = 200
-        try:
-            records = self.state.ai_chat.read_history(since=since, limit=limit)
-            self._send_json(200, {"ok": True, "messages": records, "count": len(records)})
-        except Exception as e:
-            logger.exception("ai_chat history fail")
-            self._send_json(500, {"error": str(e)})
-
     # ---------- group chat handlers ----------
 
     def _group_tmux_session_exists(self, session: str) -> bool:
@@ -9587,16 +9362,6 @@ class PushHandler(BaseHTTPRequestHandler):
             recs = chat.tail(limit)
             if recs:
                 result[cid] = {"records": recs, "count": len(recs)}
-        ai_chat = getattr(self.state, "ai_chat_history", None)
-        if ai_chat:
-            try:
-                from ai_chat import AIChatHistory
-                if isinstance(ai_chat, AIChatHistory):
-                    ai_recs = ai_chat.read_since(limit=limit)
-                    if ai_recs:
-                        result["ai-custom"] = {"records": ai_recs, "count": len(ai_recs)}
-            except Exception:
-                pass
         self._send_json(200, {"ok": True, "contacts": result})
 
     def _chat_contact_directory(self) -> list[dict[str, Any]]:
@@ -10282,7 +10047,7 @@ class PushHandler(BaseHTTPRequestHandler):
             }
         # Health context is a private structured hint for XiaoKe only.  Strip
         # it before dispatching any other contact so it cannot cross into
-        # Kairos/Kimi/apples/ai-custom history.
+        # Kairos/Kimi/apples history.
         # 2026-08-05: the Android client stamps ``health_context`` onto every
         # message, which taxed each ordinary turn with the period block.  Keep
         # it only when this message *is* the health app's "发送给小克" share;
@@ -19176,15 +18941,6 @@ class PushHandler(BaseHTTPRequestHandler):
             })
 
         self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec})
-
-    def _handle_ai_chat_upload(self):
-        """Reject before storing bytes until a safe relay attachment bridge exists."""
-        self.close_connection = True
-        self._send_json(415, {
-            "ok": False,
-            "unsupported": True,
-            "error": "夏以昼的隔离会话目前只支持文字；旧附件历史仍可查看",
-        })
 
     def _run_stackchan_voice_helper(self, args: list[str], *, timeout: int) -> tuple[bool, dict[str, Any]]:
         helper = HERE / "stackchan_voice_call.py"

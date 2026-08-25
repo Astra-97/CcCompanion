@@ -179,19 +179,6 @@ channel_transport_contacts = ["xiaoke"]
 channel_transport_fallback_to_tmux = true
 channel_transport_timeout_seconds = 5
 
-# 夏以昼（ai-custom）的 Claude transport 与上面的“小克 channel”完全隔离。
-# 它不是本 TOML 的远程设置项，而是 operator-only 的
-# state/ai_relay_config.json 字段；默认继续使用可回滚的 -p relay：
-#
-#   "claude_transport": "relay",          # relay | channel
-#   "claude_channel_url": "http://127.0.0.1:8821",
-#   "claude_channel_token_file": "/var/lib/cc-xia-relay/channel-state/channel.token",
-#   "claude_channel_timeout_seconds": 900
-#
-# 只有专用 cc-xia-claude-channel service 通过 loopback/auth/session smoke
-# 后才可在 idle 状态切成 channel。不要复用 8810、小克的 cctg、root HOME、
-# /root/.claude 或 /root/.ccbot。回滚只把该字段改回 relay；历史不迁移不删除。
-
 # 小克·工具版 (tool-version dispatcher) — 规则驱动的定时调度器（不含 AI）。
 # 在排定时间把固定的 trigger 文本，走和 /chat/send 完全一样的通道注入主 session
 # （channel transport，失败回退 tmux），并写进 chat history 让用户可见。主 session

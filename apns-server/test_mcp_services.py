@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from mcp_services import MCP_TEST_RESPONSE_LIMIT, McpServiceError, McpServiceStore, PROVIDERS
 from push import PushHandler
-from provision_mcp_runtime import _append_codex_config, _install_xia_runtime_templates
+from provision_mcp_runtime import _append_codex_config
 
 
 class McpServiceStoreTest(unittest.TestCase):
@@ -132,50 +132,6 @@ class McpServiceStoreTest(unittest.TestCase):
         with patch("mcp_services.urllib.request.build_opener", return_value=Opener(oversized)):
             self.assertEqual(self.store._test_provider("mcdonalds", "test-value"), ("failed", "服务响应过大"))
 
-    def test_xiaoke_runtime_ready_requires_authenticated_live_health(self):
-        channel_token = self.root / "channel.token"
-        channel_token.write_text("private-channel-token\n", encoding="utf-8")
-        with patch.dict(os.environ, {"CC_XIA_CHANNEL_TOKEN_PATH": str(channel_token)}), patch.object(
-            McpServiceStore, "_read_xiaoke_health", return_value=b'{"ready":true}'
-        ) as read_health:
-            self.assertTrue(self.store._xiaoke_channel_ready())
-        read_health.assert_called_once_with("private-channel-token")
-
-        channel_token.unlink()
-        with patch.dict(os.environ, {"CC_XIA_CHANNEL_TOKEN_PATH": str(channel_token)}):
-            self.assertFalse(self.store._xiaoke_channel_ready())
-
-    def test_xiaoke_health_failures_are_pending_not_status_errors(self):
-        channel_token = self.root / "channel.token"
-        cases = [b"[]", b"null", b"not-json", b"[" * 1100 + b"0" + b"]" * 1100]
-        with patch.dict(os.environ, {"CC_XIA_CHANNEL_TOKEN_PATH": str(channel_token)}):
-            for raw in cases:
-                channel_token.write_text("valid-token\n", encoding="utf-8")
-                with patch.object(McpServiceStore, "_read_xiaoke_health", return_value=raw):
-                    self.assertFalse(self.store._xiaoke_channel_ready())
-            for error in (TimeoutError(), OSError(), ValueError(), TypeError()):
-                with patch.object(McpServiceStore, "_read_xiaoke_health", side_effect=error):
-                    self.assertFalse(self.store._xiaoke_channel_ready())
-            channel_token.write_text("bad\rvalue\n", encoding="utf-8")
-            with patch.object(McpServiceStore, "_read_xiaoke_health") as read_health:
-                self.assertFalse(self.store._xiaoke_channel_ready())
-                read_health.assert_not_called()
-
-    def test_xiaoke_health_http_parser_rejects_redirect_truncation_and_oversize(self):
-        good = b'{"ready":true}'
-        response = b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\n" + good
-        self.assertEqual(self.store._parse_xiaoke_health_http(response), good)
-        invalid = [
-            b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\n",
-            b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\n\r\n",
-            b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n{}",
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
-            b"HTTP/1.1 200 OK\r\n\r\n" + (b"x" * (16 * 1024 + 1)),
-        ]
-        for raw in invalid:
-            with self.assertRaises(ValueError):
-                self.store._parse_xiaoke_health_http(raw)
-
     def test_routes_fail_closed_before_status_or_body_is_handled(self):
         get_handler = object.__new__(PushHandler)
         get_handler.path = "/mcp-services"
@@ -201,64 +157,64 @@ class McpServiceStoreTest(unittest.TestCase):
         PushHandler.do_POST(post_handler)
         self.assertEqual(post_response[0][0], 401)
 
-    def test_codex_and_xiaoke_discovery_contracts_use_the_same_fixed_bridge(self):
+    def test_retired_ai_custom_routes_return_not_found(self):
+        class FailIfRead:
+            def read(self, *_args, **_kwargs):
+                raise AssertionError("retired route must not read its request body")
+
+        retired_paths = (
+            "/ai-chat",
+            "/ai-chat/history",
+            "/ai-chat/stream",
+            "/ai-chat/upload",
+            "/ai-chat/persona",
+        )
+        for base_path in retired_paths:
+            for path in (base_path, f"{base_path}?probe=1"):
+                with self.subTest(method="GET", path=path):
+                    handler = object.__new__(PushHandler)
+                    handler.path = path
+                    responses = []
+                    handler._send_json = lambda code, body, **_kwargs: responses.append((code, body))
+                    PushHandler.do_GET(handler)
+                    self.assertEqual(responses, [(404, {"error": "not found"})])
+
+                with self.subTest(method="POST", path=path):
+                    handler = object.__new__(PushHandler)
+                    handler.path = path
+                    handler.rfile = FailIfRead()
+                    handler._read_body = lambda: self.fail("retired route must not parse its request body")
+                    responses = []
+                    handler._send_json = lambda code, body, **_kwargs: responses.append((code, body))
+                    PushHandler.do_POST(handler)
+                    self.assertEqual(responses, [(404, {"error": "not found"})])
+
+    def test_codex_discovery_contract_uses_the_fixed_bridge(self):
         codex = self.root / "codex.toml"
         _append_codex_config(codex)
-        template = Path(__file__).parent / "xia_claude_channel" / ".mcp.json.in"
-        active = self.root / "xia-active.json"
-        active.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
         bridge = self.root / "cc-companion-mcp-bridge"
         bridge.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
         bridge.chmod(0o755)
         with patch.dict(os.environ, {
             "CODEX_HOME": str(self.root),
             "CC_MCP_BRIDGE_PATH": str(bridge),
-            "CC_XIA_MCP_TEMPLATE": str(template),
-            "CC_XIA_ACTIVE_MCP_CONFIG": str(active),
             "CC_MCP_TOKEN_ROOT": str(self.root),
-        }), patch("mcp_services.pwd.getpwnam", return_value=SimpleNamespace(pw_uid=os.geteuid())), patch.object(
-            McpServiceStore, "_xiaoke_channel_ready", return_value=True
-        ):
+        }), patch("mcp_services.pwd.getpwnam", return_value=SimpleNamespace(pw_uid=os.geteuid())):
             # status expects CODEX_HOME/config.toml, exactly what Codex uses.
             (self.root / "config.toml").write_text(codex.read_text(encoding="utf-8"), encoding="utf-8")
             runtime = self.store.status()["runtime"]
         self.assertTrue(runtime["codex_registered"])
-        self.assertTrue(runtime["xiaoke_template_registered"])
-        self.assertTrue(runtime["xiaoke_active_registered"])
-        self.assertTrue(runtime["xiaoke_channel_ready"])
+        self.assertTrue(runtime["configured_tokens_ready"])
         self.assertEqual(runtime["activation"], "ready")
-        with patch.dict(os.environ, {
-            "CODEX_HOME": str(self.root),
-            "CC_MCP_BRIDGE_PATH": str(bridge),
-            "CC_XIA_MCP_TEMPLATE": str(template),
-            "CC_XIA_ACTIVE_MCP_CONFIG": str(active),
-            "CC_MCP_TOKEN_ROOT": str(self.root),
-        }), patch("mcp_services.pwd.getpwnam", return_value=SimpleNamespace(pw_uid=os.geteuid())), patch.object(
-            McpServiceStore, "_xiaoke_channel_ready", return_value=False
-        ):
-            pending = self.store.status()["runtime"]
-        self.assertFalse(pending["xiaoke_channel_ready"])
-        self.assertEqual(pending["activation"], "pending_activation")
         codex_text = codex.read_text(encoding="utf-8")
-        xia = json.loads(template.read_text(encoding="utf-8"))["mcpServers"]
-        xia_settings = json.loads((Path(__file__).parent / "xia_claude_channel" / "settings.json").read_text(encoding="utf-8"))
         for provider in ("luckin", "mcdonalds"):
             self.assertIn(f"[mcp_servers.{provider}]", codex_text)
-            self.assertEqual(xia[provider]["args"], [provider])
-            self.assertIn("cc-companion-mcp-bridge", xia[provider]["command"])
-            self.assertNotIn("sudo", json.dumps(xia[provider]))
-            self.assertIn(f"mcp__{provider}__*", xia_settings["permissions"]["allow"])
 
-    def test_provision_refuses_conflicting_codex_stanza_and_deploys_actual_xia_files(self):
+    def test_provision_refuses_conflicting_codex_stanza(self):
         codex = self.root / "config.toml"
         codex.write_text('[mcp_servers.luckin]\ncommand = "other"\nargs = ["luckin"]\n', encoding="utf-8")
         with self.assertRaises(RuntimeError):
             _append_codex_config(codex)
-        deployed = self.root / "opt-xia"
-        source = Path(__file__).parent / "xia_claude_channel"
-        _install_xia_runtime_templates(source, deployed)
-        self.assertEqual((deployed / ".mcp.json.in").read_bytes(), (source / ".mcp.json.in").read_bytes())
-        self.assertEqual((deployed / "settings.json").read_bytes(), (source / "settings.json").read_bytes())
 
 
 if __name__ == "__main__":

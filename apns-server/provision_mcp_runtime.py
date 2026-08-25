@@ -113,25 +113,12 @@ def _prepare_canonical_tokens(root: Path) -> None:
     # Legacy sources are intentionally left untouched for rollback/audit.
 
 
-def _install_xia_runtime_templates(source_dir: Path, target_dir: Path) -> None:
-    """Deploy exactly the files read by the production XiaoKe launcher."""
-    for name in (".mcp.json.in", "settings.json"):
-        source = source_dir / name
-        data = source.read_bytes()
-        # Validate before publishing a strict-MCP config into the live install.
-        import json
-        json.loads(data.decode("utf-8"))
-        _atomic_write(target_dir / name, data, 0o644)
-
-
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--apply", action="store_true", help="perform the explicitly staged installation")
     parser.add_argument("--source", type=Path, default=Path(__file__).with_name("mcp_bridge.py"))
     parser.add_argument("--bridge", type=Path, default=Path("/usr/local/libexec") / BRIDGE_NAME)
     parser.add_argument("--codex-config", type=Path, default=Path("/root/.codex/config.toml"))
-    parser.add_argument("--xia-source-dir", type=Path, default=Path(__file__).parent / "xia_claude_channel")
-    parser.add_argument("--xia-install-dir", type=Path, default=Path("/opt/cc-xia-claude-channel"))
     args = parser.parse_args(argv)
     if os.geteuid() != 0:
         parser.error("must run as root")
@@ -139,7 +126,6 @@ def main(argv: list[str]) -> int:
         f"install fixed stdio bridge at {args.bridge}",
         f"append missing fixed bridge registrations to {args.codex_config}",
         f"create relay-owned canonical token root at {CANONICAL_TOKEN_ROOT} and import missing legacy tokens",
-        f"deploy XiaoKe MCP template/settings to {args.xia_install_dir}, then start a new/restarted XiaoKe session",
         "start a new/restarted Kairos Codex session for tool discovery",
     ]
     if not args.apply:
@@ -148,7 +134,6 @@ def main(argv: list[str]) -> int:
     _install_bridge(args.source, args.bridge)
     _append_codex_config(args.codex_config)
     _prepare_canonical_tokens(CANONICAL_TOKEN_ROOT)
-    _install_xia_runtime_templates(args.xia_source_dir, args.xia_install_dir)
     print("Installed configuration; no services or sessions were restarted.")
     return 0
 
