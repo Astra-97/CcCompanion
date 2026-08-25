@@ -12410,6 +12410,23 @@ class PushHandler(BaseHTTPRequestHandler):
         return 0.0
 
     @staticmethod
+    def _kimi_reset_text_local(raw: str) -> str:
+        """Render ISO reset timestamps (e.g. 2026-08-28T02:38:31.475709Z) as
+        readable local time; pass anything else through unchanged."""
+        text = raw.strip()
+        if not re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", text):
+            return text
+        try:
+            dt = datetime.strptime(text[:19], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            return text
+        # Provider returns UTC ('Z'/' +00:00'); display in UTC+8 (local tz).
+        if text.endswith("Z") or "+00:00" in text:
+            dt = dt + timedelta(hours=8)
+        week = "一二三四五六日"[dt.weekday()]
+        return f"{dt.month}月{dt.day}日（周{week}）{dt:%H:%M}"
+
+    @staticmethod
     def _kimi_quota_windows(raw: Any) -> list[dict[str, Any]]:
         """Normalize Kimi's varying quota payload into the Android DTO.
 
@@ -12473,6 +12490,7 @@ class PushHandler(BaseHTTPRequestHandler):
             reset_text = re.sub(r"[\x00-\x1f\x7f]", "", str(
                 item.get("reset_text") or item.get("reset_at") or item.get("resetsAt") or ""
             )).strip()[:120]
+            reset_text = PushHandler._kimi_reset_text_local(reset_text)
             text = (
                 f"已用 {max(0, int(used))}/{max(0, int(total))} · 剩余 {round(percent, 1)}%"
                 if used is not None and total is not None and total >= 0
@@ -14759,7 +14777,14 @@ class PushHandler(BaseHTTPRequestHandler):
             except KimiWebError as exc:
                 logger.warning("Kimi userinfo query failed: %s", exc)
         quota_text = (
-            " · ".join(str(item.get("text") or "") for item in quota_windows if item.get("text"))
+            # 汇总行只保留各窗口已用百分比；明细（分数/剩余/重置）见下方窗口行。
+            " · ".join(
+                "{} 已用 {}%".format(
+                    str(item.get("label") or ""),
+                    round(100.0 - float(item.get("remaining_percent") or 0.0)),
+                )
+                for item in quota_windows if item.get("text")
+            )
             or "配额信息暂不可用"
         )
         session_status: dict[str, Any] = {}
