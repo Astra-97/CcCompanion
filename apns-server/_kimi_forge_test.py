@@ -176,7 +176,7 @@ class HandleKimiForgeTest(unittest.TestCase):
             # User-facing notice: history row plus one APNs banner.
             chat = handler.state.contact_chats["kimi"]
             self.assertEqual(1, len(chat.rows))
-            self.assertEqual("system", chat.rows[0]["role"])
+            self.assertEqual("assistant", chat.rows[0]["role"])
             self.assertIn("session_new", chat.rows[0]["text"])
             self.assertIn("长跑", chat.rows[0]["text"])
             self.assertIn("done-1.md", chat.rows[0]["text"])
@@ -282,7 +282,7 @@ class AutoForgePipelineTest(unittest.TestCase):
             # No silent forge: the notice names the automatic trigger.
             chat = handler.state.contact_chats["kimi"]
             self.assertEqual(1, len(chat.rows))
-            self.assertEqual("system", chat.rows[0]["role"])
+            self.assertEqual("assistant", chat.rows[0]["role"])
             self.assertEqual("system:kimi-forge", chat.rows[0]["source"])
             self.assertIn("自动 forge", chat.rows[0]["text"])
             self.assertIn("session_new", chat.rows[0]["text"])

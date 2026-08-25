@@ -1145,6 +1145,77 @@ class KimiWebChatRoutingTest(unittest.TestCase):
             [(row[0], row[1]) for row in web.calls if row[0] == "replace-stuck"],
         )
 
+    def test_stuck_busy_replacement_appends_recovery_notice_and_pushes(self):
+        class StuckBusyWeb(FakeWebChat):
+            def ensure_active_session(self, *, model, thinking, **_kwargs):
+                raise KimiWebSessionBusy("web-session-old")
+            def recover_owned_orphaned_prompt(self, _lease):
+                raise AssertionError("no durable lease means the old session must not be aborted")
+            def load_active_session_id(self):
+                return "web-session-old"
+            def replace_stuck_busy_session(self, session_id, **_kwargs):
+                self.calls.append(("replace-stuck", session_id))
+                return "web-session-new"
+
+        handler, chat, web = self.make_handler(web=StuckBusyWeb())
+        pushed = []
+        handler._send_chat_notification = lambda title, body: pushed.append((title, body))
+        handler._handle_kimi_chat_send({"text": "continue after false busy"}, "kimi")
+        self.wait_idle(handler)
+
+        self.assertEqual(200, handler.responses[-1][0])
+        notices = [row for row in chat.records if row.get("source") == "system:kimi-session-recovery"]
+        self.assertEqual(1, len(notices))
+        notice = notices[0]
+        self.assertEqual("assistant", notice["role"])
+        self.assertIn("web-session-old", notice["text"])
+        self.assertIn("web-session-new", notice["text"])
+        # The notice precedes the user's own message so the lost reply is explained in order.
+        user_index = next(i for i, row in enumerate(chat.records) if row["text"] == "continue after false busy")
+        self.assertLess(chat.records.index(notice), user_index)
+        self.assertEqual(1, len(pushed))
+        self.assertEqual("web-session-new", handler.responses[-1][1]["turn"]["session_id"])
+
+    def test_stale_pointer_swap_after_restart_appends_recovery_notice(self):
+        class StalePointerWeb(FakeWebChat):
+            def load_active_session_id(self):
+                return "web-session-dead"
+            def ensure_active_session(self, *, model, thinking, **_kwargs):
+                self.calls.append(("ensure", model, thinking))
+                return "web-session-fresh"
+
+        handler, chat, web = self.make_handler(web=StalePointerWeb())
+        pushed = []
+        handler._send_chat_notification = lambda title, body: pushed.append((title, body))
+        handler._handle_kimi_chat_send({"text": "after restart"}, "kimi")
+        self.wait_idle(handler)
+
+        self.assertEqual(200, handler.responses[-1][0])
+        notices = [row for row in chat.records if row.get("source") == "system:kimi-session-recovery"]
+        self.assertEqual(1, len(notices))
+        self.assertEqual("assistant", notices[0]["role"])
+        self.assertIn("web-session-dead", notices[0]["text"])
+        self.assertIn("web-session-fresh", notices[0]["text"])
+        self.assertIn("无法继续", notices[0]["text"])
+        self.assertEqual(1, len(pushed))
+
+    def test_stable_pointer_and_first_session_stay_silent(self):
+        class StableWeb(FakeWebChat):
+            def load_active_session_id(self):
+                return "web-session-1"
+
+        handler, chat, _web = self.make_handler(web=StableWeb())
+        handler._handle_kimi_chat_send({"text": "ordinary"}, "kimi")
+        self.wait_idle(handler)
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertFalse(any(row.get("source") == "system:kimi-session-recovery" for row in chat.records))
+
+        # No pointer at all (first-ever session) is not a swap either.
+        handler, chat, _web = self.make_handler(web=FakeWebChat())
+        handler._handle_kimi_chat_send({"text": "first ever"}, "kimi")
+        self.wait_idle(handler)
+        self.assertFalse(any(row.get("source") == "system:kimi-session-recovery" for row in chat.records))
+
     def test_recovery_network_wait_does_not_hold_kimi_turn_lock(self):
         entered, release = threading.Event(), threading.Event()
 

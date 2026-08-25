@@ -11052,6 +11052,40 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception:
             logger.warning("Kimi Web orphan terminal history update failed")
 
+    def _notify_kimi_session_recovery(self, old_session_id: str, new_session_id: str, *, reason: str) -> None:
+        """Append + push a notice for an automatic recovery session swap.
+
+        The controlled forge pipeline (``_kimi_forge_finish_handoff``) already
+        notifies the user; the recovery swaps inside
+        ``_handle_kimi_web_chat_send`` — stale/deleted pointer or a proven
+        stale-busy flag after a Kimi Web process restart — used to be silent,
+        so Astra only saw the previous reply go missing.  There is no
+        pre-switch moment to catch here: the swap itself *is* the recovery,
+        discovered while preparing her next message.
+        """
+        if reason == "stale_busy":
+            opening = "Kimi 服务重启后旧会话留下了假忙标记，已安全切换到新会话"
+        else:
+            opening = "Kimi 服务重启后旧会话已无法继续，已自动切换到新会话"
+        text = (
+            f"{opening}（旧 {old_session_id} → 新 {new_session_id}）。"
+            "旧会话历史仍完整保留在磁盘上；如果上一条回复没送到，把那句话重发一次就好。"
+        )
+        try:
+            # role=assistant（而非 system）：与受控 forge 通知一致，Android 的
+            # RealtimeNotificationService 只对 assistant 消息弹通知。
+            self._chat_for_contact("kimi").append(
+                role="assistant",
+                text=text,
+                source="system:kimi-session-recovery",
+            )
+        except Exception:
+            logger.exception("Kimi session recovery notice history append failed")
+        try:
+            self._send_chat_notification("Kimi 已自动切换到新会话", text[:80])
+        except Exception:
+            logger.warning("Kimi session recovery notification failed", exc_info=True)
+
     @staticmethod
     def _kimi_is_routine_readonly_approval(approval: dict[str, Any]) -> bool:
         """Allow one recognizable local read; unknown/manual work stays blocked.
@@ -11176,6 +11210,18 @@ class PushHandler(BaseHTTPRequestHandler):
                     "reason": "已整理上一轮 Kimi 的残留状态；请重新发送这条消息。",
                 })
                 return
+        # Capture the active-session pointer before preparation so the two
+        # silent recovery swaps below (stale/deleted pointer after a Kimi Web
+        # restart, proven stale-busy replacement) can be made visible to the
+        # user afterwards instead of looking like a lost reply.
+        previous_session_id = ""
+        load_pointer = getattr(web, "load_active_session_id", None)
+        if callable(load_pointer):
+            try:
+                previous_session_id = str(load_pointer() or "")
+            except Exception:
+                logger.warning("Kimi Web active-session pointer read failed before send")
+        session_recovery: tuple[str, str] | None = None
         try:
             model, effort = self._kimi_selection()
             session_id = web.ensure_active_session(model=model, thinking=effort, status_timeout=0.75)
@@ -11238,6 +11284,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         # below, before App history becomes visible or a new
                         # prompt can be submitted.
                         recovery = "replacement_created"
+                        session_recovery = (exc.session_id, "stale_busy")
             if recovery != "replacement_created":
                 self._release_kimi_control(prepare_token)
                 discard_uncommitted_attachments()
@@ -11265,6 +11312,15 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.exception("Kimi Web session preparation crashed")
             self._send_json(503, {"ok": False, "error": "kimi_web_unavailable"})
             return
+
+        if session_recovery is None and previous_session_id and previous_session_id != session_id:
+            # ensure_active_session fell through to create_session because the
+            # old pointer was stale/deleted (typical after a Kimi Web process
+            # restart).  A first-ever session has no previous pointer and is
+            # not a swap, so it stays silent.
+            session_recovery = (previous_session_id, "pointer_lost")
+        if session_recovery is not None:
+            self._notify_kimi_session_recovery(session_recovery[0], session_id, reason=session_recovery[1])
 
         # 上下文阈值自动 forge（默认 80%）：与 POST /kimi/forge 同一套
         # 移交管线，换的是本通道（kimi_web）的活跃会话指针。此时仍持有
@@ -14465,8 +14521,12 @@ class PushHandler(BaseHTTPRequestHandler):
         )
         notice = self._kimi_forge_notice_text(old_session_id, new_session_id, tasks, seed_ok, trigger=trigger)
         try:
+            # role=assistant（而非 system）：Android 的 RealtimeNotificationService
+            # 只对 assistant 消息弹通知（isNotifiableAssistant），system 消息只会
+            # 静静躺在聊天记录里——这正是"forge 完成通知从来没收到"的第二层原因。
+            # source 保留 system:kimi-forge 作为出处标记。对齐 Kairos forge 通知。
             self._chat_for_contact("kimi").append(
-                role="system",
+                role="assistant",
                 text=notice,
                 source="system:kimi-forge",
             )
