@@ -3,6 +3,7 @@ import tempfile
 import threading
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from kimi_acp import KimiACPCancelled, KimiACPError
@@ -1362,6 +1363,104 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.assertEqual([], kimi.records)
         self.assertEqual([], tts_calls)
         self.assertFalse(_should_generate_chat_append_tts("kimi", "assistant", "plain", None, True))
+
+    def _make_kimi_append_handler(self, attachments_dir):
+        """Minimal handler state for exercising _handle_chat_append success paths."""
+        handler, chat, _web = self.make_handler()
+        handler._contact_id_from_body = lambda body: str(body.get("contact_id") or "xiaoke")
+        handler._check_auth = lambda: True
+        handler._has_pending_group_reply = lambda: False
+        handler._send_chat_notification = lambda *_args, **_kwargs: None
+        handler.state.settings = {"tts_enabled": False}
+        handler.state.tokens = types.SimpleNamespace(all_active=lambda: [])
+        handler.state.attachments_dir = Path(attachments_dir)
+        return handler, chat
+
+    def test_kimi_append_accepts_image_attachment_by_url(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            handler, chat = self._make_kimi_append_handler(tmpdir)
+            handler._handle_chat_append({
+                "contact_id": "kimi",
+                "text": "文生图结果",
+                "role": "assistant",
+                "attachment_url": "/attachments/gen-img.png",
+                "attachment_type": "image",
+                "attachment_filename": "gen-img.png",
+            })
+            status, payload = handler.responses[-1]
+            self.assertEqual(200, status)
+            self.assertTrue(payload["ok"])
+            rec = chat.records[-1]
+            self.assertEqual("assistant", rec["role"])
+            self.assertEqual("文生图结果", rec["text"])
+            self.assertEqual("/attachments/gen-img.png", rec["attachment_url"])
+            self.assertEqual("image", rec["attachment_type"])
+            self.assertEqual("gen-img.png", rec["attachment_filename"])
+
+    def test_kimi_append_copies_image_attachment_path_into_store(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            handler, chat = self._make_kimi_append_handler(tmpdir)
+            src = Path(tmpdir) / "source.jpg"
+            src.write_bytes(b"\xff\xd8\xff test jpeg")
+            # 无 caption 的纯图片消息: text 可整个省略
+            handler._handle_chat_append({
+                "contact_id": "kimi",
+                "role": "assistant",
+                "attachment_path": str(src),
+            })
+            status, payload = handler.responses[-1]
+            self.assertEqual(200, status)
+            self.assertTrue(payload["ok"])
+            rec = chat.records[-1]
+            self.assertEqual("", rec["text"])
+            self.assertEqual("image", rec["attachment_type"])
+            self.assertEqual("source.jpg", rec["attachment_filename"])
+            stored_url = rec["attachment_url"]
+            self.assertTrue(stored_url.startswith("/attachments/"))
+            stored_name = stored_url.rsplit("/", 1)[-1]
+            self.assertTrue(stored_name.endswith(".jpg"))
+            self.assertEqual(
+                b"\xff\xd8\xff test jpeg",
+                (Path(tmpdir) / stored_name).read_bytes(),
+            )
+
+    def test_kimi_append_rejects_non_image_and_untyped_attachments(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            handler, chat = self._make_kimi_append_handler(tmpdir)
+            txt = Path(tmpdir) / "notes.txt"
+            txt.write_text("not an image")
+            before = set(os.listdir(tmpdir))
+            for body in (
+                # 显式非图片类型
+                {"contact_id": "kimi", "text": "file", "attachment_url": "/attachments/a.zip", "attachment_type": "file"},
+                # 纯 attachment_url 未显式声明 image
+                {"contact_id": "kimi", "text": "untyped", "attachment_url": "/attachments/a.png"},
+                # attachment_path 扩展名不是图片
+                {"contact_id": "kimi", "text": "txt", "attachment_path": str(txt)},
+                # 只有 type/filename 没有实际附件
+                {"contact_id": "kimi", "text": "type only", "attachment_type": "image"},
+                # 互动卡片 metadata 仍然拒绝
+                {"contact_id": "kimi", "text": "card", "metadata": {"card_title": "Interactive"}},
+            ):
+                handler._handle_chat_append(body)
+                self.assertEqual(415, handler.responses[-1][0])
+                self.assertEqual("kimi_text_only", handler.responses[-1][1]["error"])
+            self.assertEqual([], chat.records)
+            # 被拒的 attachment_path 不得复制进附件库 (不留孤儿文件)
+            self.assertEqual(before, set(os.listdir(tmpdir)))
+
+    def test_kimi_append_image_attachment_requires_auth(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            handler, chat = self._make_kimi_append_handler(tmpdir)
+            handler._check_auth = lambda: False
+            handler._handle_chat_append({
+                "contact_id": "kimi",
+                "text": "no auth",
+                "attachment_url": "/attachments/gen.png",
+                "attachment_type": "image",
+            })
+            self.assertEqual(401, handler.responses[-1][0])
+            self.assertEqual([], chat.records)
 
     def test_web_turn_failure_cleans_lock_typing_and_draft_without_acp_fallback(self):
         class FailingWeb(FakeWebChat):

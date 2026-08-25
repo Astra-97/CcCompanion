@@ -18422,6 +18422,8 @@ class PushHandler(BaseHTTPRequestHandler):
         也支持从 mac mini 这边发图/文件 给 iPhone:
           attachment_path (本地文件 server 复制进 attachments/) 或
           attachment_url (server 已存的 /attachments/<file>)
+        kimi 窗口 2026-08-25 起额外接受图片附件 (文生图入库), 仍拒绝
+        互动卡片 metadata 与非图片附件。
         """
         if not self._check_auth():
             self._send_json(401, {"error": "auth required"})
@@ -18442,6 +18444,11 @@ class PushHandler(BaseHTTPRequestHandler):
                 "role",
                 "source",
                 "client_msg_id",
+                # 图片附件字段 (2026-08-25 放开): 复用下方通用附件入库路径
+                "attachment_path",
+                "attachment_url",
+                "attachment_type",
+                "attachment_filename",
             }
             role_in = str(body.get("role") or "assistant")
             text_in = body.get("text")
@@ -18449,17 +18456,49 @@ class PushHandler(BaseHTTPRequestHandler):
                 key not in allowed_fields and value is not None
                 for key, value in body.items()
             )
+            kimi_attachment_path = body.get("attachment_path")
+            kimi_attachment_url = body.get("attachment_url")
+            kimi_attachment_type = body.get("attachment_type")
+            kimi_has_attachment = bool(
+                kimi_attachment_path
+                or kimi_attachment_url
+                or kimi_attachment_type
+                or body.get("attachment_filename")
+            )
+            kimi_image_ok = True
+            if kimi_has_attachment:
+                # 只接受图片: 显式 attachment_type 必须是 "image"; attachment_path
+                # 无显式类型时按扩展名推断; 纯 attachment_url 必须显式声明 image。
+                if not (kimi_attachment_path or kimi_attachment_url):
+                    kimi_image_ok = False
+                elif kimi_attachment_type is not None:
+                    kimi_image_ok = kimi_attachment_type == "image"
+                elif kimi_attachment_path:
+                    kimi_image_ok = (
+                        Path(str(kimi_attachment_path)).expanduser().suffix.lower()
+                        in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
+                    )
+                else:
+                    kimi_image_ok = False
+            kimi_text_ok = isinstance(text_in, str) and bool(text_in.strip())
+            if (
+                not kimi_text_ok
+                and kimi_has_attachment
+                and (text_in is None or isinstance(text_in, str))
+            ):
+                # 图片消息允许省略/留空 caption
+                kimi_text_ok = True
             if (
                 role_in not in {"user", "assistant"}
-                or not isinstance(text_in, str)
-                or not text_in.strip()
+                or not kimi_text_ok
                 or has_non_plain_fields
                 or kimi_had_metadata
+                or not kimi_image_ok
             ):
                 self._send_json(415, {
                     "ok": False,
                     "error": "kimi_text_only",
-                    "reason": "Kimi 的 append 入口只接受纯文字 user/assistant 消息。",
+                    "reason": "Kimi 的 append 入口只接受纯文字或图片附件的 user/assistant 消息。",
                 })
                 return
         metadata_in = body.get("metadata")
@@ -18473,20 +18512,13 @@ class PushHandler(BaseHTTPRequestHandler):
                 for key, value in metadata_in.items()
             )
         )
-        has_attachment = any(
-            body.get(field)
-            for field in (
-                "attachment_path",
-                "attachment_url",
-                "attachment_type",
-                "attachment_filename",
-            )
-        )
-        if contact_id == "kimi" and (has_attachment or has_card_metadata):
+        # kimi 的图片附件已在上面白名单块校验过, 这里只兜底拦互动卡片
+        # (正常不可达: kimi 带任何 metadata 都已在上面被拒绝)。
+        if contact_id == "kimi" and has_card_metadata:
             self._send_json(415, {
                 "ok": False,
                 "error": "kimi_text_only",
-                "reason": "Kimi 当前不接受附件或互动卡片。",
+                "reason": "Kimi 当前不接受互动卡片。",
             })
             return
         raw_text = body.get("text", "")
