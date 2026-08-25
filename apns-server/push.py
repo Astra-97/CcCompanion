@@ -159,6 +159,7 @@ from kimi_preferences import (
     KimiPreferenceError,
     KimiPreferencePersistenceError,
     KimiPreferenceStore,
+    effective_kimi_effort,
 )
 from kimi_terminal_observer import KimiTerminalObserver
 from kimi_web_client import KimiWebClient, KimiWebError, KimiWebRecoveryConflict, KimiWebSessionBusy
@@ -14043,8 +14044,9 @@ class PushHandler(BaseHTTPRequestHandler):
         self._send_json(200, self._kimi_preferences_payload())
 
     def _handle_kimi_preferences_post(self, body: dict[str, Any]) -> None:
+        previous_model, _previous_effort = self.state.kimi_preferences.snapshot()
         try:
-            self.state.kimi_preferences.save_validated(
+            model, effort = self.state.kimi_preferences.save_validated(
                 str(body.get("model") or ""),
                 str(body.get("reasoning_effort") or ""),
             )
@@ -14062,16 +14064,49 @@ class PushHandler(BaseHTTPRequestHandler):
                 "error": "kimi_preferences_persistence_failed",
             })
             return
+        if model != previous_model:
+            self._notify_kimi_model_switched(previous_model, model, effort)
         self._send_json(200, self._kimi_preferences_payload())
+
+    def _notify_kimi_model_switched(self, previous_model: str, model: str, effort: str) -> None:
+        """Append + push a notice when the App picker moves Kimi to a new model.
+
+        Same shape as ``_notify_kimi_session_recovery``: role=assistant is
+        required because Android's RealtimeNotificationService only notifies
+        on assistant rows.  The selection itself applies on the next prompt
+        submit (per-prompt model override); no Kimi Web restart is involved.
+        """
+        effective_effort = effective_kimi_effort(model, effort)
+        text = f"已切到 {model} 模型"
+        if effective_effort:
+            text += f"（推理强度 {effective_effort}）"
+        text += "。从下一条回复开始生效，当前会话与上下文保持不变。"
+        try:
+            self._chat_for_contact("kimi").append(
+                role="assistant",
+                text=text,
+                source="system:kimi-model-switch",
+            )
+        except Exception:
+            logger.exception("Kimi model switch notice history append failed")
+        try:
+            self._send_chat_notification("Kimi 已切换模型", text[:80])
+        except Exception:
+            logger.warning("Kimi model switch notification failed", exc_info=True)
 
     def _kimi_selection(self) -> tuple[str, str]:
         store = getattr(self.state, "kimi_preferences", None)
         snapshot = getattr(store, "snapshot", None)
         if callable(snapshot):
-            return snapshot()
-        # Compatibility for minimal in-process test doubles only. The real
-        # ServerState always constructs KimiPreferenceStore above.
-        return KIMI_APP_DEFAULT_MODEL, KIMI_APP_DEFAULT_EFFORT
+            model, effort = snapshot()
+        else:
+            # Compatibility for minimal in-process test doubles only. The real
+            # ServerState always constructs KimiPreferenceStore above.
+            model, effort = KIMI_APP_DEFAULT_MODEL, KIMI_APP_DEFAULT_EFFORT
+        # Models without support_efforts (e.g. the DeepSeek aliases) reject
+        # any thinking field outright; strip it at this single choke point so
+        # every caller (send/new/switch/forge/group/ACP) stays valid.
+        return model, effective_kimi_effort(model, effort)
 
     def _prepare_kimi_selected_session(self, model: str, effort: str) -> str:
         """Pin and read back one selection; ACP itself is the authority."""

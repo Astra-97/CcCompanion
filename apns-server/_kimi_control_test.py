@@ -13,7 +13,9 @@ from kimi_acp import KimiACPClient, _activity_from_update
 from kimi_preferences import (
     KIMI_APP_DEFAULT_EFFORT,
     KIMI_APP_DEFAULT_MODEL,
+    KIMI_APP_EFFORTLESS_MODELS,
     KimiPreferenceStore,
+    effective_kimi_effort,
 )
 from kimi_terminal_observer import KimiTerminalObserver
 from link_preview import LinkPreviewBundle
@@ -40,6 +42,43 @@ class KimiPreferencesTest(unittest.TestCase):
                 store.save_validated("untrusted/provider", "high")
             with self.assertRaises(ValueError):
                 store.save_validated("kimi-code/k3-256k", "medium")
+
+    def test_deepseek_aliases_are_allowlisted_only_when_locally_configured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "kimi.toml"
+            config.write_text(
+                '[models."kimi-code/k3-256k"]\nmodel="k3-256k"\n'
+                '[models."deepseek/v4-pro"]\nmodel="deepseek-v4-pro"\n'
+                '[models."deepseek/v4-flash"]\nmodel="deepseek-v4-flash"\n',
+                encoding="utf-8",
+            )
+            store = KimiPreferenceStore(root / "prefs.json", config_path=config)
+            store.save_validated("deepseek/v4-pro", "high")
+            self.assertEqual(("deepseek/v4-pro", "high"), store.snapshot())
+            store.save_validated("deepseek/v4-flash", "low")
+            self.assertEqual(("deepseek/v4-flash", "low"), store.snapshot())
+
+            missing = KimiPreferenceStore(root / "other.json", config_path=root / "missing.toml")
+            with self.assertRaises(ValueError):
+                missing.save_validated("deepseek/v4-pro", "high")
+
+    def test_effortless_models_never_forward_a_thinking_effort(self):
+        for model in KIMI_APP_EFFORTLESS_MODELS:
+            with self.subTest(model=model):
+                self.assertEqual("", effective_kimi_effort(model, "high"))
+        self.assertEqual("max", effective_kimi_effort("kimi-code/k3", "max"))
+        self.assertEqual("", effective_kimi_effort("kimi-code/k3", ""))
+
+    def test_payload_marks_effortless_models_with_empty_effort_lists(self):
+        store = KimiPreferenceStore(
+            Path(tempfile.gettempdir()) / "kimi-control-payload-prefs.json",
+            allowed_models=("kimi-code/k3", "deepseek/v4-pro"),
+        )
+        by_id = {item["id"]: item for item in store.payload_models()}
+        self.assertEqual(["low", "high", "max"], by_id["kimi-code/k3"]["supported_reasoning_efforts"])
+        self.assertEqual([], by_id["deepseek/v4-pro"]["supported_reasoning_efforts"])
+        self.assertEqual("", by_id["deepseek/v4-pro"]["default_reasoning_effort"])
 
 
 class KimiACPPreferencePinTest(unittest.TestCase):
@@ -171,6 +210,69 @@ class KimiControlRoutesTest(unittest.TestCase):
             [item["id"] for item in payload["models"]],
             payload["available_models"],
         )
+
+    def test_kimi_selection_strips_effort_for_effortless_models(self):
+        prefs = KimiPreferenceStore(
+            Path(self.tmp.name) / "prefs-ds.json",
+            allowed_models=("kimi-code/k3", "deepseek/v4-pro"),
+        )
+        self.handler.state.kimi_preferences = prefs
+        prefs.save_validated("kimi-code/k3", "max")
+        self.assertEqual(("kimi-code/k3", "max"), self.handler._kimi_selection())
+        prefs.save_validated("deepseek/v4-pro", "max")
+        self.assertEqual(("deepseek/v4-pro", ""), self.handler._kimi_selection())
+
+    def test_model_switch_appends_notice_and_pushes_once(self):
+        appended = []
+        pushed = []
+        chat = types.SimpleNamespace(append=lambda **row: appended.append(row))
+        self.handler._chat_for_contact = lambda contact: chat
+        self.handler._send_chat_notification = lambda title, body: pushed.append((title, body))
+
+        self.handler._handle_kimi_preferences_post({"model": "kimi-code/k3", "reasoning_effort": "low"})
+        self.assertEqual(200, self.handler.responses[-1][0])
+        self.assertEqual(1, len(appended))
+        self.assertEqual("assistant", appended[0]["role"])
+        self.assertEqual("system:kimi-model-switch", appended[0]["source"])
+        self.assertIn("已切到 kimi-code/k3 模型", appended[0]["text"])
+        self.assertIn("推理强度 low", appended[0]["text"])
+        self.assertEqual(1, len(pushed))
+        self.assertIn("kimi-code/k3", pushed[0][1])
+
+        # Re-saving the same model is a no-op: no duplicate chat row or push.
+        self.handler._handle_kimi_preferences_post({"model": "kimi-code/k3", "reasoning_effort": "high"})
+        self.assertEqual(200, self.handler.responses[-1][0])
+        self.assertEqual(1, len(appended))
+        self.assertEqual(1, len(pushed))
+
+        # An invalid model never notifies.
+        self.handler._handle_kimi_preferences_post({"model": "untrusted/provider", "reasoning_effort": "high"})
+        self.assertEqual(400, self.handler.responses[-1][0])
+        self.assertEqual(1, len(appended))
+
+    def test_model_switch_notice_for_effortless_model_omits_effort(self):
+        prefs = KimiPreferenceStore(
+            Path(self.tmp.name) / "prefs-ds.json",
+            allowed_models=(KIMI_APP_DEFAULT_MODEL, "deepseek/v4-flash"),
+        )
+        self.handler.state.kimi_preferences = prefs
+        appended = []
+        self.handler._chat_for_contact = lambda contact: types.SimpleNamespace(
+            append=lambda **row: appended.append(row),
+        )
+        self.handler._send_chat_notification = lambda *_args: None
+
+        self.handler._handle_kimi_preferences_post({"model": "deepseek/v4-flash", "reasoning_effort": "high"})
+        self.assertEqual(200, self.handler.responses[-1][0])
+        self.assertIn("已切到 deepseek/v4-flash 模型", appended[0]["text"])
+        self.assertNotIn("推理强度", appended[0]["text"])
+
+    def test_switch_notice_failure_never_breaks_the_preferences_response(self):
+        self.handler._chat_for_contact = lambda _contact: (_ for _ in ()).throw(RuntimeError("disk gone"))
+        self.handler._send_chat_notification = lambda *_args: (_ for _ in ()).throw(RuntimeError("push down"))
+        self.handler._handle_kimi_preferences_post({"model": "kimi-code/k3", "reasoning_effort": "low"})
+        self.assertEqual(200, self.handler.responses[-1][0])
+        self.assertEqual("kimi-code/k3", self.handler.responses[-1][1]["model"])
 
     def test_sessions_are_sanitized_and_never_echo_raw_provider_fields(self):
         self.web.local = [{

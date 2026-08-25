@@ -113,7 +113,9 @@ allowed_ips = []
 # The Android App keeps a private per-contact model/effort preference and
 # pins+reads it back on every ACP prepare/load/new/forge. It never writes Kimi
 # Code's global config.toml. Only the locally configured audited aliases
-# k3-256k, k3, kimi-for-coding and kimi-for-coding-highspeed are selectable.
+# k3-256k, k3, kimi-for-coding, kimi-for-coding-highspeed, deepseek/v4-pro
+# and deepseek/v4-flash are selectable. The DeepSeek aliases declare no
+# support_efforts, so no thinking effort is ever forwarded for them.
 # Default: kimi-code/k3-256k with high effort.
 # kimi_config_path = "/root/.kimi-code/config.toml"
 # kimi_semantic_memory_recall_enabled = true

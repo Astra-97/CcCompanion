@@ -22,10 +22,31 @@ KIMI_APP_MODELS = (
     "kimi-code/k3",
     "kimi-code/kimi-for-coding",
     "kimi-code/kimi-for-coding-highspeed",
+    "deepseek/v4-pro",
+    "deepseek/v4-flash",
 )
 KIMI_APP_EFFORTS = ("low", "high", "max")
 KIMI_APP_DEFAULT_MODEL = "kimi-code/k3-256k"
 KIMI_APP_DEFAULT_EFFORT = "high"
+# These allowlisted aliases declare no support_efforts in the local Kimi
+# config; the engine hard-fails any thinking effort submitted for them
+# (v4-pro thinking is a boolean, v4-flash has no thinking at all).  The App
+# picker still stores an effort value, but it is never forwarded for these.
+KIMI_APP_EFFORTLESS_MODELS = (
+    "deepseek/v4-pro",
+    "deepseek/v4-flash",
+)
+
+
+def effective_kimi_effort(model: str, reasoning_effort: str) -> str:
+    """Return the effort that may actually leave this process for ``model``.
+
+    An empty string means "do not send a thinking field": kimi_web_client
+    already omits blank values on both session create and prompt submit.
+    """
+    if str(model or "").strip() in KIMI_APP_EFFORTLESS_MODELS:
+        return ""
+    return str(reasoning_effort or "").strip().lower()
 
 
 class KimiPreferenceError(ValueError):
@@ -100,8 +121,12 @@ class KimiPreferenceStore:
         return [
             {
                 "id": model,
-                "supported_reasoning_efforts": list(KIMI_APP_EFFORTS),
-                "default_reasoning_effort": KIMI_APP_DEFAULT_EFFORT,
+                "supported_reasoning_efforts": (
+                    [] if model in KIMI_APP_EFFORTLESS_MODELS else list(KIMI_APP_EFFORTS)
+                ),
+                "default_reasoning_effort": (
+                    "" if model in KIMI_APP_EFFORTLESS_MODELS else KIMI_APP_DEFAULT_EFFORT
+                ),
             }
             for model in self.allowed_models
         ]
