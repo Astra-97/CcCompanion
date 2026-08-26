@@ -24,6 +24,8 @@ KIMI_APP_MODELS = (
     "kimi-code/kimi-for-coding-highspeed",
     "deepseek/v4-pro",
     "deepseek/v4-flash",
+    "zhipu/glm-5.3",
+    "zhipu/glm-5.3-flash",
 )
 KIMI_APP_EFFORTS = ("low", "high", "max")
 KIMI_APP_DEFAULT_MODEL = "kimi-code/k3-256k"
