@@ -632,6 +632,19 @@ class KimiWebChatRoutingTest(unittest.TestCase):
             __import__("time").sleep(0.01)
         raise AssertionError("Kimi Web worker did not finish")
 
+    @staticmethod
+    def wait_queue_drained(handler):
+        """等排队 worker 把队列投递完：队列空、worker 退出（含投递/退避中）且无活跃轮/预约。"""
+        for _ in range(600):
+            with handler.state.kimi_turn_lock:
+                idle = not handler.state.kimi_active_turn and not handler.state.kimi_prepare_token
+                pending = bool(getattr(handler.state, "kimi_chat_queue", None))
+                running = bool(getattr(handler.state, "kimi_chat_queue_worker_running", False))
+            if idle and not pending and not running:
+                return
+            __import__("time").sleep(0.02)
+        raise AssertionError("Kimi chat queue did not drain")
+
     def test_private_web_turn_never_calls_acp_and_keeps_kimi_history_isolated(self):
         handler, chat, web = self.make_handler()
         handler.state.kimi_acp.prepare_session = Mock(side_effect=AssertionError("ACP fallback"))
@@ -776,7 +789,8 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         handler._commit_kimi_recall.assert_not_called()
         self.assertEqual(503, handler.responses[-1][0])
 
-    def test_consumed_attachment_is_deleted_when_busy_rejects_before_history(self):
+    def test_busy_send_commits_attachment_and_queues_for_later(self):
+        """忙时不再 409 丢附件：消息与附件入库入队，等当前轮结束自动发送。"""
         with tempfile.TemporaryDirectory() as directory:
             stored_path = os.path.join(directory, "consumed.pdf")
             with open(stored_path, "wb") as handle:
@@ -784,18 +798,24 @@ class KimiWebChatRoutingTest(unittest.TestCase):
             handler, chat, _web = self.make_handler()
             handler.state.attachments_dir = directory
             handler.state.kimi_active_turn = {"user_ts": "old-turn"}
-            handler._handle_kimi_chat_send({
-                "text": "new",
-                "_pwa_staged_attachments": [{
-                    "attachment_id": "consumed", "attachment_url": "/attachments/consumed.pdf",
-                    "filename": "report.pdf", "type": "file", "media_type": "application/pdf",
-                    "size": 3, "stored_path": stored_path,
-                }],
-            }, "kimi")
+            with patch("push.threading.Thread"):  # 本用例只断言入队，不跑 worker
+                handler._handle_kimi_chat_send({
+                    "text": "new",
+                    "_pwa_staged_attachments": [{
+                        "attachment_id": "consumed", "attachment_url": "/attachments/consumed.pdf",
+                        "filename": "report.pdf", "type": "file", "media_type": "application/pdf",
+                        "size": 3, "stored_path": stored_path,
+                    }],
+                }, "kimi")
 
-            self.assertEqual(409, handler.responses[-1][0])
-            self.assertEqual([], chat.records)
-            self.assertFalse(os.path.exists(stored_path))
+            status, payload = handler.responses[-1]
+            self.assertEqual(200, status)
+            self.assertTrue(payload["queued"])
+            self.assertEqual(1, len(chat.records))
+            self.assertEqual("/attachments/consumed.pdf", chat.records[0]["attachment_url"])
+            # 附件已随历史提交，忙时绝不删除。
+            self.assertTrue(os.path.exists(stored_path))
+            self.assertEqual(1, len(handler.state.kimi_chat_queue))
 
     def test_prompt_rejection_preserves_attachment_already_committed_to_history(self):
         class RejectingWeb(FakeWebChat):
@@ -838,7 +858,8 @@ class KimiWebChatRoutingTest(unittest.TestCase):
 
         self.assertEqual(["terminal-release", "web-prepare"], order)
 
-    def test_web_chat_never_appends_or_submits_while_kimi_tui_is_uncertain(self):
+    def test_web_chat_queues_without_submitting_while_kimi_tui_is_uncertain(self):
+        """TUI 不确定期间绝不提交 prompt；消息入库入队，等就绪后自动发出。"""
         handler, chat, web = self.make_handler()
         handler.state.kimi_terminal = types.SimpleNamespace(
             input_transaction=lambda: __import__("contextlib").nullcontext(),
@@ -847,13 +868,15 @@ class KimiWebChatRoutingTest(unittest.TestCase):
             ),
         )
 
-        handler._handle_kimi_web_chat_send({"text": "must not submit"}, "kimi", web)
+        with patch("push.threading.Thread"):  # 本用例只断言入队，不跑 worker
+            handler._handle_kimi_web_chat_send({"text": "must not submit"}, "kimi", web)
 
-        self.assertEqual([], chat.records)
+        self.assertEqual(["must not submit"], [row["text"] for row in chat.records])
         self.assertEqual([], web.calls)
-        self.assertEqual(409, handler.responses[-1][0])
-        self.assertEqual("kimi_terminal_busy", handler.responses[-1][1]["error"])
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertTrue(handler.responses[-1][1]["queued"])
         self.assertEqual("", handler.state.kimi_prepare_token)
+        self.assertEqual(1, len(handler.state.kimi_chat_queue))
 
     def test_stream_subscription_is_ready_before_submit_and_exact_stop_is_fenced(self):
         handler, chat, web = self.make_handler(web=FakeWebChat(wait_for_stop=True))
@@ -1010,12 +1033,15 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.assertEqual(1, web.status_calls)
         self.assertFalse(handler.state.contact_typing_states["apples"]["is_typing"])
 
-    def test_second_turn_and_history_failure_fail_before_web_submit(self):
+    def test_second_turn_queues_and_history_failure_fail_before_web_submit(self):
         handler, chat, web = self.make_handler()
         handler.state.kimi_active_turn = {"user_ts": "old", "cancel_event": threading.Event(), "session_id": "s"}
-        handler._handle_kimi_chat_send({"text": "second"}, "kimi")
-        self.assertEqual(409, handler.responses[-1][0])
+        with patch("push.threading.Thread"):  # 本用例只断言入队，不跑 worker
+            handler._handle_kimi_chat_send({"text": "second"}, "kimi")
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertTrue(handler.responses[-1][1]["queued"])
         self.assertFalse(web.calls)
+        self.assertEqual(["second"], [row["text"] for row in chat.records])
 
         class BrokenChat(FakeChat):
             def append(self, **_record): raise OSError("disk")
@@ -1024,7 +1050,69 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.assertEqual(500, handler.responses[-1][0])
         self.assertEqual(["ensure"], [row[0] for row in web.calls])
 
-    def test_orphaned_web_busy_prompt_is_recovered_then_client_retry_appends_once(self):
+    def test_queued_messages_auto_send_in_order_after_active_turn_ends(self):
+        """活跃轮期间的消息按序排队，轮结束后 worker 依次自动发出。"""
+        handler, chat, web = self.make_handler()
+        handler.state.kimi_active_turn = {
+            "user_ts": "busy-turn", "cancel_event": threading.Event(), "session_id": "web-session-1",
+        }
+        handler._handle_kimi_chat_send({"text": "第一条"}, "kimi")
+        handler._handle_kimi_chat_send({"text": "第二条"}, "kimi")
+        self.assertEqual([200, 200], [status for status, _ in handler.responses[-2:]])
+        self.assertEqual([1, 2], [payload["queue_position"] for _, payload in handler.responses[-2:]])
+        # 轮进行中绝不碰 Web。
+        self.assertFalse(web.calls)
+
+        handler.state.kimi_active_turn = {}
+        self.wait_queue_drained(handler)
+        self.wait_idle(handler)
+
+        prompts = [row[2] for row in web.calls if row[0] == "submit"]
+        self.assertEqual(2, len(prompts))
+        self.assertIn("第一条", prompts[0])
+        self.assertIn("第二条", prompts[1])
+        user_texts = [row["text"] for row in chat.records if row["role"] == "user"]
+        self.assertEqual(["第一条", "第二条"], user_texts)
+
+    def test_chat_queue_full_returns_429_and_marks_failed(self):
+        """队列有界：满了才报错（429，不是 409），消息仍入库；429 同步告知 App。"""
+        handler, chat, web = self.make_handler()
+        handler.state.kimi_active_turn = {
+            "user_ts": "busy", "cancel_event": threading.Event(), "session_id": "s",
+        }
+        with patch("push.KIMI_CHAT_QUEUE_MAX", 1), patch("push.threading.Thread"):
+            handler._handle_kimi_chat_send({"text": "queued"}, "kimi")
+            handler._handle_kimi_chat_send({"text": "overflow"}, "kimi")
+        self.assertEqual(200, handler.responses[-2][0])
+        status, payload = handler.responses[-1]
+        self.assertEqual(429, status)
+        self.assertEqual("kimi_queue_full", payload["error"])
+        self.assertEqual(["queued", "overflow"], [row["text"] for row in chat.records])
+        # 第一条仍在排队，reply_state 属于它；溢出消息由 429 同步告知，不覆盖queued 态。
+        self.assertEqual("queued", handler.state.chat_reply_states["kimi"]["reply_state"])
+        self.assertFalse(web.calls)
+
+    def test_stop_clear_queued_empties_queue_and_marks_interrupted(self):
+        """Stop 链路的清空途径：clear_queued 清掉排队消息并标记 interrupted。"""
+        handler, chat, web = self.make_handler()
+        handler.state.kimi_active_turn = {
+            "user_ts": "busy", "cancel_event": threading.Event(), "session_id": "s",
+        }
+        with patch("push.threading.Thread"):
+            handler._handle_kimi_chat_send({"text": "排队一"}, "kimi")
+            handler._handle_kimi_chat_send({"text": "排队二"}, "kimi")
+        self.assertEqual(2, len(handler.state.kimi_chat_queue))
+
+        handler.state.kimi_active_turn = {}
+        handler._handle_kimi_chat_stop("", body={"clear_queued": True})
+        status, payload = handler.responses[-1]
+        self.assertEqual(200, status)
+        self.assertEqual(2, payload["cleared_queued"])
+        self.assertEqual(0, len(handler.state.kimi_chat_queue))
+        self.assertEqual("interrupted", handler.state.chat_reply_states["kimi"]["reply_state"])
+        self.assertFalse(web.calls)
+
+    def test_orphaned_web_busy_prompt_is_recovered_then_queued_message_auto_sends(self):
         class OrphanedBusyWeb(FakeWebChat):
             def __init__(self):
                 super().__init__()
@@ -1044,19 +1132,20 @@ class KimiWebChatRoutingTest(unittest.TestCase):
 
         handler, chat, web = self.make_handler(web=OrphanedBusyWeb())
         handler._handle_kimi_chat_send({"text": "retry after orphan"}, "kimi")
-        self.assertEqual(409, handler.responses[-1][0])
-        self.assertEqual("kimi_web_orphan_recovered_retry", handler.responses[-1][1]["error"])
-        self.assertNotIn("retry after orphan", [row["text"] for row in chat.records])
-        self.assertEqual(1, sum(bool(row.get("metadata", {}).get("orphan_recovery")) for row in chat.records))
-        handler._handle_kimi_chat_send({"text": "retry after orphan"}, "kimi")
+        # 不再 409 要求用户重发：消息入库入队，回收完成后 worker 自动重投。
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertTrue(handler.responses[-1][1]["queued"])
+        self.assertEqual(1, [row["text"] for row in chat.records].count("retry after orphan"))
+        self.assertEqual(1, sum(bool((row.get("metadata") or {}).get("orphan_recovery")) for row in chat.records))
+        self.wait_queue_drained(handler)
         self.wait_idle(handler)
 
         self.assertEqual(["ensure", "recover", "ensure", "stream", "submit"], [row[0] for row in web.calls])
         self.assertIn(("recover", "web-session-1"), web.calls)
+        # 重投绝不重复入库。
         self.assertEqual(1, [row["text"] for row in chat.records].count("retry after orphan"))
-        self.assertEqual(200, handler.responses[-1][0])
 
-    def test_idle_stream_lost_lease_is_reconciled_before_new_history_or_submit(self):
+    def test_idle_stream_lost_lease_is_reconciled_then_queued_message_auto_sends(self):
         class IdleLeaseWeb(FakeWebChat):
             def __init__(self):
                 super().__init__(); self.reconciled = False
@@ -1068,12 +1157,14 @@ class KimiWebChatRoutingTest(unittest.TestCase):
 
         handler, chat, web = self.make_handler(web=IdleLeaseWeb())
         handler._handle_kimi_chat_send({"text": "new after idle"}, "kimi")
-        self.assertEqual(409, handler.responses[-1][0])
-        self.assertEqual("kimi_web_orphan_recovered_retry", handler.responses[-1][1]["error"])
+        # 残留 lease 整理期间不再 409：消息入库入队，整理完自动重投。
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertTrue(handler.responses[-1][1]["queued"])
         self.assertFalse(any(row[0] == "submit" for row in web.calls))
-        self.assertNotIn("new after idle", [row["text"] for row in chat.records])
-        handler._handle_kimi_chat_send({"text": "new after idle"}, "kimi")
+        self.assertEqual(1, [row["text"] for row in chat.records].count("new after idle"))
+        self.wait_queue_drained(handler)
         self.wait_idle(handler)
+        self.assertTrue(any(row[0] == "submit" for row in web.calls))
         self.assertEqual(1, [row["text"] for row in chat.records].count("new after idle"))
 
     def test_upstream_busy_does_not_recover_while_a_legitimate_local_turn_owns_control(self):
@@ -1085,11 +1176,15 @@ class KimiWebChatRoutingTest(unittest.TestCase):
 
         handler, chat, web = self.make_handler(web=ShouldNotRecover())
         handler.state.kimi_active_turn = {"user_ts": "live", "session_id": "web-session-1"}
-        handler._handle_kimi_chat_send({"text": "do not interrupt"}, "kimi")
-        self.assertEqual(409, handler.responses[-1][0])
-        self.assertEqual([], chat.records)
+        with patch("push.threading.Thread"):  # 活跃轮期间 worker 不应启动投递
+            handler._handle_kimi_chat_send({"text": "do not interrupt"}, "kimi")
+        # 不再 409：入库入队，等本地轮结束自动发送；全程不碰 Web。
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertTrue(handler.responses[-1][1]["queued"])
+        self.assertEqual(["do not interrupt"], [row["text"] for row in chat.records])
+        self.assertEqual(1, len(handler.state.kimi_chat_queue))
 
-    def test_ambiguous_orphan_busy_reports_conflict_without_history_append(self):
+    def test_ambiguous_orphan_busy_queues_then_fails_visibly_after_bounded_retries(self):
         class AmbiguousBusyWeb(FakeWebChat):
             def ensure_active_session(self, *, model, thinking, **_kwargs):
                 raise KimiWebSessionBusy("web-session-1")
@@ -1100,13 +1195,18 @@ class KimiWebChatRoutingTest(unittest.TestCase):
                 raise KimiWebRecoveryConflict("prompt moved")
 
         handler, chat, web = self.make_handler(web=AmbiguousBusyWeb())
-        handler._handle_kimi_chat_send({"text": "safe conflict"}, "kimi")
-        self.assertEqual(409, handler.responses[-1][0])
-        self.assertEqual("kimi_web_busy_recovery_conflict", handler.responses[-1][1]["error"])
-        self.assertEqual([], chat.records)
-        self.assertEqual("", handler.state.kimi_prepare_token)
+        with patch("push.KIMI_CHAT_QUEUE_MAX_ATTEMPTS", 0):
+            handler._handle_kimi_chat_send({"text": "safe conflict"}, "kimi")
+            # 归属不明的忙态不再 409：入库入队；重投上限后落可见失败说明。
+            self.assertEqual(200, handler.responses[-1][0])
+            self.assertTrue(handler.responses[-1][1]["queued"])
+            self.assertEqual(["safe conflict"], [row["text"] for row in chat.records])
+            self.assertEqual("", handler.state.kimi_prepare_token)
+            self.wait_queue_drained(handler)
+        notes = [row["text"] for row in chat.records if row["role"] == "assistant"]
+        self.assertTrue(any("未能送出" in note for note in notes))
 
-    def test_external_busy_without_durable_app_lease_never_aborts_or_appends(self):
+    def test_external_busy_without_durable_app_lease_never_aborts_and_queues(self):
         class ExternalBusyWeb(FakeWebChat):
             def ensure_active_session(self, *, model, thinking, **_kwargs):
                 raise KimiWebSessionBusy("web-session-1")
@@ -1114,10 +1214,14 @@ class KimiWebChatRoutingTest(unittest.TestCase):
                 raise AssertionError("unknown provider prompt must never be aborted")
 
         handler, chat, _web = self.make_handler(web=ExternalBusyWeb())
-        handler._handle_kimi_chat_send({"text": "external busy"}, "kimi")
-        self.assertEqual(409, handler.responses[-1][0])
-        self.assertEqual("kimi_web_busy_recovery_conflict", handler.responses[-1][1]["error"])
-        self.assertEqual([], chat.records)
+        with patch("push.KIMI_CHAT_QUEUE_MAX_ATTEMPTS", 0):
+            handler._handle_kimi_chat_send({"text": "external busy"}, "kimi")
+            self.assertEqual(200, handler.responses[-1][0])
+            self.assertTrue(handler.responses[-1][1]["queued"])
+            self.assertEqual(["external busy"], [row["text"] for row in chat.records])
+            self.wait_queue_drained(handler)
+        notes = [row["text"] for row in chat.records if row["role"] == "assistant"]
+        self.assertTrue(any("未能送出" in note for note in notes))
 
     def test_proven_stuck_busy_switches_session_inside_prepare_reservation_then_sends_once(self):
         class StuckBusyWeb(FakeWebChat):
@@ -1258,7 +1362,7 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.assertEqual(200, handler.responses[-1][0])
         self.assertTrue(handler.responses[-1][1]["stopped"])
         self.assertEqual([{"session_id": "web-session-1", "prompt_id": "prompt-1"}], web.cleared)
-        self.assertEqual(1, sum(bool(row.get("metadata", {}).get("orphan_recovery")) for row in chat.records))
+        self.assertEqual(1, sum(bool((row.get("metadata") or {}).get("orphan_recovery")) for row in chat.records))
         handler.state.kimi_recovery_token = "other"
         handler._handle_kimi_chat_stop("orphan-ts")
         self.assertEqual(409, handler.responses[-1][0])

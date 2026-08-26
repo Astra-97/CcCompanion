@@ -1114,6 +1114,22 @@ KIMI_TERMINAL_SESSION_OPTION = "@ccc_kimi_terminal_session"
 # one early idle read into authority to terminate the pane it just submitted.
 KIMI_TERMINAL_SUBMIT_GRACE_SECONDS = 3.0
 KIMI_TERMINAL_IDLE_CONFIRMATION_GAP_SECONDS = 0.5
+# Kimi 私聊消息排队：活跃回复轮或 prepare/recovery/acquire 过渡态期间新
+# 消息不再 409 拒绝，入库入队后由 worker 在空闲时按序自动发出。队列有界，
+# 满了才返回 429；重投次数有上限，超限落失败卡片，绝不静默吞消息。
+KIMI_CHAT_QUEUE_MAX = 20
+KIMI_CHAT_QUEUE_MAX_ATTEMPTS = 3
+# 终端输入排队：只读 capture 永不拒绝；忙时输入不 423，排队等终端就绪后
+# 按序投递。投递固定走正常发送路径重入，保序用 appendleft 放回队首。
+# 重试按排队时长兜底（一轮长回复可能数分钟），不用固定次数，避免长生成
+# 期间把用户输入丢弃。
+TERMINAL_INPUT_QUEUE_MAX = 30
+TERMINAL_INPUT_QUEUE_TTL_SECONDS = 900.0
+TERMINAL_INPUT_QUEUE_RETRY_SECONDS = 0.75
+# 中断类控制键（Kimi 终端）忙时直达 owned pane，不排队：语义是"立即打断"，
+# 排队到就绪后才送达反而会误伤下一条 prompt。Kairos 不使用直达（C-c 会
+# 绕开 CODEX_RUNS 的中断簿记），一律排队。
+TERMINAL_INTERRUPT_KEYS = {"Escape", "C-c"}
 KAIROS_TERMINAL_COMPAT_LOCK_WAIT_TEXT = (
     "旧版 standalone 客户端占用兼容锁；等待它退出后自动连接…"
 )
@@ -1776,6 +1792,42 @@ class KimiTerminalBridge:
         if self.terminal_state(expected_pane) != "ready":
             raise KimiTerminalBusy("Kimi 正在回复，终端暂时只读")
         return expected_pane
+
+    def peek_owned_pane(self) -> str | None:
+        """只读返回当前 owned pane；不做 Web 会话校验，也绝不启动 TUI。
+
+        只读 capture 的忙时回退专用：acquire 被过渡态栅栏挡住时，既有 pane
+        的内容仍然可以安全展示。任何校验失败都返回 None，由调用方退化为
+        占位说明，绝不抛错打断轮询。
+        """
+        with self._lock:
+            try:
+                if not self._has_session_locked() or not self._owns_session_locked():
+                    return None
+                pane_id, pane_dead = self._pane_status_locked()
+            except Exception:
+                return None
+            return None if pane_dead else pane_id
+
+    def send_control_key(self, key_name: str) -> bool:
+        """把中断类控制键（Escape/C-c）直接发给当前 owned pane。
+
+        只读围栏保护的是文本输入的顺序与归属；中断键的语义是"立即生效"，
+        排队到就绪后再送达反而会打断下一条 prompt。这里仍做 pane 归属与
+        存活的身份校验，仅跳过 readiness 围栏；pane 不可验证时返回 False，
+        由调用方报错，绝不落到名字不精确的 tmux 目标上。
+        """
+        with self._lock:
+            if not self._has_session_locked() or not self._owns_session_locked():
+                return False
+            pane_id, pane_dead = self._pane_status_locked()
+            if pane_dead:
+                return False
+            result = self._run_tmux(["tmux", "send-keys", "-t", pane_id, key_name])
+            if result.returncode != 0:
+                raise KimiTerminalUnavailable("Kimi 终端按键失败")
+            self._touch_locked()
+            return True
 
     def _kill_exact_pane_locked(self, expected_pane: str) -> bool:
         """Kill one verified owned pane; never target the reusable session name."""
@@ -4028,6 +4080,18 @@ class ServerState:
         # Short reservation while an authenticated terminal capture verifies
         # the Web-owned session outside the turn lock.
         self.kimi_terminal_acquire_token = ""
+        # Kimi 私聊待发送队列（见 KIMI_CHAT_QUEUE_MAX）：活跃轮/过渡态期间
+        # 新消息入库后在此排队，worker 空闲时按序自动发出。仅内存态：服务
+        # 重启后由既有 orphan 恢复链路提示，不在重启后自动补发旧消息。
+        self.kimi_chat_queue: deque[dict[str, Any]] = deque()
+        self.kimi_chat_queue_worker_running = False
+        # Kimi/Kairos 终端输入队列：忙时输入不再 423，排队等终端就绪后由
+        # worker 重入正常发送路径按序投递。
+        self.terminal_input_queue_lock = threading.Lock()
+        self.kimi_terminal_input_queue: deque[dict[str, Any]] = deque()
+        self.kimi_terminal_input_worker_running = False
+        self.kairos_terminal_input_queue: deque[dict[str, Any]] = deque()
+        self.kairos_terminal_input_worker_running = False
         # A Kimi ACP process is not a tmux console.  Keep its terminal-shaped
         # UI as a separate, prompt-free observer rather than ever capturing
         # ACP stdio or giving it remote terminal input.
@@ -4622,6 +4686,26 @@ def _should_generate_chat_append_tts(
         and not attachment_url
         and enabled
     )
+
+
+class _QueuedSendResponderProxy:
+    """后台 worker 重入请求处理器时捕获 HTTP 响应，而不是写 socket。
+
+    排队消息/排队终端输入的投递直接复用正常请求路径（含全部栅栏与簿记），
+    唯一的差别是没有真实连接可写。`__getattr__` 把其余属性访问原样转发给
+    真实 handler，所以处理器内部逻辑零改动；`_send_json` 的调用结果由
+    worker 检查，用来判断投递成功、仍忙（重试）还是失败。
+    """
+
+    def __init__(self, handler: Any) -> None:
+        self._handler = handler
+        self.responses: list[tuple[int, Any]] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._handler, name)
+
+    def _send_json(self, status: int, payload: Any = None, **_kwargs: Any) -> None:
+        self.responses.append((status, payload))
 
 
 class PushHandler(BaseHTTPRequestHandler):
@@ -10915,17 +10999,96 @@ class PushHandler(BaseHTTPRequestHandler):
         quoted_ts = body.get("quoted_ts") or None
         staged_attachments = list(body.get("_pwa_staged_attachments") or [])
         attachments_committed = False
+        # 队列 worker 重入标记：`_kimi_precommitted_record` 是入队时已入库的
+        # user 消息（历史绝不重复写），`_kimi_queue_item` 是队列项本体（忙时
+        # 重投而不是再次入队新记录）。两者都只由本服务内部产生。
+        precommitted_record = body.get("_kimi_precommitted_record")
+        if not (isinstance(precommitted_record, dict) and str(precommitted_record.get("ts") or "")):
+            precommitted_record = None
+        queued_item = body.get("_kimi_queue_item")
+        if not isinstance(queued_item, dict):
+            queued_item = None
 
         def discard_uncommitted_attachments() -> None:
             if not attachments_committed:
                 self._discard_uncommitted_staged_attachments(staged_attachments)
 
-        if not text and not staged_attachments:
+        if not text and not staged_attachments and precommitted_record is None:
             self._send_json(400, {"ok": False, "error": "text or attachment required"})
             return
         link_bundle = self._kimi_link_bundle(text)
         xhs_login_card_allowed = self._kimi_xhs_login_card_allowed(link_bundle)
         metadata = merge_preview_metadata(body.get("metadata"), link_bundle)
+
+        def enqueue_busy(reason: str) -> None:
+            """忙时唯一出口：新消息入库入队（200 queued），队列重入只重投。
+
+            历史上这里一律 409 让 App 自己重试；现在排队等当前轮/过渡态结束
+            后由 worker 按序自动发出。队列满才返回 429（消息已入库并标记
+            failed，绝不静默丢失）。
+            """
+            nonlocal attachments_committed
+            if queued_item is not None:
+                kept = self._requeue_kimi_chat_turn(queued_item, reason=reason)
+                self._send_json(200, {
+                    "ok": True, "queued": kept, "record": precommitted_record, "reason": reason,
+                })
+                return
+            chat = self._chat_for_contact(contact_id)
+            primary_attachment = staged_attachments[0] if staged_attachments else {}
+            try:
+                rec = chat.append(
+                    role="user",
+                    text=text,
+                    source=self._source_for_request("kimi-web"),
+                    quoted_ts=quoted_ts,
+                    metadata=metadata,
+                    attachment_url=primary_attachment.get("attachment_url") or None,
+                    attachment_type=primary_attachment.get("type") or None,
+                    attachment_filename=primary_attachment.get("filename") or None,
+                )
+            except Exception:
+                logger.exception("Kimi Web busy-queue history append failed")
+                self._send_json(500, {"ok": False, "error": "kimi_history_unavailable"})
+                return
+            attachments_committed = True
+            position = self._enqueue_kimi_chat_turn({
+                "kind": "web",
+                "contact_id": contact_id,
+                "text": text,
+                "quoted_ts": quoted_ts,
+                "metadata": metadata,
+                "record": rec,
+                # 附件已随历史记录提交；投递时仍需原始 staged 记录喂给
+                # submit_prompt，否则排队消息的附件内容到不了 Kimi。
+                "staged_attachments": staged_attachments,
+                "attempts": 0,
+                "queued_at": str(rec.get("ts") or ""),
+            })
+            if position is None:
+                self._set_chat_failed(contact_id, user_ts=rec["ts"], source="kimi-web:queue-full")
+                self._send_json(429, {
+                    "ok": False,
+                    "error": "kimi_queue_full",
+                    "reason": "排队消息过多，请等当前回复完成后再发。",
+                    "record": rec,
+                })
+                return
+            self._set_chat_queued(
+                contact_id,
+                user_ts=str(rec.get("ts") or ""),
+                queued_at=str(rec.get("ts") or ""),
+                queue_position=position,
+                source="cc-app:kimi-web",
+            )
+            self._send_json(200, {
+                "ok": True,
+                "queued": True,
+                "record": rec,
+                "queue_position": position,
+                "reason": reason,
+            })
+
         with self.state.kimi_turn_lock:
             if (
                 self.state.kimi_active_turn
@@ -10933,12 +11096,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 or getattr(self.state, "kimi_recovery_token", "")
                 or getattr(self.state, "kimi_terminal_acquire_token", "")
             ):
-                discard_uncommitted_attachments()
-                self._send_json(409, {
-                    "ok": False,
-                    "error": "kimi_turn_active",
-                    "reason": "Stop the current Kimi reply before sending another message",
-                })
+                enqueue_busy("kimi_turn_active")
                 return
             prepare_token = secrets.token_hex(16)
             self.state.kimi_prepare_token = prepare_token
@@ -10946,15 +11104,14 @@ class PushHandler(BaseHTTPRequestHandler):
             handed_off = self._handoff_kimi_terminal_to_writer(prepare_token)
         except KimiTerminalBusy:
             self._release_kimi_control(prepare_token)
-            discard_uncommitted_attachments()
-            self._send_json(409, {
-                "ok": False,
-                "error": "kimi_terminal_busy",
-                "reason": "Kimi 终端可能仍在生成；请先在终端停止或离开后再发送。",
-            })
+            enqueue_busy("kimi_terminal_busy")
             return
         if not handed_off:
             self._release_kimi_control(prepare_token)
+            if queued_item is not None:
+                self._fail_queued_kimi_chat(queued_item, "kimi_terminal_handoff_failed")
+                self._send_json(503, {"ok": False, "error": "kimi_terminal_handoff_failed"})
+                return
             discard_uncommitted_attachments()
             self._send_json(503, {"ok": False, "error": "kimi_terminal_handoff_failed"})
             return
@@ -10968,13 +11125,10 @@ class PushHandler(BaseHTTPRequestHandler):
                 logger.warning("Kimi Web idle lease reconciliation failed")
                 idle_lease = {}
             if isinstance(idle_lease, dict) and idle_lease:
+                # 残留状态已安全整理；消息不再要求用户重发，排队自动重投。
                 self._mark_kimi_orphan_terminal(idle_lease, outcome="failed")
                 self._release_kimi_control(prepare_token)
-                discard_uncommitted_attachments()
-                self._send_json(409, {
-                    "ok": False, "error": "kimi_web_orphan_recovered_retry",
-                    "reason": "已整理上一轮 Kimi 的残留状态；请重新发送这条消息。",
-                })
+                enqueue_busy("kimi_web_orphan_recovered_retry")
                 return
         # Capture the active-session pointer before preparation so the two
         # silent recovery swaps below (stale/deleted pointer after a Kimi Web
@@ -10994,13 +11148,10 @@ class PushHandler(BaseHTTPRequestHandler):
         except KimiWebSessionBusy as exc:
             recovery, recovered_lease = self._recover_orphaned_kimi_web_prompt(web, exc.session_id, prepare_token)
             if recovery == "recovered":
+                # 上一轮已安全回收；消息不再要求用户重发，排队自动重投。
                 self._mark_kimi_orphan_terminal(recovered_lease, outcome="interrupted")
                 self._release_kimi_control(prepare_token)
-                discard_uncommitted_attachments()
-                self._send_json(409, {
-                    "ok": False, "error": "kimi_web_orphan_recovered_retry",
-                    "reason": "上一轮 Kimi 已安全回收；请重新发送这条消息。",
-                })
+                enqueue_busy("kimi_web_orphan_recovered_retry")
                 return
             # Kimi Web can retain a false ``busy`` flag after the process that
             # started a background wait is gone.  Only the prepare reservation
@@ -11028,6 +11179,10 @@ class PushHandler(BaseHTTPRequestHandler):
                         pass
                     except KimiWebError:
                         self._release_kimi_control(prepare_token)
+                        if queued_item is not None:
+                            kept = self._requeue_kimi_chat_turn(queued_item, reason="kimi_web_recovery_failed")
+                            self._send_json(200, {"ok": True, "queued": kept, "reason": "kimi_web_recovery_failed"})
+                            return
                         discard_uncommitted_attachments()
                         self._send_json(503, {
                             "ok": False,
@@ -11038,6 +11193,10 @@ class PushHandler(BaseHTTPRequestHandler):
                     except Exception:
                         logger.exception("Kimi Web stale-busy session replacement crashed")
                         self._release_kimi_control(prepare_token)
+                        if queued_item is not None:
+                            kept = self._requeue_kimi_chat_turn(queued_item, reason="kimi_web_recovery_failed")
+                            self._send_json(200, {"ok": True, "queued": kept, "reason": "kimi_web_recovery_failed"})
+                            return
                         discard_uncommitted_attachments()
                         self._send_json(503, {
                             "ok": False,
@@ -11053,27 +11212,36 @@ class PushHandler(BaseHTTPRequestHandler):
                         session_recovery = (exc.session_id, "stale_busy")
             if recovery != "replacement_created":
                 self._release_kimi_control(prepare_token)
+                if recovery in {"local_conflict", "pending", "upstream_conflict"}:
+                    # 过渡态/归属不明一律排队自动重投，不再 409 拒绝用户消息。
+                    enqueue_busy(f"kimi_web_busy_recovery_{recovery}" if recovery != "local_conflict" else "kimi_turn_active")
+                    return
+                if queued_item is not None:
+                    kept = self._requeue_kimi_chat_turn(queued_item, reason="kimi_web_recovery_failed")
+                    self._send_json(200, {"ok": True, "queued": kept, "reason": "kimi_web_recovery_failed"})
+                    return
                 discard_uncommitted_attachments()
-                status, error = (
-                    (409, "kimi_turn_active") if recovery == "local_conflict" else
-                    (409, "kimi_web_busy_recovery_pending") if recovery == "pending" else
-                    (409, "kimi_web_busy_recovery_conflict") if recovery == "upstream_conflict" else
-                    (503, "kimi_web_recovery_failed")
-                )
-                reasons = {
-                    "kimi_web_busy_recovery_pending": "上一轮 Kimi 仍在停止中，请稍后重试。",
-                    "kimi_web_busy_recovery_conflict": "检测到非本 App 可证明拥有的 Kimi 工作，未做中止。",
-                    "kimi_web_recovery_failed": "Kimi 回收暂时失败，未提交这条消息。",
-                }
-                self._send_json(status, {"ok": False, "error": error, **({"reason": reasons[error]} if error in reasons else {})})
+                self._send_json(503, {
+                    "ok": False,
+                    "error": "kimi_web_recovery_failed",
+                    "reason": "Kimi 回收暂时失败，未提交这条消息。",
+                })
                 return
         except KimiWebError:
             self._release_kimi_control(prepare_token)
+            if queued_item is not None:
+                kept = self._requeue_kimi_chat_turn(queued_item, reason="kimi_web_unavailable")
+                self._send_json(200, {"ok": True, "queued": kept, "reason": "kimi_web_unavailable"})
+                return
             discard_uncommitted_attachments()
             self._send_json(503, {"ok": False, "error": "kimi_web_unavailable"})
             return
         except Exception:
             self._release_kimi_control(prepare_token)
+            if queued_item is not None:
+                kept = self._requeue_kimi_chat_turn(queued_item, reason="kimi_web_unavailable")
+                self._send_json(200, {"ok": True, "queued": kept, "reason": "kimi_web_unavailable"})
+                return
             discard_uncommitted_attachments()
             logger.exception("Kimi Web session preparation crashed")
             self._send_json(503, {"ok": False, "error": "kimi_web_unavailable"})
@@ -11100,29 +11268,33 @@ class PushHandler(BaseHTTPRequestHandler):
         with self.state.kimi_turn_lock:
             if self.state.kimi_prepare_token != prepare_token or self.state.kimi_active_turn:
                 self._release_kimi_control(prepare_token)
-                discard_uncommitted_attachments()
-                self._send_json(409, {"ok": False, "error": "kimi_turn_active"})
+                enqueue_busy("kimi_turn_active")
                 return
             chat = self._chat_for_contact(contact_id)
-            primary_attachment = staged_attachments[0] if staged_attachments else {}
-            try:
-                rec = chat.append(
-                    role="user",
-                    text=text,
-                    source=self._source_for_request("kimi-web"),
-                    quoted_ts=quoted_ts,
-                    metadata=metadata,
-                    attachment_url=primary_attachment.get("attachment_url") or None,
-                    attachment_type=primary_attachment.get("type") or None,
-                    attachment_filename=primary_attachment.get("filename") or None,
-                )
-            except Exception:
-                logger.exception("Kimi Web history append failed")
-                self._release_kimi_control(prepare_token)
-                discard_uncommitted_attachments()
-                self._send_json(500, {"ok": False, "error": "kimi_history_unavailable"})
-                return
-            attachments_committed = True
+            if precommitted_record is not None:
+                # 队列重入：历史在入队时已写入（含附件），这里绝不重复 append。
+                rec = precommitted_record
+                attachments_committed = True
+            else:
+                primary_attachment = staged_attachments[0] if staged_attachments else {}
+                try:
+                    rec = chat.append(
+                        role="user",
+                        text=text,
+                        source=self._source_for_request("kimi-web"),
+                        quoted_ts=quoted_ts,
+                        metadata=metadata,
+                        attachment_url=primary_attachment.get("attachment_url") or None,
+                        attachment_type=primary_attachment.get("type") or None,
+                        attachment_filename=primary_attachment.get("filename") or None,
+                    )
+                except Exception:
+                    logger.exception("Kimi Web history append failed")
+                    self._release_kimi_control(prepare_token)
+                    discard_uncommitted_attachments()
+                    self._send_json(500, {"ok": False, "error": "kimi_history_unavailable"})
+                    return
+                attachments_committed = True
             cancel_event = threading.Event()
             self.state.kimi_active_turn = {
                 "user_ts": str(rec.get("ts") or ""),
@@ -11756,7 +11928,14 @@ class PushHandler(BaseHTTPRequestHandler):
         """Queue one plain-text turn into Kimi's isolated ACP session."""
         text = str(body.get("text") or "").strip()
         quoted_ts = body.get("quoted_ts") or None
-        if not text:
+        # 与 Web 路径相同的队列重入标记（ACP 是回滚通道，正常部署走 Web）。
+        precommitted_record = body.get("_kimi_precommitted_record")
+        if not (isinstance(precommitted_record, dict) and str(precommitted_record.get("ts") or "")):
+            precommitted_record = None
+        queued_item = body.get("_kimi_queue_item")
+        if not isinstance(queued_item, dict):
+            queued_item = None
+        if not text and precommitted_record is None:
             self._send_json(400, {"ok": False, "error": "text required"})
             return
         link_bundle = self._kimi_link_bundle(text)
@@ -11764,33 +11943,83 @@ class PushHandler(BaseHTTPRequestHandler):
         # User-supplied metadata is deliberately discarded. Only the server's
         # bounded link preview schema is stored alongside the Kimi message.
         metadata = merge_preview_metadata(None, link_bundle)
+
+        def enqueue_busy(reason: str) -> None:
+            """忙时唯一出口：新消息入库入队（200 queued），队列重入只重投。"""
+            if queued_item is not None:
+                kept = self._requeue_kimi_chat_turn(queued_item, reason=reason)
+                self._send_json(200, {
+                    "ok": True, "queued": kept, "record": precommitted_record, "reason": reason,
+                })
+                return
+            chat = self._chat_for_contact(contact_id)
+            try:
+                rec = chat.append(
+                    role="user",
+                    text=text,
+                    source=self._source_for_request("kimi"),
+                    quoted_ts=quoted_ts,
+                    metadata=metadata,
+                )
+            except Exception:
+                logger.exception("Kimi ACP busy-queue history append failed")
+                self._send_json(500, {"ok": False, "error": "kimi_history_unavailable"})
+                return
+            position = self._enqueue_kimi_chat_turn({
+                "kind": "acp",
+                "contact_id": contact_id,
+                "text": text,
+                "quoted_ts": quoted_ts,
+                "metadata": metadata,
+                "record": rec,
+                "attempts": 0,
+                "queued_at": str(rec.get("ts") or ""),
+            })
+            if position is None:
+                self._set_chat_failed(contact_id, user_ts=rec["ts"], source="kimi-acp:queue-full")
+                self._send_json(429, {
+                    "ok": False,
+                    "error": "kimi_queue_full",
+                    "reason": "排队消息过多，请等当前回复完成后再发。",
+                    "record": rec,
+                })
+                return
+            self._set_chat_queued(
+                contact_id,
+                user_ts=str(rec.get("ts") or ""),
+                queued_at=str(rec.get("ts") or ""),
+                queue_position=position,
+                source="cc-app:kimi",
+            )
+            self._send_json(200, {
+                "ok": True,
+                "queued": True,
+                "record": rec,
+                "queue_position": position,
+                "reason": reason,
+            })
+
         with self.state.kimi_turn_lock:
             if (
                 self.state.kimi_active_turn
                 or self.state.kimi_prepare_token
                 or getattr(self.state, "kimi_terminal_acquire_token", "")
             ):
-                self._send_json(409, {
-                    "ok": False,
-                    "error": "kimi_turn_active",
-                    "reason": "Stop the current Kimi reply before sending another message",
-                })
+                enqueue_busy("kimi_turn_active")
                 return
             prepare_token = secrets.token_hex(16)
             self.state.kimi_prepare_token = prepare_token
 
         try:
             handed_off = self._handoff_kimi_terminal_to_writer(prepare_token)
-        except KimiTerminalBusy as exc:
+        except KimiTerminalBusy:
             self._release_kimi_control(prepare_token)
-            self._send_json(409, {
-                "ok": False,
-                "error": "kimi_terminal_busy",
-                "reason": str(exc),
-            })
+            enqueue_busy("kimi_terminal_busy")
             return
         if not handed_off:
             self._release_kimi_control(prepare_token)
+            if queued_item is not None:
+                self._fail_queued_kimi_chat(queued_item, "kimi_terminal_handoff_failed")
             self._send_json(503, {
                 "ok": False,
                 "error": "kimi_terminal_handoff_failed",
@@ -11827,27 +12056,27 @@ class PushHandler(BaseHTTPRequestHandler):
             if self.state.kimi_prepare_token != prepare_token or self.state.kimi_active_turn:
                 self._release_kimi_control(prepare_token)
                 self.state.kimi_acp.close()
-                self._send_json(409, {
-                    "ok": False,
-                    "error": "kimi_turn_active",
-                    "reason": "Kimi 会话准备状态已变化，本次消息未发送。",
-                })
+                enqueue_busy("kimi_turn_active")
                 return
             chat = self._chat_for_contact(contact_id)
-            try:
-                rec = chat.append(
-                    role="user",
-                    text=text,
-                    source=self._source_for_request("kimi"),
-                    quoted_ts=quoted_ts,
-                    metadata=metadata,
-                )
-            except Exception:
-                logger.exception("Kimi history append failed")
-                self._release_kimi_control(prepare_token)
-                self.state.kimi_acp.close()
-                self._send_json(500, {"ok": False, "error": "kimi_history_unavailable"})
-                return
+            if precommitted_record is not None:
+                # 队列重入：历史在入队时已写入，这里绝不重复 append。
+                rec = precommitted_record
+            else:
+                try:
+                    rec = chat.append(
+                        role="user",
+                        text=text,
+                        source=self._source_for_request("kimi"),
+                        quoted_ts=quoted_ts,
+                        metadata=metadata,
+                    )
+                except Exception:
+                    logger.exception("Kimi history append failed")
+                    self._release_kimi_control(prepare_token)
+                    self.state.kimi_acp.close()
+                    self._send_json(500, {"ok": False, "error": "kimi_history_unavailable"})
+                    return
             cancel_event = threading.Event()
             self.state.kimi_active_turn = {
                 "user_ts": str(rec.get("ts") or ""),
@@ -12630,8 +12859,21 @@ class PushHandler(BaseHTTPRequestHandler):
             return True, "stopped"
         return False, outcome
 
-    def _handle_kimi_chat_stop(self, user_ts: str) -> None:
+    def _handle_kimi_chat_stop(self, user_ts: str, body: dict[str, Any] | None = None) -> None:
+        # 停止链路的排队清空途径：body.clear_queued=True 时先把待发送队列里
+        # 的消息标记 interrupted 并清空，再执行本轮停止语义。排队消息是用户
+        # 明确发出去的，普通 Stop 不会动它们，必须显式要求。
+        clear_queued = bool((body or {}).get("clear_queued"))
+        cleared_queued = self._clear_kimi_chat_queue() if clear_queued else 0
         if not user_ts:
+            if clear_queued:
+                self._send_json(200, {
+                    "ok": True,
+                    "stopped": False,
+                    "cleared_queued": cleared_queued,
+                    "message": f"已清空 {cleared_queued} 条排队消息。",
+                })
+                return
             self._send_json(400, {
                 "ok": False,
                 "error": "missing_turn_identity",
@@ -12667,11 +12909,13 @@ class PushHandler(BaseHTTPRequestHandler):
             if stopped:
                 self._send_json(200, {
                     "ok": True, "stopped": True, "user_ts": user_ts, "message": "已停止 Kimi 生成。",
+                    **({"cleared_queued": cleared_queued} if clear_queued else {}),
                 })
             elif outcome == "none":
                 self._send_json(200, {
                     "ok": True, "stopped": False, "already_finished": True,
                     "message": "这轮 Kimi 生成已经结束。",
+                    **({"cleared_queued": cleared_queued} if clear_queued else {}),
                 })
             elif outcome in {"conflict", "pending"}:
                 self._send_json(409, {"ok": False, "error": "kimi_web_busy_recovery_pending"})
@@ -12750,6 +12994,7 @@ class PushHandler(BaseHTTPRequestHandler):
             "stopped": True,
             "user_ts": active_ts,
             "message": "已停止 Kimi 生成。",
+            **({"cleared_queued": cleared_queued} if clear_queued else {}),
         })
 
     def _load_codex_target(self) -> tuple[str | None, Path]:
@@ -13790,6 +14035,289 @@ class PushHandler(BaseHTTPRequestHandler):
             if self.state.kimi_prepare_token == token:
                 self.state.kimi_prepare_token = ""
 
+    # ---------- Kimi 私聊消息排队（忙时不 409，轮结束自动发送） ----------
+
+    def _kimi_chat_queue(self) -> deque[dict[str, Any]]:
+        """惰性兼容测试夹具的队列访问；真实 ServerState 已在 __init__ 建好。"""
+        queue = getattr(self.state, "kimi_chat_queue", None)
+        if queue is None:
+            queue = deque()
+            self.state.kimi_chat_queue = queue
+        return queue
+
+    def _kimi_chat_idle_locked(self) -> bool:
+        """调用方须持有 kimi_turn_lock。所有 writer/过渡预约都空闲才可投递。"""
+        return not (
+            self.state.kimi_active_turn
+            or self.state.kimi_prepare_token
+            or getattr(self.state, "kimi_recovery_token", "")
+            or getattr(self.state, "kimi_terminal_acquire_token", "")
+        )
+
+    def _push_kimi_chat_queue_locked(self, item: dict[str, Any]) -> int | None:
+        """入队并按需唤醒 worker；返回队列位置，满则 None。须持有 turn lock。"""
+        queue = self._kimi_chat_queue()
+        if len(queue) >= KIMI_CHAT_QUEUE_MAX:
+            return None
+        queue.append(item)
+        position = len(queue)
+        if not getattr(self.state, "kimi_chat_queue_worker_running", False):
+            self.state.kimi_chat_queue_worker_running = True
+            threading.Thread(target=self._kimi_chat_queue_worker, daemon=True).start()
+        return position
+
+    def _enqueue_kimi_chat_turn(self, item: dict[str, Any]) -> int | None:
+        with self.state.kimi_turn_lock:
+            return self._push_kimi_chat_queue_locked(item)
+
+    def _requeue_kimi_chat_turn(self, item: dict[str, Any], *, reason: str) -> bool:
+        """过渡态重投：attempts 超限或队列满则落失败卡片，不再占用队列。"""
+        item["attempts"] = int(item.get("attempts") or 0) + 1
+        if item["attempts"] > KIMI_CHAT_QUEUE_MAX_ATTEMPTS:
+            self._fail_queued_kimi_chat(item, reason)
+            return False
+        with self.state.kimi_turn_lock:
+            position = self._push_kimi_chat_queue_locked(item)
+        if position is None:
+            self._fail_queued_kimi_chat(item, "kimi_queue_full")
+            return False
+        return True
+
+    def _fail_queued_kimi_chat(self, item: dict[str, Any], reason: str) -> None:
+        """排队消息最终失败：历史里留下可见的失败说明，绝不静默吞掉。"""
+        kind = str(item.get("kind") or "web")
+        record = item.get("record") if isinstance(item.get("record"), dict) else {}
+        user_ts = str(record.get("ts") or item.get("user_ts") or "")
+        logger.warning("Kimi queued %s send failed permanently reason=%s user_ts=%s", kind, reason, user_ts)
+        try:
+            if kind == "group":
+                self.state.group_chat.append(
+                    "kimi",
+                    "（这条 @Kimi 的群聊消息在等待期间多次遇到状态切换，未能送出，请重新 @ 一次。）",
+                    source="system:group:kimi-queue-failed",
+                )
+                return
+            contact_id = str(item.get("contact_id") or "kimi")
+            chat = self._chat_for_contact(contact_id)
+            chat.append(
+                role="assistant",
+                text="这条消息在 Kimi 状态切换期间多次未能送出，请重新发送一次。",
+                source="kimi-web:queue-failed",
+                metadata={"kimi_user_ts": user_ts, "turn_terminal": True},
+            )
+            if user_ts:
+                self._set_chat_failed(contact_id, user_ts=user_ts, source="kimi-web:queue-failed")
+        except Exception:
+            logger.warning("Kimi queued-send failure note append failed", exc_info=True)
+
+    def _kimi_chat_queue_worker(self) -> None:
+        """串行投递待发送队列：只在完全空闲时弹出一条，重入正常发送管线。
+
+        不挂任何轮结束钩子——worker 以 0.5s 轮询空闲态，活跃轮、prepare、
+        recovery、终端 acquire 任一存在都继续等待，因此过渡态下的消息既不
+        丢失也不乱序。重投（requeue）由处理器内部的忙时分支完成，worker
+        只负责在两次尝试之间退避，避免状态持续冲突时空转。
+        """
+        while True:
+            with self.state.kimi_turn_lock:
+                queue = self._kimi_chat_queue()
+                if not queue:
+                    self.state.kimi_chat_queue_worker_running = False
+                    return
+                item = queue.popleft() if self._kimi_chat_idle_locked() else None
+            if item is None:
+                time.sleep(0.5)
+                continue
+            outcome = self._dispatch_queued_kimi_chat(item)
+            if outcome == "requeued":
+                time.sleep(min(1.0 * max(1, int(item.get("attempts") or 1)), 5.0))
+
+    def _dispatch_queued_kimi_chat(self, item: dict[str, Any]) -> str:
+        """投递一条排队消息；返回 started / requeued / failed 供 worker 退避。"""
+        kind = str(item.get("kind") or "web")
+        if kind == "group":
+            try:
+                self._start_group_kimi_reply(
+                    self.state.group_chat,
+                    str(item.get("text") or ""),
+                    sender_name=str(item.get("sender_name") or "Astra"),
+                    user_ts=str(item.get("user_ts") or ""),
+                    hop_count=int(item.get("hop_count") or 0),
+                    attachments=item.get("attachments"),
+                )
+            except Exception:
+                logger.exception("queued group Kimi reply dispatch crashed")
+                return "failed"
+            return "started"
+        contact_id = str(item.get("contact_id") or "kimi")
+        record = item.get("record") if isinstance(item.get("record"), dict) else None
+        if not record or not str(record.get("ts") or ""):
+            logger.warning("queued Kimi send lacks a committed history record, dropped")
+            return "failed"
+        proxy = _QueuedSendResponderProxy(self)
+        body = {
+            "text": str(item.get("text") or ""),
+            "quoted_ts": item.get("quoted_ts"),
+            "metadata": item.get("metadata"),
+            "_pwa_staged_attachments": list(item.get("staged_attachments") or []),
+            "_kimi_precommitted_record": record,
+            "_kimi_queue_item": item,
+        }
+        try:
+            if kind == "acp":
+                proxy._handle_kimi_acp_chat_send(body, contact_id)
+            else:
+                web = getattr(self.state, "kimi_web", None)
+                if not all(callable(getattr(web, name, None)) for name in (
+                    "ensure_active_session", "submit_prompt", "stream_session",
+                )):
+                    self._fail_queued_kimi_chat(item, "kimi_web_unavailable")
+                    return "failed"
+                proxy._handle_kimi_web_chat_send(body, contact_id, web)
+        except Exception:
+            logger.exception("queued Kimi send dispatch crashed")
+            self._fail_queued_kimi_chat(item, "dispatch_crashed")
+            return "failed"
+        for status, payload in proxy.responses:
+            if status == 200 and isinstance(payload, dict) and payload.get("turn"):
+                return "started"
+        # 处理器内部的忙时分支会重投并响应 200 queued（无 turn）；其余非
+        # 成功出口（503/失败卡片）视为本次投递终结，worker 不额外退避。
+        saw_queued = any(
+            status == 200 and isinstance(payload, dict) and payload.get("queued")
+            for status, payload in proxy.responses
+        )
+        return "requeued" if saw_queued else "failed"
+
+    def _clear_kimi_chat_queue(self) -> int:
+        """Stop 链路的队列清空途径：排队消息标记为 interrupted，返回条数。"""
+        with self.state.kimi_turn_lock:
+            queue = self._kimi_chat_queue()
+            items = list(queue)
+            queue.clear()
+        for item in items:
+            if str(item.get("kind") or "") == "group":
+                continue
+            record = item.get("record") if isinstance(item.get("record"), dict) else {}
+            user_ts = str(record.get("ts") or "")
+            if not user_ts:
+                continue
+            try:
+                self._set_chat_interrupted(
+                    str(item.get("contact_id") or "kimi"),
+                    user_ts=user_ts,
+                    source="cc-app:kimi:cancelled-before-run",
+                )
+            except Exception:
+                logger.debug("queued Kimi send interrupt-mark failed", exc_info=True)
+        return len(items)
+
+    # ---------- 终端输入排队（忙时不 423，就绪后按序投递） ----------
+
+    def _enqueue_terminal_input(self, target: str, endpoint: str, body: dict[str, Any]) -> int | None:
+        """把一条终端输入放入目标队列并唤醒 worker；返回位置，满则 None。"""
+        queue_attr = f"{target}_terminal_input_queue"
+        running_attr = f"{target}_terminal_input_worker_running"
+        lock = getattr(self.state, "terminal_input_queue_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self.state.terminal_input_queue_lock = lock
+        with lock:
+            queue = getattr(self.state, queue_attr, None)
+            if queue is None:
+                queue = deque()
+                setattr(self.state, queue_attr, queue)
+            if len(queue) >= TERMINAL_INPUT_QUEUE_MAX:
+                return None
+            queue.append({
+                "endpoint": endpoint,
+                "body": dict(body),
+                "attempts": 0,
+                "queued_at": datetime.now(timezone.utc).isoformat(),
+                "queued_monotonic": time.monotonic(),
+            })
+            position = len(queue)
+            if not getattr(self.state, running_attr, False):
+                setattr(self.state, running_attr, True)
+                threading.Thread(target=self._terminal_input_worker, args=(target,), daemon=True).start()
+            return position
+
+    def _terminal_input_worker(self, target: str) -> None:
+        """按序投递排队输入：重入正常发送路径；仍忙则放回队首稍候重试。
+
+        重入体带 `_queued_terminal_retry` 标记，忙时分支对它保留旧的错误
+        响应（由代理捕获）而不是再次入队，避免 worker 自我循环。失败投递
+        有次数上限，超限丢弃并记日志——终端输入不在聊天历史里，丢弃不会
+        静默吞掉用户消息。
+        """
+        queue_attr = f"{target}_terminal_input_queue"
+        running_attr = f"{target}_terminal_input_worker_running"
+        lock = self.state.terminal_input_queue_lock
+        while True:
+            with lock:
+                queue = getattr(self.state, queue_attr)
+                if not queue:
+                    setattr(self.state, running_attr, False)
+                    return
+                item = queue.popleft()
+            if self._deliver_queued_terminal_input(item):
+                continue
+            item["attempts"] = int(item.get("attempts") or 0) + 1
+            age = time.monotonic() - float(item.get("queued_monotonic") or time.monotonic())
+            if age >= TERMINAL_INPUT_QUEUE_TTL_SECONDS:
+                logger.warning(
+                    "queued %s terminal input dropped after %.0fs / %s attempts",
+                    target, age, item["attempts"],
+                )
+                continue
+            with lock:
+                queue.appendleft(item)
+            time.sleep(TERMINAL_INPUT_QUEUE_RETRY_SECONDS)
+
+    def _deliver_queued_terminal_input(self, item: dict[str, Any]) -> bool:
+        proxy = _QueuedSendResponderProxy(self)
+        body = dict(item.get("body") or {})
+        body["_queued_terminal_retry"] = True
+        try:
+            if str(item.get("endpoint") or "") == "key":
+                proxy._handle_terminal_key(body)
+            else:
+                proxy._handle_tmux_send(body)
+        except Exception:
+            logger.exception("queued terminal input delivery crashed")
+            return False
+        return any(status == 200 for status, _payload in proxy.responses)
+
+    def _enqueue_or_report_terminal_input(
+        self,
+        target: str,
+        endpoint: str,
+        body: dict[str, Any],
+        *,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """终端输入忙时分支的统一出口：worker 重试保留错误，用户请求入队。"""
+        if body.get("_queued_terminal_retry"):
+            # worker 重入：不再次入队，返回忙态错误供 worker 判断重试。
+            self._send_json(503, {"ok": False, "error": "terminal_busy_retry", "target": target})
+            return
+        position = self._enqueue_terminal_input(target, endpoint, body)
+        if position is None:
+            self._send_json(429, {
+                "ok": False,
+                "error": "terminal_input_queue_full",
+                "target": target,
+                "reason": "排队输入过多，请稍后再试。",
+            })
+            return
+        self._send_json(200, {
+            "ok": True,
+            "queued": True,
+            "queue_position": position,
+            "session": target,
+            **(extra or {}),
+        })
+
     def _handoff_kimi_terminal_to_writer(self, prepare_token: str) -> bool:
         """Release an idle TUI after reserving a Web/ACP writer, without lock inversion.
 
@@ -14000,6 +14528,8 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _send_kimi_terminal_unavailable(self, exc: KimiTerminalUnavailable) -> None:
         if isinstance(exc, KimiTerminalBusy):
+            # 423 对用户入口已彻底消失（capture 只读放行、输入排队）；此分支
+            # 只剩 worker 内部重试等防御性调用，保留原语义供其识别忙态。
             self._send_json(423, {
                 "ok": False,
                 "error": "kimi_busy",
@@ -14008,11 +14538,14 @@ class PushHandler(BaseHTTPRequestHandler):
             })
             return
         if isinstance(exc, KimiTerminalNoActiveSession):
+            # 确实无任何会话才报错；携带自愈信息让前端能直接引导恢复。
             self._send_json(409, {
                 "ok": False,
                 "error": "no_active_kimi_session",
                 "target": KIMI_TERMINAL_ALIAS,
                 "message": str(exc),
+                "recoverable": True,
+                "hint": "在 Kimi 聊天页发送一条消息即可创建会话，终端随后会自动接上。",
             })
             return
         self._send_json(503, {"error": str(exc), "target": KIMI_TERMINAL_ALIAS})
@@ -16325,12 +16858,37 @@ class PushHandler(BaseHTTPRequestHandler):
         """Reply in apples through the same Web session without re-appending its user row."""
         attachments = list(attachments or [])
         with self.state.kimi_turn_lock:
-            if self.state.kimi_active_turn or self.state.kimi_prepare_token:
-                chat.append(role="system", text="Kimi 正在处理另一条消息。", source="system:group:kimi", sender_id="system", sender_name="系统")
-                self._set_typing_for_contact("apples", {"is_typing": False, "since": None})
-                return
-            token = secrets.token_hex(16)
-            self.state.kimi_prepare_token = token
+            busy = bool(
+                self.state.kimi_active_turn
+                or self.state.kimi_prepare_token
+                or getattr(self.state, "kimi_recovery_token", "")
+                or getattr(self.state, "kimi_terminal_acquire_token", "")
+            )
+            token = "" if busy else secrets.token_hex(16)
+            if token:
+                self.state.kimi_prepare_token = token
+        if busy:
+            # 群入口同样不丢消息：忙时入队，当前轮/过渡态结束后 worker 自动
+            # 按序重入本函数发出。队列满才退回旧的系统提示行为。
+            position = self._enqueue_kimi_chat_turn({
+                "kind": "group",
+                "contact_id": "apples",
+                "text": text,
+                "sender_name": sender_name,
+                "user_ts": user_ts,
+                "hop_count": hop_count,
+                "attachments": attachments,
+                "attempts": 0,
+                "queued_at": user_ts,
+            })
+            note = (
+                "Kimi 正在处理另一条消息，这条已排队，会在它完成后自动回复。"
+                if position is not None else
+                "Kimi 正在处理另一条消息，且排队已满，这条没能送入队列。"
+            )
+            chat.append(role="system", text=note, source="system:group:kimi", sender_id="system", sender_name="系统")
+            self._set_typing_for_contact("apples", {"is_typing": False, "since": None})
+            return
         try:
             model, effort = self._kimi_selection()
             session_id = self.state.kimi_web.ensure_active_session(model=model, thinking=effort)
@@ -21238,14 +21796,91 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         self._handle_tmux_capture_transaction(requested_session, lines)
 
+    def _kimi_capture_readonly_fallback(self, lines: int, message: str, *, no_session: bool = False) -> None:
+        """只读 capture 的忙时/无会话回退：任何状态下都返回 200，绝不 423/409。
+
+        已有 owned pane 时直接捕获其内容（纯只读，不做会话校验、不启动
+        TUI），并附带 busy 标志供前端展示；没有 pane 时返回一条占位说明，
+        前端照常轮询，状态恢复后自然接上。无会话时额外带 error 字段帮助
+        前端自愈（提示去聊天页发一条消息即可创建会话）。
+        """
+        terminal = getattr(self.state, "kimi_terminal", None)
+        peek = getattr(terminal, "peek_owned_pane", None)
+        pane = ""
+        if callable(peek):
+            try:
+                pane = str(peek() or "")
+            except Exception:
+                pane = ""
+        content = ""
+        terminal_state = "waiting"
+        lease = ""
+        if pane:
+            try:
+                result = subprocess.run(
+                    ["tmux", "capture-pane", "-t", pane, "-p", "-S", str(-lines)],
+                    capture_output=True, text=True, timeout=3,
+                )
+                if result.returncode == 0:
+                    content = _trim_terminal_capture(result.stdout)
+            except Exception:
+                content = ""
+            state_for_pane = getattr(terminal, "terminal_state", None)
+            if callable(state_for_pane):
+                try:
+                    terminal_state = state_for_pane(pane)
+                except KimiTerminalUnavailable:
+                    terminal_state = "waiting"
+                except Exception:
+                    terminal_state = "waiting"
+            lease_for_pane = getattr(terminal, "lease_for_pane", None)
+            if callable(lease_for_pane):
+                try:
+                    lease = lease_for_pane(pane)
+                except Exception:
+                    lease = ""
+            touch = getattr(terminal, "touch", None)
+            if callable(touch):
+                try:
+                    touch()
+                except Exception:
+                    pass
+        if not content.strip():
+            content = (
+                "当前没有可恢复的 Kimi 会话；在聊天页发一条消息即可创建。\n"
+                if no_session
+                else f"{message or 'Kimi 终端正在切换状态，请稍候…'}\n"
+            )
+        payload: dict[str, Any] = {
+            "ok": True,
+            "session": KIMI_TERMINAL_ALIAS,
+            "content": content,
+            "state": terminal_state,
+            "busy": True,
+            "message": message,
+        }
+        if lease:
+            payload["lease"] = lease
+        if no_session:
+            payload["error"] = "no_active_kimi_session"
+        self._send_json(200, payload)
+
     def _handle_tmux_capture_transaction(self, requested_session: str, lines: int) -> None:
         try:
             session, public_session, is_kairos = self._resolve_terminal_session(requested_session)
         except KairosTerminalUnavailable as exc:
             self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
             return
+        except KimiTerminalBusy as exc:
+            # 只读捕获永不拒绝：忙时尽力展示既有 pane 内容，附 busy 标志。
+            self._kimi_capture_readonly_fallback(lines, str(exc))
+            return
+        except KimiTerminalNoActiveSession as exc:
+            # 无会话也不报错：有 pane 展示 pane，没有则给自愈提示。
+            self._kimi_capture_readonly_fallback(lines, str(exc), no_session=True)
+            return
         except KimiTerminalUnavailable as exc:
-            self._send_kimi_terminal_unavailable(exc)
+            self._send_json(503, {"error": str(exc), "target": KIMI_TERMINAL_ALIAS})
             return
         kimi_lease = ""
         try:
@@ -21385,8 +22020,34 @@ class PushHandler(BaseHTTPRequestHandler):
             except KairosTerminalUnavailable as exc:
                 self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
                 return
+            except (KimiTerminalBusy, KimiTerminalNoActiveSession):
+                # resize 是幂等布局操作：忙时/无会话时对既有 pane 尽力执行，
+                # 没有 pane 则安然忽略（下一次成功操作会带上新尺寸），
+                # 这种纯布局请求绝不 423/409。
+                pane = ""
+                peek = getattr(self.state.kimi_terminal, "peek_owned_pane", None)
+                if callable(peek):
+                    try:
+                        pane = str(peek() or "")
+                    except Exception:
+                        pane = ""
+                if pane:
+                    try:
+                        subprocess.run(
+                            ["tmux", "resize-window", "-t", pane, "-x", str(columns), "-y", str(rows)],
+                            capture_output=True, text=True, timeout=3,
+                        )
+                        self.state.kimi_terminal.touch()
+                    except Exception:
+                        pass
+                self._send_json(200, {
+                    "ok": True, "session": KIMI_TERMINAL_ALIAS,
+                    "columns": columns, "rows": rows,
+                    "deferred": not pane,
+                })
+                return
             except KimiTerminalUnavailable as exc:
-                self._send_kimi_terminal_unavailable(exc)
+                self._send_json(503, {"error": str(exc), "target": KIMI_TERMINAL_ALIAS})
                 return
             try:
                 result = subprocess.run(
@@ -21440,10 +22101,46 @@ class PushHandler(BaseHTTPRequestHandler):
                 require_ready=True,
             )
         except KairosTerminalNotReady as exc:
-            self._send_kairos_terminal_not_ready(exc)
+            # Kairos 回复中不再 423：输入进队列，就绪后由 worker 按序投递。
+            if body.get("_queued_terminal_retry"):
+                self._send_kairos_terminal_not_ready(exc)
+                return
+            self._enqueue_or_report_terminal_input(
+                KAIROS_TERMINAL_ALIAS,
+                "key",
+                {"session": requested_session, "key": key_name},
+                extra={"key": key_name},
+            )
             return
         except KairosTerminalUnavailable as exc:
             self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
+            return
+        except KimiTerminalBusy as exc:
+            if body.get("_queued_terminal_retry"):
+                self._send_kimi_terminal_unavailable(exc)
+                return
+            if key_name in TERMINAL_INTERRUPT_KEYS:
+                # 中断键语义是"立即生效"：直达 owned pane（仍做身份校验），
+                # 不排队——排到就绪后才送达会误伤下一条 prompt。
+                try:
+                    injected = self.state.kimi_terminal.send_control_key(key_name)
+                except KimiTerminalUnavailable as key_exc:
+                    self._send_json(503, {"error": str(key_exc), "target": KIMI_TERMINAL_ALIAS})
+                    return
+                if not injected:
+                    self._send_json(503, {
+                        "error": "Kimi 终端 pane 不可验证，中断键未送达",
+                        "target": KIMI_TERMINAL_ALIAS,
+                    })
+                    return
+                self._send_json(200, {"ok": True, "key": key_name, "session": KIMI_TERMINAL_ALIAS, "direct": True})
+                return
+            self._enqueue_or_report_terminal_input(
+                KIMI_TERMINAL_ALIAS,
+                "key",
+                {"session": requested_session, "key": key_name},
+                extra={"key": key_name},
+            )
             return
         except KimiTerminalUnavailable as exc:
             self._send_kimi_terminal_unavailable(exc)
@@ -21523,10 +22220,44 @@ class PushHandler(BaseHTTPRequestHandler):
                     require_ready=True,
                 )
             except KairosTerminalNotReady as exc:
-                self._send_kairos_terminal_not_ready(exc)
+                if body.get("_queued_terminal_retry"):
+                    self._send_kairos_terminal_not_ready(exc)
+                    return
+                self._enqueue_or_report_terminal_input(
+                    KAIROS_TERMINAL_ALIAS,
+                    "send",
+                    {"session": str(requested_session), "key": special_key},
+                    extra={"key": special_key},
+                )
                 return
             except KairosTerminalUnavailable as exc:
                 self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
+                return
+            except KimiTerminalBusy as exc:
+                if body.get("_queued_terminal_retry"):
+                    self._send_kimi_terminal_unavailable(exc)
+                    return
+                if special_key in TERMINAL_INTERRUPT_KEYS:
+                    # 中断键直达 owned pane（仍做身份校验），不排队。
+                    try:
+                        injected = self.state.kimi_terminal.send_control_key(special_key)
+                    except KimiTerminalUnavailable as key_exc:
+                        self._send_json(503, {"error": str(key_exc), "target": KIMI_TERMINAL_ALIAS})
+                        return
+                    if not injected:
+                        self._send_json(503, {
+                            "error": "Kimi 终端 pane 不可验证，中断键未送达",
+                            "target": KIMI_TERMINAL_ALIAS,
+                        })
+                        return
+                    self._send_json(200, {"ok": True, "session": KIMI_TERMINAL_ALIAS, "key": special_key, "direct": True})
+                    return
+                self._enqueue_or_report_terminal_input(
+                    KIMI_TERMINAL_ALIAS,
+                    "send",
+                    {"session": str(requested_session), "key": special_key},
+                    extra={"key": special_key},
+                )
                 return
             except KimiTerminalUnavailable as exc:
                 self._send_kimi_terminal_unavailable(exc)
@@ -21568,10 +22299,30 @@ class PushHandler(BaseHTTPRequestHandler):
                 require_ready=True,
             )
         except KairosTerminalNotReady as exc:
-            self._send_kairos_terminal_not_ready(exc)
+            if body.get("_queued_terminal_retry"):
+                self._send_kairos_terminal_not_ready(exc)
+                return
+            # Kairos 回复中不再 423：文本输入进队列，就绪后按序投递。
+            self._enqueue_or_report_terminal_input(
+                KAIROS_TERMINAL_ALIAS,
+                "send",
+                {"session": str(requested_session), "keys": keys, "enter": enter},
+            )
             return
         except KairosTerminalUnavailable as exc:
             self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
+            return
+        except KimiTerminalBusy as exc:
+            if body.get("_queued_terminal_retry"):
+                self._send_kimi_terminal_unavailable(exc)
+                return
+            # Kimi 忙（过渡态或自有 prompt 未确认完成）：文本输入进队列，
+            # 就绪后按序投递，不再 423。
+            self._enqueue_or_report_terminal_input(
+                KIMI_TERMINAL_ALIAS,
+                "send",
+                {"session": str(requested_session), "keys": keys, "enter": enter},
+            )
             return
         except KimiTerminalUnavailable as exc:
             self._send_kimi_terminal_unavailable(exc)

@@ -683,16 +683,21 @@ class HandlerRoutingTest(unittest.TestCase):
     def test_waiting_kairos_rejects_text_and_enter_without_any_injection(
         self, run: mock.Mock, popen: mock.Mock,
     ) -> None:
+        # Kairos 回复中不再 423：输入进队列（200 queued），就绪后由 worker 按序投递。
         for body in (
             {"session": "kairos", "keys": "do not queue", "enter": True},
             {"session": "kairos", "keys": "", "enter": True},
         ):
             bridge = FakeBridge(ready=False)
             handler = self.handler(bridge)
-            handler._handle_tmux_send(body)
-            self.assertEqual(handler.responses[-1][0], 423)
-            self.assertEqual(handler.responses[-1][1]["state"], "waiting")
+            with mock.patch("push.threading.Thread"):  # 挡住 worker，避免在 mock 环境乱试
+                handler._handle_tmux_send(body)
+            status, payload = handler.responses[-1]
+            self.assertEqual(status, 200)
+            self.assertTrue(payload["queued"])
+            self.assertEqual(payload["session"], "kairos")
             self.assertEqual(bridge.ready_calls, 1)
+            self.assertEqual(len(handler.state.kairos_terminal_input_queue), 1)
         run.assert_not_called()
         popen.assert_not_called()
 
@@ -700,15 +705,23 @@ class HandlerRoutingTest(unittest.TestCase):
     def test_waiting_kairos_rejects_both_key_endpoints_without_send_keys(
         self, run: mock.Mock,
     ) -> None:
+        # 特殊键同样入队（200 queued），不在等待期间直接 send-keys。
         bridge = FakeBridge(ready=False)
         handler = self.handler(bridge)
-        handler._handle_terminal_key({"session": "kairos", "key": "Escape"})
-        self.assertEqual(handler.responses[-1][0], 423)
+        with mock.patch("push.threading.Thread"):
+            handler._handle_terminal_key({"session": "kairos", "key": "Escape"})
+        status, payload = handler.responses[-1]
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["queued"])
+        self.assertEqual(payload["key"], "Escape")
 
         bridge = FakeBridge(ready=False)
         handler = self.handler(bridge)
-        handler._handle_tmux_send({"session": "kairos", "key": "Escape"})
-        self.assertEqual(handler.responses[-1][0], 423)
+        with mock.patch("push.threading.Thread"):
+            handler._handle_tmux_send({"session": "kairos", "key": "Escape"})
+        status, payload = handler.responses[-1]
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["queued"])
         run.assert_not_called()
 
     @mock.patch("push.subprocess.Popen")

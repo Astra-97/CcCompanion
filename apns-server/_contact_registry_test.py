@@ -27,8 +27,8 @@ class FakeHandler:
     def _handle_codex_abort(self, body):
         self.calls.append(("kairos-stop", body))
 
-    def _handle_kimi_chat_stop(self, user_ts):
-        self.calls.append(("kimi-stop", user_ts))
+    def _handle_kimi_chat_stop(self, user_ts, body=None):
+        self.calls.append(("kimi-stop", user_ts, body))
 
     def _send_json(self, status, payload):
         self.responses.append((status, payload))
@@ -64,7 +64,7 @@ class ContactRegistryTest(unittest.TestCase):
         self.assertEqual("kimi", handler.calls[1][2])
         self.assertEqual(("_handle_xiaoke_chat_send", {"text": "hi"}), handler.calls[2])
         self.assertEqual("u1", handler.calls[3][1]["user_ts"])
-        self.assertEqual(("kimi-stop", "u2"), handler.calls[4])
+        self.assertEqual(("kimi-stop", "u2", {"contact_id": "kimi", "user_ts": "u2"}), handler.calls[4])
         self.assertEqual(("_handle_xiaoke_chat_stop", {"contact_id": "xiaoke", "user_ts": "u3", "session": "s"}), handler.calls[5])
 
     def test_provider_endpoint_tables_do_not_catch_unrelated_paths(self):

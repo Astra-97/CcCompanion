@@ -926,9 +926,109 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         handler.responses = []
         handler._send_json = lambda status, payload: handler.responses.append((status, payload))
         handler._handle_tmux_capture()
-        self.assertEqual(409, handler.responses[-1][0])
-        self.assertEqual("no_active_kimi_session", handler.responses[-1][1]["error"])
-        self.assertNotIn("foreign-session", json.dumps(handler.responses[-1][1]))
+        # 只读 capture 永不 409：无会话时返回 200 + error 字段和自愈引导文案。
+        self.assertEqual(200, handler.responses[-1][0])
+        payload = handler.responses[-1][1]
+        self.assertEqual("no_active_kimi_session", payload["error"])
+        self.assertTrue(payload["busy"])
+        self.assertIn("聊天页", payload["content"])
+        self.assertNotIn("foreign-session", json.dumps(payload))
+        bridge.ensure.assert_not_called()
+
+    def _busy_kimi_route_handler(self, bridge):
+        """Kimi 过渡态（prepare 预约持有中）的路由夹具：acquire 必抛 Busy。"""
+        handler = object.__new__(PushHandler)
+        handler.path = "/tmux/capture?session=kimi&lines=20"
+        web = types.SimpleNamespace(cwd="/workspace")
+        handler.state = types.SimpleNamespace(
+            default_session="cctg", active_session="cctg",
+            kimi_turn_lock=threading.RLock(), kimi_active_turn={},
+            kimi_prepare_token="held", kimi_recovery_token="",
+            kimi_terminal_acquire_token="", kimi_web=web, kimi_terminal=bridge,
+        )
+        handler.responses = []
+        handler._send_json = lambda status, payload: handler.responses.append((status, payload))
+        return handler
+
+    def test_busy_kimi_capture_returns_readonly_pane_content_with_busy_flag(self):
+        bridge = types.SimpleNamespace(
+            input_transaction=lambda: nullcontext(),
+            ensure=mock.Mock(return_value="%42"),
+            peek_owned_pane=mock.Mock(return_value="%42"),
+            terminal_state=lambda _pane: "running",
+            lease_for_pane=lambda _pane: "lease-1",
+            touch=mock.Mock(),
+        )
+        handler = self._busy_kimi_route_handler(bridge)
+        with mock.patch("push.subprocess.run") as run:
+            run.return_value = types.SimpleNamespace(returncode=0, stdout="Kimi 正在回复…\n")
+            handler._handle_tmux_capture()
+        # 忙时只读 capture 不再 423：尽力展示既有 pane 内容并带 busy 标志。
+        status, payload = handler.responses[-1]
+        self.assertEqual(200, status)
+        self.assertTrue(payload["busy"])
+        self.assertIn("Kimi 正在回复", payload["content"])
+        self.assertEqual("running", payload["state"])
+        self.assertEqual("lease-1", payload["lease"])
+        self.assertEqual("%42", run.call_args.args[0][3])
+        bridge.ensure.assert_not_called()
+        bridge.touch.assert_called_once_with()
+
+    def test_busy_kimi_capture_without_pane_returns_placeholder(self):
+        bridge = types.SimpleNamespace(
+            input_transaction=lambda: nullcontext(),
+            ensure=mock.Mock(return_value="%42"),
+            peek_owned_pane=mock.Mock(return_value=None),
+        )
+        handler = self._busy_kimi_route_handler(bridge)
+        with mock.patch("push.subprocess.run") as run:
+            handler._handle_tmux_capture()
+        status, payload = handler.responses[-1]
+        self.assertEqual(200, status)
+        self.assertTrue(payload["busy"])
+        self.assertIn("请稍候", payload["content"])
+        self.assertNotIn("error", payload)
+        run.assert_not_called()
+        bridge.ensure.assert_not_called()
+
+    def test_busy_kimi_text_input_is_queued_not_rejected(self):
+        bridge = types.SimpleNamespace(
+            input_transaction=lambda: nullcontext(),
+            ensure=mock.Mock(return_value="%42"),
+            tmux_session="ccc-kimi-terminal",
+        )
+        handler = self._busy_kimi_route_handler(bridge)
+        with mock.patch("push.subprocess.run") as run, mock.patch("push.subprocess.Popen") as popen, \
+                mock.patch("push.threading.Thread"):  # 挡住 worker，避免在 mock 环境乱试
+            handler._handle_tmux_send({"session": "kimi", "keys": "排队输入", "enter": True})
+        # 忙时文本输入不再 423：进队列，就绪后由 worker 按序投递。
+        status, payload = handler.responses[-1]
+        self.assertEqual(200, status)
+        self.assertTrue(payload["queued"])
+        self.assertEqual("kimi", payload["session"])
+        self.assertEqual(1, len(handler.state.kimi_terminal_input_queue))
+        run.assert_not_called()
+        popen.assert_not_called()
+        bridge.ensure.assert_not_called()
+
+    def test_busy_kimi_interrupt_key_goes_directly_to_owned_pane(self):
+        bridge = types.SimpleNamespace(
+            input_transaction=lambda: nullcontext(),
+            ensure=mock.Mock(return_value="%42"),
+            tmux_session="ccc-kimi-terminal",
+            send_control_key=mock.Mock(return_value=True),
+        )
+        handler = self._busy_kimi_route_handler(bridge)
+        with mock.patch("push.subprocess.run") as run, mock.patch("push.threading.Thread"):
+            handler._handle_terminal_key({"session": "kimi", "key": "C-c"})
+        # 中断键语义是"立即生效"：直达 owned pane，不排队也不 423。
+        status, payload = handler.responses[-1]
+        self.assertEqual(200, status)
+        self.assertTrue(payload["direct"])
+        self.assertEqual("C-c", payload["key"])
+        bridge.send_control_key.assert_called_once_with("C-c")
+        self.assertFalse(getattr(handler.state, "kimi_terminal_input_queue", None))
+        run.assert_not_called()
         bridge.ensure.assert_not_called()
 
     def test_prepare_reservation_during_web_validation_is_caught_before_ensure(self):
