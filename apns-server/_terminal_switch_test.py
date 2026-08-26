@@ -317,6 +317,64 @@ class BridgeLifecycleTest(unittest.TestCase):
         self.assertIsNotNone(bridge._timer)
         self.assertTrue(any(argv[1] == "kill-pane" for argv in calls))
 
+    def test_waiting_pane_input_goes_directly_to_the_owned_pane(self) -> None:
+        tmp, command = self.executable()
+        self.addCleanup(tmp.cleanup)
+        calls: list[list[str]] = []
+
+        def runner(argv: list[str], **_kwargs: object) -> types.SimpleNamespace:
+            calls.append(argv)
+            action = argv[1]
+            if action == "has-session":
+                return completed(0)
+            if action == "show-options":
+                if "-p" in argv:  # pane 级 ready 标记：仍在等待锁
+                    return completed(1)
+                return completed(0, KAIROS_TERMINAL_OWNER_VALUE + "\n")
+            if action == "display-message":
+                return completed(0, "%42|0\n")
+            return completed(0)
+
+        bridge = KairosTerminalBridge(command=command, idle_seconds=60, runner=runner)
+        self.addCleanup(bridge.release)
+
+        # 忙时文本直达 owned pane：私有 buffer + paste + Enter，跳过 ready 围栏。
+        self.assertTrue(bridge.send_text("忙时输入", True))
+        set_buffer = next(argv for argv in calls if argv[1] == "set-buffer")
+        self.assertEqual(set_buffer[-1], "忙时输入")
+        self.assertIn("--", set_buffer)
+        paste = next(argv for argv in calls if argv[1] == "paste-buffer")
+        self.assertIn("%42", paste)
+        self.assertIn("-d", paste)
+        self.assertEqual(
+            [argv for argv in calls if argv[1] == "send-keys"][-1],
+            ["tmux", "send-keys", "-t", "%42", "Enter"],
+        )
+
+        calls.clear()
+        self.assertTrue(bridge.send_control_key("Escape"))
+        self.assertIn(["tmux", "send-keys", "-t", "%42", "Escape"], calls)
+
+    def test_direct_input_fails_closed_when_pane_unverifiable(self) -> None:
+        tmp, command = self.executable()
+        self.addCleanup(tmp.cleanup)
+        calls: list[list[str]] = []
+
+        def runner(argv: list[str], **_kwargs: object) -> types.SimpleNamespace:
+            calls.append(argv)
+            if argv[1] == "has-session":
+                return completed(0)
+            if argv[1] == "show-options":
+                return completed(0, "someone-else\n")  # 归属校验失败
+            return completed(0)
+
+        bridge = KairosTerminalBridge(command=command, idle_seconds=60, runner=runner)
+        self.assertFalse(bridge.send_text("hi", True))
+        self.assertFalse(bridge.send_control_key("Escape"))
+        self.assertFalse(any(
+            argv[1] in {"set-buffer", "paste-buffer", "send-keys"} for argv in calls
+        ))
+
 
 class FakeBridge:
     def __init__(
@@ -334,6 +392,8 @@ class FakeBridge:
         self.state_calls: list[str | None] = []
         self.release_calls = 0
         self.release_if_calls: list[str] = []
+        self.control_keys: list[str] = []
+        self.text_inputs: list[tuple[str, bool]] = []
         self.input_lock = threading.Lock()
 
     def input_transaction(self):
@@ -367,6 +427,14 @@ class FakeBridge:
 
     def release_if_pane(self, expected_pane: str) -> bool:
         self.release_if_calls.append(expected_pane)
+        return True
+
+    def send_control_key(self, key_name: str) -> bool:
+        self.control_keys.append(key_name)
+        return True
+
+    def send_text(self, text: str, enter: bool) -> bool:
+        self.text_inputs.append((text, enter))
         return True
 
 
@@ -680,48 +748,47 @@ class HandlerRoutingTest(unittest.TestCase):
 
     @mock.patch("push.subprocess.Popen")
     @mock.patch("push.subprocess.run")
-    def test_waiting_kairos_rejects_text_and_enter_without_any_injection(
+    def test_waiting_kairos_text_and_enter_go_directly_to_owned_pane(
         self, run: mock.Mock, popen: mock.Mock,
     ) -> None:
-        # Kairos 回复中不再 423：输入进队列（200 queued），就绪后由 worker 按序投递。
-        for body in (
-            {"session": "kairos", "keys": "do not queue", "enter": True},
-            {"session": "kairos", "keys": "", "enter": True},
+        # Kairos 回复中不再 423 也不排队：输入直达 owned pane，由 tty 缓冲。
+        for body, expected in (
+            ({"session": "kairos", "keys": "direct while busy", "enter": True}, ("direct while busy", True)),
+            ({"session": "kairos", "keys": "", "enter": True}, ("", True)),
         ):
             bridge = FakeBridge(ready=False)
             handler = self.handler(bridge)
-            with mock.patch("push.threading.Thread"):  # 挡住 worker，避免在 mock 环境乱试
-                handler._handle_tmux_send(body)
+            handler._handle_tmux_send(body)
             status, payload = handler.responses[-1]
             self.assertEqual(status, 200)
-            self.assertTrue(payload["queued"])
+            self.assertTrue(payload["direct"])
             self.assertEqual(payload["session"], "kairos")
             self.assertEqual(bridge.ready_calls, 1)
-            self.assertEqual(len(handler.state.kairos_terminal_input_queue), 1)
+            self.assertEqual(bridge.text_inputs, [expected])
         run.assert_not_called()
         popen.assert_not_called()
 
     @mock.patch("push.subprocess.run")
-    def test_waiting_kairos_rejects_both_key_endpoints_without_send_keys(
+    def test_waiting_kairos_keys_go_directly_on_both_endpoints(
         self, run: mock.Mock,
     ) -> None:
-        # 特殊键同样入队（200 queued），不在等待期间直接 send-keys。
+        # 特殊键同样直达（200 direct），不排队也不 423。
         bridge = FakeBridge(ready=False)
         handler = self.handler(bridge)
-        with mock.patch("push.threading.Thread"):
-            handler._handle_terminal_key({"session": "kairos", "key": "Escape"})
+        handler._handle_terminal_key({"session": "kairos", "key": "Escape"})
         status, payload = handler.responses[-1]
         self.assertEqual(status, 200)
-        self.assertTrue(payload["queued"])
+        self.assertTrue(payload["direct"])
         self.assertEqual(payload["key"], "Escape")
+        self.assertEqual(bridge.control_keys, ["Escape"])
 
         bridge = FakeBridge(ready=False)
         handler = self.handler(bridge)
-        with mock.patch("push.threading.Thread"):
-            handler._handle_tmux_send({"session": "kairos", "key": "Escape"})
+        handler._handle_tmux_send({"session": "kairos", "key": "Escape"})
         status, payload = handler.responses[-1]
         self.assertEqual(status, 200)
-        self.assertTrue(payload["queued"])
+        self.assertTrue(payload["direct"])
+        self.assertEqual(bridge.control_keys, ["Escape"])
         run.assert_not_called()
 
     @mock.patch("push.subprocess.Popen")

@@ -25,6 +25,17 @@ class FakeChat:
         return list(self.records[-limit:])
 
 
+class FakeGroupChat(FakeChat):
+    """群历史 append 的前两个参数是位置参数 (role, text)。"""
+
+    def append(self, role=None, text=None, **record):
+        if role is not None:
+            record.setdefault("role", role)
+        if text is not None:
+            record.setdefault("text", text)
+        return super().append(**record)
+
+
 class _LegacyKimiACPFixtures:
     def handler(self):
         kimi = FakeChat()
@@ -1223,63 +1234,69 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         notes = [row["text"] for row in chat.records if row["role"] == "assistant"]
         self.assertTrue(any("未能送出" in note for note in notes))
 
-    def test_proven_stuck_busy_switches_session_inside_prepare_reservation_then_sends_once(self):
-        class StuckBusyWeb(FakeWebChat):
+    def test_proven_stale_busy_after_restart_reuses_session_without_notice(self):
+        class StaleBusyWeb(FakeWebChat):
             def ensure_active_session(self, *, model, thinking, **_kwargs):
                 self.calls.append(("ensure", model, thinking))
                 raise KimiWebSessionBusy("web-session-old")
             def recover_owned_orphaned_prompt(self, _lease):
                 raise AssertionError("no durable lease means the old session must not be aborted")
-            def replace_stuck_busy_session(self, session_id, **kwargs):
-                self.calls.append(("replace-stuck", session_id, dict(kwargs)))
+            def stuck_busy_predates_process(self, session_id):
+                self.calls.append(("predates", session_id))
+                return True
+            def reset_stuck_busy_session(self, session_id, **kwargs):
+                self.calls.append(("reset-stuck", session_id, dict(kwargs)))
                 self.assert_prepare_reservation()
-                return "web-session-new"
+                return session_id
 
-        handler, chat, web = self.make_handler(web=StuckBusyWeb())
+        handler, chat, web = self.make_handler(web=StaleBusyWeb())
         web.assert_prepare_reservation = lambda: self.assertTrue(
-            bool(handler.state.kimi_prepare_token), "replacement must remain inside prepare reservation",
+            bool(handler.state.kimi_prepare_token), "reset must remain inside prepare reservation",
         )
-        handler._handle_kimi_chat_send({"text": "continue after false busy"}, "kimi")
-        self.wait_idle(handler)
-
-        self.assertEqual(200, handler.responses[-1][0])
-        self.assertEqual("web-session-new", handler.responses[-1][1]["turn"]["session_id"])
-        self.assertEqual(1, [row["text"] for row in chat.records].count("continue after false busy"))
-        self.assertEqual(
-            [("replace-stuck", "web-session-old")],
-            [(row[0], row[1]) for row in web.calls if row[0] == "replace-stuck"],
-        )
-
-    def test_stuck_busy_replacement_appends_recovery_notice_and_pushes(self):
-        class StuckBusyWeb(FakeWebChat):
-            def ensure_active_session(self, *, model, thinking, **_kwargs):
-                raise KimiWebSessionBusy("web-session-old")
-            def recover_owned_orphaned_prompt(self, _lease):
-                raise AssertionError("no durable lease means the old session must not be aborted")
-            def load_active_session_id(self):
-                return "web-session-old"
-            def replace_stuck_busy_session(self, session_id, **_kwargs):
-                self.calls.append(("replace-stuck", session_id))
-                return "web-session-new"
-
-        handler, chat, web = self.make_handler(web=StuckBusyWeb())
         pushed = []
         handler._send_chat_notification = lambda title, body: pushed.append((title, body))
         handler._handle_kimi_chat_send({"text": "continue after false busy"}, "kimi")
         self.wait_idle(handler)
 
         self.assertEqual(200, handler.responses[-1][0])
-        notices = [row for row in chat.records if row.get("source") == "system:kimi-session-recovery"]
-        self.assertEqual(1, len(notices))
-        notice = notices[0]
-        self.assertEqual("assistant", notice["role"])
-        self.assertIn("web-session-old", notice["text"])
-        self.assertIn("web-session-new", notice["text"])
-        # The notice precedes the user's own message so the lost reply is explained in order.
-        user_index = next(i for i, row in enumerate(chat.records) if row["text"] == "continue after false busy")
-        self.assertLess(chat.records.index(notice), user_index)
-        self.assertEqual(1, len(pushed))
-        self.assertEqual("web-session-new", handler.responses[-1][1]["turn"]["session_id"])
+        # 假忙被证明早于本进程启动：清标记复用旧会话，不开新会话。
+        self.assertEqual("web-session-old", handler.responses[-1][1]["turn"]["session_id"])
+        self.assertEqual(1, [row["text"] for row in chat.records].count("continue after false busy"))
+        self.assertEqual(
+            [("reset-stuck", "web-session-old")],
+            [(row[0], row[1]) for row in web.calls if row[0] == "reset-stuck"],
+        )
+        # 没有会话切换，因此没有恢复通知、没有推送。
+        self.assertFalse(any(row.get("source") == "system:kimi-session-recovery" for row in chat.records))
+        self.assertEqual([], pushed)
+
+    def test_unproven_busy_after_restart_stays_fail_closed_without_new_session(self):
+        class UnprovenBusyWeb(FakeWebChat):
+            def ensure_active_session(self, *, model, thinking, **_kwargs):
+                raise KimiWebSessionBusy("web-session-old")
+            def recover_owned_orphaned_prompt(self, _lease):
+                raise AssertionError("no durable lease means the old session must not be aborted")
+            def stuck_busy_predates_process(self, _session_id):
+                return False
+            def reset_stuck_busy_session(self, *_args, **_kwargs):
+                raise AssertionError("unproven busy must never be cleared")
+            def replace_stuck_busy_session(self, *_args, **_kwargs):
+                raise AssertionError("unproven busy must never switch sessions")
+
+        handler, chat, web = self.make_handler(web=UnprovenBusyWeb())
+        pushed = []
+        handler._send_chat_notification = lambda title, body: pushed.append((title, body))
+        with patch("push.KIMI_CHAT_QUEUE_MAX_ATTEMPTS", 0):
+            handler._handle_kimi_chat_send({"text": "maybe live external work"}, "kimi")
+            # 无法证明是重启遗留的忙：不开新会话、不清标记，入库排队自动重投。
+            self.assertEqual(200, handler.responses[-1][0])
+            self.assertTrue(handler.responses[-1][1]["queued"])
+            self.assertEqual(["maybe live external work"], [row["text"] for row in chat.records])
+            self.wait_queue_drained(handler)
+        self.assertFalse(any(row.get("source") == "system:kimi-session-recovery" for row in chat.records))
+        self.assertEqual([], pushed)
+        notes = [row["text"] for row in chat.records if row["role"] == "assistant"]
+        self.assertTrue(any("未能送出" in note for note in notes))
 
     def test_stale_pointer_swap_after_restart_appends_recovery_notice(self):
         class StalePointerWeb(FakeWebChat):
@@ -1919,6 +1936,193 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.assertEqual({}, handler.state.kimi_active_turn)
         self.assertTrue(typing and typing[-1][0][1].get("is_typing") is False)
         thread_crash.assert_not_called()
+
+    def test_idle_web_send_with_pending_queue_enqueues_at_tail(self):
+        """队列非空时（worker 轮询窗口）新 Web 消息入队跟尾，不插队直达。"""
+        handler, chat, web = self.make_handler()
+        handler._kimi_chat_queue().append({
+            "kind": "web", "contact_id": "kimi", "text": "先到",
+            "record": {"ts": "ts-old"}, "staged_attachments": [], "attempts": 0,
+        })
+        with patch("push.threading.Thread"):  # 本用例只断言入队，不跑 worker
+            handler._handle_kimi_web_chat_send({"text": "后到"}, "kimi", web)
+
+        status, payload = handler.responses[-1]
+        self.assertEqual(200, status)
+        self.assertTrue(payload["queued"])
+        self.assertEqual("kimi_queue_ahead", payload["reason"])
+        queue = handler._kimi_chat_queue()
+        self.assertEqual(["先到", "后到"], [item["text"] for item in queue])
+        self.assertEqual("", handler.state.kimi_prepare_token)
+        self.assertFalse(web.calls)
+        self.assertEqual(["后到"], [row["text"] for row in chat.records])
+
+    def test_idle_acp_send_with_pending_queue_enqueues_at_tail(self):
+        """ACP 回滚通道与 Web 入口一致：队列非空时新消息入队跟尾。"""
+        handler, chat, _web = self.make_handler()
+        handler._kimi_chat_queue().append({
+            "kind": "acp", "contact_id": "kimi", "text": "先到",
+            "record": {"ts": "ts-old"}, "attempts": 0,
+        })
+        with patch("push.threading.Thread"):  # 本用例只断言入队，不跑 worker
+            handler._handle_kimi_acp_chat_send({"text": "后到"}, "kimi")
+
+        status, payload = handler.responses[-1]
+        self.assertEqual(200, status)
+        self.assertTrue(payload["queued"])
+        self.assertEqual("kimi_queue_ahead", payload["reason"])
+        self.assertEqual(["先到", "后到"], [item["text"] for item in handler._kimi_chat_queue()])
+        self.assertEqual("", handler.state.kimi_prepare_token)
+
+    def test_idle_group_reply_with_pending_queue_enqueues_at_tail(self):
+        """群入口同样保序：队列非空时新群消息入队跟尾并留一条排队提示。"""
+        handler, chat, web = self.make_handler()
+        handler._kimi_chat_queue().append({
+            "kind": "group", "contact_id": "apples", "text": "先到",
+            "sender_name": "Astra", "user_ts": "ts-old", "hop_count": 0,
+            "attachments": [], "attempts": 0,
+        })
+        with patch("push.threading.Thread"):  # 本用例只断言入队，不跑 worker
+            outcome = handler._start_group_kimi_reply(
+                chat, "后到", sender_name="Astra", user_ts="ts-new", hop_count=0,
+            )
+
+        self.assertEqual("started", outcome)
+        queue = handler._kimi_chat_queue()
+        self.assertEqual(["先到", "后到"], [item["text"] for item in queue])
+        self.assertEqual("group", queue[-1]["kind"])
+        notes = [row for row in chat.records if row.get("source") == "system:group:kimi"]
+        self.assertEqual(1, len(notes))
+        self.assertIn("已排队", notes[0]["text"])
+        self.assertEqual("", handler.state.kimi_prepare_token)
+        self.assertFalse(web.calls)
+
+    def test_chat_queue_worker_survives_a_crashed_iteration(self):
+        """worker 单次迭代崩溃只丢该条、记日志继续跑，running 标志不卡死。"""
+        handler, chat, web = self.make_handler()
+        original_dispatch = handler._dispatch_queued_kimi_chat
+        dispatched = []
+
+        def flaky_dispatch(item):
+            dispatched.append(item.get("text"))
+            if len(dispatched) == 1:
+                raise RuntimeError("transient worker crash")
+            return original_dispatch(item)
+
+        handler._dispatch_queued_kimi_chat = flaky_dispatch
+        with patch("push.threading.Thread"):  # 先入队两条，worker 由本用例手动启动
+            for text in ("崩溃条", "存活条"):
+                rec = chat.append(role="user", text=text, source="test:kimi-web")
+                handler._enqueue_kimi_chat_turn({
+                    "kind": "web", "contact_id": "kimi", "text": text,
+                    "record": rec, "staged_attachments": [], "attempts": 0,
+                })
+        self.assertTrue(handler.state.kimi_chat_queue_worker_running)
+
+        worker = threading.Thread(target=handler._kimi_chat_queue_worker, daemon=True)
+        worker.start()
+        self.wait_queue_drained(handler)
+        worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(handler.state.kimi_chat_queue_worker_running)
+        self.assertEqual(["崩溃条", "存活条"], dispatched)
+        prompts = [row[2] for row in web.calls if row[0] == "submit"]
+        self.assertEqual(1, len(prompts))
+        self.assertIn("存活条", prompts[0])
+        self.wait_idle(handler)
+
+    def test_group_reentry_requeues_without_note_spam_and_keeps_attempts(self):
+        """worker 重入再遇忙：重投保序、attempts 计数保留、不重复写排队提示。"""
+        handler, chat, web = self.make_handler()
+        handler.state.kimi_active_turn = {
+            "user_ts": "busy", "cancel_event": threading.Event(), "session_id": "s",
+        }
+        item = {
+            "kind": "group", "contact_id": "apples", "text": "@Kimi 群消息",
+            "sender_name": "Astra", "user_ts": "ts-1", "hop_count": 0,
+            "attachments": [], "attempts": 2,
+        }
+        records_before = len(chat.records)
+        with patch("push.threading.Thread"):  # 本用例只断言重投，不跑 worker
+            outcome = handler._start_group_kimi_reply(
+                chat, item["text"], sender_name="Astra", user_ts="ts-1",
+                hop_count=0, queue_item=item,
+            )
+
+        self.assertEqual("requeued", outcome)
+        self.assertEqual(3, item["attempts"])
+        queue = handler._kimi_chat_queue()
+        self.assertEqual(1, len(queue))
+        self.assertIs(item, queue[0])
+        self.assertEqual(records_before, len(chat.records))
+        self.assertFalse(web.calls)
+
+    def test_requeue_puts_item_back_at_front_in_order(self):
+        """过渡态重投放回队首：本就先到的消息不被新到消息插队。"""
+        handler, _chat, _web = self.make_handler()
+        with patch("push.threading.Thread"):  # 本用例只断言队序，不跑 worker
+            for text in ("新到一", "新到二"):
+                handler._enqueue_kimi_chat_turn({
+                    "kind": "web", "contact_id": "kimi", "text": text,
+                    "record": {"ts": f"ts-{text}"}, "staged_attachments": [], "attempts": 0,
+                })
+            older = {
+                "kind": "web", "contact_id": "kimi", "text": "先到",
+                "record": {"ts": "ts-older"}, "staged_attachments": [], "attempts": 1,
+            }
+            kept = handler._requeue_kimi_chat_turn(older, reason="kimi_turn_active")
+
+        self.assertTrue(kept)
+        self.assertEqual(2, older["attempts"])
+        self.assertEqual(
+            ["先到", "新到一", "新到二"],
+            [item["text"] for item in handler._kimi_chat_queue()],
+        )
+
+    def test_failed_queued_web_message_discards_staged_attachment_files(self):
+        """排队消息永久失败：随队 staged 附件文件一并清理，不留孤儿文件。"""
+        with tempfile.TemporaryDirectory() as directory:
+            stored_path = os.path.join(directory, "staged.png")
+            with open(stored_path, "wb") as handle:
+                handle.write(b"png")
+            handler, chat, _web = self.make_handler()
+            handler.state.attachments_dir = directory
+            item = {
+                "kind": "web", "contact_id": "kimi", "text": "带附件",
+                "record": {"ts": "ts-1"},
+                "staged_attachments": [{"stored_path": stored_path}],
+                "attempts": 3,
+            }
+            handler._fail_queued_kimi_chat(item, "kimi_turn_active")
+
+            self.assertFalse(os.path.exists(stored_path))
+            notes = [row for row in chat.records if row.get("source") == "kimi-web:queue-failed"]
+            self.assertEqual(1, len(notes))
+
+    def test_failed_queued_group_message_discards_attachment_files(self):
+        """群队列项的附件存在 attachments 键：永久失败时同样要清理文件。"""
+        with tempfile.TemporaryDirectory() as directory:
+            stored_path = os.path.join(directory, "group-staged.png")
+            with open(stored_path, "wb") as handle:
+                handle.write(b"png")
+            handler, _chat, _web = self.make_handler()
+            handler.state.attachments_dir = directory
+            handler.state.group_chat = FakeGroupChat()
+            item = {
+                "kind": "group", "contact_id": "apples", "text": "@Kimi 带附件",
+                "sender_name": "Astra", "user_ts": "ts-1", "hop_count": 0,
+                "attachments": [{"stored_path": stored_path}],
+                "attempts": 3,
+            }
+            handler._fail_queued_kimi_chat(item, "kimi_turn_active")
+
+            self.assertFalse(os.path.exists(stored_path))
+            notes = [
+                row for row in handler.state.group_chat.records
+                if row.get("source") == "system:group:kimi-queue-failed"
+            ]
+            self.assertEqual(1, len(notes))
 
 
 if __name__ == "__main__":

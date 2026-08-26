@@ -79,6 +79,7 @@ class KimiWebClient:
         start_timeout: float = 30.0,
         state_path: str | Path | None = None,
         cwd: str | Path = DEFAULT_KIMI_CWD,
+        started_at: float | None = None,
     ):
         self.command = str(Path(command).expanduser())
         self.kimi_code_home = Path(kimi_code_home).expanduser()
@@ -92,6 +93,15 @@ class KimiWebClient:
             self.state_path.with_name("kimi_web_turn_lease.json")
             if self.state_path is not None else None
         )
+        self.recovery_guard_path = (
+            self.state_path.with_name("kimi_web_recovery_guard.json")
+            if self.state_path is not None else None
+        )
+        # Process incarnation timestamp.  Server state carries no busy-since
+        # timestamp, so the client's own durable guard markers can only be
+        # judged against the moment this process started.  The parameter
+        # exists for tests; production constructs the client at startup.
+        self._started_at = float(started_at) if started_at else time.time()
         self.cwd = str(Path(cwd).expanduser().resolve())
         self._process: subprocess.Popen[str] | None = None
         self._token = ""
@@ -612,11 +622,14 @@ class KimiWebClient:
                     os.fsync(directory_fd)
                 finally:
                     os.close(directory_fd)
-                return True
             except FileNotFoundError:
                 return False
             except OSError as exc:
                 raise KimiWebError("Kimi Web turn lease could not be cleared") from exc
+        # The owned turn's lifecycle ended here; the timestamp lets a later
+        # process prove a prompt-free busy flag predates its own start.
+        self.note_turn_finished(lease["session_id"])
+        return True
 
     def set_turn_lease_state(self, *, session_id: str, prompt_id: str, state: str) -> bool:
         """Mark an exact owned prompt without ever replacing another lease."""
@@ -669,6 +682,157 @@ class KimiWebClient:
             })
             return True
 
+    # Restart-proof stale-busy guard ------------------------------------------
+    # The Web server can revive a ``busy`` flag whose prompt state is gone
+    # (its process restarted mid-wait).  The server status carries no
+    # busy-since timestamp, so whether that flag is a leftover from before
+    # *this* process started can only be judged against this client's own
+    # durable guard file.  It records the two moments this client can prove:
+    # when the last App-owned turn on a session finished (its lease was
+    # cleared) and when a busy flag was first/last observed.  Only a marker
+    # older than this process's start may promote a prompt-free busy flag to
+    # "proven stale"; anything else stays fail-closed.
+
+    @contextmanager
+    def _recovery_guard_lock(self, *, exclusive: bool):
+        if self.recovery_guard_path is None:
+            raise KimiWebError("Kimi Web recovery guard path is required")
+        self.recovery_guard_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.recovery_guard_path.with_suffix(".lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def _load_recovery_guard_unlocked(self) -> dict[str, dict[str, str]]:
+        assert self.recovery_guard_path is not None
+        try:
+            payload = json.loads(self.recovery_guard_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or payload.get("version") != 1:
+                return {}
+            sessions = payload.get("sessions")
+            if not isinstance(sessions, dict):
+                return {}
+            guard: dict[str, dict[str, str]] = {}
+            for raw_id, raw_entry in sessions.items():
+                session_id = self._valid_session_id(raw_id)
+                if not session_id or not isinstance(raw_entry, dict):
+                    continue
+                entry = {
+                    key: str(raw_entry.get(key) or "")[:32]
+                    for key in ("busy_first_seen_at", "busy_last_seen_at", "last_turn_finished_at")
+                }
+                guard[session_id] = {key: value for key, value in entry.items() if value}
+            return guard
+        except (FileNotFoundError, OSError, ValueError):
+            return {}
+
+    def _write_recovery_guard_unlocked(self, guard: dict[str, dict[str, str]]) -> None:
+        assert self.recovery_guard_path is not None
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{self.recovery_guard_path.name}.", suffix=".tmp", dir=self.recovery_guard_path.parent,
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"version": 1, "sessions": guard}, handle, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_name, self.recovery_guard_path)
+            directory_fd = os.open(self.recovery_guard_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def _update_recovery_guard(self, session_id: str, **updates: str | None) -> None:
+        """Best-effort marker write; guard failures must never break a send."""
+        session_id = self._valid_session_id(session_id)
+        if not session_id or self.recovery_guard_path is None:
+            return
+        try:
+            with self._recovery_guard_lock(exclusive=True):
+                guard = self._load_recovery_guard_unlocked()
+                entry = dict(guard.get(session_id) or {})
+                for key, value in updates.items():
+                    if value is None:
+                        entry.pop(key, None)
+                    else:
+                        entry[key] = value
+                if entry:
+                    guard[session_id] = entry
+                else:
+                    guard.pop(session_id, None)
+                self._write_recovery_guard_unlocked(guard)
+        except Exception:
+            self.logger.warning("Kimi Web recovery guard update failed", exc_info=True)
+
+    def note_turn_finished(self, session_id: str) -> None:
+        """Record that the last App-owned turn on this session ended now."""
+        self._update_recovery_guard(session_id, last_turn_finished_at=str(time.time()))
+
+    def note_busy_observed(self, session_id: str) -> None:
+        """Record a busy sighting; first-seen survives until an idle sighting."""
+        session_id = self._valid_session_id(session_id)
+        if not session_id or self.recovery_guard_path is None:
+            return
+        now = str(time.time())
+        try:
+            with self._recovery_guard_lock(exclusive=True):
+                guard = self._load_recovery_guard_unlocked()
+                entry = dict(guard.get(session_id) or {})
+                entry.setdefault("busy_first_seen_at", now)
+                entry["busy_last_seen_at"] = now
+                guard[session_id] = entry
+                self._write_recovery_guard_unlocked(guard)
+        except Exception:
+            self.logger.warning("Kimi Web recovery guard update failed", exc_info=True)
+
+    def note_session_idle(self, session_id: str) -> None:
+        """Close the busy episode once the session is proven idle again."""
+        self._update_recovery_guard(session_id, busy_first_seen_at=None, busy_last_seen_at=None)
+
+    def stuck_busy_predates_process(self, session_id: str) -> bool:
+        """True only when durable markers prove the busy predates this process.
+
+        A marker written by this same process never qualifies: it cannot
+        distinguish a pre-restart leftover from live external work started
+        after boot.  A missing or garbled guard is simply unproven.
+        """
+        session_id = self._valid_session_id(session_id)
+        if not session_id or self.recovery_guard_path is None:
+            return False
+        try:
+            with self._recovery_guard_lock(exclusive=False):
+                entry = self._load_recovery_guard_unlocked().get(session_id) or {}
+        except Exception:
+            return False
+        started = float(self._started_at or 0)
+        if started <= 0:
+            return False
+        for key in ("busy_first_seen_at", "last_turn_finished_at"):
+            try:
+                marked_at = float(entry.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+            if 0 < marked_at < started:
+                return True
+        return False
+
     def create_session(
         self,
         *,
@@ -717,7 +881,9 @@ class KimiWebClient:
                 status = {}
             if status:
                 if bool(status.get("busy")):
+                    self.note_busy_observed(session_id)
                     raise KimiWebSessionBusy(session_id)
+                self.note_session_idle(session_id)
                 return session_id
         return self.create_session(
             model=model,
@@ -855,6 +1021,74 @@ class KimiWebClient:
         if not self.compare_and_swap_active_session_id(session_id, replacement_id):
             raise KimiWebRecoveryConflict("Kimi Web active session changed before stale-busy pointer switch")
         return replacement_id
+
+    def abort_session(self, session_id: str, *, timeout: float = 10.0) -> dict[str, Any]:
+        """Session-level abort; used only after prompt-free stale-busy proof."""
+        session_id = self._valid_session_id(session_id)
+        if not session_id:
+            raise KimiWebError("session_id is required")
+        return self._request(
+            "POST",
+            f"/api/v1/sessions/{urllib.parse.quote(session_id, safe='')}:abort",
+            data={}, timeout=max(0.1, min(float(timeout), 10.0)),
+        )
+
+    def reset_stuck_busy_session(
+        self,
+        session_id: str,
+        *,
+        status_timeout: float = 0.75,
+        settle_timeout: float = 1.5,
+    ) -> str:
+        """Clear a proven stale ``busy`` flag and keep the *same* session.
+
+        This is the restart root-fix counterpart of
+        :meth:`replace_stuck_busy_session`: instead of moving the App pointer
+        to a fresh session, it aborts the zombie flag in place and reuses the
+        existing session, so the conversation continues where it was.
+        Callers must first prove via :meth:`stuck_busy_predates_process` that
+        the busy marker predates this process; this method independently
+        re-proves the unchanged pointer, the absence of a durable App lease,
+        and the absence of live prompt work (twice before the abort, once
+        after).  Any doubt raises ``KimiWebRecoveryConflict`` and leaves the
+        session and pointer untouched.
+        """
+        session_id = self._valid_session_id(session_id)
+        if not session_id:
+            raise KimiWebRecoveryConflict("Kimi Web busy session id is invalid")
+        timeout = max(0.1, min(float(status_timeout), 5.0))
+        if self.load_active_session_id() != session_id:
+            raise KimiWebRecoveryConflict("Kimi Web active session changed before stale-busy reset")
+        # This App has a single durable-turn slot.  A lease for any session is
+        # evidence of an owned turn whose lifecycle is not fully known.
+        if self.load_turn_lease():
+            raise KimiWebRecoveryConflict("Kimi Web has a durable App lease")
+        if not self._confirm_stuck_busy_without_prompt(session_id, timeout=timeout):
+            raise KimiWebRecoveryConflict("Kimi Web busy session still has prompt work or changed state")
+        try:
+            self.abort_session(session_id, timeout=max(0.1, min(10.0, timeout * 4.0)))
+        except KimiWebRequestRejected:
+            # Nothing in flight to abort; the settle check below decides.
+            pass
+        deadline = time.monotonic() + max(0.2, min(float(settle_timeout), 5.0))
+        while True:
+            status = self.get_session_status(session_id, timeout=timeout)
+            if status.get("busy") is False:
+                break
+            if time.monotonic() >= deadline:
+                raise KimiWebRecoveryConflict("Kimi Web stale busy flag did not clear")
+            time.sleep(0.1)
+        # Race fence: nothing may have started while the flag was clearing.
+        if self.load_active_session_id() != session_id:
+            raise KimiWebRecoveryConflict("Kimi Web active session changed during stale-busy reset")
+        if self.load_turn_lease():
+            raise KimiWebRecoveryConflict("Kimi Web gained a durable App lease during stale-busy reset")
+        snapshot = self.get_snapshot(session_id, timeout=timeout)
+        prompts = self.list_prompts(session_id, timeout=timeout)
+        if not self._busy_session_has_no_prompt_evidence(snapshot, prompts):
+            raise KimiWebRecoveryConflict("Kimi Web session gained prompt work during stale-busy reset")
+        self.note_session_idle(session_id)
+        return session_id
 
     @staticmethod
     def _prompt_id_from(value: Any) -> str:

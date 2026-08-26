@@ -1119,17 +1119,9 @@ KIMI_TERMINAL_IDLE_CONFIRMATION_GAP_SECONDS = 0.5
 # 满了才返回 429；重投次数有上限，超限落失败卡片，绝不静默吞消息。
 KIMI_CHAT_QUEUE_MAX = 20
 KIMI_CHAT_QUEUE_MAX_ATTEMPTS = 3
-# 终端输入排队：只读 capture 永不拒绝；忙时输入不 423，排队等终端就绪后
-# 按序投递。投递固定走正常发送路径重入，保序用 appendleft 放回队首。
-# 重试按排队时长兜底（一轮长回复可能数分钟），不用固定次数，避免长生成
-# 期间把用户输入丢弃。
-TERMINAL_INPUT_QUEUE_MAX = 30
-TERMINAL_INPUT_QUEUE_TTL_SECONDS = 900.0
-TERMINAL_INPUT_QUEUE_RETRY_SECONDS = 0.75
-# 中断类控制键（Kimi 终端）忙时直达 owned pane，不排队：语义是"立即打断"，
-# 排队到就绪后才送达反而会误伤下一条 prompt。Kairos 不使用直达（C-c 会
-# 绕开 CODEX_RUNS 的中断簿记），一律排队。
-TERMINAL_INTERRUPT_KEYS = {"Escape", "C-c"}
+# 终端输入不排队：与真实终端一致，忙时键盘字节同样直达底层 pane，由 tty
+# 缓冲到进程消费。只有 pane 归属/存活无法验证这类真实错误才返回失败，
+# 用户入口永不 423、永不等待"就绪"。
 KAIROS_TERMINAL_COMPAT_LOCK_WAIT_TEXT = (
     "旧版 standalone 客户端占用兼容锁；等待它退出后自动连接…"
 )
@@ -1353,9 +1345,12 @@ class KairosTerminalBridge:
     def require_ready(self) -> str:
         """Return the exact live pane only after qiaokairos owns the lock.
 
-        Capture is allowed during the waiting phase, but no input may enter its
-        PTY until qiaokairos has acquired and revalidated the shared session
-        pointer and published the exact pane-scoped readiness marker.
+        Capture is allowed during the waiting phase, but the default input
+        path stays fenced until qiaokairos has acquired and revalidated the
+        shared session pointer and published the exact pane-scoped readiness
+        marker.  Busy user input bypasses this fence through send_text /
+        send_control_key, which deliver straight to the verified owned pane
+        (real-terminal semantics: the tty buffers the bytes).
         """
         with self._lock:
             if not self._has_session_locked():
@@ -1375,6 +1370,62 @@ class KairosTerminalBridge:
                 )
             self._touch_locked()
             return pane_id
+
+    def send_control_key(self, key_name: str) -> bool:
+        """把按键直接发给 owned pane，跳过 readiness 围栏（忙时直达）。
+
+        与真实终端一致：等待锁期间键入的字节由 tty 缓冲，就绪后被消费。
+        仍做会话归属与 pane 存活校验；不可验证时返回 False，由调用方报错。
+        """
+        with self._lock:
+            if not self._has_session_locked() or not self._owns_session_locked():
+                return False
+            pane_id, pane_dead = self._pane_status_locked()
+            if pane_dead:
+                return False
+            result = self._run_tmux(["tmux", "send-keys", "-t", pane_id, key_name])
+            if result.returncode != 0:
+                raise KairosTerminalUnavailable("Kairos 终端按键失败")
+            self._touch_locked()
+            return True
+
+    def send_text(self, text: str, enter: bool) -> bool:
+        """把文本输入直接写进 owned pane，跳过 readiness 围栏（忙时直达）。
+
+        使用请求级私有 buffer，并发输入不会互相覆盖；tmux 失败尽力清理
+        buffer 并抛 KairosTerminalUnavailable，pane 不可验证返回 False。
+        """
+        with self._lock:
+            if not self._has_session_locked() or not self._owns_session_locked():
+                return False
+            pane_id, pane_dead = self._pane_status_locked()
+            if pane_dead:
+                return False
+            buffer_name: str | None = None
+            try:
+                if text:
+                    buffer_name = f"ccc-kairos-{secrets.token_hex(8)}"
+                    load = self._run_tmux(["tmux", "set-buffer", "-b", buffer_name, "--", text])
+                    if load.returncode != 0:
+                        raise KairosTerminalUnavailable("Kairos 终端输入失败")
+                    paste = self._run_tmux([
+                        "tmux", "paste-buffer", "-b", buffer_name, "-t", pane_id, "-p", "-d",
+                    ])
+                    if paste.returncode != 0:
+                        raise KairosTerminalUnavailable("Kairos 终端输入失败")
+                if enter:
+                    submit = self._run_tmux(["tmux", "send-keys", "-t", pane_id, "Enter"])
+                    if submit.returncode != 0:
+                        raise KairosTerminalUnavailable("Kairos 终端按键失败")
+            except Exception:
+                if buffer_name:
+                    try:
+                        self._run_tmux(["tmux", "delete-buffer", "-b", buffer_name])
+                    except Exception:
+                        pass
+                raise
+            self._touch_locked()
+            return True
 
     def terminal_state(self, *, expected_pane: str | None = None) -> tuple[str, str]:
         """Return the exact live pane and its input state.
@@ -1788,7 +1839,12 @@ class KimiTerminalBridge:
             return True
 
     def require_ready(self, expected_pane: str) -> str:
-        """Fence Kimi input behind the same state used by capture."""
+        """Fence the default Kimi input path behind the capture state.
+
+        Busy user input bypasses this fence through send_text /
+        send_control_key, which deliver straight to the verified owned pane
+        (real-terminal semantics: the tty buffers the bytes).
+        """
         if self.terminal_state(expected_pane) != "ready":
             raise KimiTerminalBusy("Kimi 正在回复，终端暂时只读")
         return expected_pane
@@ -1826,6 +1882,47 @@ class KimiTerminalBridge:
             result = self._run_tmux(["tmux", "send-keys", "-t", pane_id, key_name])
             if result.returncode != 0:
                 raise KimiTerminalUnavailable("Kimi 终端按键失败")
+            self._touch_locked()
+            return True
+
+    def send_text(self, text: str, enter: bool) -> bool:
+        """把文本输入直接写进当前 owned pane，跳过 readiness 围栏（忙时直达）。
+
+        与真实终端一致：TUI 忙时键入的字节由 tty 缓冲，轮到它时被消费。
+        归属与存活校验同 send_control_key；使用请求级私有 buffer，并发
+        输入不会互相覆盖。Enter 成功送达后按新 prompt 记账（保持不确定态
+        围栏一致）。pane 不可验证返回 False，tmux 失败抛错并清理 buffer。
+        """
+        with self._lock:
+            if not self._has_session_locked() or not self._owns_session_locked():
+                return False
+            pane_id, pane_dead = self._pane_status_locked()
+            if pane_dead:
+                return False
+            buffer_name: str | None = None
+            try:
+                if text:
+                    buffer_name = f"ccc-kimi-{secrets.token_hex(8)}"
+                    load = self._run_tmux(["tmux", "set-buffer", "-b", buffer_name, "--", text])
+                    if load.returncode != 0:
+                        raise KimiTerminalUnavailable("Kimi 终端输入失败")
+                    paste = self._run_tmux([
+                        "tmux", "paste-buffer", "-b", buffer_name, "-t", pane_id, "-p", "-d",
+                    ])
+                    if paste.returncode != 0:
+                        raise KimiTerminalUnavailable("Kimi 终端输入失败")
+                if enter:
+                    submit = self._run_tmux(["tmux", "send-keys", "-t", pane_id, "Enter"])
+                    if submit.returncode != 0:
+                        raise KimiTerminalUnavailable("Kimi 终端按键失败")
+                    self.mark_prompt_submitted()
+            except Exception:
+                if buffer_name:
+                    try:
+                        self._run_tmux(["tmux", "delete-buffer", "-b", buffer_name])
+                    except Exception:
+                        pass
+                raise
             self._touch_locked()
             return True
 
@@ -4085,13 +4182,6 @@ class ServerState:
         # 重启后由既有 orphan 恢复链路提示，不在重启后自动补发旧消息。
         self.kimi_chat_queue: deque[dict[str, Any]] = deque()
         self.kimi_chat_queue_worker_running = False
-        # Kimi/Kairos 终端输入队列：忙时输入不再 423，排队等终端就绪后由
-        # worker 重入正常发送路径按序投递。
-        self.terminal_input_queue_lock = threading.Lock()
-        self.kimi_terminal_input_queue: deque[dict[str, Any]] = deque()
-        self.kimi_terminal_input_worker_running = False
-        self.kairos_terminal_input_queue: deque[dict[str, Any]] = deque()
-        self.kairos_terminal_input_worker_running = False
         # A Kimi ACP process is not a tmux console.  Keep its terminal-shaped
         # UI as a separate, prompt-free observer rather than ever capturing
         # ACP stdio or giving it remote terminal input.
@@ -10906,17 +10996,15 @@ class PushHandler(BaseHTTPRequestHandler):
         """Append + push a notice for an automatic recovery session swap.
 
         The controlled forge pipeline (``_kimi_forge_finish_handoff``) already
-        notifies the user; the recovery swaps inside
-        ``_handle_kimi_web_chat_send`` — stale/deleted pointer or a proven
-        stale-busy flag after a Kimi Web process restart — used to be silent,
-        so Astra only saw the previous reply go missing.  There is no
-        pre-switch moment to catch here: the swap itself *is* the recovery,
-        discovered while preparing her next message.
+        notifies the user; the recovery swap inside
+        ``_handle_kimi_web_chat_send`` — a stale/deleted pointer after a Kimi
+        Web process restart — used to be silent, so Astra only saw the
+        previous reply go missing.  There is no pre-switch moment to catch
+        here: the swap itself *is* the recovery, discovered while preparing
+        her next message.  A proven stale-busy flag is instead cleared in
+        place and the old session reused, which needs no notice.
         """
-        if reason == "stale_busy":
-            opening = "Kimi 服务重启后旧会话留下了假忙标记，已安全切换到新会话"
-        else:
-            opening = "Kimi 服务重启后旧会话已无法继续，已自动切换到新会话"
+        opening = "Kimi 服务重启后旧会话已无法继续，已自动切换到新会话"
         text = (
             f"{opening}（旧 {old_session_id} → 新 {new_session_id}）。"
             "旧会话历史仍完整保留在磁盘上；如果上一条回复没送到，把那句话重发一次就好。"
@@ -11090,13 +11178,17 @@ class PushHandler(BaseHTTPRequestHandler):
             })
 
         with self.state.kimi_turn_lock:
-            if (
+            turn_busy = bool(
                 self.state.kimi_active_turn
                 or self.state.kimi_prepare_token
                 or getattr(self.state, "kimi_recovery_token", "")
                 or getattr(self.state, "kimi_terminal_acquire_token", "")
-            ):
-                enqueue_busy("kimi_turn_active")
+            )
+            # 队列里还有先到消息时新请求一律入队跟尾：轮刚结束的 worker 轮询
+            # 窗口内若放行走直达，新消息会插队到旧排队消息之前，破坏按序承诺。
+            queue_ahead = queued_item is None and bool(self._kimi_chat_queue())
+            if turn_busy or queue_ahead:
+                enqueue_busy("kimi_turn_active" if turn_busy else "kimi_queue_ahead")
                 return
             prepare_token = secrets.token_hex(16)
             self.state.kimi_prepare_token = prepare_token
@@ -11130,10 +11222,11 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._release_kimi_control(prepare_token)
                 enqueue_busy("kimi_web_orphan_recovered_retry")
                 return
-        # Capture the active-session pointer before preparation so the two
-        # silent recovery swaps below (stale/deleted pointer after a Kimi Web
-        # restart, proven stale-busy replacement) can be made visible to the
-        # user afterwards instead of looking like a lost reply.
+        # Capture the active-session pointer before preparation so the silent
+        # recovery swap below (stale/deleted pointer after a Kimi Web restart)
+        # can be made visible to the user afterwards instead of looking like a
+        # lost reply.  A proven stale-busy reset reuses the same session and
+        # deliberately stays silent — nothing is swapped.
         previous_session_id = ""
         load_pointer = getattr(web, "load_active_session_id", None)
         if callable(load_pointer):
@@ -11154,13 +11247,17 @@ class PushHandler(BaseHTTPRequestHandler):
                 enqueue_busy("kimi_web_orphan_recovered_retry")
                 return
             # Kimi Web can retain a false ``busy`` flag after the process that
-            # started a background wait is gone.  Only the prepare reservation
-            # holder may replace that *specific* session, and the adapter
-            # re-proves there is no active/queued prompt or durable
-            # App lease before it moves the pointer.  A genuine prompt,
-            # transport uncertainty, or a changed pointer stays fail-closed.
-            replacement = getattr(web, "replace_stuck_busy_session", None)
-            if recovery == "upstream_conflict" and callable(replacement):
+            # started a background wait is gone.  When the adapter's durable
+            # guard markers prove that busy predates *this* process (a restart
+            # leftover), the flag is cleared in place and the original session
+            # is reused — no new session, no swap notice.  A busy that cannot
+            # be proven pre-boot (possibly live external work) stays
+            # fail-closed and the message waits in the queue.  The adapter
+            # independently re-proves no active/queued prompt and no durable
+            # App lease before it clears anything.
+            reset = getattr(web, "reset_stuck_busy_session", None)
+            predates = getattr(web, "stuck_busy_predates_process", None)
+            if recovery == "upstream_conflict" and callable(reset) and callable(predates):
                 with self.state.kimi_turn_lock:
                     owns_reservation = (
                         self.state.kimi_prepare_token == prepare_token
@@ -11169,12 +11266,12 @@ class PushHandler(BaseHTTPRequestHandler):
                     )
                 if owns_reservation:
                     try:
-                        session_id = replacement(
-                            exc.session_id,
-                            model=model,
-                            thinking=effort,
-                            status_timeout=0.75,
-                        )
+                        if predates(exc.session_id):
+                            # The reservation is still checked again
+                            # immediately below, before App history becomes
+                            # visible or a new prompt can be submitted.
+                            session_id = reset(exc.session_id, status_timeout=0.75)
+                            recovery = "stale_busy_cleared"
                     except KimiWebRecoveryConflict:
                         pass
                     except KimiWebError:
@@ -11191,7 +11288,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         })
                         return
                     except Exception:
-                        logger.exception("Kimi Web stale-busy session replacement crashed")
+                        logger.exception("Kimi Web stale-busy session reset crashed")
                         self._release_kimi_control(prepare_token)
                         if queued_item is not None:
                             kept = self._requeue_kimi_chat_turn(queued_item, reason="kimi_web_recovery_failed")
@@ -11204,13 +11301,7 @@ class PushHandler(BaseHTTPRequestHandler):
                             "reason": "Kimi 状态检查暂时失败，未提交这条消息。",
                         })
                         return
-                    else:
-                        # The reservation is still checked again immediately
-                        # below, before App history becomes visible or a new
-                        # prompt can be submitted.
-                        recovery = "replacement_created"
-                        session_recovery = (exc.session_id, "stale_busy")
-            if recovery != "replacement_created":
+            if recovery != "stale_busy_cleared":
                 self._release_kimi_control(prepare_token)
                 if recovery in {"local_conflict", "pending", "upstream_conflict"}:
                     # 过渡态/归属不明一律排队自动重投，不再 409 拒绝用户消息。
@@ -12000,12 +12091,16 @@ class PushHandler(BaseHTTPRequestHandler):
             })
 
         with self.state.kimi_turn_lock:
-            if (
+            turn_busy = bool(
                 self.state.kimi_active_turn
                 or self.state.kimi_prepare_token
                 or getattr(self.state, "kimi_terminal_acquire_token", "")
-            ):
-                enqueue_busy("kimi_turn_active")
+            )
+            # 与 Web 入口一致：队列非空时新请求入队跟尾，不在 worker 轮询
+            # 窗口内插队到先到消息之前。
+            queue_ahead = queued_item is None and bool(self._kimi_chat_queue())
+            if turn_busy or queue_ahead:
+                enqueue_busy("kimi_turn_active" if turn_busy else "kimi_queue_ahead")
                 return
             prepare_token = secrets.token_hex(16)
             self.state.kimi_prepare_token = prepare_token
@@ -14054,12 +14149,18 @@ class PushHandler(BaseHTTPRequestHandler):
             or getattr(self.state, "kimi_terminal_acquire_token", "")
         )
 
-    def _push_kimi_chat_queue_locked(self, item: dict[str, Any]) -> int | None:
-        """入队并按需唤醒 worker；返回队列位置，满则 None。须持有 turn lock。"""
+    def _push_kimi_chat_queue_locked(self, item: dict[str, Any], *, front: bool = False) -> int | None:
+        """入队并按需唤醒 worker；返回队列位置，满则 None。须持有 turn lock。
+
+        ``front=True`` 用于重投： item 本就排在新到消息之前，放回队首保序。
+        """
         queue = self._kimi_chat_queue()
         if len(queue) >= KIMI_CHAT_QUEUE_MAX:
             return None
-        queue.append(item)
+        if front:
+            queue.appendleft(item)
+        else:
+            queue.append(item)
         position = len(queue)
         if not getattr(self.state, "kimi_chat_queue_worker_running", False):
             self.state.kimi_chat_queue_worker_running = True
@@ -14071,13 +14172,13 @@ class PushHandler(BaseHTTPRequestHandler):
             return self._push_kimi_chat_queue_locked(item)
 
     def _requeue_kimi_chat_turn(self, item: dict[str, Any], *, reason: str) -> bool:
-        """过渡态重投：attempts 超限或队列满则落失败卡片，不再占用队列。"""
+        """过渡态重投：放回队首保序；attempts 超限或队列满则落失败卡片。"""
         item["attempts"] = int(item.get("attempts") or 0) + 1
         if item["attempts"] > KIMI_CHAT_QUEUE_MAX_ATTEMPTS:
             self._fail_queued_kimi_chat(item, reason)
             return False
         with self.state.kimi_turn_lock:
-            position = self._push_kimi_chat_queue_locked(item)
+            position = self._push_kimi_chat_queue_locked(item, front=True)
         if position is None:
             self._fail_queued_kimi_chat(item, "kimi_queue_full")
             return False
@@ -14089,6 +14190,14 @@ class PushHandler(BaseHTTPRequestHandler):
         record = item.get("record") if isinstance(item.get("record"), dict) else {}
         user_ts = str(record.get("ts") or item.get("user_ts") or "")
         logger.warning("Kimi queued %s send failed permanently reason=%s user_ts=%s", kind, reason, user_ts)
+        # 最终失败的排队消息不会再投递，随队的 staged 附件文件一并清理，
+        # 避免 staging 目录泄漏。群队列项的附件存在 "attachments" 键。
+        try:
+            self._discard_uncommitted_staged_attachments(
+                item.get("staged_attachments") or item.get("attachments")
+            )
+        except Exception:
+            logger.warning("Kimi queued-send staged attachment cleanup failed", exc_info=True)
         try:
             if kind == "group":
                 self.state.group_chat.append(
@@ -14116,39 +14225,46 @@ class PushHandler(BaseHTTPRequestHandler):
         不挂任何轮结束钩子——worker 以 0.5s 轮询空闲态，活跃轮、prepare、
         recovery、终端 acquire 任一存在都继续等待，因此过渡态下的消息既不
         丢失也不乱序。重投（requeue）由处理器内部的忙时分支完成，worker
-        只负责在两次尝试之间退避，避免状态持续冲突时空转。
+        只负责在两次尝试之间退避，避免状态持续冲突时空转。循环体整体兜
+        底异常：单次迭代崩溃只记日志继续跑，绝不带走线程让 running 标志
+        卡死、队列静默积压。
         """
         while True:
-            with self.state.kimi_turn_lock:
-                queue = self._kimi_chat_queue()
-                if not queue:
-                    self.state.kimi_chat_queue_worker_running = False
-                    return
-                item = queue.popleft() if self._kimi_chat_idle_locked() else None
-            if item is None:
+            try:
+                with self.state.kimi_turn_lock:
+                    queue = self._kimi_chat_queue()
+                    if not queue:
+                        self.state.kimi_chat_queue_worker_running = False
+                        return
+                    item = queue.popleft() if self._kimi_chat_idle_locked() else None
+                if item is None:
+                    time.sleep(0.5)
+                    continue
+                outcome = self._dispatch_queued_kimi_chat(item)
+                if outcome == "requeued":
+                    time.sleep(min(1.0 * max(1, int(item.get("attempts") or 1)), 5.0))
+            except Exception:
+                logger.exception("Kimi chat queue worker iteration crashed; continuing")
                 time.sleep(0.5)
-                continue
-            outcome = self._dispatch_queued_kimi_chat(item)
-            if outcome == "requeued":
-                time.sleep(min(1.0 * max(1, int(item.get("attempts") or 1)), 5.0))
 
     def _dispatch_queued_kimi_chat(self, item: dict[str, Any]) -> str:
         """投递一条排队消息；返回 started / requeued / failed 供 worker 退避。"""
         kind = str(item.get("kind") or "web")
         if kind == "group":
             try:
-                self._start_group_kimi_reply(
+                outcome = self._start_group_kimi_reply(
                     self.state.group_chat,
                     str(item.get("text") or ""),
                     sender_name=str(item.get("sender_name") or "Astra"),
                     user_ts=str(item.get("user_ts") or ""),
                     hop_count=int(item.get("hop_count") or 0),
                     attachments=item.get("attachments"),
+                    queue_item=item,
                 )
             except Exception:
                 logger.exception("queued group Kimi reply dispatch crashed")
                 return "failed"
-            return "started"
+            return "requeued" if outcome == "requeued" else "started"
         contact_id = str(item.get("contact_id") or "kimi")
         record = item.get("record") if isinstance(item.get("record"), dict) else None
         if not record or not str(record.get("ts") or ""):
@@ -14212,111 +14328,71 @@ class PushHandler(BaseHTTPRequestHandler):
                 logger.debug("queued Kimi send interrupt-mark failed", exc_info=True)
         return len(items)
 
-    # ---------- 终端输入排队（忙时不 423，就绪后按序投递） ----------
+    # ---------- 终端输入忙时直达（真实终端语义：tty 缓冲，不排队） ----------
 
-    def _enqueue_terminal_input(self, target: str, endpoint: str, body: dict[str, Any]) -> int | None:
-        """把一条终端输入放入目标队列并唤醒 worker；返回位置，满则 None。"""
-        queue_attr = f"{target}_terminal_input_queue"
-        running_attr = f"{target}_terminal_input_worker_running"
-        lock = getattr(self.state, "terminal_input_queue_lock", None)
-        if lock is None:
-            lock = threading.Lock()
-            self.state.terminal_input_queue_lock = lock
-        with lock:
-            queue = getattr(self.state, queue_attr, None)
-            if queue is None:
-                queue = deque()
-                setattr(self.state, queue_attr, queue)
-            if len(queue) >= TERMINAL_INPUT_QUEUE_MAX:
-                return None
-            queue.append({
-                "endpoint": endpoint,
-                "body": dict(body),
-                "attempts": 0,
-                "queued_at": datetime.now(timezone.utc).isoformat(),
-                "queued_monotonic": time.monotonic(),
-            })
-            position = len(queue)
-            if not getattr(self.state, running_attr, False):
-                setattr(self.state, running_attr, True)
-                threading.Thread(target=self._terminal_input_worker, args=(target,), daemon=True).start()
-            return position
-
-    def _terminal_input_worker(self, target: str) -> None:
-        """按序投递排队输入：重入正常发送路径；仍忙则放回队首稍候重试。
-
-        重入体带 `_queued_terminal_retry` 标记，忙时分支对它保留旧的错误
-        响应（由代理捕获）而不是再次入队，避免 worker 自我循环。失败投递
-        有次数上限，超限丢弃并记日志——终端输入不在聊天历史里，丢弃不会
-        静默吞掉用户消息。
-        """
-        queue_attr = f"{target}_terminal_input_queue"
-        running_attr = f"{target}_terminal_input_worker_running"
-        lock = self.state.terminal_input_queue_lock
-        while True:
-            with lock:
-                queue = getattr(self.state, queue_attr)
-                if not queue:
-                    setattr(self.state, running_attr, False)
-                    return
-                item = queue.popleft()
-            if self._deliver_queued_terminal_input(item):
-                continue
-            item["attempts"] = int(item.get("attempts") or 0) + 1
-            age = time.monotonic() - float(item.get("queued_monotonic") or time.monotonic())
-            if age >= TERMINAL_INPUT_QUEUE_TTL_SECONDS:
-                logger.warning(
-                    "queued %s terminal input dropped after %.0fs / %s attempts",
-                    target, age, item["attempts"],
-                )
-                continue
-            with lock:
-                queue.appendleft(item)
-            time.sleep(TERMINAL_INPUT_QUEUE_RETRY_SECONDS)
-
-    def _deliver_queued_terminal_input(self, item: dict[str, Any]) -> bool:
-        proxy = _QueuedSendResponderProxy(self)
-        body = dict(item.get("body") or {})
-        body["_queued_terminal_retry"] = True
+    def _send_kimi_key_direct(self, key_name: str) -> None:
+        """Kimi 忙时按键直达 owned pane：保留身份校验，仅跳过 ready 围栏。"""
         try:
-            if str(item.get("endpoint") or "") == "key":
-                proxy._handle_terminal_key(body)
-            else:
-                proxy._handle_tmux_send(body)
-        except Exception:
-            logger.exception("queued terminal input delivery crashed")
-            return False
-        return any(status == 200 for status, _payload in proxy.responses)
-
-    def _enqueue_or_report_terminal_input(
-        self,
-        target: str,
-        endpoint: str,
-        body: dict[str, Any],
-        *,
-        extra: dict[str, Any] | None = None,
-    ) -> None:
-        """终端输入忙时分支的统一出口：worker 重试保留错误，用户请求入队。"""
-        if body.get("_queued_terminal_retry"):
-            # worker 重入：不再次入队，返回忙态错误供 worker 判断重试。
-            self._send_json(503, {"ok": False, "error": "terminal_busy_retry", "target": target})
+            injected = self.state.kimi_terminal.send_control_key(key_name)
+        except KimiTerminalUnavailable as exc:
+            self._send_json(503, {"error": str(exc), "target": KIMI_TERMINAL_ALIAS})
             return
-        position = self._enqueue_terminal_input(target, endpoint, body)
-        if position is None:
-            self._send_json(429, {
-                "ok": False,
-                "error": "terminal_input_queue_full",
-                "target": target,
-                "reason": "排队输入过多，请稍后再试。",
+        if not injected:
+            self._send_json(503, {
+                "error": "Kimi 终端 pane 不可验证，按键未送达",
+                "target": KIMI_TERMINAL_ALIAS,
             })
             return
         self._send_json(200, {
-            "ok": True,
-            "queued": True,
-            "queue_position": position,
-            "session": target,
-            **(extra or {}),
+            "ok": True, "key": key_name, "session": KIMI_TERMINAL_ALIAS, "direct": True,
         })
+
+    def _send_kimi_text_direct(self, keys: Any, enter: bool) -> None:
+        """Kimi 忙时文本直达 owned pane：字节由 tty 缓冲，不排队不等待就绪。"""
+        try:
+            delivered = self.state.kimi_terminal.send_text(str(keys or ""), enter)
+        except KimiTerminalUnavailable as exc:
+            self._send_json(503, {"error": str(exc), "target": KIMI_TERMINAL_ALIAS})
+            return
+        if not delivered:
+            self._send_json(503, {
+                "error": "Kimi 终端 pane 不可验证，输入未送达",
+                "target": KIMI_TERMINAL_ALIAS,
+            })
+            return
+        self._send_json(200, {"ok": True, "session": KIMI_TERMINAL_ALIAS, "direct": True})
+
+    def _send_kairos_key_direct(self, key_name: str) -> None:
+        """Kairos 忙时按键直达 owned pane：保留身份校验，仅跳过 ready 围栏。"""
+        try:
+            injected = self.state.kairos_terminal.send_control_key(key_name)
+        except KairosTerminalUnavailable as exc:
+            self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
+            return
+        if not injected:
+            self._send_json(503, {
+                "error": "Kairos 终端 pane 不可验证，按键未送达",
+                "target": KAIROS_TERMINAL_ALIAS,
+            })
+            return
+        self._send_json(200, {
+            "ok": True, "key": key_name, "session": KAIROS_TERMINAL_ALIAS, "direct": True,
+        })
+
+    def _send_kairos_text_direct(self, keys: Any, enter: bool) -> None:
+        """Kairos 忙时文本直达 owned pane：字节由 tty 缓冲，不排队不等待就绪。"""
+        try:
+            delivered = self.state.kairos_terminal.send_text(str(keys or ""), enter)
+        except KairosTerminalUnavailable as exc:
+            self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
+            return
+        if not delivered:
+            self._send_json(503, {
+                "error": "Kairos 终端 pane 不可验证，输入未送达",
+                "target": KAIROS_TERMINAL_ALIAS,
+            })
+            return
+        self._send_json(200, {"ok": True, "session": KAIROS_TERMINAL_ALIAS, "direct": True})
 
     def _handoff_kimi_terminal_to_writer(self, prepare_token: str) -> bool:
         """Release an idle TUI after reserving a Web/ACP writer, without lock inversion.
@@ -14528,9 +14604,9 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _send_kimi_terminal_unavailable(self, exc: KimiTerminalUnavailable) -> None:
         if isinstance(exc, KimiTerminalBusy):
-            # 423 对用户入口已彻底消失（capture 只读放行、输入排队）；此分支
-            # 只剩 worker 内部重试等防御性调用，保留原语义供其识别忙态。
-            self._send_json(423, {
+            # 用户入口的忙态已分流：capture/resize 只读放行，输入直达 pane。
+            # 此分支只剩防御性兜底，按真实错误处理，不再 423。
+            self._send_json(503, {
                 "ok": False,
                 "error": "kimi_busy",
                 "target": KIMI_TERMINAL_ALIAS,
@@ -16854,8 +16930,14 @@ class PushHandler(BaseHTTPRequestHandler):
         user_ts: str,
         hop_count: int,
         attachments: list[dict[str, Any]] | None = None,
-    ) -> None:
-        """Reply in apples through the same Web session without re-appending its user row."""
+        queue_item: dict[str, Any] | None = None,
+    ) -> str:
+        """Reply in apples through the same Web session without re-appending its user row.
+
+        ``queue_item`` 是队列 worker 重入标记（队列项本体）：重入再遇忙时走
+        计数重投且不重复写「已排队」系统提示；返回 "requeued" 供 worker 退避。
+        其余出口返回 "started"（含各类已落地提示的失败终态）。
+        """
         attachments = list(attachments or [])
         with self.state.kimi_turn_lock:
             busy = bool(
@@ -16864,10 +16946,20 @@ class PushHandler(BaseHTTPRequestHandler):
                 or getattr(self.state, "kimi_recovery_token", "")
                 or getattr(self.state, "kimi_terminal_acquire_token", "")
             )
-            token = "" if busy else secrets.token_hex(16)
+            # 与私聊入口一致：队列非空时新消息入队跟尾，不在 worker 轮询
+            # 窗口内插队到先到消息之前。
+            queue_ahead = queue_item is None and bool(self._kimi_chat_queue())
+            token = "" if (busy or queue_ahead) else secrets.token_hex(16)
             if token:
                 self.state.kimi_prepare_token = token
-        if busy:
+        if busy or queue_ahead:
+            if queue_item is not None:
+                # worker 重入又遇竞态忙：重投计数保留（不重置 attempts），也
+                # 不重复 append 系统提示刷屏；超限由 _fail_queued_kimi_chat
+                # 落单条可见失败说明。
+                self._requeue_kimi_chat_turn(queue_item, reason="kimi_turn_active")
+                self._set_typing_for_contact("apples", {"is_typing": False, "since": None})
+                return "requeued"
             # 群入口同样不丢消息：忙时入队，当前轮/过渡态结束后 worker 自动
             # 按序重入本函数发出。队列满才退回旧的系统提示行为。
             position = self._enqueue_kimi_chat_turn({
@@ -16888,7 +16980,7 @@ class PushHandler(BaseHTTPRequestHandler):
             )
             chat.append(role="system", text=note, source="system:group:kimi", sender_id="system", sender_name="系统")
             self._set_typing_for_contact("apples", {"is_typing": False, "since": None})
-            return
+            return "started"
         try:
             model, effort = self._kimi_selection()
             session_id = self.state.kimi_web.ensure_active_session(model=model, thinking=effort)
@@ -16896,12 +16988,12 @@ class PushHandler(BaseHTTPRequestHandler):
             self._release_kimi_control(token)
             chat.append(role="assistant", text="Kimi 当前不可用。", source="group:kimi-web:error", sender_id="kimi", sender_name="Kimi")
             self._set_typing_for_contact("apples", {"is_typing": False, "since": None})
-            return
+            return "started"
         cancel_event = threading.Event()
         with self.state.kimi_turn_lock:
             if self.state.kimi_prepare_token != token or self.state.kimi_active_turn:
                 self._release_kimi_control(token)
-                return
+                return "started"
             self.state.kimi_prepare_token = ""
             self.state.kimi_active_turn = {"user_ts": user_ts, "session_id": session_id, "prompt_id": "", "cancel_event": cancel_event, "transport": "kimi-web", "group": True}
             self._set_typing_for_contact("apples", {
@@ -17319,7 +17411,7 @@ class PushHandler(BaseHTTPRequestHandler):
             cancel_event.set()
             cleanup_group_turn()
             chat.append(role="assistant", text="Kimi 连接失败。", source="group:kimi-web:error", sender_id="kimi", sender_name="Kimi")
-            return
+            return "started"
         try:
             result = self.state.kimi_web.submit_prompt(
                 session_id,
@@ -17343,6 +17435,7 @@ class PushHandler(BaseHTTPRequestHandler):
             cancel_event.set()
             cleanup_group_turn()
             chat.append(role="assistant", text="Kimi 发送失败。", source="group:kimi-web:error", sender_id="kimi", sender_name="Kimi")
+        return "started"
 
     # apples 群 agent-to-agent loop guard 常量
     APPLES_HOP_LIMIT = 2  # 人发起后, agent A 回 -> agent B 再接一轮就停 (kairos verdict 收紧 3->2)
@@ -21686,13 +21779,6 @@ class PushHandler(BaseHTTPRequestHandler):
             self.state.kairos_terminal.release()
         return requested, requested, False
 
-    def _send_kairos_terminal_not_ready(self, exc: KairosTerminalNotReady) -> None:
-        self._send_json(423, {
-            "error": str(exc),
-            "target": KAIROS_TERMINAL_ALIAS,
-            "state": "waiting",
-        })
-
     def _finish_kairos_terminal_failure(
         self,
         *,
@@ -22100,47 +22186,18 @@ class PushHandler(BaseHTTPRequestHandler):
                 requested_session,
                 require_ready=True,
             )
-        except KairosTerminalNotReady as exc:
-            # Kairos 回复中不再 423：输入进队列，就绪后由 worker 按序投递。
-            if body.get("_queued_terminal_retry"):
-                self._send_kairos_terminal_not_ready(exc)
-                return
-            self._enqueue_or_report_terminal_input(
-                KAIROS_TERMINAL_ALIAS,
-                "key",
-                {"session": requested_session, "key": key_name},
-                extra={"key": key_name},
-            )
+        except KairosTerminalNotReady:
+            # 忙时直达：与真实终端一致，键入字节由 pane/tty 缓冲，等当前
+            # 回复结束后被消费。不排队、不 423；pane 不可验证才是错误。
+            self._send_kairos_key_direct(key_name)
             return
         except KairosTerminalUnavailable as exc:
             self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
             return
-        except KimiTerminalBusy as exc:
-            if body.get("_queued_terminal_retry"):
-                self._send_kimi_terminal_unavailable(exc)
-                return
-            if key_name in TERMINAL_INTERRUPT_KEYS:
-                # 中断键语义是"立即生效"：直达 owned pane（仍做身份校验），
-                # 不排队——排到就绪后才送达会误伤下一条 prompt。
-                try:
-                    injected = self.state.kimi_terminal.send_control_key(key_name)
-                except KimiTerminalUnavailable as key_exc:
-                    self._send_json(503, {"error": str(key_exc), "target": KIMI_TERMINAL_ALIAS})
-                    return
-                if not injected:
-                    self._send_json(503, {
-                        "error": "Kimi 终端 pane 不可验证，中断键未送达",
-                        "target": KIMI_TERMINAL_ALIAS,
-                    })
-                    return
-                self._send_json(200, {"ok": True, "key": key_name, "session": KIMI_TERMINAL_ALIAS, "direct": True})
-                return
-            self._enqueue_or_report_terminal_input(
-                KIMI_TERMINAL_ALIAS,
-                "key",
-                {"session": requested_session, "key": key_name},
-                extra={"key": key_name},
-            )
+        except KimiTerminalBusy:
+            # 终端语义：任何按键忙时也直达 owned pane（仍做 pane 身份校验，
+            # 仅跳过 ready 围栏），字节由 tty 缓冲；不排队也不 423。
+            self._send_kimi_key_direct(key_name)
             return
         except KimiTerminalUnavailable as exc:
             self._send_kimi_terminal_unavailable(exc)
@@ -22219,45 +22276,16 @@ class PushHandler(BaseHTTPRequestHandler):
                     str(requested_session),
                     require_ready=True,
                 )
-            except KairosTerminalNotReady as exc:
-                if body.get("_queued_terminal_retry"):
-                    self._send_kairos_terminal_not_ready(exc)
-                    return
-                self._enqueue_or_report_terminal_input(
-                    KAIROS_TERMINAL_ALIAS,
-                    "send",
-                    {"session": str(requested_session), "key": special_key},
-                    extra={"key": special_key},
-                )
+            except KairosTerminalNotReady:
+                # 忙时直达：字节由 pane/tty 缓冲，不排队也不 423。
+                self._send_kairos_key_direct(special_key)
                 return
             except KairosTerminalUnavailable as exc:
                 self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
                 return
-            except KimiTerminalBusy as exc:
-                if body.get("_queued_terminal_retry"):
-                    self._send_kimi_terminal_unavailable(exc)
-                    return
-                if special_key in TERMINAL_INTERRUPT_KEYS:
-                    # 中断键直达 owned pane（仍做身份校验），不排队。
-                    try:
-                        injected = self.state.kimi_terminal.send_control_key(special_key)
-                    except KimiTerminalUnavailable as key_exc:
-                        self._send_json(503, {"error": str(key_exc), "target": KIMI_TERMINAL_ALIAS})
-                        return
-                    if not injected:
-                        self._send_json(503, {
-                            "error": "Kimi 终端 pane 不可验证，中断键未送达",
-                            "target": KIMI_TERMINAL_ALIAS,
-                        })
-                        return
-                    self._send_json(200, {"ok": True, "session": KIMI_TERMINAL_ALIAS, "key": special_key, "direct": True})
-                    return
-                self._enqueue_or_report_terminal_input(
-                    KIMI_TERMINAL_ALIAS,
-                    "send",
-                    {"session": str(requested_session), "key": special_key},
-                    extra={"key": special_key},
-                )
+            except KimiTerminalBusy:
+                # 忙时直达 owned pane（保留身份校验，跳过 ready 围栏）。
+                self._send_kimi_key_direct(special_key)
                 return
             except KimiTerminalUnavailable as exc:
                 self._send_kimi_terminal_unavailable(exc)
@@ -22298,31 +22326,18 @@ class PushHandler(BaseHTTPRequestHandler):
                 str(requested_session),
                 require_ready=True,
             )
-        except KairosTerminalNotReady as exc:
-            if body.get("_queued_terminal_retry"):
-                self._send_kairos_terminal_not_ready(exc)
-                return
-            # Kairos 回复中不再 423：文本输入进队列，就绪后按序投递。
-            self._enqueue_or_report_terminal_input(
-                KAIROS_TERMINAL_ALIAS,
-                "send",
-                {"session": str(requested_session), "keys": keys, "enter": enter},
-            )
+        except KairosTerminalNotReady:
+            # 忙时直达底层 pane：与真实终端一致，文本字节由 tty 缓冲，
+            # 当前回复结束后被消费。不排队、不 423。
+            self._send_kairos_text_direct(keys, enter)
             return
         except KairosTerminalUnavailable as exc:
             self._send_json(503, {"error": str(exc), "target": KAIROS_TERMINAL_ALIAS})
             return
-        except KimiTerminalBusy as exc:
-            if body.get("_queued_terminal_retry"):
-                self._send_kimi_terminal_unavailable(exc)
-                return
-            # Kimi 忙（过渡态或自有 prompt 未确认完成）：文本输入进队列，
-            # 就绪后按序投递，不再 423。
-            self._enqueue_or_report_terminal_input(
-                KIMI_TERMINAL_ALIAS,
-                "send",
-                {"session": str(requested_session), "keys": keys, "enter": enter},
-            )
+        except KimiTerminalBusy:
+            # Kimi 忙（过渡态或自有 prompt 未确认完成）：文本直达 owned
+            # pane，由 tty 缓冲到 TUI 消费；pane 不可验证时报真实错误。
+            self._send_kimi_text_direct(keys, enter)
             return
         except KimiTerminalUnavailable as exc:
             self._send_kimi_terminal_unavailable(exc)

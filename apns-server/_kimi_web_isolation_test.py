@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from unittest.mock import Mock, patch
@@ -309,6 +310,180 @@ class KimiWebIsolationTest(unittest.TestCase):
                     client.replace_stuck_busy_session("session-old")
                 self.assertEqual("session-old", client.load_active_session_id())
                 self.assertEqual(1, sum(path == "/api/v1/sessions" for _method, path, _data in calls))
+
+    def test_reset_stuck_busy_clears_flag_and_reuses_the_same_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pointer = os.path.join(directory, "kimi_web_session.json")
+            client = KimiWebClient(command="/unused/kimi", state_path=pointer, cwd="/tmp/kimi-cwd")
+            client.save_active_session_id("session-old")
+            calls = []
+
+            def fake_request(method, path, *, data=None, timeout=10.0):
+                calls.append((method, path, data))
+                if path.endswith("/status"):
+                    aborted = any(p.endswith(":abort") for _m, p, _d in calls)
+                    return {"busy": not aborted}
+                if path.endswith("/snapshot"):
+                    return {
+                        "in_flight_turn": None,
+                        "pending_approvals": [],
+                        "pending_questions": [],
+                    }
+                if path.endswith("/prompts"):
+                    return {"active": None, "queued": []}
+                if method == "POST" and path.endswith(":abort"):
+                    return {"aborted": True}
+                raise AssertionError((method, path, data))
+
+            client._request = fake_request
+            self.assertEqual("session-old", client.reset_stuck_busy_session("session-old"))
+            # 指针不动、不建会话；只打了一次会话级 :abort，且 busy 标记已清。
+            self.assertEqual("session-old", client.load_active_session_id())
+            self.assertEqual(1, sum(p.endswith(":abort") for _m, p, _d in calls))
+            self.assertFalse(any(m == "POST" and p == "/api/v1/sessions" for m, p, _d in calls))
+
+    def test_reset_stuck_busy_fails_closed_for_prompt_evidence_lease_or_moved_pointer(self):
+        for case, snapshot, prompts, lease in (
+            ("active", {"in_flight_turn": None, "pending_approvals": [], "pending_questions": [], "current_prompt_id": "prompt-live"}, {"active": None, "queued": []}, {}),
+            ("queued", {"in_flight_turn": None, "pending_approvals": [], "pending_questions": []}, {"active": None, "queued": [{"prompt_id": "prompt-queued"}]}, {}),
+            ("missing_snapshot_empty_state", {}, {"active": None, "queued": []}, {}),
+            ("missing_active", {"in_flight_turn": None, "pending_approvals": [], "pending_questions": []}, {"queued": []}, {}),
+            ("missing_queued", {"in_flight_turn": None, "pending_approvals": [], "pending_questions": []}, {"active": None}, {}),
+            ("foreign_lease", {"in_flight_turn": None, "pending_approvals": [], "pending_questions": []}, {"active": None, "queued": []}, {
+                "session_id": "session-other", "prompt_id": "prompt-owned", "user_ts": "old", "state": "submitted", "created_at": "1",
+            }),
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                pointer = os.path.join(directory, "kimi_web_session.json")
+                client = KimiWebClient(command="/unused/kimi", state_path=pointer, cwd="/tmp/kimi-cwd")
+                client.save_active_session_id("session-old")
+                calls = []
+
+                def fake_request(method, path, *, data=None, timeout=10.0):
+                    calls.append((method, path, data))
+                    if path.endswith("/status"):
+                        return {"busy": True}
+                    if path.endswith("/snapshot"):
+                        return snapshot
+                    if path.endswith("/prompts"):
+                        return prompts
+                    raise AssertionError((method, path, data))
+
+                client._request = fake_request
+                client.load_turn_lease = lambda: lease
+                with self.assertRaises(KimiWebRecoveryConflict):
+                    client.reset_stuck_busy_session("session-old")
+                self.assertEqual("session-old", client.load_active_session_id())
+                self.assertFalse(any(p.endswith(":abort") for _m, p, _d in calls))
+
+    def test_reset_stuck_busy_fails_closed_when_the_flag_survives_abort(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pointer = os.path.join(directory, "kimi_web_session.json")
+            client = KimiWebClient(command="/unused/kimi", state_path=pointer, cwd="/tmp/kimi-cwd")
+            client.save_active_session_id("session-old")
+            calls = []
+
+            def fake_request(method, path, *, data=None, timeout=10.0):
+                calls.append((method, path, data))
+                if path.endswith("/status"):
+                    return {"busy": True}
+                if path.endswith("/snapshot"):
+                    return {"in_flight_turn": None, "pending_approvals": [], "pending_questions": []}
+                if path.endswith("/prompts"):
+                    return {"active": None, "queued": []}
+                if method == "POST" and path.endswith(":abort"):
+                    return {"aborted": False}
+                raise AssertionError((method, path, data))
+
+            client._request = fake_request
+            with self.assertRaises(KimiWebRecoveryConflict):
+                client.reset_stuck_busy_session("session-old", settle_timeout=0.3)
+            self.assertEqual("session-old", client.load_active_session_id())
+
+    def test_reset_stuck_busy_tolerates_abort_rejection_only_when_idle_afterwards(self):
+        for case, idle_after in (("rejected_then_idle", True), ("rejected_still_busy", False)):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                pointer = os.path.join(directory, "kimi_web_session.json")
+                client = KimiWebClient(command="/unused/kimi", state_path=pointer, cwd="/tmp/kimi-cwd")
+                client.save_active_session_id("session-old")
+                calls = []
+
+                def fake_request(method, path, *, data=None, timeout=10.0):
+                    calls.append((method, path, data))
+                    if path.endswith("/status"):
+                        attempted = any(p.endswith(":abort") for _m, p, _d in calls)
+                        return {"busy": not (attempted and idle_after)}
+                    if path.endswith("/snapshot"):
+                        return {"in_flight_turn": None, "pending_approvals": [], "pending_questions": []}
+                    if path.endswith("/prompts"):
+                        return {"active": None, "queued": []}
+                    if method == "POST" and path.endswith(":abort"):
+                        raise KimiWebRequestRejected("no in-flight turn")
+                    raise AssertionError((method, path, data))
+
+                client._request = fake_request
+                if idle_after:
+                    self.assertEqual("session-old", client.reset_stuck_busy_session("session-old"))
+                else:
+                    with self.assertRaises(KimiWebRecoveryConflict):
+                        client.reset_stuck_busy_session("session-old", settle_timeout=0.3)
+                self.assertEqual("session-old", client.load_active_session_id())
+
+    def test_recovery_guard_proves_only_markers_older_than_this_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pointer = os.path.join(directory, "kimi_web_session.json")
+            guard_path = os.path.join(directory, "kimi_web_recovery_guard.json")
+            client = KimiWebClient(command="/unused/kimi", state_path=pointer, cwd="/tmp/kimi-cwd", started_at=1000.0)
+            self.assertFalse(client.stuck_busy_predates_process("session-old"))
+            for markers, expected in (
+                ({"last_turn_finished_at": "999.5"}, True),
+                ({"busy_first_seen_at": "998.0", "busy_last_seen_at": "999.0"}, True),
+                ({"last_turn_finished_at": "1000.0"}, False),
+                ({"busy_first_seen_at": "1001.5"}, False),
+                ({"last_turn_finished_at": "garbage"}, False),
+                ({}, False),
+            ):
+                with open(guard_path, "w", encoding="utf-8") as handle:
+                    json.dump({"version": 1, "sessions": {"session-old": markers}}, handle)
+                self.assertEqual(expected, client.stuck_busy_predates_process("session-old"), markers)
+            # 其他会话的标记不能借用来证明本会话。
+            with open(guard_path, "w", encoding="utf-8") as handle:
+                json.dump({"version": 1, "sessions": {"session-other": {"last_turn_finished_at": "1"}}}, handle)
+            self.assertFalse(client.stuck_busy_predates_process("session-old"))
+
+    def test_recovery_guard_notes_turn_finish_busy_episode_and_idle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pointer = os.path.join(directory, "kimi_web_session.json")
+            guard_path = os.path.join(directory, "kimi_web_recovery_guard.json")
+            future = KimiWebClient(command="/unused/kimi", state_path=pointer, cwd="/tmp/kimi-cwd", started_at=time.time() + 60)
+            past = KimiWebClient(command="/unused/kimi", state_path=pointer, cwd="/tmp/kimi-cwd", started_at=time.time() - 60)
+            future.note_turn_finished("session-old")
+            self.assertTrue(future.stuck_busy_predates_process("session-old"))
+            self.assertFalse(past.stuck_busy_predates_process("session-old"))
+            future.note_busy_observed("session-old")
+            first = json.load(open(guard_path, encoding="utf-8"))["sessions"]["session-old"]
+            future.note_busy_observed("session-old")
+            second = json.load(open(guard_path, encoding="utf-8"))["sessions"]["session-old"]
+            # first_seen 不被后续观测覆盖，last_seen 更新。
+            self.assertEqual(first["busy_first_seen_at"], second["busy_first_seen_at"])
+            self.assertIn("busy_last_seen_at", second)
+            # 空闲观测只关闭忙标记，不抹掉 turn 完成时间。
+            future.note_session_idle("session-old")
+            third = json.load(open(guard_path, encoding="utf-8"))["sessions"]["session-old"]
+            self.assertNotIn("busy_first_seen_at", third)
+            self.assertIn("last_turn_finished_at", third)
+            self.assertTrue(future.stuck_busy_predates_process("session-old"))
+            self.assertEqual(0o600, os.stat(guard_path).st_mode & 0o777)
+
+    def test_clear_turn_lease_marks_the_turn_finished_in_the_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pointer = os.path.join(directory, "kimi_web_session.json")
+            client = KimiWebClient(command="/unused/kimi", state_path=pointer, cwd="/tmp/kimi-cwd", started_at=time.time() + 60)
+            client.save_turn_lease(
+                session_id="web_session-1", prompt_id="prompt-1", user_ts="1700000000.1", state="submitted",
+            )
+            self.assertTrue(client.clear_turn_lease(session_id="web_session-1", prompt_id="prompt-1"))
+            self.assertTrue(client.stuck_busy_predates_process("web_session-1"))
 
     def test_turn_lease_is_private_atomic_and_clears_only_the_exact_prompt(self):
         with tempfile.TemporaryDirectory() as directory:

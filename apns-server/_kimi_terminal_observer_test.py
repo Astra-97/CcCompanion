@@ -318,6 +318,54 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         self.assertNotIn("--continue", launch)
         self.assertNotIn("--model", launch)
 
+    def test_busy_kimi_bridge_send_text_writes_directly_to_owned_pane(self):
+        calls = []
+        def runner(argv, **_kwargs):
+            calls.append(argv)
+            if argv[1] == "has-session":
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            if argv[1] == "show-options":
+                return types.SimpleNamespace(returncode=0, stdout=KIMI_TERMINAL_OWNER_VALUE + "\n", stderr="")
+            if argv[1] == "display-message":
+                return types.SimpleNamespace(returncode=0, stdout="%42|0\n", stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"), runner=runner)
+        bridge._lease = "a" * 43
+        bridge._lease_pane = "%42"
+        epoch = bridge._prompt_epoch
+
+        # 忙时文本直达 owned pane：私有 buffer + paste + Enter，跳过 ready 围栏。
+        self.assertTrue(bridge.send_text("忙时输入", True))
+        set_buffer = next(argv for argv in calls if argv[1] == "set-buffer")
+        self.assertEqual("忙时输入", set_buffer[-1])
+        paste = next(argv for argv in calls if argv[1] == "paste-buffer")
+        self.assertIn("%42", paste)
+        self.assertIn("-d", paste)
+        send_keys = [argv for argv in calls if argv[1] == "send-keys"]
+        self.assertEqual(["tmux", "send-keys", "-t", "%42", "Enter"], send_keys[-1])
+        # Enter 送达后按新 prompt 记账：不确定态保持，epoch 前进。
+        self.assertTrue(bridge._prompt_active_uncertain)
+        self.assertEqual(epoch + 1, bridge._prompt_epoch)
+
+    def test_busy_kimi_bridge_send_text_fails_closed_on_dead_pane(self):
+        calls = []
+        def runner(argv, **_kwargs):
+            calls.append(argv)
+            if argv[1] == "has-session":
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            if argv[1] == "show-options":
+                return types.SimpleNamespace(returncode=0, stdout=KIMI_TERMINAL_OWNER_VALUE + "\n", stderr="")
+            if argv[1] == "display-message":
+                return types.SimpleNamespace(returncode=0, stdout="%42|1\n", stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"), runner=runner)
+
+        self.assertFalse(bridge.send_text("忙时输入", True))
+        self.assertFalse(bridge.send_control_key("Escape"))
+        self.assertFalse(any(
+            argv[1] in {"set-buffer", "paste-buffer", "send-keys"} for argv in calls
+        ))
+
     def test_stale_lease_cannot_release_new_kimi_pane(self):
         bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"))
         old_lease = "a" * 43
@@ -991,45 +1039,67 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         run.assert_not_called()
         bridge.ensure.assert_not_called()
 
-    def test_busy_kimi_text_input_is_queued_not_rejected(self):
+    def test_busy_kimi_text_input_goes_directly_to_owned_pane(self):
         bridge = types.SimpleNamespace(
             input_transaction=lambda: nullcontext(),
             ensure=mock.Mock(return_value="%42"),
             tmux_session="ccc-kimi-terminal",
+            send_text=mock.Mock(return_value=True),
         )
         handler = self._busy_kimi_route_handler(bridge)
-        with mock.patch("push.subprocess.run") as run, mock.patch("push.subprocess.Popen") as popen, \
-                mock.patch("push.threading.Thread"):  # 挡住 worker，避免在 mock 环境乱试
-            handler._handle_tmux_send({"session": "kimi", "keys": "排队输入", "enter": True})
-        # 忙时文本输入不再 423：进队列，就绪后由 worker 按序投递。
+        with mock.patch("push.subprocess.run") as run, mock.patch("push.subprocess.Popen") as popen:
+            handler._handle_tmux_send({"session": "kimi", "keys": "忙时输入", "enter": True})
+        # 终端语义：忙时文本直达 owned pane，由 tty 缓冲——不排队也不 423。
         status, payload = handler.responses[-1]
         self.assertEqual(200, status)
-        self.assertTrue(payload["queued"])
+        self.assertTrue(payload["direct"])
         self.assertEqual("kimi", payload["session"])
-        self.assertEqual(1, len(handler.state.kimi_terminal_input_queue))
+        bridge.send_text.assert_called_once_with("忙时输入", True)
+        self.assertFalse(getattr(handler.state, "kimi_terminal_input_queue", None))
+        run.assert_not_called()
+        popen.assert_not_called()
+        bridge.ensure.assert_not_called()
+
+    def test_busy_kimi_text_input_with_unverifiable_pane_is_a_real_error(self):
+        bridge = types.SimpleNamespace(
+            input_transaction=lambda: nullcontext(),
+            ensure=mock.Mock(return_value="%42"),
+            tmux_session="ccc-kimi-terminal",
+            send_text=mock.Mock(return_value=False),
+        )
+        handler = self._busy_kimi_route_handler(bridge)
+        with mock.patch("push.subprocess.run") as run, mock.patch("push.subprocess.Popen") as popen:
+            handler._handle_tmux_send({"session": "kimi", "keys": "忙时输入", "enter": True})
+        # pane 归属/存活无法验证是真实错误：503，绝不 423 也不排队。
+        status, payload = handler.responses[-1]
+        self.assertEqual(503, status)
+        self.assertEqual("kimi", payload["target"])
+        self.assertFalse(getattr(handler.state, "kimi_terminal_input_queue", None))
         run.assert_not_called()
         popen.assert_not_called()
         bridge.ensure.assert_not_called()
 
     def test_busy_kimi_interrupt_key_goes_directly_to_owned_pane(self):
-        bridge = types.SimpleNamespace(
-            input_transaction=lambda: nullcontext(),
-            ensure=mock.Mock(return_value="%42"),
-            tmux_session="ccc-kimi-terminal",
-            send_control_key=mock.Mock(return_value=True),
-        )
-        handler = self._busy_kimi_route_handler(bridge)
-        with mock.patch("push.subprocess.run") as run, mock.patch("push.threading.Thread"):
-            handler._handle_terminal_key({"session": "kimi", "key": "C-c"})
-        # 中断键语义是"立即生效"：直达 owned pane，不排队也不 423。
-        status, payload = handler.responses[-1]
-        self.assertEqual(200, status)
-        self.assertTrue(payload["direct"])
-        self.assertEqual("C-c", payload["key"])
-        bridge.send_control_key.assert_called_once_with("C-c")
-        self.assertFalse(getattr(handler.state, "kimi_terminal_input_queue", None))
-        run.assert_not_called()
-        bridge.ensure.assert_not_called()
+        for key in ("C-c", "Tab"):
+            with self.subTest(key=key):
+                bridge = types.SimpleNamespace(
+                    input_transaction=lambda: nullcontext(),
+                    ensure=mock.Mock(return_value="%42"),
+                    tmux_session="ccc-kimi-terminal",
+                    send_control_key=mock.Mock(return_value=True),
+                )
+                handler = self._busy_kimi_route_handler(bridge)
+                with mock.patch("push.subprocess.run") as run:
+                    handler._handle_terminal_key({"session": "kimi", "key": key})
+                # 任何按键忙时都直达 owned pane：不排队也不 423。
+                status, payload = handler.responses[-1]
+                self.assertEqual(200, status)
+                self.assertTrue(payload["direct"])
+                self.assertEqual(key, payload["key"])
+                bridge.send_control_key.assert_called_once_with(key)
+                self.assertFalse(getattr(handler.state, "kimi_terminal_input_queue", None))
+                run.assert_not_called()
+                bridge.ensure.assert_not_called()
 
     def test_prepare_reservation_during_web_validation_is_caught_before_ensure(self):
         entered, allow = threading.Event(), threading.Event()
