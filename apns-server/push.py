@@ -7135,6 +7135,15 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/memory/"):
             self._handle_memory_get()
             return
+        # Co-Reading is an explicitly scoped native-App proxy.  It must never
+        # become a generic HTTPS relay or a browser-session capability.
+        if request_path == "/reading" or request_path.startswith("/reading/"):
+            if not self._native_pairing_auth_matches():
+                self.close_connection = True
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            self._handle_reading_proxy("GET")
+            return
         # --- AI status (chat header) GET — per-contact ---
         if self.path.startswith("/ai-status"):
             qs = self._query_params()
@@ -7331,6 +7340,16 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._handle_memory_date_sync_post(body)
             else:
                 self._handle_memory_sync_post(body)
+            return
+        # Keep this before generic JSON parsing: imports are intentionally much
+        # larger than ordinary App mutations, and the reading proxy owns its
+        # own content-type, size, and schema gates.
+        if request_path == "/reading" or request_path.startswith("/reading/"):
+            if not self._native_pairing_auth_matches():
+                self.close_connection = True
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            self._handle_reading_proxy("POST")
             return
         if request_path == "/stickers/upload":
             self._handle_sticker_upload()
@@ -7652,6 +7671,24 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_voice_push(body)
         else:
             self._send_json(404, {"error": "not found"})
+
+    def do_DELETE(self):
+        """DELETE is deliberately limited to the Co-Reading book resource."""
+        from urllib.parse import urlsplit
+
+        request_path = urlsplit(self.path).path
+        if not self._check_ip_allowed():
+            return
+        if request_path == "/reading" or request_path.startswith("/reading/"):
+            # A deletion must stay fail-closed even on an old strict_auth=false
+            # deployment.  Web sessions are intentionally not authority here.
+            if not self._native_pairing_auth_matches():
+                self.close_connection = True
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            self._handle_reading_proxy("DELETE")
+            return
+        self._send_json(404, {"error": "not found"})
 
     # ---------- handlers ----------
 
@@ -20676,6 +20713,428 @@ class PushHandler(BaseHTTPRequestHandler):
         if isinstance(payload, str) and token:
             return payload.replace(token, "[redacted]")
         return payload
+
+    # ------------------------------------------------------------------
+    # Co-Reading proxy API (small, native-App-only allow-list)
+    #
+    # This is intentionally separate from /memory: Co-Reading mutations may
+    # create/delete private book data, so the request must always carry the
+    # native shared secret and neither the browser cookie nor strict_auth=false
+    # legacy mode can reach it.  The upstream token is deployment-only and is
+    # never accepted from the App.
+    # ------------------------------------------------------------------
+
+    _READING_UPSTREAM_BASE = "https://reading.xiaonancaleb.xyz"
+    _READING_TOKEN_ENV = "CC_COMPANION_READING_TOKEN"
+    _READING_TOKEN_FILE_ENV = "CC_COMPANION_READING_TOKEN_FILE"
+    _READING_TIMEOUT_SEC = 20
+    _READING_RESPONSE_LIMIT = 16 * 1024 * 1024
+    _READING_IMPORT_SOURCE_LIMIT = 15 * 1024 * 1024
+    # Base64 expands 15 MiB to 20 MiB.  Leave a small fixed envelope for the
+    # other JSON fields, but reject more before buffering the request.
+    _READING_IMPORT_REQUEST_LIMIT = 21 * 1024 * 1024
+    _READING_MUTATION_REQUEST_LIMIT = 8 * 1024
+    # Match the currently deployed importer's public book/chunk identifiers.
+    # They may contain CJK or dots, but never separators or a traversal token.
+    _READING_ID_RE = re.compile(r"[A-Za-z0-9._\-\u4e00-\u9fff]{1,128}")
+    _reading_token_cache: str | None = None
+
+    @classmethod
+    def _reading_token(cls) -> str | None:
+        """Load only an explicit environment token or an exact-0600 token file.
+
+        A token in config.toml would be easy to accidentally commit or expose
+        through configuration tooling, so this proxy deliberately does not
+        support it.  The file's contents never enter any log or HTTP response.
+        """
+        if cls._reading_token_cache:
+            return cls._reading_token_cache
+        supplied = os.environ.get(cls._READING_TOKEN_ENV, "")
+        if supplied:
+            token = supplied.strip()
+            if token and len(token) <= 4096 and token == supplied.strip():
+                cls._reading_token_cache = token
+                return token
+            return None
+        token_path = os.environ.get(cls._READING_TOKEN_FILE_ENV, "").strip()
+        if not token_path:
+            return None
+        try:
+            path = Path(token_path)
+            info = path.lstat()
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                return None
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags)
+            try:
+                opened = os.fstat(fd)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_uid != os.geteuid()
+                    or stat.S_IMODE(opened.st_mode) != 0o600
+                    or opened.st_dev != info.st_dev
+                    or opened.st_ino != info.st_ino
+                ):
+                    return None
+                raw = os.read(fd, 4098)
+            finally:
+                os.close(fd)
+            token = raw.decode("utf-8").strip()
+        except (OSError, UnicodeError):
+            return None
+        if not token or len(token) > 4096:
+            return None
+        cls._reading_token_cache = token
+        return token
+
+    @classmethod
+    def _reading_safe_id(cls, value: str) -> str | None:
+        """Return one supported path/query identifier, rejecting traversal outright."""
+        if not isinstance(value, str) or ".." in value or not cls._READING_ID_RE.fullmatch(value):
+            return None
+        return value
+
+    @staticmethod
+    def _reading_path_segment(value: str) -> str:
+        from urllib.parse import quote
+
+        return quote(value, safe="-._~")
+
+    @staticmethod
+    def _reading_url_parts(request_target: str) -> tuple[Any, list[str]] | None:
+        """Parse a relative request target without accepting encoded separators."""
+        from urllib.parse import unquote, urlsplit
+
+        try:
+            parsed = urlsplit(request_target)
+        except ValueError:
+            return None
+        if parsed.scheme or parsed.netloc or re.search(r"%(?![0-9A-Fa-f]{2})", parsed.path):
+            return None
+        try:
+            segments = [unquote(part, encoding="utf-8", errors="strict") for part in parsed.path.split("/") if part]
+        except UnicodeDecodeError:
+            return None
+        # This generic guard prevents a second decoding pass from ever turning
+        # a segment into a separator; the route-specific ID gate runs below.
+        if any(not part or "/" in part or "\\" in part or part in {".", ".."} for part in segments):
+            return None
+        return parsed, segments
+
+    @staticmethod
+    def _reading_query_book_id(query: str) -> str | None:
+        from urllib.parse import parse_qsl
+
+        if re.search(r"%(?![0-9A-Fa-f]{2})", query):
+            return None
+        try:
+            pairs = parse_qsl(query, keep_blank_values=True, strict_parsing=True, encoding="utf-8", errors="strict")
+        except (UnicodeDecodeError, ValueError):
+            return None
+        if len(pairs) != 1 or pairs[0][0] != "bookId":
+            return None
+        return PushHandler._reading_safe_id(pairs[0][1])
+
+    def _reading_route(self, method: str) -> tuple[str, int] | tuple[None, int]:
+        """Map only the mobile API surface to a fixed upstream API pathname."""
+        parsed_and_segments = self._reading_url_parts(self.path)
+        if parsed_and_segments is None:
+            return None, 400
+        parsed, segments = parsed_and_segments
+        if not segments or segments[0] != "reading":
+            return None, 404
+
+        known_paths = (
+            ("reading", "books"),
+            ("reading", "progress"),
+            ("reading", "import"),
+            ("reading", "mark-read"),
+        )
+        book_path = len(segments) >= 2 and segments[:2] == ["reading", "books"]
+        if method == "GET":
+            if segments == ["reading", "books"]:
+                if parsed.query:
+                    return None, 400
+                return "/api/books", 200
+            if len(segments) == 4 and book_path and segments[3] == "chunks":
+                if parsed.query:
+                    return None, 400
+                book_id = self._reading_safe_id(segments[2])
+                return (f"/api/books/{self._reading_path_segment(book_id)}/chunks", 200) if book_id else (None, 400)
+            if len(segments) == 5 and book_path and segments[3] == "chunks":
+                if parsed.query:
+                    return None, 400
+                book_id = self._reading_safe_id(segments[2])
+                chunk_id = self._reading_safe_id(segments[4])
+                if not book_id or not chunk_id:
+                    return None, 400
+                return f"/api/books/{self._reading_path_segment(book_id)}/chunks/{self._reading_path_segment(chunk_id)}", 200
+            if segments == ["reading", "progress"]:
+                book_id = self._reading_query_book_id(parsed.query)
+                if not book_id:
+                    return None, 400
+                from urllib.parse import urlencode
+                return "/api/progress?" + urlencode({"bookId": book_id}), 200
+        elif method == "POST":
+            if segments == ["reading", "import"]:
+                if parsed.query:
+                    return None, 400
+                return "/api/import", 200
+            if segments == ["reading", "mark-read"]:
+                if parsed.query:
+                    return None, 400
+                return "/api/mark-read", 200
+        elif method == "DELETE":
+            if len(segments) == 3 and book_path:
+                if parsed.query:
+                    return None, 400
+                book_id = self._reading_safe_id(segments[2])
+                return (f"/api/books/{self._reading_path_segment(book_id)}", 200) if book_id else (None, 400)
+
+        # Give clients a useful method boundary only for a known proxy route;
+        # do not enumerate arbitrary upstream paths.
+        if tuple(segments) in known_paths or book_path:
+            return None, 405
+        return None, 404
+
+    @staticmethod
+    def _reading_json_object(raw: bytes) -> dict[str, Any]:
+        """Parse one JSON object and reject duplicate field names at every depth."""
+        def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate JSON field")
+                result[key] = value
+            return result
+
+        decoded = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+        if not isinstance(decoded, dict):
+            raise ValueError("JSON object required")
+        return decoded
+
+    def _reading_read_body(self, limit: int) -> dict[str, Any] | None:
+        """Bound and validate a JSON body before it can be retained in memory."""
+        get_all = getattr(self.headers, "get_all", None)
+        content_types = get_all("Content-Type") if callable(get_all) else [self.headers.get("Content-Type")]
+        if not content_types or len(content_types) != 1:
+            self.close_connection = True
+            self._send_json(415, {"error": "application/json content type required"})
+            return None
+        media_type = str(content_types[0] or "").split(";", 1)[0].strip().lower()
+        if media_type != "application/json":
+            self.close_connection = True
+            self._send_json(415, {"error": "application/json content type required"})
+            return None
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            self._send_json(400, {"error": "chunked request not supported"})
+            return None
+        content_lengths = get_all("Content-Length") if callable(get_all) else [self.headers.get("Content-Length")]
+        raw_length = str(content_lengths[0] or "") if content_lengths and len(content_lengths) == 1 else ""
+        length = int(raw_length) if re.fullmatch(r"[1-9][0-9]*", raw_length) else -1
+        if length <= 0 or length > limit:
+            self.close_connection = True
+            self._send_json(413, {"error": "request_too_large"})
+            return None
+        try:
+            raw = self.rfile.read(length)
+            if len(raw) != length:
+                raise ValueError("incomplete request body")
+            return self._reading_json_object(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            self._send_json(400, {"error": f"bad json: {exc}"})
+            return None
+
+    def _reading_require_empty_body(self) -> bool:
+        """Reject bodies on GET/DELETE without leaving bytes on keep-alive."""
+        get_all = getattr(self.headers, "get_all", None)
+        content_lengths = get_all("Content-Length") if callable(get_all) else [self.headers.get("Content-Length")]
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            self._send_json(400, {"error": "request body not supported"})
+            return False
+        if not content_lengths or content_lengths == [None]:
+            return True
+        raw_length = str(content_lengths[0] or "") if len(content_lengths) == 1 else ""
+        if raw_length != "0":
+            self.close_connection = True
+            self._send_json(400, {"error": "request body not supported"})
+            return False
+        return True
+
+    @classmethod
+    def _reading_validate_import(cls, body: dict[str, Any]) -> dict[str, Any] | None:
+        # These are the complete, currently deployed /api/import fields.  Do
+        # not invent a generic options object: every value stays individually
+        # bounded before it is transparently forwarded.
+        allowed = {
+            "filename", "dataBase64", "bookId", "title", "author", "format",
+            "maxChars", "headingRegex", "minSectionChars", "overwrite",
+        }
+        if set(body) - allowed or not {"filename", "dataBase64"}.issubset(body):
+            return None
+        filename = body.get("filename")
+        data_base64 = body.get("dataBase64")
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or len(filename) > 240
+            or "/" in filename
+            or "\\" in filename
+            or any(ord(char) < 32 for char in filename)
+            or not filename.lower().endswith((".txt", ".epub"))
+        ):
+            return None
+        if not isinstance(data_base64, str) or not data_base64:
+            return None
+        encoded_data = data_base64
+        if encoded_data.startswith("data:"):
+            matched = re.fullmatch(
+                r"data:(?:application/(?:epub\+zip|octet-stream)|text/plain);base64,([A-Za-z0-9+/_-]*={0,2})",
+                encoded_data,
+                flags=re.IGNORECASE,
+            )
+            if not matched:
+                return None
+            encoded_data = matched.group(1)
+        if not encoded_data or len(encoded_data) % 4:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9+/_-]*={0,2}", encoded_data):
+            return None
+        padding = 2 if encoded_data.endswith("==") else 1 if encoded_data.endswith("=") else 0
+        if (len(encoded_data) // 4) * 3 - padding > cls._READING_IMPORT_SOURCE_LIMIT:
+            return None
+        cleaned: dict[str, Any] = {"filename": filename, "dataBase64": data_base64}
+        for field, maximum in (("bookId", 128), ("title", 240), ("author", 160)):
+            if field not in body:
+                continue
+            value = body[field]
+            if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+                return None
+            if field == "bookId" and not cls._reading_safe_id(value):
+                return None
+            cleaned[field] = value
+        if "format" in body:
+            if body["format"] not in {"txt", "epub"}:
+                return None
+            cleaned["format"] = body["format"]
+        if "overwrite" in body:
+            if not isinstance(body["overwrite"], bool):
+                return None
+            cleaned["overwrite"] = body["overwrite"]
+        for field in ("maxChars", "minSectionChars"):
+            if field not in body:
+                continue
+            value = body[field]
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 1_000_000:
+                return None
+            cleaned[field] = value
+        if "headingRegex" in body:
+            value = body["headingRegex"]
+            if not isinstance(value, str) or not value or len(value) > 200:
+                return None
+            cleaned["headingRegex"] = value
+        return cleaned
+
+    @classmethod
+    def _reading_validate_mark_read(cls, body: dict[str, Any]) -> dict[str, str] | None:
+        if set(body) != {"bookId", "chunkId"}:
+            return None
+        book_id, chunk_id = body.get("bookId"), body.get("chunkId")
+        if not isinstance(book_id, str) or not isinstance(chunk_id, str):
+            return None
+        if not cls._reading_safe_id(book_id) or not cls._reading_safe_id(chunk_id):
+            return None
+        return {"bookId": book_id, "chunkId": chunk_id}
+
+    def _handle_reading_proxy(self, method: str) -> None:
+        upstream_path, route_status = self._reading_route(method)
+        if upstream_path is None:
+            # A rejected POST has not consumed its body.  Do not let those
+            # bytes become a second request on a persistent connection.
+            if method == "POST":
+                self.close_connection = True
+            self._send_json(route_status, {"error": "method not allowed" if route_status == 405 else "not found" if route_status == 404 else "invalid reading request"})
+            return
+        token = self._reading_token()
+        if not token:
+            if method == "POST":
+                self.close_connection = True
+            self._send_json(502, {"error": "reading token not configured"})
+            return
+        body: dict[str, Any] | None = None
+        if method == "POST":
+            limit = self._READING_IMPORT_REQUEST_LIMIT if upstream_path == "/api/import" else self._READING_MUTATION_REQUEST_LIMIT
+            incoming = self._reading_read_body(limit)
+            if incoming is None:
+                return
+            body = self._reading_validate_import(incoming) if upstream_path == "/api/import" else self._reading_validate_mark_read(incoming)
+            if body is None:
+                self._send_json(400, {"error": "invalid reading request"})
+                return
+        elif not self._reading_require_empty_body():
+            return
+        status, payload = self._reading_request(method, upstream_path, token, body)
+        self._send_json(status, payload)
+
+    @staticmethod
+    def _reading_open(request: Any, timeout: float) -> Any:
+        """Open with redirects disabled; redirects could otherwise defeat the fixed host."""
+        import urllib.request
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+                return None
+
+        return urllib.request.build_opener(NoRedirect()).open(request, timeout=timeout)
+
+    @classmethod
+    def _reading_request(cls, method: str, upstream_path: str, token: str, body: dict[str, Any] | None = None) -> tuple[int, Any]:
+        """Forward one fixed API request and surface only bounded JSON responses."""
+        import urllib.error
+        import urllib.request
+
+        encoded_body = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8") if body is not None else None
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "CcCompanion/1.0",
+        }
+        if encoded_body is not None:
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(
+            cls._READING_UPSTREAM_BASE + upstream_path,
+            data=encoded_body,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with cls._reading_open(request, cls._READING_TIMEOUT_SEC) as response:
+                content_type = str(response.headers.get("Content-Type", "")).split(";", 1)[0].strip().lower()
+                if content_type != "application/json":
+                    return 502, {"error": "reading upstream returned invalid content type"}
+                raw = response.read(cls._READING_RESPONSE_LIMIT + 1)
+                if len(raw) > cls._READING_RESPONSE_LIMIT:
+                    return 502, {"error": "reading upstream response too large"}
+                try:
+                    return int(response.status), cls._memory_safe_payload(json.loads(raw) if raw else {}, token)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    return 502, {"error": "reading upstream returned invalid json"}
+        except urllib.error.HTTPError as exc:
+            # Do not read or relay upstream error HTML/headers.  Authentication
+            # failures are operational errors, not a signal to expose details.
+            if exc.code in {400, 404, 409, 413, 415, 422, 429}:
+                return exc.code, {"error": "reading upstream rejected request"}
+            return 502, {"error": "reading upstream unavailable"}
+        except Exception:
+            return 502, {"error": "reading upstream unavailable"}
 
     @staticmethod
     def _memory_sync_public_payload(payload: Any) -> dict[str, Any] | None:

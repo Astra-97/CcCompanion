@@ -45,6 +45,14 @@ shared_secret = ""
 # 默认 true (secure-by-default)。调试时可改 false，上线前改回 true。
 strict_auth = true
 
+# Co-Reading proxy credentials are deliberately *not* TOML values.  Set one
+# deployment-only environment variable for cc-companion.service instead:
+#   CC_COMPANION_READING_TOKEN=...
+# or point it at a regular file owned by the service account with mode 0600:
+#   CC_COMPANION_READING_TOKEN_FILE=/root/.cccompanion/reading-token
+# The App calls this server's /reading/* API with its normal X-Auth-Token;
+# the upstream Bearer token never reaches the App, logs, or this config file.
+
 # P0-1: 允许绑定 0.0.0.0 (公网接口)。默认 false = 仅本机。
 # 如果改 true，请确保前置 HTTPS reverse proxy (Caddy/Nginx) + 防火墙已配置。
 allow_public_bind = false
