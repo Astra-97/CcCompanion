@@ -4803,13 +4803,6 @@ class PushHandler(BaseHTTPRequestHandler):
 
     server_version = "CcAPNsServer/0.1"
 
-    # This is deliberately an explicit public-App allow-list, rather than all
-    # current/future bus contacts.  Adding an internal observer or privileged
-    # contact to ``state.contact_chats`` must not silently expose it through an
-    # all-contact background subscription.
-    _CHAT_STREAM_APP_CONTACTS = frozenset({
-        "xiaoke", "apples", "kairos", "kimi",
-    })
     _CHAT_STREAM_FOREGROUND_HEARTBEAT_SECONDS = 1.0
     _CHAT_STREAM_BACKGROUND_HEARTBEAT_SECONDS = 25.0
 
@@ -12296,6 +12289,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         source=source,
                         metadata=assistant_metadata,
                     )
+                    self._publish_persisted_assistant_completion(contact_id, final)
                     return str(final.get("ts") or "")
                 except Exception:
                     logger.exception("Kimi assistant history append failed")
@@ -16120,6 +16114,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     with suppress(OSError, TypeError, ValueError):
                         Path(item.get("stored_path") or "").unlink()
                 raise
+            self._publish_persisted_assistant_completion(contact_id, assistant_rec)
             assistant_appended = True
             terminal_setter = (
                 self._set_chat_failed
@@ -16163,6 +16158,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     "turn_message_kind": "terminal_answer",
                 } if user_ts else None,
             )
+            self._publish_persisted_assistant_completion(contact_id, interrupted_rec)
             assistant_appended = True
             self._set_chat_interrupted(
                 contact_id,
@@ -16183,7 +16179,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 "为避免重复执行工具，这条消息不会自动重放。]"
             )
             message = f"{draft_text}\n\n{notice}" if draft_text else notice
-            chat.append(
+            uncertain_rec = chat.append(
                 role="assistant",
                 text=message,
                 source=f"{source}:uncertain",
@@ -16193,6 +16189,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     "turn_message_kind": "terminal_answer",
                 } if user_ts else None,
             )
+            self._publish_persisted_assistant_completion(contact_id, uncertain_rec)
             assistant_appended = True
             self._set_chat_interrupted(
                 contact_id,
@@ -16724,10 +16721,14 @@ class PushHandler(BaseHTTPRequestHandler):
     ) -> None:
         self._clear_chat_draft("apples")
 
+        def append_group_assistant(**kwargs: Any) -> dict[str, Any]:
+            persisted = chat.append(role="assistant", **kwargs)
+            self._publish_persisted_assistant_completion("apples", persisted)
+            return persisted
+
         def _worker():
             if CODEX_RUNS.latest():
-                chat.append(
-                    role="assistant",
+                append_group_assistant(
                     text="我正在处理另一边的消息，稍等一下再叫我。",
                     source="group:kairos",
                     sender_id="kairos",
@@ -16747,8 +16748,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     session_id, cwd = self._load_codex_target()
                     run = CODEX_RUNS.start(source="cc-app:apples:kairos", session_id=session_id, cwd=cwd)
                     if run is None:
-                        chat.append(
-                            role="assistant",
+                        append_group_assistant(
                             text="我正在处理另一边的消息，稍等一下再叫我。",
                             source="group:kairos",
                             sender_id="kairos",
@@ -16759,8 +16759,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     selected_model, selected_effort = self._codex_preference_snapshot()
                     CODEX_RUNS.set_observer_phase(run_id, "starting")
                     if self._codex_session_busy(session_id):
-                        chat.append(
-                            role="assistant",
+                        append_group_assistant(
                             text="我正在处理另一边的消息，稍等一下再叫我。",
                             source="group:kairos",
                             sender_id="kairos",
@@ -16859,8 +16858,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         on_activity=_on_activity,
                     )
                     if cancel_event.is_set():
-                        chat.append(
-                            role="assistant",
+                        append_group_assistant(
                             text="已中断当前生成。",
                             source="group:kairos",
                             sender_id="kairos",
@@ -16875,8 +16873,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     if return_code != 0 and stderr_text:
                         logger.warning("group kairos codex return_code=%s stderr=%s", return_code, stderr_text[-800:])
                     answer = (answer or "").strip() or "Kairos 没有返回可展示内容。"
-                    rec = chat.append(
-                        role="assistant",
+                    rec = append_group_assistant(
                         text=answer,
                         source="group:kairos",
                         sender_id="kairos",
@@ -16888,8 +16885,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     )
                 except Exception as e:
                     logger.exception("group kairos codex worker failed")
-                    chat.append(
-                        role="assistant",
+                    append_group_assistant(
                         text=f"Kairos 接入出错：{e}",
                         source="group:kairos",
                         sender_id="kairos",
@@ -16939,6 +16935,11 @@ class PushHandler(BaseHTTPRequestHandler):
         其余出口返回 "started"（含各类已落地提示的失败终态）。
         """
         attachments = list(attachments or [])
+
+        def append_group_kimi_assistant(**kwargs: Any) -> dict[str, Any]:
+            persisted = chat.append(role="assistant", **kwargs)
+            self._publish_persisted_assistant_completion("apples", persisted)
+            return persisted
         with self.state.kimi_turn_lock:
             busy = bool(
                 self.state.kimi_active_turn
@@ -16986,7 +16987,7 @@ class PushHandler(BaseHTTPRequestHandler):
             session_id = self.state.kimi_web.ensure_active_session(model=model, thinking=effort)
         except Exception:
             self._release_kimi_control(token)
-            chat.append(role="assistant", text="Kimi 当前不可用。", source="group:kimi-web:error", sender_id="kimi", sender_name="Kimi")
+            append_group_kimi_assistant(text="Kimi 当前不可用。", source="group:kimi-web:error", sender_id="kimi", sender_name="Kimi")
             self._set_typing_for_contact("apples", {"is_typing": False, "since": None})
             return "started"
         cancel_event = threading.Event()
@@ -17381,8 +17382,8 @@ class PushHandler(BaseHTTPRequestHandler):
                     source="group:kimi-web:activity",
                     group=True,
                 )
-                rec = chat.append(
-                    role="assistant", text=answer,
+                rec = append_group_kimi_assistant(
+                    text=answer,
                     source="group:kimi-web" if terminal_reason == "completed" else f"group:kimi-web:{terminal_reason}",
                     sender_id="kimi", sender_name="Kimi",
                     mentions=sorted(self._detect_apples_mentions(answer)),
@@ -17410,7 +17411,7 @@ class PushHandler(BaseHTTPRequestHandler):
         if not ready.wait(10):
             cancel_event.set()
             cleanup_group_turn()
-            chat.append(role="assistant", text="Kimi 连接失败。", source="group:kimi-web:error", sender_id="kimi", sender_name="Kimi")
+            append_group_kimi_assistant(text="Kimi 连接失败。", source="group:kimi-web:error", sender_id="kimi", sender_name="Kimi")
             return "started"
         try:
             result = self.state.kimi_web.submit_prompt(
@@ -17434,7 +17435,7 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception:
             cancel_event.set()
             cleanup_group_turn()
-            chat.append(role="assistant", text="Kimi 发送失败。", source="group:kimi-web:error", sender_id="kimi", sender_name="Kimi")
+            append_group_kimi_assistant(text="Kimi 发送失败。", source="group:kimi-web:error", sender_id="kimi", sender_name="Kimi")
         return "started"
 
     # apples 群 agent-to-agent loop guard 常量
@@ -18080,6 +18081,50 @@ class PushHandler(BaseHTTPRequestHandler):
         self.state.chat_stream_bus.publish(rec)
         self._send_json(200, {"ok": True})
 
+    def _publish_persisted_assistant_completion(
+        self,
+        contact_id: str,
+        rec: dict[str, Any] | None,
+    ) -> None:
+        """Publish the canonical persisted assistant completion, best-effort.
+
+        History is authoritative: this helper is deliberately called only
+        after ``chat.append`` returned. A bus failure must never turn a
+        successful durable append into an HTTP/turn failure.
+        """
+        try:
+            if not isinstance(rec, dict) or str(rec.get("role") or "") != "assistant":
+                return
+            text = rec.get("text")
+            if not isinstance(text, str) or not text.strip():
+                return
+            source = str(rec.get("source") or "").strip().lower()
+            if (
+                text.startswith("💓|")
+                or text.startswith("[op]")
+                or source.startswith("task")
+                or "heartbeat" in source
+            ):
+                return
+            clean_contact_id = str(contact_id or "").strip().lower()
+            if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", clean_contact_id):
+                return
+            persisted_ts = str(rec.get("ts") or "").strip()
+            if not persisted_ts:
+                return
+            publish = getattr(getattr(self.state, "chat_stream_bus", None), "publish", None)
+            if callable(publish):
+                publish({
+                    "event": "done",
+                    "stream_id": f"persisted:{clean_contact_id}:{persisted_ts}",
+                    "contact_id": clean_contact_id,
+                    "text": text,
+                    "ts": persisted_ts,
+                    "persisted": True,
+                })
+        except Exception:
+            logger.exception("persisted assistant SSE publish failed contact=%s", contact_id)
+
     def _handle_voice_call_cancel(self, body: dict[str, Any]) -> None:
         """Cancel one exact internal XiaoKe voice turn and release its TUI."""
 
@@ -18166,6 +18211,20 @@ class PushHandler(BaseHTTPRequestHandler):
         """Fail closed for the wider all-contact subscription."""
         return bool(self._native_pairing_auth_matches() or self._web_session_matches())
 
+    def _realtime_stream_contact_ids(self) -> frozenset[str]:
+        """Return the server-owned public identities allowed on wildcard SSE.
+
+        ``contact_chats`` may also contain internal observers and privileged
+        histories. A contact enters the wider subscription only when its
+        public directory route explicitly opts into both history and realtime.
+        """
+        return frozenset(
+            str(contact.get("id") or "")
+            for contact in self._chat_contact_directory()
+            if "history" in contact.get("capabilities", [])
+            and "realtime" in contact.get("capabilities", [])
+        )
+
     def _chat_stream_subscription(
         self,
     ) -> tuple[str, frozenset[str], float] | None:
@@ -18197,11 +18256,7 @@ class PushHandler(BaseHTTPRequestHandler):
             if not self._chat_stream_explicit_auth_matches():
                 self._send_json(401, {"error": "unauthorized"})
                 return None
-            available = getattr(self.state, "contact_chats", {})
-            allowed = frozenset(
-                contact_id for contact_id in self._CHAT_STREAM_APP_CONTACTS
-                if contact_id in available
-            )
+            allowed = self._realtime_stream_contact_ids()
             return "all", allowed, heartbeat_seconds
 
         contact_filter = self._contact_id_from_query()
@@ -18247,6 +18302,7 @@ class PushHandler(BaseHTTPRequestHandler):
             if contact_filter == "all":
                 connected.update({
                     "contacts": "all",
+                    "contact_ids": sorted(allowed_contacts),
                     "heartbeat": "background" if heartbeat_seconds > 1 else "foreground",
                 })
             else:
@@ -19231,6 +19287,8 @@ class PushHandler(BaseHTTPRequestHandler):
                 return
         else:
             rec = append_record()
+
+        self._publish_persisted_assistant_completion(contact_id, rec)
 
         # move 成功 append 后缓存 client_msg_id (LRU 100)
         if role == "move" and client_msg_id:

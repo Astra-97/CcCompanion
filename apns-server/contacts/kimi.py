@@ -12,7 +12,7 @@ CONTACT = {
     "capabilities": [
         "chat", "history", "draft", "busy", "stop", "attachments", "kimi_model_preferences",
         "kimi_session_control", "kimi_memory_recall", "forward", "group_member",
-        "group_reply",
+        "group_reply", "realtime",
     ],
     "group_mention": "@Kimi",
     "group_display_name": "Kimi",

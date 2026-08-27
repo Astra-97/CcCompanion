@@ -15,17 +15,17 @@ _OTHER_CONTACTS = (
     },
     {
         "id": "apples", "display_name": "苹果幼稚园", "provider": "group-router",
-        "terminal_target": "", "capabilities": ["chat", "history", "draft", "busy", "attachments", "forward", "group_chat"], "stop_fields": [],
+        "terminal_target": "", "capabilities": ["chat", "history", "draft", "busy", "attachments", "forward", "group_chat", "realtime"], "stop_fields": [],
     },
     {
         "id": "toolbot", "display_name": "小克·工具版", "provider": "task-observer",
-        "terminal_target": "", "capabilities": ["history"], "stop_fields": [],
+        "terminal_target": "", "capabilities": ["history", "realtime"], "stop_fields": [],
     },
 )
 _OTHER_ROUTES = {
     "hajiki": {"capabilities": ["history"]},
     "apples": {"send_handler": "apples", "capabilities": _OTHER_CONTACTS[1]["capabilities"]},
-    "toolbot": {"capabilities": ["history"]},
+    "toolbot": {"capabilities": ["history", "realtime"]},
 }
 _LEGACY_FALLBACK_ROUTES = {
     # Focused handler fixtures created before ServerState.contact_routes used
@@ -33,12 +33,12 @@ _LEGACY_FALLBACK_ROUTES = {
     # compatible: absence of the registration table must never grant the
     # newer Kairos/Kimi control capabilities merely because the server code
     # was upgraded.
-    "xiaoke": {"send_handler": "xiaoke", "capabilities": ["chat", "history", "draft", "busy", "stop", "attachments", "terminal", "forward", "group_member", "group_reply"], "group_dispatcher": "xiaoke"},
-    "kairos": {"send_handler": "kairos", "capabilities": ["chat", "history", "draft", "busy", "stop", "attachments", "terminal", "forward", "group_member", "group_reply"], "group_dispatcher": "kairos"},
-    "kimi": {"send_handler": "kimi", "capabilities": ["chat", "history", "draft", "busy", "stop", "attachments", "forward", "group_member", "group_reply"], "group_dispatcher": "kimi"},
+    "xiaoke": {"send_handler": "xiaoke", "capabilities": ["chat", "history", "draft", "busy", "stop", "attachments", "terminal", "forward", "group_member", "group_reply", "realtime"], "group_dispatcher": "xiaoke"},
+    "kairos": {"send_handler": "kairos", "capabilities": ["chat", "history", "draft", "busy", "stop", "attachments", "terminal", "forward", "group_member", "group_reply", "realtime"], "group_dispatcher": "kairos"},
+    "kimi": {"send_handler": "kimi", "capabilities": ["chat", "history", "draft", "busy", "stop", "attachments", "forward", "group_member", "group_reply", "realtime"], "group_dispatcher": "kimi"},
     "hajiki": {"capabilities": ["history"]},
-    "apples": {"send_handler": "apples", "capabilities": ["chat", "history", "draft", "busy", "attachments", "forward", "group_chat"]},
-    "toolbot": {"capabilities": ["history"]},
+    "apples": {"send_handler": "apples", "capabilities": ["chat", "history", "draft", "busy", "attachments", "forward", "group_chat", "realtime"]},
+    "toolbot": {"capabilities": ["history", "realtime"]},
 }
 _SEND_HANDLERS = frozenset({"xiaoke", "kairos", "kimi", "apples"})
 _GROUP_DISPATCHERS = frozenset({"xiaoke", "kairos", "kimi"})

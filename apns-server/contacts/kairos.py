@@ -12,7 +12,7 @@ CONTACT = {
     "capabilities": [
         "chat", "history", "draft", "busy", "stop", "attachments", "terminal",
         "model_preferences", "session_control", "memory_recall", "forward",
-        "group_member", "group_reply",
+        "group_member", "group_reply", "realtime",
     ],
     "group_mention": "@Kairos",
     "group_color": "gold",

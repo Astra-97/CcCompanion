@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 import threading
 import types
@@ -6,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from chat_history import ChatStreamBus
 from kimi_acp import KimiACPCancelled, KimiACPError
 from link_preview import LinkPreviewBundle
 from kimi_web_client import KimiWebError, KimiWebSessionBusy
@@ -1518,6 +1520,58 @@ class KimiWebChatRoutingTest(unittest.TestCase):
             self.assertEqual("image", rec["attachment_type"])
             self.assertEqual("gen-img.png", rec["attachment_filename"])
 
+    def test_apples_assistant_append_publishes_one_persisted_completion_event(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            handler, _chat = self._make_kimi_append_handler(tmpdir)
+            bus = ChatStreamBus()
+            queue = bus.subscribe()
+            handler.state.chat_stream_bus = bus
+            handler._apples_source_member = lambda _source: "xiaoke"
+            handler._apples_member_name = lambda member_id: member_id
+            handler._normalize_mentioned_member_ids = lambda _value: []
+            handler._detect_apples_mentions = lambda _text: set()
+            handler._maybe_route_apples_assistant_mention = lambda *_args, **_kwargs: []
+            handler.state.task_buffer = types.SimpleNamespace(
+                append=lambda **_kwargs: {"ok": True},
+            )
+
+            handler._handle_chat_append({
+                "contact_id": "apples",
+                "role": "assistant",
+                "text": "群聊完成回复",
+            })
+
+            self.assertEqual(200, handler.responses[-1][0])
+            self.assertEqual(1, len(queue))
+            event = queue.popleft()
+            self.assertEqual("done", event["event"])
+            self.assertEqual("apples", event["contact_id"])
+            self.assertTrue(event["persisted"])
+            self.assertTrue(event["stream_id"].startswith("persisted:apples:"))
+
+            handler._handle_chat_append({
+                "contact_id": "apples", "role": "assistant", "text": "[op] private status",
+            })
+            handler._handle_chat_append({
+                "contact_id": "apples", "role": "task", "text": "internal task",
+            })
+            self.assertEqual([], list(queue))
+            handler._publish_persisted_assistant_completion("apples", {
+                "role": "assistant", "text": "heartbeat", "source": "heartbeat", "ts": "heartbeat-ts",
+            })
+            self.assertEqual([], list(queue))
+            bus.unsubscribe(queue)
+
+            class FailingBus:
+                def publish(self, _event):
+                    raise OSError("subscriber unavailable")
+
+            handler.state.chat_stream_bus = FailingBus()
+            handler._handle_chat_append({
+                "contact_id": "apples", "role": "assistant", "text": "durable despite SSE failure",
+            })
+            self.assertEqual(200, handler.responses[-1][0])
+
     def test_kimi_append_copies_image_attachment_path_into_store(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             handler, chat = self._make_kimi_append_handler(tmpdir)
@@ -1802,6 +1856,9 @@ class KimiWebChatRoutingTest(unittest.TestCase):
 
     def test_group_web_reply_does_not_duplicate_user_and_preserves_group_identity(self):
         handler, chat, web = self.make_handler(web=FakeWebChat(text="@Kairos 群里好"))
+        bus = ChatStreamBus()
+        queue = bus.subscribe()
+        handler.state.chat_stream_bus = bus
         user = chat.append(role="user", text="@Kimi 你好", source="android-app:apples", sender_id="astra", sender_name="方小南")
         routed = []
         typing = []
@@ -1829,6 +1886,56 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.assertEqual("auto", next(row[3]["permission_mode"] for row in web.calls if row[0] == "submit"))
         self.assertEqual([1], routed)
         self.assertTrue(typing and typing[-1][1]["is_typing"] is False)
+        events = list(queue)
+        completion = next(event for event in events if event["text"] == "@Kairos 群里好")
+        self.assertEqual("apples", completion["contact_id"])
+        bus.unsubscribe(queue)
+
+    def test_group_kairos_final_reply_publishes_persisted_completion(self):
+        class FakeRunner:
+            def __init__(self, **_kwargs): pass
+
+            def run_prompt(self, **kwargs):
+                kwargs["on_update"]("Kairos draft")
+                return "thread-group", "Kairos 群最终回复", "", 0
+
+        fake_runs = types.SimpleNamespace(
+            latest=lambda: None,
+            start=lambda **_kwargs: ("run-group", threading.Event()),
+            set_observer_phase=lambda *_args: None,
+            publish_runner_activity=lambda *_args: None,
+            finish=lambda *_args: None,
+        )
+        handler, chat, _web = self.make_handler()
+        bus = ChatStreamBus()
+        queue = bus.subscribe()
+        handler.state.chat_stream_bus = bus
+        handler.state.codex_bin = "codex"
+        handler.state.codex_home = "/tmp/codex"
+        handler._clear_chat_draft = lambda _contact: None
+        handler._load_codex_target = lambda: ("session-group", "/tmp")
+        handler._codex_preference_snapshot = lambda: ("model", "low")
+        handler._codex_session_busy = lambda _session: False
+        handler._save_codex_target = lambda *_args: None
+        handler._apples_member_name = lambda member_id: member_id
+        handler._detect_apples_mentions = lambda _text: set()
+        handler._maybe_route_apples_assistant_mention = lambda *_args, **_kwargs: []
+        handler._has_pending_group_reply = lambda: False
+        handler._set_typing_for_contact = lambda *_args, **_kwargs: None
+        with patch("push.CODEX_RUNS", fake_runs), patch.dict(
+            sys.modules,
+            {"codex_common": types.SimpleNamespace(CodexRunner=FakeRunner)},
+        ):
+            handler._start_group_kairos_reply(chat, "@Kairos 你好", sender_name="Astra")
+            deadline = __import__("time").monotonic() + 1
+            while not queue and __import__("time").monotonic() < deadline:
+                __import__("time").sleep(0.01)
+
+        event = next(event for event in queue if event["text"] == "Kairos 群最终回复")
+        self.assertEqual("apples", event["contact_id"])
+        self.assertEqual("Kairos 群最终回复", event["text"])
+        self.assertTrue(event["stream_id"].startswith("persisted:apples:"))
+        bus.unsubscribe(queue)
 
     def test_group_web_reply_passes_attachment_batch_only_in_prompt_content(self):
         with tempfile.TemporaryDirectory() as directory:

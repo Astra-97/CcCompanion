@@ -100,9 +100,8 @@ class BackgroundChatStreamTest(unittest.TestCase):
         )
         target, allowed, heartbeat = valid._chat_stream_subscription()
         self.assertEqual(target, "all")
-        self.assertEqual(allowed, PushHandler._CHAT_STREAM_APP_CONTACTS)
-        self.assertEqual(allowed, frozenset({"xiaoke", "apples", "kairos", "kimi"}))
-        for excluded in ("hajiki", "toolbot", "internal-admin"):
+        self.assertEqual(allowed, frozenset({"xiaoke", "apples", "kairos", "kimi", "toolbot"}))
+        for excluded in ("hajiki", "internal-admin"):
             self.assertNotIn(excluded, allowed)
         self.assertEqual(heartbeat, 25.0)
 
@@ -185,13 +184,14 @@ class BackgroundChatStreamTest(unittest.TestCase):
 
         wire = writer.snapshot().decode("utf-8")
         self.assertIn('"contacts": "all"', wire)
+        self.assertIn('"contact_ids": ["apples", "kairos", "kimi", "toolbot", "xiaoke"]', wire)
         self.assertIn('"text": "visible"', wire)
         self.assertIn("正在处理（详情已隐藏）", wire)
         self.assertIn('"worker_id": "reviewer"', wire)
         self.assertNotIn('"task"', wire)
         for forbidden in (
             "sensitive-internal", "hajiki-background-excluded",
-            "toolbot-background-excluded", "sensitive-prompt", "sensitive-worker-task",
+            "sensitive-prompt", "sensitive-worker-task",
             "sensitive-activity", "private-source", "/private/session", "/private/cmd",
         ):
             self.assertNotIn(forbidden, wire)
