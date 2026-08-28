@@ -53,6 +53,15 @@ strict_auth = true
 # The App calls this server's /reading/* API with its normal X-Auth-Token;
 # the upstream Bearer token never reaches the App, logs, or this config file.
 
+# AI-assisted reading continuation uses a *different* 0600 JSON token file,
+# configured only in the service environment, never here:
+#   CC_COMPANION_READING_AI_BRIDGE_TOKEN_FILE=/var/lib/cc-xia-relay/channel-state/reading-ai-bridge-tokens.json
+# Its JSON shape is {"fixed-ai-contact": "separate-private-token"}.  A matching
+# per-contact MCP credential file is also deployment-only.  The bridge exposes
+# no book, chunk, contact, or text arguments—only requestedChars (1..1000) and
+# requestId.  Do not enable it for a contact that lacks ai_reading_continue in
+# the server-owned contact registry.
+
 # P0-1: 允许绑定 0.0.0.0 (公网接口)。默认 false = 仅本机。
 # 如果改 true，请确保前置 HTTPS reverse proxy (Caddy/Nginx) + 防火墙已配置。
 allow_public_bind = false

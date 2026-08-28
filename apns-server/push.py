@@ -7341,6 +7341,18 @@ class PushHandler(BaseHTTPRequestHandler):
             else:
                 self._handle_memory_sync_post(body)
             return
+        # This fixed-identity bridge is deliberately dispatched before the
+        # native-App reading proxy.  It authenticates with its own credential,
+        # rather than accepting the App pairing token or any caller-selected
+        # contact in a JSON payload.
+        if request_path == "/reading/ai/continue":
+            contact_id = self._reading_ai_bridge_contact()
+            if contact_id is None:
+                self.close_connection = True
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            self._handle_reading_ai_continue(contact_id)
+            return
         # Keep this before generic JSON parsing: imports are intentionally much
         # larger than ordinary App mutations, and the reading proxy owns its
         # own content-type, size, and schema gates.
@@ -10119,6 +10131,7 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.exception("xiaoke busy-queue history append failed")
             self._send_json(500, {"ok": False, "error": f"history append failed: {exc}"})
             return
+        self._reading_ai_grant_after_user_append(contact_id, rec)
         message_id = self._channel_message_id(body, contact_id, text, quoted_ts)
         ok, err, _channel_response = self._send_to_channel_transport(
             message_id=message_id,
@@ -10170,6 +10183,12 @@ class PushHandler(BaseHTTPRequestHandler):
                 "attachment_url",
                 "attachment_type",
                 "attachment_filename",
+                # System / bridge shapes are never accepted from an App user
+                # message.  A reading_share remains allowed and is separately
+                # parsed as a user-authorized frozen snapshot below.
+                "ai_reading",
+                "ai_reading_event",
+                "system",
             ):
                 raw_metadata.pop(reserved_key, None)
             if raw_metadata:
@@ -10420,6 +10439,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 logger.exception("xiaoke history append failed")
                 self._send_json(500, {"ok": False, "error": f"history append failed: {exc}"})
                 return
+            self._reading_ai_grant_after_user_append(contact_id, rec)
         if voice_reply_token:
             self.state.pending_voice_replies.register(
                 voice_reply_token,
@@ -11169,6 +11189,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 logger.exception("Kimi Web busy-queue history append failed")
                 self._send_json(500, {"ok": False, "error": "kimi_history_unavailable"})
                 return
+            self._reading_ai_grant_after_user_append(contact_id, rec)
             attachments_committed = True
             position = self._enqueue_kimi_chat_turn({
                 "kind": "web",
@@ -11416,6 +11437,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     self._send_json(500, {"ok": False, "error": "kimi_history_unavailable"})
                     return
                 attachments_committed = True
+                self._reading_ai_grant_after_user_append(contact_id, rec)
             cancel_event = threading.Event()
             self.state.kimi_active_turn = {
                 "user_ts": str(rec.get("ts") or ""),
@@ -16728,6 +16750,7 @@ class PushHandler(BaseHTTPRequestHandler):
             attachment_type=primary_attachment.get("type") or None,
             attachment_filename=primary_attachment.get("filename") or None,
         )
+        self._reading_ai_grant_after_user_append(contact_id, rec)
         self._set_typing_for_contact(contact_id, {"is_typing": True, "since": rec["ts"]})
         self._clear_chat_draft(contact_id)
         self._enqueue_kairos_task({
@@ -20728,12 +20751,23 @@ class PushHandler(BaseHTTPRequestHandler):
     _READING_TOKEN_ENV = "CC_COMPANION_READING_TOKEN"
     _READING_TOKEN_FILE_ENV = "CC_COMPANION_READING_TOKEN_FILE"
     _READING_TIMEOUT_SEC = 20
+    _READING_IMPORT_TIMEOUT_SEC = 120
+    _READING_AUTO_HEADING_PROFILE = "auto-v1"
+    _READING_AUTO_HEADING_REGEX = r"(?mi)^\s*(?:(?:第[0-9一二三四五六七八九十百千万零〇两]+[章节回卷部篇]|序章|楔子|前言|后记|尾声|番外).*$|chapter\s+\d+\b.*)$"
+    _READING_AUTO_MIN_SECTION_CHARS = 1
     _READING_RESPONSE_LIMIT = 16 * 1024 * 1024
     _READING_IMPORT_SOURCE_LIMIT = 15 * 1024 * 1024
     # Base64 expands 15 MiB to 20 MiB.  Leave a small fixed envelope for the
     # other JSON fields, but reject more before buffering the request.
     _READING_IMPORT_REQUEST_LIMIT = 21 * 1024 * 1024
     _READING_MUTATION_REQUEST_LIMIT = 8 * 1024
+    _READING_AI_REQUEST_LIMIT = 1024
+    _READING_AI_STATE_PATH_ENV = "CC_COMPANION_READING_AI_STATE_PATH"
+    _READING_AI_RESULTS_DIR_ENV = "CC_COMPANION_READING_AI_RESULTS_DIR"
+    _READING_AI_BRIDGE_TOKEN_FILE_ENV = "CC_COMPANION_READING_AI_BRIDGE_TOKEN_FILE"
+    _READING_AI_DEFAULT_STATE_PATH = Path("/var/lib/cc-xia-relay/channel-state/reading-ai-anchors.json")
+    _READING_AI_DEFAULT_TOKEN_FILE = Path("/var/lib/cc-xia-relay/channel-state/reading-ai-bridge-tokens.json")
+    _READING_AI_LOCK = threading.RLock()
     # Match the currently deployed importer's public book/chunk identifiers.
     # They may contain CJK or dots, but never separators or a traversal token.
     _READING_ID_RE = re.compile(r"[A-Za-z0-9._\-\u4e00-\u9fff]{1,128}")
@@ -20976,7 +21010,7 @@ class PushHandler(BaseHTTPRequestHandler):
         # bounded before it is transparently forwarded.
         allowed = {
             "filename", "dataBase64", "bookId", "title", "author", "format",
-            "maxChars", "headingRegex", "minSectionChars", "overwrite",
+            "maxChars", "headingProfile", "overwrite",
         }
         if set(body) - allowed or not {"filename", "dataBase64"}.issubset(body):
             return None
@@ -21029,18 +21063,23 @@ class PushHandler(BaseHTTPRequestHandler):
             if not isinstance(body["overwrite"], bool):
                 return None
             cleaned["overwrite"] = body["overwrite"]
-        for field in ("maxChars", "minSectionChars"):
+        for field in ("maxChars",):
             if field not in body:
                 continue
             value = body[field]
             if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 1_000_000:
                 return None
             cleaned[field] = value
-        if "headingRegex" in body:
-            value = body["headingRegex"]
-            if not isinstance(value, str) or not value or len(value) > 200:
+        if "headingProfile" in body:
+            if (
+                body["headingProfile"] != cls._READING_AUTO_HEADING_PROFILE
+                or not filename.lower().endswith(".txt")
+                or body.get("format", "txt") != "txt"
+            ):
                 return None
-            cleaned["headingRegex"] = value
+            cleaned["headingRegex"] = cls._READING_AUTO_HEADING_REGEX
+            # A profile must not silently discard short real chapters.
+            cleaned["minSectionChars"] = cls._READING_AUTO_MIN_SECTION_CHARS
         return cleaned
 
     @classmethod
@@ -21053,6 +21092,415 @@ class PushHandler(BaseHTTPRequestHandler):
         if not cls._reading_safe_id(book_id) or not cls._reading_safe_id(chunk_id):
             return None
         return {"bookId": book_id, "chunkId": chunk_id}
+
+    @classmethod
+    def _reading_ai_allowed_contacts(cls, state: Any) -> set[str]:
+        """Only a server-registered AI session may receive a fixed bridge."""
+        contacts = chat_contact_directory(state)
+        return {
+            str(contact.get("id") or "").strip().lower()
+            for contact in contacts
+            if "ai_reading_continue" in set(contact.get("capabilities") or [])
+        }
+
+    @classmethod
+    def _reading_ai_state_path(cls) -> Path:
+        configured = os.environ.get(cls._READING_AI_STATE_PATH_ENV, "").strip()
+        return Path(configured).expanduser() if configured else cls._READING_AI_DEFAULT_STATE_PATH
+
+    @classmethod
+    def _reading_ai_results_directory(cls) -> Path:
+        configured = os.environ.get(cls._READING_AI_RESULTS_DIR_ENV, "").strip()
+        return Path(configured).expanduser() if configured else cls._reading_ai_state_path().with_name("reading-ai-results")
+
+    @classmethod
+    def _reading_ai_load_json_file(cls, path: Path) -> dict[str, Any]:
+        try:
+            info = path.lstat()
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                return {}
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags)
+            try:
+                opened = os.fstat(fd)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_uid != os.geteuid()
+                    or stat.S_IMODE(opened.st_mode) != 0o600
+                    or opened.st_dev != info.st_dev
+                    or opened.st_ino != info.st_ino
+                ):
+                    return {}
+                raw = os.read(fd, 1024 * 1024 + 1)
+            finally:
+                os.close(fd)
+            if len(raw) > 1024 * 1024:
+                return {}
+            value = json.loads(raw.decode("utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, UnicodeError, ValueError):
+            return {}
+
+    @classmethod
+    def _reading_ai_store_load(cls) -> dict[str, Any]:
+        value = cls._reading_ai_load_json_file(cls._reading_ai_state_path())
+        anchors = value.get("anchors") if isinstance(value.get("anchors"), dict) else {}
+        # v1 stored complete excerpts in this shared file.  Keep a small
+        # migration input only long enough to move it into per-request files;
+        # new writes never put an unbounded request ledger back here.
+        legacy_requests = value.get("requests") if isinstance(value.get("requests"), dict) else {}
+        return {"version": 2, "anchors": anchors, "legacyRequests": legacy_requests}
+
+    @classmethod
+    def _reading_ai_store_save(cls, value: dict[str, Any]) -> None:
+        path = cls._reading_ai_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".reading-ai-", dir=path.parent)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"version": 2, "anchors": value.get("anchors", {})}, handle, ensure_ascii=False, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            os.chmod(path, 0o600)
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(temporary)
+
+    @classmethod
+    def _reading_ai_result_path(cls, contact_id: str, request_id: str) -> Path | None:
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", contact_id) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", request_id):
+            return None
+        return cls._reading_ai_results_directory() / contact_id / f"{request_id}.json"
+
+    @classmethod
+    def _reading_ai_result_load(cls, contact_id: str, request_id: str) -> dict[str, Any] | None:
+        path = cls._reading_ai_result_path(contact_id, request_id)
+        if path is None:
+            return None
+        value = cls._reading_ai_load_json_file(path)
+        if value.get("requestId") != request_id or not isinstance(value.get("text"), str):
+            return None
+        return value
+
+    @classmethod
+    def _reading_ai_result_save(cls, contact_id: str, request_id: str, result: dict[str, Any]) -> None:
+        path = cls._reading_ai_result_path(contact_id, request_id)
+        if path is None:
+            raise ValueError("invalid reading AI result path")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+        fd, temporary = tempfile.mkstemp(prefix=".reading-ai-result-", dir=path.parent)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(result, handle, ensure_ascii=False, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            os.chmod(path, 0o600)
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(temporary)
+
+    @classmethod
+    def _reading_ai_migrate_legacy_results(cls, value: dict[str, Any]) -> bool:
+        """Move bounded v1 entries once, then let the compact anchor state win."""
+        changed = False
+        for contact_id, entries in value.get("legacyRequests", {}).items():
+            if not isinstance(contact_id, str) or not isinstance(entries, dict):
+                continue
+            for request_id, result in entries.items():
+                if not isinstance(request_id, str) or not isinstance(result, dict):
+                    continue
+                if cls._reading_ai_result_load(contact_id, request_id) is None:
+                    cls._reading_ai_result_save(contact_id, request_id, result)
+                changed = True
+        return changed
+
+    @classmethod
+    def _reading_ai_reconcile_cached_result(cls, value: dict[str, Any], contact_id: str, result: dict[str, Any]) -> bool:
+        """Finish a crashed result write without ever moving a newer anchor back."""
+        current = value["anchors"].get(contact_id)
+        from_anchor = result.get("from")
+        to_anchor = result.get("to")
+        if not isinstance(current, dict) or not isinstance(from_anchor, dict) or not isinstance(to_anchor, dict):
+            return False
+        if not all(current.get(key) == from_anchor.get(key) for key in ("bookId", "chunkId", "anchorOffset")):
+            return False
+        value["anchors"][contact_id] = {**current, **to_anchor}
+        return True
+
+    @classmethod
+    def _reading_ai_bridge_tokens(cls) -> dict[str, str]:
+        raw_path = os.environ.get(cls._READING_AI_BRIDGE_TOKEN_FILE_ENV, "").strip()
+        value = cls._reading_ai_load_json_file(Path(raw_path).expanduser() if raw_path else cls._READING_AI_DEFAULT_TOKEN_FILE)
+        return {
+            contact.strip().lower(): token.strip()
+            for contact, token in value.items()
+            if isinstance(contact, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", contact.strip().lower())
+            and isinstance(token, str) and 16 <= len(token.strip()) <= 4096
+        }
+
+    def _reading_ai_bridge_contact(self) -> str | None:
+        contact = str(self.headers.get("X-CC-Reading-AI-Contact", "") or "").strip().lower()
+        token = str(self.headers.get("X-CC-Reading-AI-Token", "") or "")
+        expected = self._reading_ai_bridge_tokens().get(contact, "")
+        if not contact or not expected or not token:
+            return None
+        try:
+            return contact if hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")) else None
+        except UnicodeError:
+            return None
+
+    def _reading_ai_grant_from_metadata(self, contact_id: str, metadata: Any) -> None:
+        """Validate and persist a user-authorized AI-only source cursor.
+
+        The manifest and one body are fetched before a grant is written.  This
+        proves the book/chapter/UTF-16 offset really exist without retaining
+        any source text, and prevents a later re-share from moving an existing
+        same-book cursor backwards.
+        """
+        if contact_id not in self._reading_ai_allowed_contacts(self.state) or not isinstance(metadata, dict):
+            return
+        share = metadata.get("reading_share")
+        if not isinstance(share, dict) or share.get("schemaVersion") != 2:
+            return
+        book_id = share.get("bookId")
+        chunk_id = share.get("chunkId")
+        anchor = share.get("anchorOffset")
+        title = share.get("bookTitle")
+        chapter = share.get("chapterTitle", "")
+        if (
+            not isinstance(book_id, str) or not self._reading_safe_id(book_id)
+            or not isinstance(chunk_id, str) or not self._reading_safe_id(chunk_id)
+            or isinstance(anchor, bool) or not isinstance(anchor, int) or not 0 <= anchor <= 16_000_000
+            or not isinstance(title, str) or not 1 <= len(title.strip()) <= 240
+            or not isinstance(chapter, str) or len(chapter.strip()) > 320
+        ):
+            return
+        token = self._reading_token()
+        if not token:
+            return
+        manifest_status, manifest_payload = self._reading_request(
+            "GET", f"/api/books/{self._reading_path_segment(book_id)}/chunks", token,
+        )
+        manifest = manifest_payload.get("chunks", manifest_payload) if isinstance(manifest_payload, dict) else manifest_payload
+        if manifest_status != 200 or not isinstance(manifest, list):
+            return
+        ordered_ids = [
+            candidate for item in manifest if isinstance(item, dict)
+            for candidate in [str(item.get("id") or item.get("chunkId") or "")]
+            if self._reading_safe_id(candidate)
+        ]
+        try:
+            new_index = ordered_ids.index(chunk_id)
+        except ValueError:
+            return
+        chapter_status, chapter_payload = self._reading_request(
+            "GET", f"/api/books/{self._reading_path_segment(book_id)}/chunks/{self._reading_path_segment(chunk_id)}", token,
+        )
+        chapter_text = chapter_payload.get("text", "") if isinstance(chapter_payload, dict) else ""
+        if chapter_status != 200 or not isinstance(chapter_text, str) or anchor > len(chapter_text.encode("utf-16-le")) // 2:
+            return
+        with self._READING_AI_LOCK:
+            value = self._reading_ai_store_load()
+            existing = value["anchors"].get(contact_id)
+            if isinstance(existing, dict) and existing.get("bookId") == book_id:
+                old_id = existing.get("chunkId")
+                old_offset = existing.get("anchorOffset")
+                try:
+                    old_index = ordered_ids.index(old_id) if isinstance(old_id, str) else -1
+                except ValueError:
+                    old_index = -1
+                if old_index > new_index or (old_index == new_index and isinstance(old_offset, int) and old_offset >= anchor):
+                    return
+            value["anchors"][contact_id] = {
+                "bookId": book_id, "chunkId": chunk_id, "anchorOffset": anchor,
+                "bookTitle": title.strip(), "chapterTitle": chapter.strip(),
+            }
+            # A new explicit share supersedes only this AI identity's prior cursor.
+            self._reading_ai_store_save(value)
+
+    def _reading_ai_grant_after_user_append(self, contact_id: str, record: Any) -> None:
+        """Grant only after the exact user message was durably accepted.
+
+        Providers may reject or queue a request before history exists.  The
+        bridge never treats an ingress body as authorization: one successful
+        append is the sole hook and every queue path calls it exactly there.
+        """
+        if not isinstance(record, dict) or record.get("role") != "user":
+            return
+        try:
+            self._reading_ai_grant_from_metadata(contact_id, record.get("metadata"))
+        except Exception:
+            # A source validation outage must not turn a persisted user chat
+            # turn into a failed send; no anchor is written on an exception.
+            logger.exception("reading AI grant validation failed contact_id=%s", contact_id)
+
+    @staticmethod
+    def _reading_ai_utf16_slice(text: str, start_units: int, limit_units: int) -> tuple[str, int]:
+        """Slice without splitting a surrogate pair; offsets are Android UTF-16 units."""
+        used = 0
+        index = 0
+        target = max(0, start_units)
+        while index < len(text) and used < target:
+            width = 2 if ord(text[index]) > 0xFFFF else 1
+            if used + width > target:
+                break
+            used += width
+            index += 1
+        start = index
+        taken = 0
+        while index < len(text):
+            width = 2 if ord(text[index]) > 0xFFFF else 1
+            if taken + width > limit_units:
+                break
+            taken += width
+            index += 1
+        return text[start:index], used + taken
+
+    @classmethod
+    def _reading_ai_existing_event(cls, chat: Any, request_id: str) -> bool:
+        try:
+            # ``tail(250)`` silently lost idempotency after a busy chat.  Read
+            # the durable history so an old request ID can never append a
+            # second event after the state ledger is restored.
+            with Path(chat.path).open("r", encoding="utf-8") as handle:
+                rows = (json.loads(line) for line in handle if line.strip())
+                for row in rows:
+                    metadata = row.get("metadata") if isinstance(row, dict) else None
+                    event = metadata.get("ai_reading_event") if isinstance(metadata, dict) else None
+                    if isinstance(event, dict) and event.get("requestId") == request_id:
+                        return True
+        except Exception:
+            return False
+        return False
+
+    def _reading_ai_continue(self, contact_id: str, requested_chars: int, request_id: str) -> tuple[int, dict[str, Any]]:
+        if contact_id not in self._reading_ai_allowed_contacts(self.state):
+            return 403, {"error": "reading AI is not enabled for this contact"}
+        with self._READING_AI_LOCK:
+            value = self._reading_ai_store_load()
+            migrated = self._reading_ai_migrate_legacy_results(value)
+            cached = self._reading_ai_result_load(contact_id, request_id)
+            if cached is not None:
+                if migrated or self._reading_ai_reconcile_cached_result(value, contact_id, cached):
+                    self._reading_ai_store_save(value)
+                return 200, dict(cached)
+            anchor = value["anchors"].get(contact_id)
+            if not isinstance(anchor, dict):
+                return 409, {"error": "no user-authorized reading anchor"}
+            from_anchor = dict(anchor)
+            book_id = anchor.get("bookId")
+            chunk_id = anchor.get("chunkId")
+            offset = anchor.get("anchorOffset")
+            if not isinstance(book_id, str) or not self._reading_safe_id(book_id) or not isinstance(chunk_id, str) or not self._reading_safe_id(chunk_id) or isinstance(offset, bool) or not isinstance(offset, int):
+                return 409, {"error": "reading anchor is invalid"}
+            token = self._reading_token()
+            if not token:
+                return 502, {"error": "reading upstream unavailable"}
+            chunks_status, chunks_payload = self._reading_request("GET", f"/api/books/{self._reading_path_segment(book_id)}/chunks", token)
+            chunks = chunks_payload.get("chunks", chunks_payload) if isinstance(chunks_payload, dict) else chunks_payload
+            if chunks_status != 200 or not isinstance(chunks, list):
+                return 502, {"error": "reading manifest unavailable"}
+            descriptors = [
+                (chunk_id, str(item.get("title") or item.get("sectionTitle") or ""))
+                for item in chunks if isinstance(item, dict)
+                for chunk_id in [str(item.get("id") or item.get("chunkId") or "")]
+                if self._reading_safe_id(chunk_id)
+            ]
+            current = next((index for index, item in enumerate(descriptors) if item[0] == chunk_id), -1)
+            if current < 0:
+                return 409, {"error": "authorized chapter is unavailable"}
+            remaining = requested_chars
+            pieces: list[str] = []
+            next_chunk, next_offset = chunk_id, max(0, offset)
+            next_chapter_title = str(anchor.get("chapterTitle") or "").strip()[:320]
+            completed = False
+            while remaining > 0 and current < len(descriptors):
+                candidate_id, candidate_title = descriptors[current]
+                body_status, body_payload = self._reading_request("GET", f"/api/books/{self._reading_path_segment(book_id)}/chunks/{self._reading_path_segment(candidate_id)}", token)
+                body = body_payload.get("text", "") if isinstance(body_payload, dict) else ""
+                if body_status != 200 or not isinstance(body, str):
+                    return 502, {"error": "reading chapter unavailable"}
+                piece, used_offset = self._reading_ai_utf16_slice(body, next_offset if candidate_id == chunk_id else 0, remaining)
+                if piece:
+                    pieces.append(piece)
+                    remaining -= len(piece.encode("utf-16-le")) // 2
+                chapter_units = len(body.encode("utf-16-le")) // 2
+                if used_offset < chapter_units:
+                    next_chunk, next_offset = candidate_id, used_offset
+                    next_chapter_title = candidate_title.strip()[:320]
+                    break
+                current += 1
+                if current < len(descriptors):
+                    next_chunk, next_offset = descriptors[current][0], 0
+                    next_chapter_title = descriptors[current][1].strip()[:320]
+                    chunk_id = next_chunk
+                else:
+                    next_chunk, next_offset = candidate_id, chapter_units
+                    completed = True
+            excerpt = "".join(pieces)
+            if not excerpt:
+                return 409, {"error": "authorized reading has reached the end"}
+            title = str(anchor.get("bookTitle") or "").strip()[:240] or "阅读"
+            chapter_title = next_chapter_title or descriptors[current if current < len(descriptors) else len(descriptors) - 1][1].strip()[:320]
+            returned_chars = len(excerpt.encode("utf-16-le")) // 2
+            event_id = f"reading-ai:{contact_id}:{request_id}"
+            to_anchor = {
+                "bookId": book_id, "chunkId": next_chunk, "anchorOffset": next_offset,
+                "chapterTitle": chapter_title,
+            }
+            result = {
+                "requestId": request_id, "requestedChars": requested_chars, "text": excerpt,
+                "bookTitle": title, "chapterTitle": chapter_title,
+                "eventId": event_id, "from": {
+                    "bookId": from_anchor.get("bookId"), "chunkId": from_anchor.get("chunkId"),
+                    "anchorOffset": from_anchor.get("anchorOffset"),
+                }, "to": to_anchor, "returnedChars": returned_chars, "completed": completed,
+            }
+            chat = self._chat_for_contact(contact_id)
+            if not self._reading_ai_existing_event(chat, request_id):
+                chat.append(
+                    role="system", text=f"已完成《{title}》的受限续读。",
+                    source="reading-ai-bridge",
+                    metadata={"system_event": True, "no_model_context": True, "ai_reading_event": {
+                        "eventId": event_id,
+                        "requestId": request_id, "requestedChars": requested_chars,
+                        "bookTitle": title, "chapterTitle": chapter_title,
+                        "from": result["from"], "to": to_anchor,
+                        "returnedChars": returned_chars, "completed": completed,
+                    }},
+                )
+            # The result is the durable idempotency ledger.  It is deliberately
+            # per-request: a 1000-character reply cannot eventually overflow
+            # the small anchor state file and erase old request IDs.
+            self._reading_ai_result_save(contact_id, request_id, result)
+            value["anchors"][contact_id] = {**anchor, **to_anchor}
+            self._reading_ai_store_save(value)
+            return 200, result
+
+    def _handle_reading_ai_continue(self, contact_id: str) -> None:
+        incoming = self._reading_read_body(self._READING_AI_REQUEST_LIMIT)
+        if incoming is None:
+            return
+        if set(incoming) != {"requestedChars", "requestId"}:
+            self._send_json(400, {"error": "invalid reading AI request"})
+            return
+        requested = incoming.get("requestedChars")
+        request_id = incoming.get("requestId")
+        if isinstance(requested, bool) or not isinstance(requested, int) or not 1 <= requested <= 1000 or not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", request_id):
+            self._send_json(400, {"error": "invalid reading AI request"})
+            return
+        status, payload = self._reading_ai_continue(contact_id, requested, request_id)
+        self._send_json(status, payload)
 
     def _handle_reading_proxy(self, method: str) -> None:
         upstream_path, route_status = self._reading_route(method)
@@ -21116,7 +21564,8 @@ class PushHandler(BaseHTTPRequestHandler):
             method=method,
         )
         try:
-            with cls._reading_open(request, cls._READING_TIMEOUT_SEC) as response:
+            timeout = cls._READING_IMPORT_TIMEOUT_SEC if method == "POST" and upstream_path == "/api/import" else cls._READING_TIMEOUT_SEC
+            with cls._reading_open(request, timeout) as response:
                 content_type = str(response.headers.get("Content-Type", "")).split(";", 1)[0].strip().lower()
                 if content_type != "application/json":
                     return 502, {"error": "reading upstream returned invalid content type"}

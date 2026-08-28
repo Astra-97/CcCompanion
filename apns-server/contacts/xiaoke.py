@@ -10,7 +10,7 @@ CONTACT = {
     "terminal_target": "",
     "capabilities": [
         "chat", "history", "draft", "busy", "stop", "attachments", "terminal",
-        "forward", "group_member", "group_reply", "realtime",
+        "forward", "group_member", "group_reply", "realtime", "ai_reading_continue",
     ],
     "group_display_name": "小克（螃蟹版）",
     "group_mention": "@小克",

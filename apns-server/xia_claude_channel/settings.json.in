@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__reading-continue__continue_reading",
+      "mcp__luckin__*",
+      "mcp__mcdonalds__*"
+    ],
+    "deny": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch"]
+  }
+}

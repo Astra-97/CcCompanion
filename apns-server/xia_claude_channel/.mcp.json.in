@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "reading-continue": {
+      "command": "/usr/local/libexec/cc-companion-reading-ai-mcp",
+      "args": ["xiaoke"]
+    },
+    "luckin": {
+      "command": "/usr/local/libexec/cc-companion-mcp-bridge",
+      "args": ["luckin"]
+    },
+    "mcdonalds": {
+      "command": "/usr/local/libexec/cc-companion-mcp-bridge",
+      "args": ["mcdonalds"]
+    }
+  }
+}
