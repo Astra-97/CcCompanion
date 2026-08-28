@@ -26,6 +26,8 @@ KIMI_APP_MODELS = (
     "deepseek/v4-flash",
     "zhipu/glm-5.3",
     "zhipu/glm-5.3-flash",
+    "openrouter/gemini-3.7-flash",
+    "openrouter/gemini-3.1-pro",
 )
 KIMI_APP_EFFORTS = ("low", "high", "max")
 KIMI_APP_DEFAULT_MODEL = "kimi-code/k3-256k"
