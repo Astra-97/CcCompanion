@@ -96,6 +96,25 @@ class KairosRecallCardTest(unittest.TestCase):
         self.assertEqual(card["metadata"]["recall_session_id"], "session-a")
         self.assertEqual(card["metadata"]["recall_memory_keys"], ["v1:" + "a" * 64])
 
+    def test_card_keeps_only_a_bounded_memory_id(self):
+        handler = self.handler(FakeRecall(self.result()))
+        user = self.chat.append(role="user", text="测试", source="app")
+        result = types.SimpleNamespace(
+            context="【记忆浮现·自动检索】\n安全上下文",
+            items=(
+                {"date": "2026-07-19", "title": "可打开", "snippet": "安全摘要", "memory_id": "m_safe_1"},
+                {"date": "2026-07-20", "title": "旧卡", "snippet": "安全摘要", "memory_id": "../unsafe"},
+            ),
+            memory_keys=(),
+        )
+
+        self.assertTrue(handler._append_kairos_recall_card(
+            self.chat, result, user_ts=user["ts"], source="memory-recall:kairos", session_id="session-a"
+        ))
+        items = self.chat.tail(1)[0]["metadata"]["items"]
+        self.assertEqual(items[0]["memory_id"], "m_safe_1")
+        self.assertNotIn("memory_id", items[1])
+
     def test_seen_keys_are_persistent_session_scoped_and_do_not_scan_chat_history(self):
         recall = FakeRecall(self.result())
         handler = self.handler(recall)

@@ -150,6 +150,68 @@ class MemoryProxyTest(unittest.TestCase):
         urlopen.assert_not_called()
         self.assertEqual(handler.responses[0][0], 404)
 
+    def test_exact_memory_route_forwards_one_bounded_id_without_query(self):
+        handler = self.handler("/memory/item/memory_123")
+        captured = {}
+
+        class FakeOpener:
+            def open(self, req, timeout=None):
+                captured["url"] = req.full_url
+                captured["headers"] = dict(req.headers)
+                captured["timeout"] = timeout
+                return _FakeResponse(200, {"id": "memory_123", "content": "safe"})
+
+        with patch.object(PushHandler, "_memory_token", classmethod(lambda cls: "tok-abc")), \
+                patch("urllib.request.build_opener", return_value=FakeOpener()):
+            handler._handle_memory_get()
+        self.assertEqual(captured["url"], "https://memory.xiaonancaleb.xyz/api/memories/memory_123")
+        self.assertEqual(captured["headers"].get("Authorization"), "Bearer tok-abc")
+        self.assertEqual(handler.responses[0][0], 200)
+
+    def test_exact_memory_route_rejects_path_query_and_unsafe_id_without_upstream(self):
+        for path in (
+            "/memory/item/",
+            "/memory/item/a/b",
+            "/memory/item/a%2Fb",
+            "/memory/item/a?redirect=https://example.test",
+            "/memory/item/" + "a" * 129,
+        ):
+            handler = self.handler(path)
+            with patch("urllib.request.build_opener") as opener:
+                handler._handle_memory_get()
+            opener.assert_not_called()
+            self.assertEqual(handler.responses[0][0], 404)
+
+    def test_exact_memory_route_rejects_mismatched_response_id(self):
+        handler = self.handler("/memory/item/requested_id")
+
+        class FakeOpener:
+            def open(self, req, timeout=None):
+                return _FakeResponse(200, {"id": "different_id", "content": "wrong record"})
+
+        with patch.object(PushHandler, "_memory_token", classmethod(lambda cls: "tok-abc")), \
+                patch("urllib.request.build_opener", return_value=FakeOpener()):
+            handler._handle_memory_get()
+        self.assertEqual(handler.responses[0], (502, {"error": "memory upstream returned mismatched item"}))
+
+    def test_exact_memory_route_redacts_token_even_if_upstream_echoes_it(self):
+        handler = self.handler("/memory/item/memory_123")
+
+        class FakeOpener:
+            def open(self, req, timeout=None):
+                return _FakeResponse(200, {
+                    "id": "memory_123",
+                    "content": "unexpected tok-abc echo",
+                    "tok-abc-field": ["tok-abc"],
+                })
+
+        with patch.object(PushHandler, "_memory_token", classmethod(lambda cls: "tok-abc")), \
+                patch("urllib.request.build_opener", return_value=FakeOpener()):
+            handler._handle_memory_get()
+        status, payload = handler.responses[0]
+        self.assertEqual(status, 200)
+        self.assertNotIn("tok-abc", json.dumps(payload))
+
     def test_path_traversal_not_forwarded(self):
         handler = self.handler("/memory/../admin")
         with patch("urllib.request.urlopen") as urlopen:

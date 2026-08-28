@@ -10796,6 +10796,9 @@ class PushHandler(BaseHTTPRequestHandler):
                         "title": str(raw_item.get("title") or "")[:60],
                         "snippet": str(raw_item.get("snippet") or "")[:80],
                     }
+                    memory_id = str(raw_item.get("memory_id") or "").strip()
+                    if self._MEMORY_ID_RE.fullmatch(memory_id):
+                        item["memory_id"] = memory_id
                     if any(item.values()):
                         items.append(item)
                 if not items:
@@ -15997,6 +16000,9 @@ class PushHandler(BaseHTTPRequestHandler):
                     "title": str(raw_item.get("title") or "")[:60],
                     "snippet": str(raw_item.get("snippet") or "")[:80],
                 }
+                memory_id = str(raw_item.get("memory_id") or "").strip()
+                if self._MEMORY_ID_RE.fullmatch(memory_id):
+                    item["memory_id"] = memory_id
                 if any(item.values()):
                     items.append(item)
             if not items:
@@ -20520,6 +20526,11 @@ class PushHandler(BaseHTTPRequestHandler):
         "/memory/board": "/api/board",
         "/memory/calendar": "/api/calendar",
     }
+    # A recall-card item is allowed to carry only this opaque, stable identity.
+    # The native App can ask for one exact record, never choose an upstream
+    # path or query string.
+    _MEMORY_ITEM_PREFIX = "/memory/item/"
+    _MEMORY_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
     _MEMORY_ALLOWED_PARAMS = (
         "query",
         "category",
@@ -20562,6 +20573,21 @@ class PushHandler(BaseHTTPRequestHandler):
         from urllib.parse import urlparse, parse_qs, urlencode
 
         parsed = urlparse(self.path)
+        if parsed.path.startswith(self._MEMORY_ITEM_PREFIX):
+            memory_id = parsed.path[len(self._MEMORY_ITEM_PREFIX):]
+            # An exact item fetch never accepts a query string, encoded slash,
+            # or a second path segment.  Reject before token loading so bad
+            # input cannot reach the upstream or disclose config state.
+            if parsed.query or not self._MEMORY_ID_RE.fullmatch(memory_id):
+                self._send_json(404, {"error": "not found"})
+                return
+            token = self._memory_token()
+            if not token:
+                self._send_json(502, {"error": "memory token not configured"})
+                return
+            status, payload = self._memory_exact_request(memory_id, token)
+            self._send_json(status, payload)
+            return
         upstream_path = self._MEMORY_ROUTES.get(parsed.path)
         if not upstream_path:
             self._send_json(404, {"error": "not found"})
@@ -20720,6 +20746,53 @@ class PushHandler(BaseHTTPRequestHandler):
             return 502, {"error": f"memory upstream http {e.code}"}
         except Exception:
             logger.warning("memory proxy upstream unreachable for %s", url.split("?")[0])
+            return 502, {"error": "memory upstream unreachable"}
+
+    @staticmethod
+    def _memory_exact_request(memory_id: str, token: str) -> tuple[int, Any]:
+        """Fetch one fixed HTTPS memory record without following redirects."""
+        import urllib.error
+        import urllib.request
+
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        # The caller has already validated the opaque id; build the credentialed
+        # destination here so no caller can ever select a host, query, or path.
+        url = f"{PushHandler._MEMORY_UPSTREAM_BASE}/api/memories/{memory_id}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "curl/7.81.0",
+                "Accept": "application/json",
+            },
+            method="GET",
+        )
+        try:
+            opener = urllib.request.build_opener(_NoRedirect)
+            with opener.open(req, timeout=10) as resp:
+                raw = resp.read(PushHandler._MEMORY_RESPONSE_LIMIT + 1)
+                if len(raw) > PushHandler._MEMORY_RESPONSE_LIMIT:
+                    return 502, {"error": "memory upstream response too large"}
+                try:
+                    payload = json.loads(raw) if raw else {}
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    return 502, {"error": "memory upstream returned invalid json"}
+                payload = PushHandler._memory_safe_payload(payload, token)
+                if not isinstance(payload, dict) or str(payload.get("id") or "").strip() != memory_id:
+                    return 502, {"error": "memory upstream returned mismatched item"}
+                return resp.status, payload
+        except urllib.error.HTTPError as error:
+            # A redirect is intentionally not followed; Location never reaches
+            # the native client and the bearer never leaves the fixed host.
+            logger.warning("memory exact proxy upstream http %s", error.code)
+            return 404 if error.code == 404 else 502, {
+                "error": "memory not found" if error.code == 404 else "memory upstream unavailable"
+            }
+        except Exception:
+            logger.warning("memory exact proxy upstream unreachable")
             return 502, {"error": "memory upstream unreachable"}
 
     @staticmethod
