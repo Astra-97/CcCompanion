@@ -57,6 +57,7 @@ GET_ROUTES = {
     "/kimi/status": "_handle_kimi_status",
     "/kimi/terminal/observer": "_handle_kimi_terminal_observer",
     "/kimi/preferences": "_handle_kimi_preferences_get",
+    "/kimi/reader-themes": "_handle_kimi_reader_themes_get",
     "/kimi/sessions": "_handle_kimi_sessions",
 }
 

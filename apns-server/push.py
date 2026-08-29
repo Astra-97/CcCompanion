@@ -163,6 +163,7 @@ from kimi_preferences import (
     effective_kimi_effort,
 )
 from kimi_terminal_observer import KimiTerminalObserver
+from reader_themes import load_reader_themes, reader_themes_config_path
 from kimi_web_client import KimiWebClient, KimiWebError, KimiWebRecoveryConflict, KimiWebSessionBusy
 from contacts import (
     chat_contact_directory,
@@ -4191,6 +4192,7 @@ class ServerState:
             contact_history_dir / "kimi_preferences.json",
             config_path=server_cfg.get("kimi_config_path", "/root/.kimi-code/config.toml"),
         )
+        self.reader_themes_config_path = reader_themes_config_path(server_cfg)
         self.kimi_acp = KimiACPClient(
             command=server_cfg.get("kimi_bin", "/root/.kimi-code/bin/kimi"),
             cwd=server_cfg.get("kimi_cwd", DEFAULT_KIMI_CWD),
@@ -14738,6 +14740,12 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _handle_kimi_preferences_get(self) -> None:
         self._send_json(200, self._kimi_preferences_payload())
+
+    def _handle_kimi_reader_themes_get(self) -> None:
+        # Read-only server-owned palette: the App falls back to its built-in
+        # copy of the same defaults, so a missing/broken file is never fatal.
+        config_path = getattr(self.state, "reader_themes_config_path", None) or reader_themes_config_path(None)
+        self._send_json(200, {"ok": True, **load_reader_themes(config_path)})
 
     def _handle_kimi_preferences_post(self, body: dict[str, Any]) -> None:
         previous_model, _previous_effort = self.state.kimi_preferences.snapshot()
