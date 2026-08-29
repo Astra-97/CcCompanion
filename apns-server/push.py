@@ -1118,9 +1118,24 @@ KIMI_TERMINAL_SUBMIT_GRACE_SECONDS = 3.0
 KIMI_TERMINAL_IDLE_CONFIRMATION_GAP_SECONDS = 0.5
 # Kimi 私聊消息排队：活跃回复轮或 prepare/recovery/acquire 过渡态期间新
 # 消息不再 409 拒绝，入库入队后由 worker 在空闲时按序自动发出。队列有界，
-# 满了才返回 429；重投次数有上限，超限落失败卡片，绝不静默吞消息。
+# 满了才返回 429；真故障重投次数有上限、忙类重投有入队时长兜底，超限/超时
+# 都落失败卡片，绝不静默吞消息。
 KIMI_CHAT_QUEUE_MAX = 20
 KIMI_CHAT_QUEUE_MAX_ATTEMPTS = 3
+# 「合法忙」类过渡态重投（上游会话在跑长任务、本地轮/终端占用未结束等，
+# 等忙完就能成）不消耗 attempts 判死配额——否则 Kimi 跑 1-2 小时后台任务
+# 期间重投配额被耗尽，排队消息被误判死丢弃。真故障（崩溃、503、网络错误）
+# 不在此列，照旧按 attempts 计数。
+KIMI_CHAT_QUEUE_BUSY_REQUEUE_REASONS = frozenset({
+    "kimi_turn_active",
+    "kimi_terminal_busy",
+    "kimi_web_orphan_recovered_retry",
+    "kimi_web_busy_recovery_pending",
+    "kimi_web_busy_recovery_upstream_conflict",
+})
+# 忙类重投的兜底：不允许无限重投无兜底，入队超过此时长仍投不出去才判死，
+# 照旧落可见失败卡片。取保守值，覆盖「过夜长任务」级别的合法忙。
+KIMI_CHAT_QUEUE_MAX_WAIT_SECONDS = 6 * 3600
 # 终端输入不排队：与真实终端一致，忙时键盘字节同样直达底层 pane，由 tty
 # 缓冲到进程消费。只有 pane 归属/存活无法验证这类真实错误才返回失败，
 # 用户入口永不 423、永不等待"就绪"。
@@ -14247,12 +14262,41 @@ class PushHandler(BaseHTTPRequestHandler):
         with self.state.kimi_turn_lock:
             return self._push_kimi_chat_queue_locked(item)
 
-    def _requeue_kimi_chat_turn(self, item: dict[str, Any], *, reason: str) -> bool:
-        """过渡态重投：放回队首保序；attempts 超限或队列满则落失败卡片。"""
-        item["attempts"] = int(item.get("attempts") or 0) + 1
-        if item["attempts"] > KIMI_CHAT_QUEUE_MAX_ATTEMPTS:
-            self._fail_queued_kimi_chat(item, reason)
+    @staticmethod
+    def _kimi_chat_queue_wait_expired(item: dict[str, Any]) -> bool:
+        """忙类重投的时间兜底：入队（queued_at）至今超过上限视为卡死。
+
+        时间戳缺失或不可解析时不判死：生产路径入队必写 ISO 时间，解析失败
+        不该成为误杀消息的理由（真故障另有 attempts 配额兜底）。
+        """
+        raw = str(item.get("queued_at") or "")
+        try:
+            queued_dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
             return False
+        if queued_dt.tzinfo is None:
+            queued_dt = queued_dt.replace(tzinfo=timezone.utc)
+        wait = (datetime.now(timezone.utc) - queued_dt).total_seconds()
+        return wait > KIMI_CHAT_QUEUE_MAX_WAIT_SECONDS
+
+    def _requeue_kimi_chat_turn(self, item: dict[str, Any], *, reason: str) -> bool:
+        """过渡态重投：放回队首保序。
+
+        「合法忙」类原因（KIMI_CHAT_QUEUE_BUSY_REQUEUE_REASONS，等忙完就能
+        成）不消耗 attempts 判死配额，以入队时长兜底：排队超过
+        KIMI_CHAT_QUEUE_MAX_WAIT_SECONDS 仍投不出去才落失败卡片。真故障
+        （崩溃、503、网络错误）照旧按 attempts 计数，超限判死。队列满同样
+        落失败卡片——任何终态都对用户可见，绝不静默吞消息。
+        """
+        if reason in KIMI_CHAT_QUEUE_BUSY_REQUEUE_REASONS:
+            if self._kimi_chat_queue_wait_expired(item):
+                self._fail_queued_kimi_chat(item, f"{reason}_wait_expired")
+                return False
+        else:
+            item["attempts"] = int(item.get("attempts") or 0) + 1
+            if item["attempts"] > KIMI_CHAT_QUEUE_MAX_ATTEMPTS:
+                self._fail_queued_kimi_chat(item, reason)
+                return False
         with self.state.kimi_turn_lock:
             position = self._push_kimi_chat_queue_locked(item, front=True)
         if position is None:
@@ -17060,9 +17104,9 @@ class PushHandler(BaseHTTPRequestHandler):
                 self.state.kimi_prepare_token = token
         if busy or queue_ahead:
             if queue_item is not None:
-                # worker 重入又遇竞态忙：重投计数保留（不重置 attempts），也
-                # 不重复 append 系统提示刷屏；超限由 _fail_queued_kimi_chat
-                # 落单条可见失败说明。
+                # worker 重入又遇竞态忙：重投且不重复 append 系统提示刷屏。
+                # kimi_turn_active 属「合法忙」类，不消耗 attempts 配额；排队
+                # 超时的兜底判死由 _requeue_kimi_chat_turn 落单条可见失败说明。
                 self._requeue_kimi_chat_turn(queue_item, reason="kimi_turn_active")
                 self._set_typing_for_contact("apples", {"is_typing": False, "since": None})
                 return "requeued"

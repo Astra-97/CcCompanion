@@ -4,6 +4,7 @@ import tempfile
 import threading
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -1208,9 +1209,13 @@ class KimiWebChatRoutingTest(unittest.TestCase):
                 raise KimiWebRecoveryConflict("prompt moved")
 
         handler, chat, web = self.make_handler(web=AmbiguousBusyWeb())
-        with patch("push.KIMI_CHAT_QUEUE_MAX_ATTEMPTS", 0):
+        # 忙类重投不消耗 attempts（见 KIMI_CHAT_QUEUE_BUSY_REQUEUE_REASONS），
+        # 判死走入队时长兜底；这里直接压死兜底判定让用例立即落到失败终态。
+        with patch("push.KIMI_CHAT_QUEUE_MAX_ATTEMPTS", 0), patch(
+            "push.PushHandler._kimi_chat_queue_wait_expired", return_value=True,
+        ):
             handler._handle_kimi_chat_send({"text": "safe conflict"}, "kimi")
-            # 归属不明的忙态不再 409：入库入队；重投上限后落可见失败说明。
+            # 归属不明的忙态不再 409：入库入队；等待兜底超时后落可见失败说明。
             self.assertEqual(200, handler.responses[-1][0])
             self.assertTrue(handler.responses[-1][1]["queued"])
             self.assertEqual(["safe conflict"], [row["text"] for row in chat.records])
@@ -1227,7 +1232,9 @@ class KimiWebChatRoutingTest(unittest.TestCase):
                 raise AssertionError("unknown provider prompt must never be aborted")
 
         handler, chat, _web = self.make_handler(web=ExternalBusyWeb())
-        with patch("push.KIMI_CHAT_QUEUE_MAX_ATTEMPTS", 0):
+        with patch("push.KIMI_CHAT_QUEUE_MAX_ATTEMPTS", 0), patch(
+            "push.PushHandler._kimi_chat_queue_wait_expired", return_value=True,
+        ):
             handler._handle_kimi_chat_send({"text": "external busy"}, "kimi")
             self.assertEqual(200, handler.responses[-1][0])
             self.assertTrue(handler.responses[-1][1]["queued"])
@@ -1288,7 +1295,9 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         handler, chat, web = self.make_handler(web=UnprovenBusyWeb())
         pushed = []
         handler._send_chat_notification = lambda title, body: pushed.append((title, body))
-        with patch("push.KIMI_CHAT_QUEUE_MAX_ATTEMPTS", 0):
+        with patch("push.KIMI_CHAT_QUEUE_MAX_ATTEMPTS", 0), patch(
+            "push.PushHandler._kimi_chat_queue_wait_expired", return_value=True,
+        ):
             handler._handle_kimi_chat_send({"text": "maybe live external work"}, "kimi")
             # 无法证明是重启遗留的忙：不开新会话、不清标记，入库排队自动重投。
             self.assertEqual(200, handler.responses[-1][0])
@@ -2140,7 +2149,8 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.wait_idle(handler)
 
     def test_group_reentry_requeues_without_note_spam_and_keeps_attempts(self):
-        """worker 重入再遇忙：重投保序、attempts 计数保留、不重复写排队提示。"""
+        """worker 重入再遇忙：重投保序、不重复写排队提示；kimi_turn_active 是
+        「合法忙」类重投，不消耗 attempts 判死配额（时间兜底见专门用例）。"""
         handler, chat, web = self.make_handler()
         handler.state.kimi_active_turn = {
             "user_ts": "busy", "cancel_event": threading.Event(), "session_id": "s",
@@ -2158,7 +2168,7 @@ class KimiWebChatRoutingTest(unittest.TestCase):
             )
 
         self.assertEqual("requeued", outcome)
-        self.assertEqual(3, item["attempts"])
+        self.assertEqual(2, item["attempts"])
         queue = handler._kimi_chat_queue()
         self.assertEqual(1, len(queue))
         self.assertIs(item, queue[0])
@@ -2178,7 +2188,8 @@ class KimiWebChatRoutingTest(unittest.TestCase):
                 "kind": "web", "contact_id": "kimi", "text": "先到",
                 "record": {"ts": "ts-older"}, "staged_attachments": [], "attempts": 1,
             }
-            kept = handler._requeue_kimi_chat_turn(older, reason="kimi_turn_active")
+            # 用真故障类 reason：忙类 reason 不再消耗 attempts（见专门用例）。
+            kept = handler._requeue_kimi_chat_turn(older, reason="dispatch_crashed")
 
         self.assertTrue(kept)
         self.assertEqual(2, older["attempts"])
@@ -2186,6 +2197,74 @@ class KimiWebChatRoutingTest(unittest.TestCase):
             ["先到", "新到一", "新到二"],
             [item["text"] for item in handler._kimi_chat_queue()],
         )
+
+    def test_busy_requeue_never_consumes_attempts_quota(self):
+        """「合法忙」类重投（上游会话在跑长任务等，等忙完就能成）反复重投也
+        不消耗 attempts 判死配额：消息一直留在队里等忙完，不落失败卡片。"""
+        from push import KIMI_CHAT_QUEUE_BUSY_REQUEUE_REASONS, KIMI_CHAT_QUEUE_MAX_ATTEMPTS
+        handler, chat, _web = self.make_handler()
+        rec = chat.append(role="user", text="等忙完", source="test:kimi-web")
+        for reason in sorted(KIMI_CHAT_QUEUE_BUSY_REQUEUE_REASONS):
+            with self.subTest(reason=reason):
+                item = {
+                    "kind": "web", "contact_id": "kimi", "text": "等忙完",
+                    "record": rec, "staged_attachments": [], "attempts": 0,
+                }
+                with patch("push.threading.Thread"):  # 只断言重投入队，不跑 worker
+                    for _ in range(KIMI_CHAT_QUEUE_MAX_ATTEMPTS + 3):
+                        kept = handler._requeue_kimi_chat_turn(item, reason=reason)
+                        self.assertTrue(kept)
+                        handler._kimi_chat_queue().clear()
+                self.assertEqual(0, item["attempts"])
+        self.assertFalse(any(
+            row.get("source") == "kimi-web:queue-failed" for row in chat.records
+        ))
+
+    def test_busy_requeue_fails_visibly_after_wait_expired(self):
+        """时间兜底：入队超过 KIMI_CHAT_QUEUE_MAX_WAIT_SECONDS 的忙类重投仍
+        判死并落可见失败卡片——绝不无限重投，也绝不静默吞消息。"""
+        from push import KIMI_CHAT_QUEUE_MAX_WAIT_SECONDS
+        handler, chat, _web = self.make_handler()
+        rec = chat.append(role="user", text="排太久了", source="test:kimi-web")
+        item = {
+            "kind": "web", "contact_id": "kimi", "text": "排太久了",
+            "record": rec, "staged_attachments": [], "attempts": 0,
+            "queued_at": (
+                datetime.now(timezone.utc)
+                - timedelta(seconds=KIMI_CHAT_QUEUE_MAX_WAIT_SECONDS + 60)
+            ).isoformat(),
+        }
+        kept = handler._requeue_kimi_chat_turn(
+            item, reason="kimi_web_busy_recovery_upstream_conflict",
+        )
+
+        self.assertFalse(kept)
+        self.assertEqual(0, len(handler._kimi_chat_queue()))
+        notes = [row for row in chat.records if row.get("source") == "kimi-web:queue-failed"]
+        self.assertEqual(1, len(notes))
+        self.assertIn("未能送出", notes[0]["text"])
+        self.assertEqual("failed", handler.state.chat_reply_states["kimi"]["reply_state"])
+
+    def test_real_fault_requeue_still_fails_at_attempts_cap(self):
+        """真故障（崩溃/503/网络错误）照旧按 attempts 计数：超限判死落卡片。"""
+        from push import KIMI_CHAT_QUEUE_MAX_ATTEMPTS
+        handler, chat, _web = self.make_handler()
+        rec = chat.append(role="user", text="真故障", source="test:kimi-web")
+        item = {
+            "kind": "web", "contact_id": "kimi", "text": "真故障",
+            "record": rec, "staged_attachments": [], "attempts": 0,
+        }
+        with patch("push.threading.Thread"):  # 只断言重投入队，不跑 worker
+            for expected in range(1, KIMI_CHAT_QUEUE_MAX_ATTEMPTS + 1):
+                self.assertTrue(handler._requeue_kimi_chat_turn(item, reason="kimi_web_unavailable"))
+                self.assertEqual(expected, item["attempts"])
+                handler._kimi_chat_queue().clear()
+            kept = handler._requeue_kimi_chat_turn(item, reason="kimi_web_unavailable")
+
+        self.assertFalse(kept)
+        self.assertEqual(0, len(handler._kimi_chat_queue()))
+        notes = [row for row in chat.records if row.get("source") == "kimi-web:queue-failed"]
+        self.assertEqual(1, len(notes))
 
     def test_failed_queued_web_message_discards_staged_attachment_files(self):
         """排队消息永久失败：随队 staged 附件文件一并清理，不留孤儿文件。"""
@@ -2282,6 +2361,8 @@ class KimiWebChatRoutingTest(unittest.TestCase):
             outcome = handler._dispatch_queued_kimi_chat(item)
 
         self.assertEqual("requeued", outcome)
+        # 本路径的重投 reason 是真故障类 kimi_web_recovery_failed（FakeWebChat
+        # 无 recover_owned_orphaned_prompt），照旧消耗 attempts 配额。
         self.assertEqual(1, item["attempts"])
         queue = handler._kimi_chat_queue()
         self.assertEqual(1, len(queue))
