@@ -869,6 +869,16 @@ class KimiWebClient:
         The ACP pointer is deliberately never imported or overwritten.  It
         remains a rollback record while new App turns start in an explicitly
         separate Web-owned session.
+
+        The session-level ``busy`` flag also goes up while only background
+        subagent tasks run: Kimi Web's SessionService counts every agent's
+        ``turn.started`` into the session's active-turn set, while
+        ``POST /prompts`` only queues behind the *main* agent's active
+        prompt.  A busy with twice-proven empty prompt evidence is therefore
+        safe to submit through; withholding it queued App messages behind
+        hours-long background work for no reason.  Any prompt evidence (an
+        active or queued prompt, a pending approval/question, an unfamiliar
+        response shape) stays fail-closed as before.
         """
         self.start()
         session_id = self.load_active_session_id()
@@ -882,6 +892,13 @@ class KimiWebClient:
             if status:
                 if bool(status.get("busy")):
                     self.note_busy_observed(session_id)
+                    if self._confirm_stuck_busy_without_prompt(session_id, timeout=status_timeout):
+                        self.logger.warning(
+                            "Kimi Web session %s reports busy without any prompt work; "
+                            "submitting through background-only busy",
+                            session_id,
+                        )
+                        return session_id
                     raise KimiWebSessionBusy(session_id)
                 self.note_session_idle(session_id)
                 return session_id

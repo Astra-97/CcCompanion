@@ -429,6 +429,66 @@ class KimiWebIsolationTest(unittest.TestCase):
                         client.reset_stuck_busy_session("session-old", settle_timeout=0.3)
                 self.assertEqual("session-old", client.load_active_session_id())
 
+    def test_ensure_active_session_submits_through_background_only_busy(self):
+        """后台子代理任务也会把会话级 busy 顶起来，但主会话没有 prompt 工作
+        时 POST /prompts 仍会立即受理——这种忙不再让 App 消息排队。"""
+        with tempfile.TemporaryDirectory() as directory:
+            pointer = os.path.join(directory, "kimi_web_session.json")
+            client = KimiWebClient(command="/unused/kimi", state_path=pointer, cwd="/tmp/kimi-cwd")
+            client.save_active_session_id("session-old")
+            client.start = lambda: None
+            calls = []
+
+            def fake_request(method, path, *, data=None, timeout=10.0):
+                calls.append((method, path, data))
+                if path.endswith("/status"):
+                    return {"busy": True}
+                if path.endswith("/snapshot"):
+                    return {"in_flight_turn": None, "pending_approvals": [], "pending_questions": []}
+                if path.endswith("/prompts"):
+                    return {"active": None, "queued": []}
+                raise AssertionError((method, path, data))
+
+            client._request = fake_request
+            self.assertEqual("session-old", client.ensure_active_session())
+            self.assertEqual("session-old", client.load_active_session_id())
+            # 复用同一会话：不开新会话、不 abort、不动指针。
+            self.assertFalse(any(method == "POST" for method, _path, _data in calls))
+
+    def test_ensure_active_session_stays_fail_closed_for_real_prompt_work(self):
+        """有任何 prompt 证据（活跃/排队 prompt、待审批、陌生形状）照旧报忙排队。"""
+        idle_snapshot = {"in_flight_turn": None, "pending_approvals": [], "pending_questions": []}
+        for case, snapshot, prompts in (
+            ("active_prompt", idle_snapshot, {"active": {"prompt_id": "prompt-live"}, "queued": []}),
+            ("queued_prompt", idle_snapshot, {"active": None, "queued": [{"prompt_id": "prompt-queued"}]}),
+            ("in_flight_turn", {**idle_snapshot, "in_flight_turn": {"prompt_id": "prompt-live"}}, {"active": None, "queued": []}),
+            ("pending_approval", {**idle_snapshot, "pending_approvals": [{"id": "approval-1"}]}, {"active": None, "queued": []}),
+            ("missing_snapshot_shape", {}, {"active": None, "queued": []}),
+            ("missing_prompts_shape", idle_snapshot, {}),
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                pointer = os.path.join(directory, "kimi_web_session.json")
+                client = KimiWebClient(command="/unused/kimi", state_path=pointer, cwd="/tmp/kimi-cwd")
+                client.save_active_session_id("session-old")
+                client.start = lambda: None
+                calls = []
+
+                def fake_request(method, path, *, data=None, timeout=10.0):
+                    calls.append((method, path, data))
+                    if path.endswith("/status"):
+                        return {"busy": True}
+                    if path.endswith("/snapshot"):
+                        return snapshot
+                    if path.endswith("/prompts"):
+                        return prompts
+                    raise AssertionError((method, path, data))
+
+                client._request = fake_request
+                with self.assertRaises(KimiWebSessionBusy):
+                    client.ensure_active_session()
+                self.assertEqual("session-old", client.load_active_session_id())
+                self.assertFalse(any(method == "POST" for method, _path, _data in calls))
+
     def test_recovery_guard_proves_only_markers_older_than_this_process(self):
         with tempfile.TemporaryDirectory() as directory:
             pointer = os.path.join(directory, "kimi_web_session.json")
