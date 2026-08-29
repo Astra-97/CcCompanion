@@ -53,6 +53,7 @@ from datetime import date, datetime, timedelta, timezone
 import sys
 import threading
 import time
+import types
 import unicodedata
 try:
     import fcntl
@@ -4782,17 +4783,34 @@ class _QueuedSendResponderProxy:
     """后台 worker 重入请求处理器时捕获 HTTP 响应，而不是写 socket。
 
     排队消息/排队终端输入的投递直接复用正常请求路径（含全部栅栏与簿记），
-    唯一的差别是没有真实连接可写。`__getattr__` 把其余属性访问原样转发给
-    真实 handler，所以处理器内部逻辑零改动；`_send_json` 的调用结果由
-    worker 检查，用来判断投递成功、仍忙（重试）还是失败。
+    唯一的差别是没有真实连接可写——worker 挂在某个早已结束的请求 handler
+    上，它的 socket 随时已关闭。`__getattr__` 把真实 handler 的绑定方法
+    重绑到 proxy 自身（其余属性原样转发），所以处理器内部逻辑零改动、
+    整棵调用树的 `self` 都是 proxy，任何 `_send_json` 都只进 responses；
+    调用结果由 worker 检查，用来判断投递成功、仍忙（重试）还是失败。
     """
 
     def __init__(self, handler: Any) -> None:
-        self._handler = handler
-        self.responses: list[tuple[int, Any]] = []
+        object.__setattr__(self, "_handler", handler)
+        object.__setattr__(self, "responses", [])
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._handler, name)
+        attr = getattr(self._handler, name)
+        # 绑定方法必须以 proxy 为 self 重入：否则处理器内部的 self 仍是真实
+        # handler，self._send_json 会绕过捕获直接写那条早已结束的请求连接
+        # （socket 关闭后即 OSError: [Errno 9] Bad file descriptor），把排队
+        # 消息炸进 dispatch_crashed 永久失败。重绑后整棵调用树的 _send_json
+        # 都落入 responses，属性读写经 __getattr__/__setattr__ 照常转发。
+        if isinstance(attr, types.MethodType) and attr.__self__ is self._handler:
+            return types.MethodType(attr.__func__, self)
+        return attr
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # 处理器内部对 self 的写同样落到真实 handler，proxy 保持透明替身。
+        if name in {"_handler", "responses"}:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._handler, name, value)
 
     def _send_json(self, status: int, payload: Any = None, **_kwargs: Any) -> None:
         self.responses.append((status, payload))
@@ -14303,6 +14321,20 @@ class PushHandler(BaseHTTPRequestHandler):
                 logger.exception("Kimi chat queue worker iteration crashed; continuing")
                 time.sleep(0.5)
 
+    def _requeue_after_dispatch_crash(self, item: dict[str, Any]) -> bool:
+        """投递崩溃后的兜底：重投而不是永久失败，返回是否仍在队列中。
+
+        fd 失效、上游进程刚重启这类瞬时崩溃下一次投递多半自愈，直接判
+        永久失败会把用户消息静默吞掉。重投走 attempts 计数兜底，超限由
+        _requeue_kimi_chat_turn 落可见失败卡片。若处理器内部已把本项重投
+        回队列（其后的收尾步骤才崩），按身份判重，不重复入队。
+        """
+        with self.state.kimi_turn_lock:
+            already_queued = any(existing is item for existing in self._kimi_chat_queue())
+        if already_queued:
+            return True
+        return self._requeue_kimi_chat_turn(item, reason="dispatch_crashed")
+
     def _dispatch_queued_kimi_chat(self, item: dict[str, Any]) -> str:
         """投递一条排队消息；返回 started / requeued / failed 供 worker 退避。"""
         kind = str(item.get("kind") or "web")
@@ -14319,7 +14351,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 )
             except Exception:
                 logger.exception("queued group Kimi reply dispatch crashed")
-                return "failed"
+                return "requeued" if self._requeue_after_dispatch_crash(item) else "failed"
             return "requeued" if outcome == "requeued" else "started"
         contact_id = str(item.get("contact_id") or "kimi")
         record = item.get("record") if isinstance(item.get("record"), dict) else None
@@ -14348,8 +14380,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 proxy._handle_kimi_web_chat_send(body, contact_id, web)
         except Exception:
             logger.exception("queued Kimi send dispatch crashed")
-            self._fail_queued_kimi_chat(item, "dispatch_crashed")
-            return "failed"
+            return "requeued" if self._requeue_after_dispatch_crash(item) else "failed"
         for status, payload in proxy.responses:
             if status == 200 and isinstance(payload, dict) and payload.get("turn"):
                 return "started"

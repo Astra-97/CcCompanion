@@ -2231,6 +2231,129 @@ class KimiWebChatRoutingTest(unittest.TestCase):
             ]
             self.assertEqual(1, len(notes))
 
+    def test_queued_web_dispatch_survives_dead_worker_handler_socket(self):
+        """worker 挂在已结束的请求 handler 上：其 socket 关闭后真实 _send_json
+        吃 OSError Errno 9。响应必须被 proxy 捕获，投递本身照常完成。"""
+        handler, chat, web = self.make_handler()
+
+        def dead_socket_send(status, payload):
+            raise OSError(9, "Bad file descriptor")
+
+        handler._send_json = dead_socket_send
+        rec = chat.append(role="user", text="排队消息", source="test:kimi-web")
+        item = {
+            "kind": "web", "contact_id": "kimi", "text": "排队消息",
+            "record": rec, "staged_attachments": [], "attempts": 0,
+        }
+        outcome = handler._dispatch_queued_kimi_chat(item)
+        self.wait_idle(handler)
+
+        self.assertEqual("started", outcome)
+        prompts = [row[2] for row in web.calls if row[0] == "submit"]
+        self.assertEqual(1, len(prompts))
+        self.assertIn("排队消息", prompts[0])
+        # 真实 handler 的 _send_json（会写死 socket 的那条）全程未被触发。
+        self.assertEqual([], handler.responses)
+        self.assertFalse(any(
+            row.get("source") == "kimi-web:queue-failed" for row in chat.records
+        ))
+
+    def test_queued_web_busy_reentry_with_dead_socket_requeues(self):
+        """事故复现：busy 重入 + worker handler 连接已死。修复前 enqueue_busy
+        的 200 queued 写 socket 炸出 Errno 9，被外层当成 dispatch_crashed 永久
+        失败；现在响应被捕获，消息重投回队首等下次投递。"""
+        class BusyWeb(FakeWebChat):
+            def ensure_active_session(self, *, model, thinking, **_kwargs):
+                self.calls.append(("ensure", model, thinking))
+                raise KimiWebSessionBusy("web-session-1")
+
+        handler, chat, web = self.make_handler(web=BusyWeb())
+
+        def dead_socket_send(status, payload):
+            raise OSError(9, "Bad file descriptor")
+
+        handler._send_json = dead_socket_send
+        rec = chat.append(role="user", text="排队消息", source="test:kimi-web")
+        item = {
+            "kind": "web", "contact_id": "kimi", "text": "排队消息",
+            "record": rec, "staged_attachments": [], "attempts": 0,
+        }
+        with patch("push.threading.Thread"):  # 只断言重投入队，不跑真实 worker
+            outcome = handler._dispatch_queued_kimi_chat(item)
+
+        self.assertEqual("requeued", outcome)
+        self.assertEqual(1, item["attempts"])
+        queue = handler._kimi_chat_queue()
+        self.assertEqual(1, len(queue))
+        self.assertIs(item, queue[0])
+        # 既无失败卡片也无重复入库：消息仍在队列里等下次空闲投递。
+        self.assertFalse(any(
+            row.get("source") == "kimi-web:queue-failed" for row in chat.records
+        ))
+        self.assertEqual(1, [row["text"] for row in chat.records].count("排队消息"))
+
+    def test_queued_dispatch_crash_requeues_then_fails_visibly_at_cap(self):
+        """投递崩溃（瞬时 fd 失效/上游刚重启）不再一次判死刑：先重投，
+        attempts 超限才落可见失败卡片并标记 failed，消息绝不静默丢失。"""
+        handler, chat, _web = self.make_handler()
+        handler._handle_kimi_web_chat_send = Mock(side_effect=RuntimeError("transient crash"))
+        rec = chat.append(role="user", text="崩溃消息", source="test:kimi-web")
+        item = {
+            "kind": "web", "contact_id": "kimi", "text": "崩溃消息",
+            "record": rec, "staged_attachments": [], "attempts": 0,
+        }
+        with patch("push.threading.Thread"):  # 只断言重投入队，不跑真实 worker
+            outcome = handler._dispatch_queued_kimi_chat(item)
+
+        self.assertEqual("requeued", outcome)
+        self.assertEqual(1, item["attempts"])
+        self.assertIs(item, handler._kimi_chat_queue()[0])
+        self.assertFalse(any(
+            row.get("source") == "kimi-web:queue-failed" for row in chat.records
+        ))
+
+        handler._kimi_chat_queue().clear()
+        with patch("push.KIMI_CHAT_QUEUE_MAX_ATTEMPTS", 0), patch("push.threading.Thread"):
+            outcome = handler._dispatch_queued_kimi_chat(item)
+
+        self.assertEqual("failed", outcome)
+        self.assertEqual(0, len(handler._kimi_chat_queue()))
+        notes = [row for row in chat.records if row.get("source") == "kimi-web:queue-failed"]
+        self.assertEqual(1, len(notes))
+        self.assertIn("未能送出", notes[0]["text"])
+        self.assertEqual("failed", handler.state.chat_reply_states["kimi"]["reply_state"])
+
+    def test_queued_group_dispatch_crash_requeues_then_fails_visibly(self):
+        """群投递崩溃同样不静默丢：先重投，超限后群里落可见失败说明。"""
+        handler, _chat, _web = self.make_handler()
+        handler.state.group_chat = FakeGroupChat()
+        handler._start_group_kimi_reply = Mock(side_effect=RuntimeError("transient crash"))
+        item = {
+            "kind": "group", "contact_id": "apples", "text": "@Kimi 群消息",
+            "sender_name": "Astra", "user_ts": "ts-1", "hop_count": 0,
+            "attachments": [], "attempts": 0,
+        }
+        with patch("push.threading.Thread"):
+            first = handler._dispatch_queued_kimi_chat(item)
+
+        self.assertEqual("requeued", first)
+        self.assertIs(item, handler._kimi_chat_queue()[0])
+        self.assertFalse(any(
+            row.get("source") == "system:group:kimi-queue-failed"
+            for row in handler.state.group_chat.records
+        ))
+
+        handler._kimi_chat_queue().clear()
+        with patch("push.KIMI_CHAT_QUEUE_MAX_ATTEMPTS", 0), patch("push.threading.Thread"):
+            second = handler._dispatch_queued_kimi_chat(item)
+
+        self.assertEqual("failed", second)
+        notes = [
+            row for row in handler.state.group_chat.records
+            if row.get("source") == "system:group:kimi-queue-failed"
+        ]
+        self.assertEqual(1, len(notes))
+
 
 if __name__ == "__main__":
     unittest.main()
