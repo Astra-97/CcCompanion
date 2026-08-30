@@ -11,6 +11,7 @@
   </style>
 </head>
 <body>
+  <style>.wallpaper{background-image:url("./assets/memory-library-bg-667adabd.png")}</style>
   <main class="preview">
     <header class="preview-head"><div><div class="eyebrow">CC Companion · Memory preview</div><h1>记忆库的长文，也该有真实的玻璃和呼吸。</h1><p>默认展示一篇脱敏的“昨日”长日记。手机内只保留生产已有的返回、刷新、复制、滚动与底栏；左侧短样例仅是预览页控制。</p></div><span class="notice">仅预览 · 内容已脱敏</span></header>
     <section class="stage"><aside class="rail"><h2>看不同长度</h2><p>长文超过生产阅读卡的 Haze 安全阈值时，模拟切换为同配方的 dense fallback，避免整张高卡失去可读性。</p><div class="samples"><button class="sample" data-sample="diary" aria-pressed="true"><strong>昨日长日记</strong><small>默认 · 长文压力与 dense fallback</small></button><button class="sample" data-sample="short"><strong>结构化短记录</strong><small>H2/H3、段落、列表与引用</small></button><button class="sample" data-sample="legacy"><strong>旧记录回退</strong><small>无 display_markdown 时保持原始 content</small></button></div><div class="rail-note"><i></i><p><strong>真实层级</strong><br>当前 App 壁纸、聊天页分段 veil、#1B1714 @40% / 20px blur / 0.75px 白色描边均按当前 MemoryScreen 复刻。</p></div></aside>
@@ -28,5 +29,150 @@
     function detail(id){sample=id;content.replaceChildren(document.querySelector('#'+id).content.cloneNode(true));if(id==='diary'){const reading=content.querySelector('.reading');['diary-tail','diary-tail-2','diary-tail-3'].forEach(tailId=>reading.append(document.querySelector('#'+tailId).content.cloneNode(true)))}topmeta.textContent=topBarStats;content.scrollTop=0;document.querySelectorAll('.sample').forEach(x=>x.setAttribute('aria-pressed',String(x.dataset.sample===id)));const card=content.querySelector('.card');card.classList.toggle('dense',card.scrollHeight>1350);card.dataset.glassMode=card.classList.contains('dense')?'dense-fallback':'live-glass';content.querySelectorAll('[data-copy]').forEach(b=>b.onclick=async()=>{const text=b.dataset.copy==='full'?content.querySelector('.reading').innerText:b.dataset.copy;try{await navigator.clipboard.writeText(text);show(b.dataset.copy==='full'?'已复制示例全文':'已复制示例记忆 ID')}catch{show('已触发复制 · 浏览器未授权剪贴板')}})}
     function list(){topmeta.textContent=topBarStats;content.innerHTML='<div class="library-intro"><div class="eyebrow">Memory archive</div><h2>记忆库</h2><p>同步内容保留来源标签；点开一条记录查看正文层级。</p></div><div class="list"><button class="list-card" data-open="diary"><strong>Day · 昨日 · 把一天慢慢放好</strong><small>日记 · display_markdown</small><span>默认长文与 dense fallback</span></button><button class="list-card" data-open="short"><strong>今日的身体记录</strong><small>运动健康 · display_markdown</small><span>结构化短记录</span></button><button class="list-card" data-open="legacy"><strong>旧记录示例</strong><small>历史记录 · content</small><span>旧记录兼容回退</span></button></div>';content.querySelectorAll('[data-open]').forEach(b=>b.onclick=()=>detail(b.dataset.open))}
     document.querySelectorAll('.sample').forEach(b=>b.onclick=()=>detail(b.dataset.sample));back.onclick=()=>content.querySelector('[data-testid]')?list():detail(sample);document.querySelector('#refresh').onclick=()=>{document.querySelector('.refresh-surface').classList.add('spinning');show('预览内容已刷新 · 仍为脱敏示例');setTimeout(()=>document.querySelector('.refresh-surface').classList.remove('spinning'),500)};document.querySelectorAll('[data-nav]').forEach(b=>b.onclick=()=>show(b.dataset.nav+'入口保留为真实底栏'));detail('diary');window.__previewReady=true;
+  </script>
+  <script src="./day169-data.js"></script>
+  <script>
+    (() => {
+      const records = window.REAL_MEMORY_DATA;
+      const realContent = document.querySelector('#content');
+      const realToast = document.querySelector('#toast');
+      const realTopmeta = document.querySelector('#topmeta');
+      const copyIcon = '<svg viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2"/></svg>';
+      let activeMemory = 'diary';
+      let realTimer;
+
+      const recordByKey = key => records.find(record => record.key === key) || records[0];
+      const recordTitle = record => record.content.split('\n')[0].replace(/^##\s*/, '');
+      const firstBodyLine = record => record.content.split('\n').find(line => line && !line.startsWith('##') && !/^(日期|标签|心情):/.test(line));
+      const realShow = message => {
+        realToast.textContent = message;
+        realToast.hidden = false;
+        clearTimeout(realTimer);
+        realTimer = setTimeout(() => realToast.hidden = true, 1500);
+      };
+
+      function appendText(parent, tagName, text, className) {
+        const node = document.createElement(tagName);
+        if (className) node.className = className;
+        node.textContent = text;
+        parent.append(node);
+        return node;
+      }
+
+      function renderReading(record, target) {
+        const sectionPattern = /^(?:🌅|🏥|🦀|🚄|📋|🥦|💳|🎂|😴|❤️|🩸|🍽️|🏃)/u;
+        record.content.split('\n').forEach((line, index) => {
+          const text = line.trim();
+          if (!text || index === 0 || /^(日期|标签|心情):/.test(text)) return;
+          appendText(target, sectionPattern.test(text) ? 'h3' : 'p', text);
+        });
+      }
+
+      async function copyText(text, success) {
+        try {
+          await navigator.clipboard.writeText(text);
+          realShow(success);
+        } catch {
+          realShow('已触发复制 · 浏览器未授权剪贴板');
+        }
+      }
+
+      function renderDetail(key) {
+        const record = recordByKey(key);
+        activeMemory = record.key;
+        realContent.replaceChildren();
+
+        const card = document.createElement('article');
+        card.className = 'card';
+        card.dataset.testid = 'memory-detail-card';
+        card.dataset.recordId = record.id;
+        appendText(card, 'h2', recordTitle(record));
+
+        const tags = appendText(card, 'div', '', 'tags');
+        [record.category, ...record.tags].forEach((tag, index) => appendText(tags, 'span', tag, index ? 'tag accent' : 'tag'));
+
+        const timestamp = appendText(card, 'div', '', 'timestamp');
+        appendText(timestamp, 'span', `创建 ${record.createdAt}`);
+        appendText(timestamp, 'span', `${record.source} · ${record.subcategory}`);
+
+        const actions = appendText(card, 'div', '', 'action-row');
+        const idButton = document.createElement('button');
+        idButton.className = 'copy';
+        idButton.dataset.copy = record.id;
+        idButton.innerHTML = `${copyIcon}记忆 #${record.id.slice(0, 8).toUpperCase()}`;
+        idButton.onclick = () => copyText(record.id, '已复制完整记忆 ID');
+        actions.append(idButton);
+        const fullButton = document.createElement('button');
+        fullButton.className = 'copy';
+        fullButton.dataset.copy = 'full';
+        fullButton.innerHTML = `${copyIcon}复制全文`;
+        fullButton.onclick = () => copyText(record.content, '已复制真实记录全文');
+        actions.append(fullButton);
+
+        appendText(card, 'div', '', 'rule');
+        const reading = appendText(card, 'div', '', 'reading');
+        renderReading(record, reading);
+        appendText(card, 'div', `来源 · ${record.source} · ${record.subcategory}`, 'source');
+        realContent.append(card);
+        realContent.scrollTop = 0;
+        card.classList.remove('dense');
+        card.dataset.glassMode = 'live-glass';
+        realTopmeta.textContent = '2290 条记忆 · 8 个分类';
+
+        document.querySelectorAll('.sample').forEach(button => {
+          button.hidden = !['diary', 'short'].includes(button.dataset.sample);
+          button.setAttribute('aria-pressed', String((button.dataset.sample === 'short' ? 'health' : button.dataset.sample) === record.key));
+        });
+      }
+
+      function renderList() {
+        realTopmeta.textContent = '2290 条记忆 · 8 个分类';
+        realContent.replaceChildren();
+        const intro = appendText(realContent, 'div', '', 'library-intro');
+        appendText(intro, 'div', 'Memory archive', 'eyebrow');
+        appendText(intro, 'h2', '记忆库');
+        appendText(intro, 'p', '这里展示 8 月 29 日同步进入记忆库的两条真实记录。');
+        const list = appendText(realContent, 'div', '', 'list');
+        records.forEach(record => {
+          const button = appendText(list, 'button', '', 'list-card');
+          button.dataset.open = record.key;
+          appendText(button, 'strong', recordTitle(record));
+          appendText(button, 'small', `${record.category} · ${record.subcategory} · ${record.source}`);
+          appendText(button, 'span', firstBodyLine(record));
+          button.onclick = () => renderDetail(record.key);
+        });
+        realContent.scrollTop = 0;
+      }
+
+      const headerCopy = document.querySelector('.preview-head');
+      if (headerCopy) {
+        headerCopy.querySelector('h1').textContent = '真实的 Day169，放进真实的玻璃里。';
+        headerCopy.querySelector('p').textContent = '默认展示 8 月 29 日从记忆库同步的完整日记原文；手机内保留返回、刷新、复制、滚动与底栏交互。';
+        headerCopy.querySelector('.notice').textContent = '真实记录 · 仅设计预览';
+      }
+      const sideTitle = document.querySelector('.rail h2');
+      if (sideTitle) sideTitle.textContent = '8 月 29 日真实记录';
+      const sideCopy = document.querySelector('.rail > p');
+      if (sideCopy) sideCopy.textContent = '长日记和健康记录都保持当前 App 的磨砂玻璃配方；正文不做改写。';
+      const sampleButtons = document.querySelectorAll('.sample');
+      sampleButtons[0].querySelector('strong').textContent = 'Day169 完整日记';
+      sampleButtons[0].querySelector('small').textContent = '真实原文 · diary.general';
+      sampleButtons[1].querySelector('strong').textContent = 'Day169 饮食+运动健康';
+      sampleButtons[1].querySelector('small').textContent = '真实原文 · diary.health';
+      sampleButtons[2].hidden = true;
+      document.querySelector('.foot').textContent = '公开链接用于确认设计；生产 App 尚未修改。';
+
+      sampleButtons[0].onclick = () => renderDetail('diary');
+      sampleButtons[1].onclick = () => renderDetail('health');
+      document.querySelector('#back').onclick = () => realContent.querySelector('[data-testid]') ? renderList() : renderDetail(activeMemory);
+      document.querySelector('#refresh').onclick = () => {
+        document.querySelector('.refresh-surface').classList.add('spinning');
+        realShow('真实 Day169 原文已刷新');
+        setTimeout(() => document.querySelector('.refresh-surface').classList.remove('spinning'), 500);
+      };
+      document.querySelectorAll('[data-nav]').forEach(button => button.onclick = () => realShow(`${button.dataset.nav}入口保留为真实底栏`));
+      renderDetail('diary');
+      window.__previewDataReady = true;
+    })();
   </script>
 </body></html>
