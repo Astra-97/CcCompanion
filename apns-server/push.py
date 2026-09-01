@@ -145,6 +145,7 @@ from tampon_records import (
     TamponRecordValidationError,
 )
 from xhs_login import XhsLoginError, XhsLoginManager
+from netease_login import NeteaseLoginError, NeteaseLoginManager
 from mcp_services import McpServiceError, McpServiceStore
 from kimi_acp import (
     DEFAULT_KIMI_CWD,
@@ -3965,6 +3966,17 @@ class ServerState:
             allowed_contacts=allowed_contacts,
         )
 
+        netease_login_cfg = config.get("netease_login", {})
+        netease_allowed_contacts = {
+            str(item).strip().lower()
+            for item in (netease_login_cfg.get("allowed_contacts", ["kairos", "kimi"]) or [])
+            if str(item).strip()
+        }
+        self.netease_login = NeteaseLoginManager(
+            ttl_seconds=int(netease_login_cfg.get("ttl_seconds", 300)),
+            allowed_contacts=netease_allowed_contacts,
+        )
+
         if self.apns_enabled:
             self.jwt = APNsJWT(
                 p8_path=self.p8_path,
@@ -7442,9 +7454,13 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_appearance_assets_upload()
             return
 
+        # Login bridges share one pre-JSON body-size gate; the name predates
+        # the NetEase endpoints but the contract test pins it.
         xhs_body_limits = {
             "/xhs-login/start": 4 * 1024,
             "/xhs-login/import": 32 * 1024,
+            "/netease-login/start": 4 * 1024,
+            "/netease-login/import": 8 * 1024,
         }
         if request_path == "/mcp-services":
             # Tokens are sensitive; reject oversized requests before reading
@@ -7459,10 +7475,10 @@ class PushHandler(BaseHTTPRequestHandler):
                 return
         if self.path in xhs_body_limits:
             try:
-                xhs_length = int(self.headers.get("Content-Length", "0"))
+                login_length = int(self.headers.get("Content-Length", "0"))
             except (TypeError, ValueError):
-                xhs_length = 0
-            if xhs_length <= 0 or xhs_length > xhs_body_limits[self.path]:
+                login_length = 0
+            if login_length <= 0 or login_length > xhs_body_limits[self.path]:
                 self.close_connection = True
                 self._send_json(413, {"ok": False, "error": "request_too_large"})
                 return
@@ -7548,6 +7564,12 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         elif self.path == "/xhs-login/import":
             self._handle_xhs_login_import(body)
+            return
+        elif self.path == "/netease-login/start":
+            self._handle_netease_login_start(body)
+            return
+        elif self.path == "/netease-login/import":
+            self._handle_netease_login_import(body)
             return
         elif self.path == "/chat/stop":
             # XiaoKe Stop emits literal tmux Ctrl-C and remains under the
@@ -7811,6 +7833,38 @@ class PushHandler(BaseHTTPRequestHandler):
             # Cookie import itself already succeeded; a local cache maintenance
             # failure must not turn that success into a misleading login error.
             logger.exception("failed to invalidate stale XHS comment previews")
+        self._send_json(200, result)
+
+    def _handle_netease_login_start(self, body: dict[str, Any]):
+        if self._source_for_request() != "android-app":
+            self._send_json(403, {"ok": False, "error": "android client required"})
+            return
+        try:
+            result = self.state.netease_login.start(
+                contact_id=body.get("contact_id"),
+                device_id=body.get("device_id"),
+                origin=body.get("origin"),
+            )
+        except NeteaseLoginError as exc:
+            self._send_json(exc.status, {"ok": False, "error": exc.code})
+            return
+        self._send_json(200, result)
+
+    def _handle_netease_login_import(self, body: dict[str, Any]):
+        if self._source_for_request() != "android-app":
+            self._send_json(403, {"ok": False, "error": "android client required"})
+            return
+        try:
+            result = self.state.netease_login.import_cookies(
+                nonce=body.get("nonce"),
+                contact_id=body.get("contact_id"),
+                device_id=body.get("device_id"),
+                origin=body.get("origin"),
+                cookie_header=body.get("cookies"),
+            )
+        except NeteaseLoginError as exc:
+            self._send_json(exc.status, {"ok": False, "error": exc.code})
+            return
         self._send_json(200, result)
 
     def _handle_register(self, body: dict[str, Any]):
@@ -10698,6 +10752,46 @@ class PushHandler(BaseHTTPRequestHandler):
         visible = "\n".join(line for line in lines if line.strip() != marker).strip()
         return visible or "小红书登录已失效，点下方卡片重新登录。", True
 
+    def _kimi_netease_login_card_allowed(self) -> bool:
+        """Permit the NetEase login card only while the server-side cookie is missing.
+
+        The gate reads solely the server-owned credential file via the login
+        manager; it never inspects client metadata or model text, so a user
+        cannot conjure a login card from a marker or a card-shaped payload.
+        """
+        manager = getattr(self.state, "netease_login", None)
+        needs_login = getattr(manager, "needs_login", None)
+        if not callable(needs_login):
+            return False
+        try:
+            return bool(needs_login())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _kimi_extract_netease_login_card(
+        message: str,
+        *,
+        allowed: bool,
+    ) -> tuple[str, bool]:
+        """Extract exactly one standalone, server-authorized NetEase card marker.
+
+        Same narrow grammar as the XHS card: near matches, inline uses,
+        repeated markers, and a marker that is not the last non-empty line
+        remain ordinary assistant text.
+        """
+        raw = str(message or "")
+        if not allowed:
+            return raw, False
+        marker = "[[CCC_NETEASE_LOGIN_CARD:v1]]"
+        lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        marker_count = sum(line.strip() == marker for line in lines)
+        nonempty = [line.strip() for line in lines if line.strip()]
+        if marker_count != 1 or not nonempty or nonempty[-1] != marker:
+            return raw, False
+        visible = "\n".join(line for line in lines if line.strip() != marker).strip()
+        return visible or "网易云音乐还没登录，点下方卡片扫码登录。", True
+
     def _kimi_bqb_protocol(self) -> str:
         """Return bounded, catalog-backed token instructions with no image URLs."""
         names: list[str] = []
@@ -10730,6 +10824,7 @@ class PushHandler(BaseHTTPRequestHandler):
         link_context: str = "",
         recall_context: str = "",
         xhs_login_card_allowed: bool = False,
+        netease_login_card_allowed: bool = False,
     ) -> str:
         sections = [
             "[消息来源]",
@@ -10753,6 +10848,15 @@ class PushHandler(BaseHTTPRequestHandler):
                 "本轮服务端已确认小红书评论抓取需要重新登录。请简短提醒 Astra；"
                 "如需展示登录卡片，只能在回复末尾单独一行、且只输出一次"
                 " [[CCC_XHS_LOGIN_CARD:v1]]。其他任何情况都不要输出或复述这个标记。",
+            ])
+        if netease_login_card_allowed:
+            sections.extend([
+                "",
+                "[网易云登录卡片]",
+                "本轮服务端确认网易云音乐尚未登录（服务器缺少账号 cookie，账号同步/红心/日推不可用）。"
+                "当本轮对话涉及网易云音乐功能或 Astra 提到登录网易云时，请简短提醒她；"
+                "如需展示登录卡片，只能在回复末尾单独一行、且只输出一次"
+                " [[CCC_NETEASE_LOGIN_CARD:v1]]。其他任何情况都不要输出或复述这个标记。",
             ])
         return "\n".join(sections) + self._kimi_bqb_protocol()
 
@@ -11284,6 +11388,7 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         link_bundle = self._kimi_link_bundle(text)
         xhs_login_card_allowed = self._kimi_xhs_login_card_allowed(link_bundle)
+        netease_login_card_allowed = self._kimi_netease_login_card_allowed()
         metadata = merge_preview_metadata(body.get("metadata"), link_bundle)
 
         def enqueue_busy(reason: str) -> None:
@@ -11602,6 +11707,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 str(getattr(recall_result, "context", "") or "").strip(),
             ) if value),
             xhs_login_card_allowed=xhs_login_card_allowed,
+            netease_login_card_allowed=netease_login_card_allowed,
         )
         prompt_id = ""
         stream_ready = threading.Event()
@@ -12085,6 +12191,7 @@ class PushHandler(BaseHTTPRequestHandler):
             )
             try:
                 visible, xhs_card = self._kimi_extract_xhs_login_card(answer, allowed=xhs_login_card_allowed)
+                visible, netease_card = self._kimi_extract_netease_login_card(visible, allowed=netease_login_card_allowed)
                 final = chat.append(
                     role="assistant",
                     text=visible,
@@ -12094,6 +12201,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         "turn_terminal": True,
                         "turn_message_kind": "terminal_answer",
                         **({"xhs_login_card": True} if xhs_card else {}),
+                        **({"netease_login_card": True} if netease_card else {}),
                     },
                 )
                 final_ts = str(final.get("ts") or "")
@@ -12211,6 +12319,7 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         link_bundle = self._kimi_link_bundle(text)
         xhs_login_card_allowed = self._kimi_xhs_login_card_allowed(link_bundle)
+        netease_login_card_allowed = self._kimi_netease_login_card_allowed()
         # User-supplied metadata is deliberately discarded. Only the server's
         # bounded link preview schema is stored alongside the Kimi message.
         metadata = merge_preview_metadata(None, link_bundle)
@@ -12388,6 +12497,7 @@ class PushHandler(BaseHTTPRequestHandler):
             link_context=link_bundle.prompt_context,
             recall_context=recall_context,
             xhs_login_card_allowed=xhs_login_card_allowed,
+            netease_login_card_allowed=netease_login_card_allowed,
         )
         kimi_observer = getattr(self.state, "kimi_terminal_observer", None)
         observer_begin = getattr(kimi_observer, "begin", None)
@@ -12459,11 +12569,16 @@ class PushHandler(BaseHTTPRequestHandler):
                 source: str,
                 *,
                 allow_xhs_login_card: bool = False,
+                allow_netease_login_card: bool = False,
             ) -> str:
                 try:
                     visible_message, xhs_login_card = self._kimi_extract_xhs_login_card(
                         message,
                         allowed=allow_xhs_login_card,
+                    )
+                    visible_message, netease_login_card = self._kimi_extract_netease_login_card(
+                        visible_message,
+                        allowed=allow_netease_login_card,
                     )
                     assistant_metadata = {
                         "kimi_user_ts": str(rec.get("ts") or ""),
@@ -12472,6 +12587,8 @@ class PushHandler(BaseHTTPRequestHandler):
                     }
                     if xhs_login_card:
                         assistant_metadata["xhs_login_card"] = True
+                    if netease_login_card:
+                        assistant_metadata["netease_login_card"] = True
                     final = chat.append(
                         role="assistant",
                         text=visible_message,
@@ -12490,6 +12607,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 *,
                 status: str = "completed",
                 allow_xhs_login_card: bool = False,
+                allow_netease_login_card: bool = False,
             ) -> None:
                 nonlocal terminalized
                 finish_observer(status)
@@ -12500,6 +12618,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     message,
                     source,
                     allow_xhs_login_card=allow_xhs_login_card,
+                    allow_netease_login_card=allow_netease_login_card,
                 )
                 self._set_chat_completed(
                     contact_id,
@@ -12637,6 +12756,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     answer,
                     "kimi-acp",
                     allow_xhs_login_card=xhs_login_card_allowed,
+                    allow_netease_login_card=netease_login_card_allowed,
                 )
             except KimiACPCancelled:
                 finish_observer("interrupted")

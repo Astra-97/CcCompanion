@@ -1,10 +1,10 @@
 # 网易云音乐卡片协议（music_card / netease_login_card）
 
 > Phase 1 已交付：两个开源项目部署 + push.py 收卡端点 + 本文档。
-> Phase 2 待做：Android app 渲染 music_card、实现 netease_login_card 交互、
-> 服务端 `/netease-login/import` 端点（本文 §4 是设计稿，尚未实现）。
+> Phase 2 已交付：Android app 渲染 music_card、netease_login_card 交互、
+> 服务端 `/netease-login/start|import` 端点（§4 已按实际实现更新）。
 >
-> 面向读者：Phase 2 的 app 开发者。写代码前先把 §2、§4 读完。
+> 面向读者：后续维护者。写代码前先把 §2、§4 读完。
 
 ## 1. 架构总览
 
@@ -104,53 +104,59 @@ Content-Type: application/json
   - 或 app 内 WebView 预置 `Authorization: Basic ...` 头（凭据不落 app 代码，走下发）。
 - 音频流走 `/music/file/...`，Range 请求 nginx 已透传。
 
-## 4. netease_login_card（设计稿，Phase 2 实现）
+## 4. netease_login_card（Phase 2 已实现）
 
 目标：Astra 在 app 里完成网易云网页登录，cookie（`MUSIC_U` + `__csrf`）安全落到 VPS，
 三个 netease 服务获得登录态。**cookie 全程不进聊天文本、不进日志、不进 git。**
 
-### 4.1 流程（复用 XhsLoginCard 的 WebView 收 cookie 模式）
+实现完全复用 XhsLoginCard 的 WebView 收 cookie 模式（`xhs_login.py` ↔ `netease_login.py`、
+`/xhs-login/*` ↔ `/netease-login/*`、`XhsLoginCard.kt` ↔ `NeteaseLoginCard.kt`）。
+与原设计稿的两处偏差：卡片**不内嵌 login_session_id**（一次性 nonce 由 app 点开卡片时
+经 `/netease-login/start` 现场换取，避免了历史卡片里 session 过期的问题）；登录结果
+**不单独写结果卡**（import 同步完成，app 侧 toast 提示成功/失败）。
+
+### 4.1 流程
 
 ```
-1. 用户在聊天里表达"登录网易云"（或设置页入口）
-2. 服务器在聊天历史写 netease_login_card（metadata，见 4.2），带一次性 login_session_id（TTL 300s）
-3. app 渲染登录卡 → 点击打开卡片内嵌 WebView：
-   - URL: https://music.163.com/ （登录页）
-   - WebView 开 DOM storage；用 WebViewClient + CookieManager 轮询/页面钩子
-     检测 music.163.com 域下出现 MUSIC_U cookie（XhsLoginCard 已有完全相同的收割代码路径）
-4. 收割到 MUSIC_U 和 __csrf 后，app POST 到服务器：
-     POST /netease-login/import
-     X-Auth-Token: <app pairing token>          # 复用 native pairing 鉴权
-     {"login_session_id": "...", "cookies": {"MUSIC_U": "...", "__csrf": "..."}}
-   （Body 上限 8 KiB；cookie 值只进请求体，不进 URL/日志——同 xhs-login 纪律）
-5. 服务器校验 login_session_id 未过期、字段名白名单（只收 MUSIC_U/__csrf/userAgent），
-   原子写两个 cookie 文件（0600）：
+1. 服务端门槛：push.py 每轮检查 anko3o/server/.netease_cred 是否缺少 MUSIC_U
+   （NeteaseLoginManager.needs_login()）。缺失时 Kimi prompt 附加 [网易云登录卡片] 段，
+   允许模型在回复末尾单独一行输出一次 [[CCC_NETEASE_LOGIN_CARD:v1]] 标记
+2. push.py 提取标记（同 xhs 的窄语法：唯一、独立行、最后一行），在该轮终态 assistant
+   消息 metadata 上写 netease_login_card=true；标记本身不进聊天文本
+3. app 渲染登录卡（NeteaseLoginCardPreview）→ 点击打开全屏 Dialog 内嵌 WebView：
+   - 先 POST /netease-login/start（X-Auth-Token pairing 鉴权 + android-app 来源）换取
+     一次性 nonce（TTL 300s，绑定 contact_id + device_id + origin）
+   - WebView 打开 https://music.163.com/，导航限 *.163.com、子资源限 163/126/127 域，
+     桌面 UA；用户扫码（可保存二维码到相册）或密码登录
+4. 用户点「我已确认，返回检测」，app 从 CookieManager 收割 music.163.com 域 cookie，
+   白名单过滤到 MUSIC_U/__csrf 后 POST /netease-login/import（Body ≤8 KiB，cookie
+   只进请求体——同 xhs-login 纪律）
+5. 服务器校验 nonce（一次性、300s TTL、绑定一致）、cookie 白名单与字符集，原子写
+   两个 0600 文件：
      /root/netease-music/anko3o/server/.netease_cred   → "MUSIC_U=<值>"
      /root/netease-music/env/vael-mcp.env              → NETEASE_COOKIE=/NETEASE_CSRF=
-   然后 systemctl restart netease-vael-mcp netease-music-server netease-music-mcp
-   （cookie 只在启动时读取，必须重启；这三个服务与 cc-companion 无关，随时可重启）
-6. 服务器在聊天历史写第二张卡：登录结果卡（成功/失败 + 脱敏昵称，
-   昵称来自 Anko3o 的 /music/netease/profile 探活）
+     （其余行如 NETEASE_READONLY=1 原样保留）
+   然后固定 argv 执行 systemctl restart netease-vael-mcp netease-music-server
+   netease-music-mcp（cookie 只在启动时读取，必须重启；这三个服务与 cc-companion
+   无关，随时可重启）
+6. 成功后 app toast「网易云登录已同步」，并清空本进程 WebView cookie jar
 ```
 
 不做热加载的理由：两个项目都在启动时一次性读 cookie，热加载需要改上游代码；
 重启三个小服务亚秒级完成，比维护 fork 补丁便宜。
 
-### 4.2 netease_login_card metadata schema（建议）
+### 4.2 netease_login_card metadata schema
 
 ```json
 {
   "netease_login_card": true,
-  "login_session_id": "26 位 urlsafe",
-  "expires_at": "2026-09-01T15:09:05+08:00",
-  "status": "pending",
-  "turn_terminal": false,
-  "turn_message_kind": "auxiliary_login"
+  "turn_terminal": true,
+  "turn_message_kind": "terminal_answer"
 }
 ```
 
-结果卡：`status: "success" | "expired" | "failed"`，附 `nickname`（脱敏可选）、`v1` 版本号字段
-`"schemaVersion": 1` 便于以后演进。
+卡片依附于当轮终态 assistant 消息（同 xhs_login_card 惯例），不是独立消息行；
+cookie 缺失期间每轮 prompt 都带卡片段，登录成功（cookie 落盘）后门槛自动关闭。
 
 ### 4.3 风控与合规提醒
 
@@ -182,6 +188,10 @@ Content-Type: application/json
 - 播放器 basic_auth 凭据：`/root/netease-music/PLAYER-CREDENTIALS.txt`（0600）
 - 服务端收卡代码：`apns-server/push.py`（`/music/card` 路由 + `_music_card_*` 方法），
   测试 `apns-server/_music_card_test.py`
+- 服务端登录桥：`apns-server/netease_login.py`（`/netease-login/start|import` 由 push.py
+  挂接，鉴权同 xhs-login），测试 `apns-server/_netease_login_test.py`
+- app 侧：`MusicCard.kt` / `NeteaseLoginCard.kt`（ui/chat），数据类与解析在
+  `ChatMessage.kt` / `ApiClient.kt`
 - 本地 MCP 允许清单：`apns-server/mcp_services.py` 的 `LOCAL_PROVIDERS`
   （`netease_account` → :3456，`netease_player` → :18012；回环校验在 `local_provider_endpoints()`）
 
