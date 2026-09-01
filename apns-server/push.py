@@ -3645,6 +3645,7 @@ def _inject_to_tmux_session(state: "ServerState", session: str, text: str) -> tu
 # rejected — no free-form model string ever reaches the tmux injection.
 TOOLBOT_MODEL_ALLOWLIST: frozenset = frozenset({
     "fable",
+    "claude-fable-5-1",
     "claude-opus-5",
     "claude-opus-5[1m]",
     "claude-sonnet-5",
@@ -3663,6 +3664,9 @@ TOOLBOT_MODEL_ALIASES: dict[str, str] = {
     # Old app menus may have cached this full id.  Accept it as input, but
     # canonicalize before any Claude Code command is injected.
     "claude-fable-5": "fable",
+    "fable5.1": "claude-fable-5-1",
+    "fable-5.1": "claude-fable-5-1",
+    "claude-fable-5-1": "claude-fable-5-1",
     "opus": "claude-opus-4-6",
     "opus-1m": "claude-opus-4-6[1m]",
     "opus4.7": "claude-opus-4-7",
@@ -3685,10 +3689,14 @@ TOOLBOT_EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max
 _MODELS_CACHE_PATH = Path(__file__).resolve().parent / "models_cache.json"
 _MODELS_CACHE_TTL_SECONDS = 24 * 3600
 _CLAUDE_CREDENTIALS_PATH = Path("/root/.claude/.credentials.json")
+# The claude-wrapper keeps its own OAuth token file; the CC credentials file's
+# token can go stale (no refresh path writes it), so fall back to the wrapper's.
+_CLAUDE_WRAPPER_TOKEN_PATH = Path("/root/.config/claude-wrapper/oauth-token")
 _models_menu_lock = threading.Lock()
 
 # 内置静态回退清单（与安卓端离线回退清单保持一致）。
 _STATIC_MODEL_MENU: list[dict[str, str]] = [
+    {"alias": "fable5.1", "label": "Fable 5.1", "id": "claude-fable-5-1"},
     {"alias": "fable", "label": "Fable 5", "id": "fable"},
     {"alias": "opus5", "label": "Opus 5", "id": "claude-opus-5"},
     {"alias": "opus5-1m", "label": "Opus 5 1M", "id": "claude-opus-5[1m]"},
@@ -3722,28 +3730,63 @@ def _derive_model_menu_entry(model_id: str) -> dict[str, str]:
     return {"alias": alias, "label": label, "id": model_id}
 
 
-def _fetch_anthropic_model_ids() -> list[str] | None:
-    """调 Anthropic /v1/models 拿模型 id 列表；失败返回 None。token 绝不进日志/返回体。"""
+def _read_claude_oauth_tokens() -> list[str]:
+    """Candidate Claude OAuth tokens: CC credentials first, wrapper file second
+    (raw string or JSON with accessToken/access_token). The CC credentials
+    token can be stale-dead (401), so callers must try candidates in order."""
+    candidates: list[str] = []
     try:
         creds = json.loads(_CLAUDE_CREDENTIALS_PATH.read_text())
         token = str(((creds.get("claudeAiOauth") or {}).get("accessToken")) or "").strip()
-        if not token:
+        if token:
+            candidates.append(token)
+    except Exception:
+        pass
+    try:
+        raw = _CLAUDE_WRAPPER_TOKEN_PATH.read_text().strip()
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                raw = str(parsed.get("accessToken") or parsed.get("access_token") or "").strip()
+            except (TypeError, ValueError):
+                pass
+            if raw and raw not in candidates:
+                candidates.append(raw)
+    except Exception:
+        pass
+    return candidates
+
+
+def _fetch_anthropic_model_ids() -> list[str] | None:
+    """调 Anthropic /v1/models 拿模型 id 列表；失败返回 None。token 绝不进日志/返回体。"""
+    try:
+        tokens = _read_claude_oauth_tokens()
+        if not tokens:
             logger.warning("models fetch skipped: no oauth accessToken")
             return None
         import urllib.request
-        req = urllib.request.Request(
-            "https://api.anthropic.com/v1/models?limit=100",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "anthropic-version": "2023-06-01",
-                "anthropic-beta": "oauth-2025-04-20",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-        ids = [str(m.get("id") or "").strip() for m in payload.get("data", [])]
-        ids = [m for m in ids if m]
-        return ids or None
+        for token in tokens:
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/models?limit=100",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "anthropic-version": "2023-06-01",
+                    "anthropic-beta": "oauth-2025-04-20",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                ids = [str(m.get("id") or "").strip() for m in payload.get("data", [])]
+                ids = [m for m in ids if m]
+                if ids:
+                    return ids
+            except Exception as attempt_err:
+                # 只记异常类型，不记详情（防止意外把敏感 header 带进日志）；
+                # 死 token 401 时落到下一个候选。
+                logger.warning("models fetch attempt failed: %s", type(attempt_err).__name__)
+                continue
+        return None
     except Exception as e:
         # 只记异常类型，不记详情（防止意外把敏感 header 带进日志）
         logger.warning("models fetch failed: %s", type(e).__name__)
@@ -3762,7 +3805,7 @@ def _build_model_menu(ids: list[str]) -> list[dict[str, str]]:
         # value comes from an otherwise-valid dynamic app menu.
         mid = "fable" if raw_mid == "claude-fable-5" else raw_mid
         if mid == "fable":
-            entry = dict(_STATIC_MODEL_MENU[0])
+            entry = next(e for e in _STATIC_MODEL_MENU if e["id"] == "fable")
         else:
             entry = _derive_model_menu_entry(mid)
         if entry["alias"] in seen_aliases or mid in seen_ids:
@@ -3786,7 +3829,7 @@ def _canonicalize_cached_model_menu(menu: list[dict[str, str]]) -> list[dict[str
     for raw_entry in menu:
         entry = dict(raw_entry)
         if str(entry.get("id") or "").strip().lower() == "claude-fable-5":
-            entry = dict(_STATIC_MODEL_MENU[0])
+            entry = dict(next(e for e in _STATIC_MODEL_MENU if e["id"] == "fable"))
         alias = str(entry.get("alias") or "").strip()
         model_id = str(entry.get("id") or "").strip()
         if not alias or not model_id or alias in seen_aliases or model_id in seen_ids:

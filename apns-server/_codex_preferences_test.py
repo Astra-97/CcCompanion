@@ -322,9 +322,16 @@ class ToolbotFableModelTest(unittest.TestCase):
 
     def test_static_and_dynamic_menus_expose_only_fable(self) -> None:
         self.assertEqual(_STATIC_MODEL_MENU[0], {
-            "alias": "fable", "label": "Fable 5", "id": "fable",
+            "alias": "fable5.1", "label": "Fable 5.1", "id": "claude-fable-5-1",
         })
-        live_menu = _build_model_menu(["claude-fable-5", "claude-opus-5"])
+        self.assertIn(
+            {"alias": "fable", "label": "Fable 5", "id": "fable"},
+            _STATIC_MODEL_MENU,
+        )
+        live_menu = _build_model_menu(["claude-fable-5-1", "claude-fable-5", "claude-opus-5"])
+        self.assertEqual(live_menu[0], {
+            "alias": "fable5.1", "label": "Fable 5.1", "id": "claude-fable-5-1",
+        })
         cached_menu = _canonicalize_cached_model_menu([
             {"alias": "fable5", "label": "Fable 5", "id": "claude-fable-5"},
             {"alias": "opus5", "label": "Opus 5", "id": "claude-opus-5"},
