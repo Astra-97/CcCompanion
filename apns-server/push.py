@@ -4082,6 +4082,7 @@ class ServerState:
         self.kimi_semantic_memory_recall_init_attempted = False
         self.kimi_semantic_memory_recall_lock = threading.Lock()
         self.kimi_recall_card_lock = threading.Lock()
+        self.kimi_memory_write_card_lock = threading.Lock()
         self.kimi_recall_index = KairosRecallIndex(
             Path(self.token_store_path).expanduser().parent / "kimi_recall_index.json"
         )
@@ -10864,6 +10865,85 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception:
             return False
 
+    def _append_kimi_memory_write_card(
+        self,
+        chat: ChatHistory,
+        items: Any,
+        *,
+        user_ts: str,
+        session_id: str,
+    ) -> bool:
+        """Persist one aggregated memory-write card for a Kimi ACP turn.
+
+        Mirrors the recall card's exact-turn fence: a retried or duplicated
+        flush must not stack a second card onto the same user message.  The
+        card is auxiliary turn output, never completion evidence.
+        """
+        try:
+            if not user_ts or not session_id or not items:
+                return False
+            lock = getattr(self.state, "kimi_memory_write_card_lock", None)
+            if lock is None:
+                return False
+            with lock:
+                for record in chat.tail(200):
+                    metadata = record.get("metadata")
+                    if (
+                        isinstance(metadata, dict)
+                        and metadata.get("memory_write_card") is True
+                        and str(metadata.get("kimi_user_ts") or "") == user_ts
+                    ):
+                        return False
+                today = time.strftime("%Y-%m-%d")
+                card_items: list[dict[str, str]] = []
+                for raw_item in list(items)[:10]:
+                    if not isinstance(raw_item, dict):
+                        continue
+                    action = str(raw_item.get("action") or "").strip().lower()
+                    if action not in {"write", "update"}:
+                        action = "write"
+                    item = {
+                        "action": action,
+                        "date": str(raw_item.get("date") or "")[:10] or today,
+                        "category": str(raw_item.get("category") or "")[:20],
+                        "subcategory": str(raw_item.get("subcategory") or "")[:20],
+                        "title": str(raw_item.get("title") or "")[:60],
+                        "snippet": str(raw_item.get("snippet") or "")[:80],
+                    }
+                    memory_id = str(raw_item.get("memory_id") or "").strip()
+                    if self._MEMORY_ID_RE.fullmatch(memory_id):
+                        item["memory_id"] = memory_id
+                    card_items.append(item)
+                if not card_items:
+                    return False
+                all_updates = all(item["action"] == "update" for item in card_items)
+                if len(card_items) == 1:
+                    headline = "🔄 已更新记忆" if all_updates else "✅ 已写入记忆"
+                elif all_updates:
+                    headline = f"🔄 已更新 {len(card_items)} 条记忆"
+                else:
+                    headline = f"✅ 已写入 {len(card_items)} 条记忆"
+                chat.append(
+                    role="assistant",
+                    text=f"{headline}（摘要见卡片）",
+                    source="memory-write:kimi",
+                    metadata={
+                        "memory_write_card": True,
+                        "action": "update" if all_updates else "write",
+                        "items": card_items,
+                        "kimi_user_ts": user_ts,
+                        # Same contract as the recall card: attached to the
+                        # foreground turn for ordering, but it is not that
+                        # turn's final assistant answer.
+                        "turn_terminal": False,
+                        "turn_message_kind": "auxiliary_memory_write",
+                        "write_session_id": session_id,
+                    },
+                )
+                return True
+        except Exception:
+            return False
+
     @staticmethod
     def _append_kimi_activity_summary(
         chat: ChatHistory,
@@ -12320,6 +12400,8 @@ class PushHandler(BaseHTTPRequestHandler):
             activity_items: list[str] = []
             worker_activity_items: list[dict[str, Any]] = []
             activity_labels_seen: set[str] = set()
+            memory_write_items: list[dict[str, Any]] = []
+            memory_write_call_ids: set[str] = set()
 
             def finish_observer(outcome: str) -> None:
                 """Terminalize only this exact private observer epoch once."""
@@ -12403,6 +12485,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 finish_observer(status)
                 terminalize_workers(status)
                 append_worker_history()
+                flush_memory_write_card()
                 final_ts = append_assistant_safely(
                     message,
                     source,
@@ -12495,6 +12578,38 @@ class PushHandler(BaseHTTPRequestHandler):
                     user_ts=rec["ts"],
                 )
 
+            def on_memory_write(event: dict[str, Any]) -> None:
+                """Collect kimi_acp's bounded memory-write events for this turn."""
+                if not isinstance(event, dict) or event.get("kind") != "memory_write":
+                    return
+                call_id = str(event.get("tool_call_id") or "")
+                if call_id:
+                    if call_id in memory_write_call_ids:
+                        return
+                    memory_write_call_ids.add(call_id)
+                memory_write_items.append({
+                    "action": event.get("action"),
+                    "memory_id": event.get("memory_id"),
+                    "title": event.get("title"),
+                    "category": event.get("category"),
+                    "subcategory": event.get("subcategory"),
+                    "snippet": event.get("snippet"),
+                })
+
+            def flush_memory_write_card() -> None:
+                """Append the aggregated card before the turn's terminal row."""
+                if not memory_write_items:
+                    return
+                try:
+                    self._append_kimi_memory_write_card(
+                        chat,
+                        memory_write_items,
+                        user_ts=str(rec.get("ts") or ""),
+                        session_id=session_id,
+                    )
+                except Exception:
+                    logger.debug("Kimi memory write card append failed", exc_info=True)
+
             try:
                 self.state.kimi_acp.prompt_existing(
                     prompt,
@@ -12502,6 +12617,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     turn_id=str(rec.get("ts") or ""),
                     on_update=on_update,
                     on_activity=on_activity,
+                    on_memory_write=on_memory_write,
                     cancel_event=cancel_event,
                 )
                 if recall_result is not None:
@@ -12516,6 +12632,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 finish_observer("interrupted")
                 terminalize_workers("interrupted")
                 append_worker_history()
+                flush_memory_write_card()
                 partial = "".join(chunks).strip()
                 final_ts = append_assistant_safely(
                     partial + "\n\n**[已停止生成]**" if partial else "已中断当前生成。",

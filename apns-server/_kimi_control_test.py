@@ -417,6 +417,58 @@ class KimiIsolationAndActivityTest(unittest.TestCase):
             self.assertFalse(chat.rows[0]["metadata"]["turn_terminal"])
             self.assertEqual("auxiliary_recall", chat.rows[0]["metadata"]["turn_message_kind"])
 
+    def test_kimi_memory_write_card_aggregates_and_fences_per_turn(self):
+        class Chat:
+            def __init__(self): self.rows = []
+            def tail(self, _limit): return list(self.rows)
+            def append(self, **row): self.rows.append(row); return row
+
+        chat = Chat()
+        state = types.SimpleNamespace(kimi_memory_write_card_lock=threading.Lock())
+        handler = object.__new__(PushHandler)
+        handler.state = state
+        items = [
+            {"action": "write", "memory_id": "bee5817d", "title": "瓜条",
+             "category": "daily", "subcategory": "瓜条", "snippet": "摘要一"},
+            {"action": "update", "memory_id": "../unsafe", "title": "档案",
+             "category": "core", "subcategory": "", "snippet": "摘要二"},
+        ]
+        self.assertTrue(
+            handler._append_kimi_memory_write_card(chat, items, user_ts="u1", session_id="s-k")
+        )
+        self.assertEqual(1, len(chat.rows))
+        metadata = chat.rows[0]["metadata"]
+        self.assertTrue(metadata["memory_write_card"])
+        self.assertEqual("write", metadata["action"])
+        self.assertEqual(2, len(metadata["items"]))
+        self.assertEqual("bee5817d", metadata["items"][0]["memory_id"])
+        self.assertNotIn("memory_id", metadata["items"][1])
+        self.assertFalse(metadata["turn_terminal"])
+        self.assertEqual("auxiliary_memory_write", metadata["turn_message_kind"])
+        self.assertEqual("✅ 已写入 2 条记忆（摘要见卡片）", chat.rows[0]["text"])
+        # 同一 user_ts 幂等：重试或重复 flush 不叠第二张卡。
+        self.assertFalse(
+            handler._append_kimi_memory_write_card(chat, items, user_ts="u1", session_id="s-k")
+        )
+        self.assertEqual(1, len(chat.rows))
+
+        chat2 = Chat()
+        self.assertTrue(handler._append_kimi_memory_write_card(
+            chat2,
+            [{"action": "update", "title": "档案", "category": "core",
+              "snippet": "摘要", "memory_id": "7b64ed1e"}],
+            user_ts="u2",
+            session_id="s-k",
+        ))
+        self.assertEqual("🔄 已更新记忆（摘要见卡片）", chat2.rows[0]["text"])
+        self.assertEqual("update", chat2.rows[0]["metadata"]["action"])
+        # date 缺省时落服务器当天日期。
+        self.assertTrue(chat2.rows[0]["metadata"]["items"][0]["date"])
+        # 空集合不发卡。
+        self.assertFalse(
+            handler._append_kimi_memory_write_card(chat2, [], user_ts="u3", session_id="s-k")
+        )
+
     def test_committed_kimi_recall_is_excluded_on_the_next_stable_session_turn(self):
         with tempfile.TemporaryDirectory() as tmp:
             key = "v1:" + "b" * 64

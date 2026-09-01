@@ -13,6 +13,7 @@ from kimi_acp import (
     KimiACPClient,
     KimiACPCancelled,
     KimiACPError,
+    _memory_write_from_update,
     _text_from_update,
 )
 
@@ -905,6 +906,116 @@ class KimiACPProtocolTest(unittest.TestCase):
         self.assertEqual("Kimi ACP exited", old_bucket["failure"])
         self.assertFalse(new_event.is_set())
         self.assertEqual({}, new_bucket)
+
+
+class KimiACPMemoryWriteProjectionTest(unittest.TestCase):
+    def test_completed_write_memory_projects_bounded_card_event(self):
+        event = _memory_write_from_update({
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-1",
+                "title": "mcp__memory__write_memory",
+                "status": "completed",
+                "rawInput": {
+                    "content": "景甜×孙宇晨天价彩礼瓜条\n\n追瓜实录" + "长" * 200,
+                    "category": "daily",
+                    "subcategory": "瓜条",
+                },
+                "output": '{"ok": true, "id": "bee5817d"}',
+            },
+        })
+        self.assertIsNotNone(event)
+        self.assertEqual("memory_write", event["kind"])
+        self.assertEqual("write", event["action"])
+        self.assertEqual("call-1", event["tool_call_id"])
+        self.assertEqual("bee5817d", event["memory_id"])
+        self.assertEqual("daily", event["category"])
+        self.assertEqual("瓜条", event["subcategory"])
+        self.assertEqual("景甜×孙宇晨天价彩礼瓜条", event["title"])
+        self.assertLessEqual(len(event["snippet"]), 80)
+
+    def test_update_memory_takes_id_from_raw_input_and_json_title(self):
+        event = _memory_write_from_update({
+            "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-2",
+                "title": "mcp__memory__update_memory",
+                "status": "completed",
+                "rawInput": {
+                    "id": "7b64ed1e",
+                    "content": '{"title": "碳基哥档案", "context": "更新摘要"}',
+                },
+            },
+        })
+        self.assertEqual("update", event["action"])
+        self.assertEqual("7b64ed1e", event["memory_id"])
+        self.assertEqual("碳基哥档案", event["title"])
+        self.assertEqual("更新摘要", event["snippet"])
+
+    def test_non_terminal_or_failed_calls_never_project(self):
+        for status in ("", "pending", "in_progress", "failed"):
+            with self.subTest(status=status):
+                self.assertIsNone(_memory_write_from_update({
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "title": "mcp__memory__write_memory",
+                        "status": status,
+                        "rawInput": {"content": "x"},
+                    },
+                }))
+
+    def test_unrelated_tools_and_malformed_updates_never_project(self):
+        self.assertIsNone(_memory_write_from_update({
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "title": "mcp__memory__read_memory",
+                "status": "completed",
+            },
+        }))
+        self.assertIsNone(_memory_write_from_update({
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "x"},
+            },
+        }))
+        self.assertIsNone(_memory_write_from_update(None))
+        self.assertIsNone(_memory_write_from_update({"update": "not-a-dict"}))
+
+    def test_bare_tool_name_and_title_suffix_variants_project(self):
+        bare = _memory_write_from_update({
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "title": "write_memory",
+                "status": "completed",
+                "rawInput": {"content": "hello"},
+                "output": "no json here",
+            },
+        })
+        self.assertEqual("write", bare["action"])
+        self.assertEqual("", bare["memory_id"])
+        suffixed = _memory_write_from_update({
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "title": "mcp__memory__update_memory · 7b64ed1e",
+                "status": "completed",
+                "rawInput": {"id": "7b64ed1e"},
+            },
+        })
+        self.assertEqual("update", suffixed["action"])
+        self.assertEqual("7b64ed1e", suffixed["memory_id"])
+
+    def test_unsafe_memory_id_is_dropped(self):
+        event = _memory_write_from_update({
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "title": "mcp__memory__write_memory",
+                "status": "completed",
+                "rawInput": {"content": "hello"},
+                "output": '{"id": "../escape"}',
+            },
+        })
+        self.assertEqual("", event["memory_id"])
 
 
 if __name__ == "__main__":

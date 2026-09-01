@@ -12,6 +12,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import threading
@@ -125,6 +126,122 @@ def _activity_from_update(params: Any) -> dict[str, Any] | None:
     return None
 
 
+# Bare tool names are accepted alongside the fully-qualified MCP spelling
+# because ACP implementations disagree on whether ``title`` keeps the
+# ``mcp__<server>__`` prefix.  ``update_memory`` must be matched before any
+# substring pass over ``write_memory``-family names.
+_MEMORY_WRITE_TOOL_ACTIONS = {
+    "mcp__memory__write_memory": "write",
+    "mcp__memory__update_memory": "update",
+    "write_memory": "write",
+    "update_memory": "update",
+}
+_MEMORY_WRITE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+_MEMORY_WRITE_OUTPUT_ID_RE = re.compile(
+    r'"id"\s*:\s*"([A-Za-z0-9][A-Za-z0-9_-]{0,127})"'
+)
+
+
+def _memory_write_title_snippet(content: str) -> tuple[str, str]:
+    """Derive a bounded ``(title, snippet)`` pair from raw memory content."""
+    text = str(content or "").strip()
+    if not text:
+        return "", ""
+    # chatrecord-style structured memories carry a real title/context inside
+    # JSON; the raw first line would be a brace, not a headline.
+    if text.startswith("{"):
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            title = str(payload.get("title") or "").strip()
+            snippet = str(payload.get("context") or "").strip() or title
+            return title[:60], snippet[:80]
+    collapsed = re.sub(r"\s+", " ", text)
+    first_line = ""
+    for line in text.splitlines():
+        line = line.strip().lstrip("#>*-").strip()
+        if line:
+            first_line = line
+            break
+    return first_line[:60], collapsed[:80]
+
+
+def _memory_write_output_memory_id(update: dict[str, Any]) -> str:
+    """Best-effort memory id from a completed tool call's output text."""
+    texts: list[str] = []
+    output = update.get("output")
+    if isinstance(output, str):
+        texts.append(output)
+    content = update.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            inner = block.get("content")
+            if isinstance(inner, dict) and inner.get("type") == "text":
+                texts.append(str(inner.get("text") or ""))
+            elif block.get("type") == "text":
+                texts.append(str(block.get("text") or ""))
+    for text in texts:
+        match = _MEMORY_WRITE_OUTPUT_ID_RE.search(text)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _memory_write_from_update(params: Any) -> dict[str, Any] | None:
+    """Project a completed memory-MCP write/update tool call to a card event.
+
+    Unlike the activity projection (which targets the lock-screen observer and
+    therefore copies nothing), this event feeds a chat-history card — the same
+    trust level as the recall card — so a small whitelist survives: action,
+    memory id, category, and a truncated title/snippet derived from the written
+    content.  Raw tool payloads never leave this function unbounded.
+    """
+    if not isinstance(params, dict):
+        return None
+    update = params.get("update")
+    if not isinstance(update, dict):
+        return None
+    kind = str(update.get("sessionUpdate") or "").strip().lower()
+    if kind not in {"tool_call", "tool_call_update"}:
+        return None
+    # Only a terminal success is a write; pending/in-progress/failed calls
+    # must not produce a card.
+    status = str(update.get("status") or "").strip().lower()
+    if status not in {"completed", "success", "succeeded"}:
+        return None
+    title_field = str(update.get("title") or "").strip().lower()
+    action = _MEMORY_WRITE_TOOL_ACTIONS.get(title_field)
+    if action is None:
+        for tool_name, tool_action in _MEMORY_WRITE_TOOL_ACTIONS.items():
+            if tool_name.startswith("mcp__") and tool_name in title_field:
+                action = tool_action
+                break
+    if action is None:
+        return None
+    raw_input = update.get("rawInput")
+    raw_input = raw_input if isinstance(raw_input, dict) else {}
+    title, snippet = _memory_write_title_snippet(str(raw_input.get("content") or ""))
+    memory_id = str(raw_input.get("id") or raw_input.get("memory_id") or "").strip()
+    if not memory_id:
+        memory_id = _memory_write_output_memory_id(update)
+    if not _MEMORY_WRITE_ID_RE.fullmatch(memory_id):
+        memory_id = ""
+    return {
+        "kind": "memory_write",
+        "action": action,
+        "tool_call_id": str(update.get("toolCallId") or "").strip()[:80],
+        "memory_id": memory_id,
+        "title": title,
+        "category": str(raw_input.get("category") or "").strip()[:20],
+        "subcategory": str(raw_input.get("subcategory") or "").strip()[:20],
+        "snippet": snippet,
+    }
+
+
 class KimiACPClient:
     def __init__(
         self,
@@ -160,6 +277,7 @@ class KimiACPClient:
         self._active_turn_id = ""
         self._active_update: Callable[[str], None] | None = None
         self._active_activity: Callable[[dict[str, Any]], None] | None = None
+        self._active_memory_write: Callable[[dict[str, Any]], None] | None = None
         self._reader: threading.Thread | None = None
         self._stderr_reader: threading.Thread | None = None
         self._initialized = False
@@ -455,6 +573,9 @@ class KimiACPClient:
                         activity_callback = (
                             self._active_activity if session_id == self._active_session_id else None
                         )
+                        memory_write_callback = (
+                            self._active_memory_write if session_id == self._active_session_id else None
+                        )
                     delta = _text_from_update(params)
                     if callback is not None and delta:
                         try:
@@ -467,6 +588,12 @@ class KimiACPClient:
                             activity_callback(activity)
                         except Exception:
                             self.logger.warning("Kimi ACP activity callback failed", exc_info=True)
+                    memory_write = _memory_write_from_update(params)
+                    if memory_write_callback is not None and memory_write is not None:
+                        try:
+                            memory_write_callback(memory_write)
+                        except Exception:
+                            self.logger.warning("Kimi ACP memory write callback failed", exc_info=True)
                     continue
                 # Kimi can ask its ACP client for permission. Select a bounded
                 # one-turn approval; all other client-side requests fail closed.
@@ -875,6 +1002,7 @@ class KimiACPClient:
         turn_id: str,
         on_update: Callable[[str], None] | None = None,
         on_activity: Callable[[dict[str, Any]], None] | None = None,
+        on_memory_write: Callable[[dict[str, Any]], None] | None = None,
         cancel_event: threading.Event | None = None,
     ) -> KimiACPResult:
         session_id = str(session_id or "").strip()
@@ -899,6 +1027,7 @@ class KimiACPClient:
                 self._active_turn_id = turn_id
                 self._active_update = on_update
                 self._active_activity = on_activity
+                self._active_memory_write = on_memory_write
             if cancel_event is not None and cancel_event.is_set():
                 raise KimiACPCancelled("Kimi generation cancelled before prompt")
             finished = threading.Event()
@@ -949,6 +1078,7 @@ class KimiACPClient:
                 self._active_turn_id = ""
                 self._active_update = None
                 self._active_activity = None
+                self._active_memory_write = None
             self._turn_lock.release()
 
     def _prompt_and_collect_text(
