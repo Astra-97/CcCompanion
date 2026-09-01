@@ -46,6 +46,37 @@ PROVIDERS: dict[str, dict[str, str]] = {
     },
 }
 
+# Loopback-only MCP endpoints deployed for the NetEase music integration.
+# Unlike PROVIDERS they carry no per-user token: access control is the
+# loopback bind plus the music-card webhook secret, so these endpoints must
+# never be reverse-proxied off-box or handed to the Android client.  Only
+# read-only tool sets are exposed here during the initial rollout.
+LOCAL_PROVIDERS: dict[str, dict[str, str]] = {
+    "netease_account": {
+        "name": "网易云账号（只读）",
+        "endpoint": "http://127.0.0.1:3456/mcp",
+    },
+    "netease_player": {
+        "name": "网易云播放器",
+        "endpoint": "http://127.0.0.1:18012/mcp",
+    },
+}
+
+
+def local_provider_endpoints() -> dict[str, str]:
+    """Allow-listed loopback MCP endpoints (provider_id -> URL).
+
+    Every entry must stay on loopback; assert that here so a future edit
+    cannot quietly promote a local endpoint to a remote one.
+    """
+    endpoints = {}
+    for provider_id, provider in LOCAL_PROVIDERS.items():
+        endpoint = provider["endpoint"]
+        if not endpoint.startswith(("http://127.0.0.1:", "http://[::1]:")):
+            raise McpServiceError("本地 MCP 允许清单只允许回环地址")
+        endpoints[provider_id] = endpoint
+    return endpoints
+
 
 class McpServiceError(ValueError):
     """A deliberately safe message suitable for the authenticated UI."""

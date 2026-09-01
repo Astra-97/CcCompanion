@@ -7389,6 +7389,16 @@ class PushHandler(BaseHTTPRequestHandler):
                 return
             self._handle_reading_ai_continue(contact_id)
             return
+        # Loopback music MCP card webhook.  Like the reading bridge above it
+        # authenticates with its own credential file, never with App pairing
+        # tokens, and only writes server-owned metadata cards.
+        if request_path == "/music/card":
+            if not self._music_card_auth_matches():
+                self.close_connection = True
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            self._handle_music_card()
+            return
         # Keep this before generic JSON parsing: imports are intentionally much
         # larger than ordinary App mutations, and the reading proxy owns its
         # own content-type, size, and schema gates.
@@ -21035,6 +21045,11 @@ class PushHandler(BaseHTTPRequestHandler):
     _READING_IMPORT_REQUEST_LIMIT = 21 * 1024 * 1024
     _READING_MUTATION_REQUEST_LIMIT = 8 * 1024
     _READING_AI_REQUEST_LIMIT = 1024
+    _MUSIC_CARD_REQUEST_LIMIT = 16 * 1024
+    _MUSIC_CARD_TOKEN_FILE_ENV = "CC_COMPANION_MUSIC_CARD_TOKEN_FILE"
+    _MUSIC_CARD_DEFAULT_TOKEN_FILE = Path("/root/netease-music/music-card-webhook.token")
+    _MUSIC_CARD_CONTACTS = frozenset({"kimi", "xiaoke"})
+    _MUSIC_CARD_PLAYER_BASE = "https://stackchan-backend.xiaonancaleb.xyz/music/"
     _READING_AI_STATE_PATH_ENV = "CC_COMPANION_READING_AI_STATE_PATH"
     _READING_AI_RESULTS_DIR_ENV = "CC_COMPANION_READING_AI_RESULTS_DIR"
     _READING_AI_BRIDGE_TOKEN_FILE_ENV = "CC_COMPANION_READING_AI_BRIDGE_TOKEN_FILE"
@@ -21531,6 +21546,165 @@ class PushHandler(BaseHTTPRequestHandler):
             return contact if hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")) else None
         except UnicodeError:
             return None
+
+    @classmethod
+    def _music_card_token(cls) -> str:
+        """Load the loopback music-card webhook token from its 0600 file.
+
+        The file is re-read per request so rotating the token never requires
+        a service restart; its contents never enter logs or responses.
+        """
+        raw_path = os.environ.get(cls._MUSIC_CARD_TOKEN_FILE_ENV, "").strip()
+        path = Path(raw_path).expanduser() if raw_path else cls._MUSIC_CARD_DEFAULT_TOKEN_FILE
+        try:
+            info = path.lstat()
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                return ""
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags)
+            try:
+                raw = os.read(fd, 16 * 1024 + 1)
+            finally:
+                os.close(fd)
+            if len(raw) > 16 * 1024:
+                return ""
+            token = raw.decode("utf-8").strip()
+            return token if 16 <= len(token) <= 4096 else ""
+        except (OSError, UnicodeError):
+            return ""
+
+    def _music_card_auth_matches(self) -> bool:
+        """Fail closed: the loopback webhook must prove the shared token."""
+        expected = self._music_card_token()
+        supplied = str(self.headers.get("Authorization", "") or "")
+        if not expected or not supplied.startswith("Bearer "):
+            return False
+        token = supplied[len("Bearer "):].strip()
+        if not token:
+            return False
+        try:
+            return hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8"))
+        except UnicodeError:
+            return False
+
+    @staticmethod
+    def _music_card_lyric_line(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        at = value.get("time")
+        text = str(value.get("text") or "").strip()
+        if (
+            isinstance(at, bool)
+            or not isinstance(at, (int, float))
+            or not 0 <= at <= 4 * 3600
+            or not 1 <= len(text) <= 200
+        ):
+            return None
+        out: dict[str, Any] = {"time": round(float(at), 3), "text": text}
+        trans = str(value.get("trans") or "").strip()
+        if trans:
+            out["trans"] = trans[:200]
+        return out
+
+    @classmethod
+    def _music_card_validate(cls, body: Any) -> dict[str, Any] | None:
+        """Validate and minimize one MCP card payload into safe metadata."""
+        if not isinstance(body, dict):
+            return None
+        kind = body.get("type")
+        if kind not in {"song", "lyric"}:
+            return None
+        song = body.get("song")
+        if not isinstance(song, dict):
+            return None
+        song_id = str(song.get("songId") or "").strip()
+        if not re.fullmatch(r"[0-9]{1,20}", song_id):
+            return None
+        name = str(song.get("name") or "").strip()
+        if not 1 <= len(name) <= 200:
+            return None
+        artist = str(song.get("artist") or "").strip()[:200]
+        album = str(song.get("album") or "").strip()[:200]
+        cover = str(song.get("cover") or "").strip()
+        if not re.fullmatch(r"https://[^\s]{1,500}", cover):
+            cover = ""
+        player_url = f"{cls._MUSIC_CARD_PLAYER_BASE}?song={song_id}"
+        metadata: dict[str, Any] = {
+            "music_card": True,
+            "music_card_type": kind,
+            "song": {
+                "song_id": song_id,
+                "name": name,
+                "artist": artist,
+                "album": album,
+                "cover": cover,
+            },
+            "text": str(body.get("text") or "").strip()[:500],
+            "by": str(body.get("by") or "").strip()[:32] or "ai",
+            "player_url": player_url,
+            # A music card is auxiliary output of whatever turn shared it;
+            # it is never completion evidence for that turn.
+            "turn_terminal": False,
+            "turn_message_kind": "auxiliary_music",
+        }
+        if kind == "lyric":
+            lyric = body.get("lyric")
+            if not isinstance(lyric, dict):
+                return None
+            at = lyric.get("at")
+            if isinstance(at, bool) or not isinstance(at, (int, float)) or not 0 <= at <= 4 * 3600:
+                return None
+            current = cls._music_card_lyric_line(lyric.get("line"))
+            if current is None:
+                return None
+            entry: dict[str, Any] = {"at": round(float(at), 3), "line": current}
+            prev = cls._music_card_lyric_line(lyric.get("prev"))
+            nxt = cls._music_card_lyric_line(lyric.get("next"))
+            if prev is not None:
+                entry["prev"] = prev
+            if nxt is not None:
+                entry["next"] = nxt
+            metadata["lyric"] = entry
+            metadata["player_url"] = f"{player_url}&at={int(at)}"
+        return metadata
+
+    def _handle_music_card(self) -> None:
+        incoming = self._reading_read_body(self._MUSIC_CARD_REQUEST_LIMIT)
+        if incoming is None:
+            return
+        metadata = self._music_card_validate(incoming)
+        if metadata is None:
+            self._send_json(400, {"ok": False, "error": "invalid music card"})
+            return
+        contact_id = str(incoming.get("contact") or "kimi").strip().lower()
+        if contact_id not in self._MUSIC_CARD_CONTACTS:
+            self._send_json(400, {"ok": False, "error": "unsupported contact"})
+            return
+        song = metadata["song"]
+        if metadata["music_card_type"] == "lyric":
+            line = metadata["lyric"]["line"]
+            minutes, seconds = divmod(int(metadata["lyric"]["at"]), 60)
+            text = f"🎧 分享歌词：{song['name']} {minutes:02d}:{seconds:02d}「{line['text']}」"
+        else:
+            text = f"🎵 分享歌曲：{song['name']} — {song['artist'] or '未知歌手'}"
+        try:
+            rec = self._chat_for_contact(contact_id).append(
+                role="assistant",
+                text=text,
+                source=f"music-mcp:{metadata['by']}",
+                metadata=metadata,
+            )
+        except Exception:
+            logger.exception("music_card append failed")
+            self._send_json(500, {"ok": False, "error": "append failed"})
+            return
+        self._send_json(200, {"ok": True, "contact_id": contact_id, "ts": rec.get("ts")})
+
 
     def _reading_ai_grant_from_metadata(self, contact_id: str, metadata: Any) -> None:
         """Validate and persist a user-authorized AI-only source cursor.
