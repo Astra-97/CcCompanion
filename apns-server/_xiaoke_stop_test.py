@@ -686,14 +686,16 @@ class XiaokeStopTest(unittest.TestCase):
             ], has_user_text=False),
             1.2,
         )
+        # A caption does not shorten the image ingest window (2026-09-03:
+        # captioned photos stalled on the prompt line with the 1.2s window).
         self.assertEqual(
             _xiaoke_attachment_paste_settle_seconds([
                 {"type": "image", "size": 4 * 1024 * 1024},
             ], has_user_text=True),
-            1.2,
+            12.0,
         )
 
-    def test_image_only_turn_adapts_but_captioned_turn_keeps_one_enter_window(self) -> None:
+    def test_image_turn_adapts_with_or_without_caption(self) -> None:
         image = {
             "type": "image",
             "size": 4 * 1024 * 1024,
@@ -726,7 +728,7 @@ class XiaokeStopTest(unittest.TestCase):
                 self.assertEqual(handler.responses[-1][0], 200)
                 self.assertEqual(handler.responses[-1][1]["turn"]["session"], "cctg")
 
-        self.assertEqual([entry[1] for entry in observed], [12.0, 1.2])
+        self.assertEqual([entry[1] for entry in observed], [12.0, 12.0])
         self.assertIn("[用户发了图片: cat.jpg]", observed[0][0])
         self.assertIn("caption for the image", observed[1][0])
 

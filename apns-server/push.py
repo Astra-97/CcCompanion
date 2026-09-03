@@ -1025,16 +1025,19 @@ def _xiaoke_attachment_paste_settle_seconds(
     """Return the one pre-submit settle window for a XiaoKe attachment turn.
 
     ``staged_attachments`` is the server-owned result of consuming opaque
-    upload IDs.  A user caption deliberately keeps the old text behavior;
-    only an attachment-only turn may use the adaptive window.  Within that
-    branch, do not use filenames, paths, or arbitrary metadata: only
-    canonical server type/size fields may extend the ordinary text window.
-    Non-image files keep the old behavior; an image batch gets a bounded
-    size-based window.  The caller still sends exactly one Enter after this
-    delay.
+    upload IDs.  Any image batch may use the adaptive window, with or
+    without a user caption: the TUI still has to ingest the same image
+    bytes before the one Enter, and a captioned photo stalled on the prompt
+    line was exactly the 2026-09-03 field failure (``has_user_text`` is kept
+    only for call-site compatibility).  Within that branch, do not use
+    filenames, paths, or arbitrary metadata: only canonical server type/size
+    fields may extend the ordinary text window.  Non-image files keep the
+    old behavior; an image batch gets a bounded size-based window.  The
+    caller still sends exactly one Enter after this delay.
     """
 
-    if has_user_text or not isinstance(staged_attachments, list):
+    del has_user_text  # caption no longer shortens the image ingest window
+    if not isinstance(staged_attachments, list):
         return DIRECT_TMUX_PASTE_SETTLE_SECONDS
 
     if not staged_attachments:
