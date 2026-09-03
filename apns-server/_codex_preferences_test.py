@@ -310,48 +310,51 @@ class ToolbotFableModelTest(unittest.TestCase):
         )
 
     def test_aliases_resolve_and_model_command_injects_fable(self) -> None:
-        self.assertIn("fable", TOOLBOT_MODEL_ALLOWLIST)
-        self.assertNotIn("claude-fable-5", TOOLBOT_MODEL_ALLOWLIST)
+        self.assertIn("claude-fable-5", TOOLBOT_MODEL_ALLOWLIST)
+        self.assertNotIn("fable", TOOLBOT_MODEL_ALLOWLIST)
         for choice in ("fable", "fable5", "fable-5", "claude-fable-5"):
             with self.subTest(choice=choice):
-                self.assertEqual(TOOLBOT_MODEL_ALIASES[choice], "fable")
-                self.assertEqual(self.handler._resolve_toolbot_model(choice), "fable")
+                self.assertEqual(TOOLBOT_MODEL_ALIASES[choice], "claude-fable-5")
+                self.assertEqual(self.handler._resolve_toolbot_model(choice), "claude-fable-5")
                 ok, _result = self.handler._run_toolbot_command("model", choice)
                 self.assertTrue(ok)
-                self.assertEqual(self.calls.pop()[0:2], ("cctg", "/model fable"))
+                self.assertEqual(self.calls.pop()[0:2], ("cctg", "/model claude-fable-5"))
 
     def test_static_and_dynamic_menus_expose_only_fable(self) -> None:
         self.assertEqual(_STATIC_MODEL_MENU[0], {
             "alias": "fable5.1", "label": "Fable 5.1", "id": "claude-fable-5-1",
         })
         self.assertIn(
-            {"alias": "fable", "label": "Fable 5", "id": "fable"},
+            {"alias": "fable", "label": "Fable 5", "id": "claude-fable-5"},
             _STATIC_MODEL_MENU,
         )
         live_menu = _build_model_menu(["claude-fable-5-1", "claude-fable-5", "claude-opus-5"])
         self.assertEqual(live_menu[0], {
             "alias": "fable5.1", "label": "Fable 5.1", "id": "claude-fable-5-1",
         })
+        self.assertEqual(live_menu[1], {
+            "alias": "fable5", "label": "Fable 5", "id": "claude-fable-5",
+        })
         cached_menu = _canonicalize_cached_model_menu([
-            {"alias": "fable5", "label": "Fable 5", "id": "claude-fable-5"},
+            {"alias": "fable", "label": "Fable 5", "id": "fable"},
             {"alias": "opus5", "label": "Opus 5", "id": "claude-opus-5"},
         ])
         for menu in (live_menu, cached_menu):
-            fable_entries = [entry for entry in menu if entry["id"] == "fable"]
-            self.assertEqual(fable_entries, [{"alias": "fable", "label": "Fable 5", "id": "fable"}])
-            self.assertFalse(any(entry["id"] == "claude-fable-5" for entry in menu))
+            fable5_entries = [entry for entry in menu if entry["id"] == "claude-fable-5"]
+            self.assertEqual(len(fable5_entries), 1)
+            self.assertFalse(any(entry["id"] == "fable" for entry in menu))
 
     def test_cached_dynamic_menu_is_canonicalized_before_return(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp) / "models_cache.json"
             cache.write_text(json.dumps({
                 "fetched_at": time.time(),
-                "menu": [{"alias": "fable5", "label": "Fable 5", "id": "claude-fable-5"}],
+                "menu": [{"alias": "fable", "label": "Fable 5", "id": "fable"}],
             }), encoding="utf-8")
             with mock.patch("push._MODELS_CACHE_PATH", cache):
                 menu, source = get_dynamic_model_menu()
         self.assertEqual(source, "cache")
-        self.assertEqual(menu, [{"alias": "fable", "label": "Fable 5", "id": "fable"}])
+        self.assertEqual(menu, [{"alias": "fable", "label": "Fable 5", "id": "claude-fable-5"}])
 
 
 class ManualForgePreferenceTest(unittest.TestCase):
