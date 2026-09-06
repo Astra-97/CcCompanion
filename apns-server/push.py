@@ -110,7 +110,7 @@ from timeline import Timeline
 from tts import TTS
 from settings import Settings
 from usage import UsageReader
-from link_preview import LinkPreviewBundle, LinkPreviewService, merge_preview_metadata
+from link_preview import LinkPreviewBundle, LinkPreviewService, clean_shared_link_text, merge_preview_metadata
 from voice_protocol import (
     VOICE_CALL_SOURCE,
     VOICE_INTERNAL_HEADER,
@@ -9594,13 +9594,13 @@ class PushHandler(BaseHTTPRequestHandler):
             elif item.get("comments_status") == "included_partial":
                 lines.append(
                     "- 评论已抓取并保存在上面的全文 .txt 文件中；必须先读取该全文文件后再回答。"
-                    "内容图片只是帖子配图，不能根据图片中没有评论而声称评论未抓取。"
+                    "内容图片是帖子配图（小红书评论配图也会一并列出），不能根据图片中没有评论而声称评论未抓取。"
                     "抓取范围仅为首批，可能有更多评论或楼中楼。"
                 )
             elif item.get("comments_status") == "included":
                 lines.append(
                     "- 评论已抓取并保存在上面的全文 .txt 文件中；必须先读取该全文文件后再回答。"
-                    "内容图片只是帖子配图，不能根据图片中没有评论而声称评论未抓取。"
+                    "内容图片是帖子配图（小红书评论配图也会一并列出），不能根据图片中没有评论而声称评论未抓取。"
                 )
             elif item.get("comments_status") == "fetched_empty":
                 lines.append("- 抓取范围：评论已抓取，当前返回为空。")
@@ -10444,7 +10444,9 @@ class PushHandler(BaseHTTPRequestHandler):
     def _handle_xiaoke_chat_send(self, body: dict[str, Any]) -> None:
         """Run XiaoKe's exact-turn pipeline after shared request preparation."""
         contact_id = "xiaoke"
-        text = body.get("text", "").strip()
+        # 分享卡片复制文本带的平台套话（「快来看吧」等）在入口清掉，气泡和
+        # AI 看到的都是干净文本；链接本身一定保留。
+        text = clean_shared_link_text(body.get("text", "").strip())
         quoted_ts = body.get("quoted_ts") or None
         location = body.get("location") or None
         is_card_action = (
@@ -11405,7 +11407,8 @@ class PushHandler(BaseHTTPRequestHandler):
         return ""
 
     def _handle_kimi_web_chat_send(self, body: dict[str, Any], contact_id: str, web: Any) -> None:
-        text = str(body.get("text") or "").strip()
+        # 同 xiaoke：入口清掉分享套话，链接保留。
+        text = clean_shared_link_text(str(body.get("text") or "").strip())
         quoted_ts = body.get("quoted_ts") or None
         staged_attachments = list(body.get("_pwa_staged_attachments") or [])
         attachments_committed = False
@@ -17105,7 +17108,8 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
 
     def _handle_kairos_chat_send(self, body: dict[str, Any], contact_id: str):
-        text = body.get("text", "").strip()
+        # 同 xiaoke：入口清掉分享套话，链接保留。
+        text = clean_shared_link_text(body.get("text", "").strip())
         quoted_ts = body.get("quoted_ts") or None
         staged_attachments = list(body.get("_pwa_staged_attachments") or [])
         if not text and not staged_attachments:
@@ -18232,7 +18236,8 @@ class PushHandler(BaseHTTPRequestHandler):
         return routed
 
     def _handle_apples_chat_send(self, body: dict[str, Any], contact_id: str):
-        text = body.get("text", "").strip()
+        # 同 xiaoke：入口清掉分享套话，链接保留。
+        text = clean_shared_link_text(body.get("text", "").strip())
         quoted_ts = body.get("quoted_ts") or None
         location = body.get("location") or None
         staged_attachments = list(body.get("_pwa_staged_attachments") or [])

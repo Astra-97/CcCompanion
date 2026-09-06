@@ -56,6 +56,21 @@ XHS_HOSTS = {
     "www.xhslink.cn",
 }
 WECHAT_HOSTS = {"mp.weixin.qq.com"}
+BILIBILI_HOSTS = {
+    "bilibili.com",
+    "www.bilibili.com",
+    "m.bilibili.com",
+    "b23.tv",
+    "www.b23.tv",
+}
+BILIBILI_API_HOST = "api.bilibili.com"
+X_HOSTS = {
+    "x.com",
+    "www.x.com",
+    "twitter.com",
+    "www.twitter.com",
+    "mobile.twitter.com",
+}
 XIACHUFANG_HOSTS = {
     "xiachufang.com",
     "www.xiachufang.com",
@@ -65,8 +80,10 @@ MAX_TITLE = 300
 MAX_DESCRIPTION = 800
 MAX_PAGE_IMAGES = 18
 GENERIC_CACHE_SCHEMA_VERSION = 3
-XHS_CACHE_SCHEMA_VERSION = 8
+# 版本 9：评论开始携带配图（comment_image_urls），旧缓存不含评论图。
+XHS_CACHE_SCHEMA_VERSION = 9
 WECHAT_CACHE_SCHEMA_VERSION = 1
+BILIBILI_CACHE_SCHEMA_VERSION = 1
 # Recipe extraction deliberately has its own schema: unlike generic previews,
 # its body is constructed only from a trusted Recipe JSON-LD node.
 XIACHUFANG_CACHE_SCHEMA_VERSION = 1
@@ -138,6 +155,7 @@ class ExtractedPage:
     image_url: str
     body_text: str
     image_urls: tuple[str, ...] = ()
+    comment_image_urls: tuple[str, ...] = ()
     comments: str = ""
     comments_fetched: bool = False
     comments_complete: bool = False
@@ -191,6 +209,50 @@ def detect_urls(text: str, *, limit: int = 3) -> list[str]:
         if len(out) >= hard_limit:
             break
     return out
+
+
+# App 分享文案里的平台模板套话。每条都锚定足够特异的句式，只删除套话
+# 本身，绝不吞掉同一行里的链接（抖音套话和链接常在同一行）。
+_SHARE_BOILERPLATE_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        # 小红书：「xxx发布了一篇小红书笔记，快来看吧！」
+        r"[^\n，。！!？?]{0,60}?发布了一篇小红书笔记，快来看吧[！!]*",
+        # 小红书：「，复制本条信息，打开【小红书】App查看精彩内容！」
+        r"[，,]?\s*复制本条信息，打开【小红书】[Aa][Pp][pP]查看精彩内容[！!]*",
+        # 抖音：「7.94 复制打开抖音，看看【xx的作品】」（前缀编号可有可无）
+        r"(?:\d+(?:\.\d+)?\s*[:：]?\s*)?复制打开抖音，看看【[^】\n]{0,80}】",
+        # 抖音：「好内容不容错过！」——前面必须是分隔符/行首，避免误删
+        # 「我觉得这个真的好内容不容错过」这类用户正文里的引用。
+        r"(?<![一-鿿A-Za-z0-9])好内容不容错过[！!]*",
+    )
+)
+
+
+def clean_shared_link_text(text: str) -> str:
+    """Remove known share-card boilerplate while keeping URLs and user words."""
+    value = str(text or "")
+    # 只有带链接的文本才可能是分享文案，避免误伤普通聊天。
+    if not value.strip() or not detect_urls(value):
+        return value
+    # 逐行替换：只有被改动且变空的行才删除，用户有意留的空行原样保留。
+    kept: list[str] = []
+    changed = False
+    for raw_line in value.splitlines():
+        line = raw_line
+        for pattern in _SHARE_BOILERPLATE_PATTERNS:
+            line = pattern.sub("", line)
+        if line != raw_line:
+            changed = True
+            line = re.sub(r"[ \t　]+", " ", line).strip()
+            if not line:
+                continue
+        kept.append(line)
+    if not changed:
+        return value
+    cleaned = re.sub(r"(?:\n\s*){3,}", "\n\n", "\n".join(kept)).strip()
+    # 防御：万一清空了整条消息，回退原文，绝不让用户消息凭空消失。
+    return cleaned or value
 
 
 def _metadata_url(url: str) -> str:
@@ -1353,6 +1415,55 @@ def _is_xhs_logo_url(url: str) -> bool:
     )
 
 
+_X_TWEET_TITLE_RE = re.compile(
+    r"^(?P<author>[^\n]{1,80}?)\s*\(@(?P<handle>[A-Za-z0-9_]{1,30})\)\s+on\s+(?:X|Twitter)\s*$"
+)
+# 中英文句末标点；英文句点要求后面是空白或结尾，且前面不是「字母.小写字母」
+# 形态（排除 "e.g." "i.e." 这类缩写里的句点，避免标题被截在缩写处）。
+_X_SENTENCE_END_RE = re.compile(r"[。！？!?…]|(?<![A-Za-z]\.[a-z])\.(?=\s|$)")
+_X_TITLE_SNIPPET = 60
+
+
+def _x_twitter_relayout(title: str, description: str, body_text: str) -> tuple[str, str, str]:
+    """推文没有标题概念：og:title 是「作者 (@handle) on X」，需要重排。
+
+    作者单独成行；正文升标题位——有空行分段取首段，无分段取第一个句末
+    标点前的内容，两者都没有的短推文截一小截加省略号。
+    """
+    match = _X_TWEET_TITLE_RE.match(re.sub(r"\s+", " ", str(title or "")).strip())
+    if match is None:
+        return title, description, body_text
+    author = f"{match.group('author')} (@{match.group('handle')})"
+    tweet = str(description or "").strip()
+    paragraphs = [part.strip() for part in re.split(r"(?:\r?\n\s*){2,}", tweet) if part.strip()]
+    if len(paragraphs) > 1:
+        new_title = paragraphs[0]
+    else:
+        sentence_end = _X_SENTENCE_END_RE.search(tweet)
+        if sentence_end:
+            new_title = tweet[: sentence_end.end()]
+        elif len(tweet) > _X_TITLE_SNIPPET:
+            new_title = tweet[:_X_TITLE_SNIPPET].rstrip() + "…"
+        else:
+            new_title = tweet
+    if not new_title:
+        new_title = title
+    # X 页面的可见文本大多是 JS 外壳垃圾；正文以 og:description 的推文为准。
+    new_body = f"作者：{author}"
+    if tweet:
+        new_body += f"\n\n{tweet}"
+    elif body_text:
+        new_body += f"\n\n{body_text}"
+    new_description = re.sub(r"\s+", " ", tweet).strip()[:MAX_DESCRIPTION]
+    return new_title, new_description, new_body
+
+
+def _is_bilibili_challenge_page(title_parts: list[str]) -> bool:
+    """B站风控拦截页的标题是「出错啦!」，绝不能当成视频标题存下来。"""
+    compact = re.sub(r"\s+", "", unescape(" ".join(title_parts)))
+    return compact in {"出错啦!", "出错啦！"}
+
+
 _WECHAT_TRAILING_SECTION_LABELS = {
     "互动一下",
     "相关阅读",
@@ -1715,6 +1826,10 @@ def extract_html_page(requested_url: str, payload: HTTPPayload, *, max_text_char
     site_name = meta.get("og:site_name") or ""
     generic_image = _safe_image_url(meta.get("og:image") or meta.get("twitter:image") or "", payload.url)
     is_xhs = LinkPreviewService._is_xhs(requested_url) or LinkPreviewService._is_xhs(payload.url)
+    is_bilibili = LinkPreviewService._is_bilibili(requested_url) or LinkPreviewService._is_bilibili(payload.url)
+    if is_bilibili and _is_bilibili_challenge_page(parser.title_parts):
+        raise LinkPreviewError("bilibili risk-control interstitial")
+    is_x_twitter = LinkPreviewService._is_x_twitter(requested_url) or LinkPreviewService._is_x_twitter(payload.url)
     if is_xhs:
         note_description = _xhs_initial_state_description(parser, payload.url)
         if note_description:
@@ -1752,6 +1867,8 @@ def extract_html_page(requested_url: str, payload: HTTPPayload, *, max_text_char
             raise LinkPreviewError("WeChat article body was not available")
         if not description:
             description = re.sub(r"\s+", " ", body_text).strip()[:MAX_DESCRIPTION]
+    if is_x_twitter:
+        title, description, body_text = _x_twitter_relayout(title, description, body_text)
     body_text = _redact_url_echoes(
         re.sub(r"(?:\n\s*){3,}", "\n\n", unescape(body_text)).strip(),
         *source_urls,
@@ -2209,6 +2326,8 @@ class LinkPreviewService:
                 return None
             if self._is_wechat(url) and meta.get("schema_version") != WECHAT_CACHE_SCHEMA_VERSION:
                 return None
+            if self._is_bilibili(url) and meta.get("schema_version") != BILIBILI_CACHE_SCHEMA_VERSION:
+                return None
             if (
                 self._is_xiachufang_recipe(url)
                 and meta.get("schema_version") != XIACHUFANG_CACHE_SCHEMA_VERSION
@@ -2265,6 +2384,20 @@ class LinkPreviewService:
             raw_images, requested_url, xhs_only=provider in {"xhs-api", "xhs-cli"}
         )
         is_xhs = LinkPreviewService._is_xhs(requested_url) or provider in {"xhs-api", "xhs-cli"}
+        # 评论配图由 xhs 桥接以独立数组带回（xhscdn 直链）。与帖子配图走同一
+        # 下载/缓存路径，一并在全文 txt 里列出链接，方便下载失败时仍可见。
+        raw_comment_images = data.get("comment_image_urls")
+        if not isinstance(raw_comment_images, list):
+            raw_comment_images = []
+        comment_image_urls = _dedupe_image_values(
+            raw_comment_images, requested_url, xhs_only=is_xhs
+        )
+        if comment_image_urls:
+            merged = list(image_urls)
+            for item in comment_image_urls:
+                if item not in merged and len(merged) < MAX_PAGE_IMAGES:
+                    merged.append(item)
+            image_urls = tuple(merged)
         raw_description = data.get("description") or data.get("desc") or ""
         body_text = data.get("body_text") or data.get("text") or data.get("content") or ""
         if is_xhs:
@@ -2294,6 +2427,7 @@ class LinkPreviewService:
                 body_text, *source_urls,
             )[:max_chars],
             image_urls=image_urls,
+            comment_image_urls=comment_image_urls,
             comments=_redact_url_echoes(comments, *source_urls)[:max_chars],
             comments_fetched=data.get("comments_fetched") is True or bool(comments),
             comments_complete=(data.get("comments_complete") is True)
@@ -2484,6 +2618,155 @@ class LinkPreviewService:
         return host in WECHAT_HOSTS
 
     @staticmethod
+    def _is_bilibili(url: str) -> bool:
+        try:
+            host = (urlsplit(url).hostname or "").lower().rstrip(".")
+        except ValueError:
+            return False
+        return host in BILIBILI_HOSTS or host.endswith(".bilibili.com")
+
+    @staticmethod
+    def _bilibili_bvid_from_url(url: str) -> str:
+        try:
+            path = urlsplit(url).path
+        except ValueError:
+            return ""
+        match = re.search(r"/(BV[0-9A-Za-z]{10})(?:[/?]|$)", path)
+        return match.group(1) if match else ""
+
+    @staticmethod
+    def _is_x_twitter(url: str) -> bool:
+        try:
+            host = (urlsplit(url).hostname or "").lower().rstrip(".")
+        except ValueError:
+            return False
+        return host in X_HOSTS
+
+    def _fetch_bilibili_page(self, url: str, deadline: float) -> ExtractedPage:
+        """B站视频页走免登录公开 API：详情 view + 评论 reply。"""
+        # 2026-09 实测：从服务器 IP 带浏览器 UA 必吃 412 风控页，fetcher 默认
+        # UA 反而畅通；不要在这里「优化」成浏览器 UA。
+        api_headers = {
+            "Accept": "application/json",
+            "Referer": "https://www.bilibili.com/",
+        }
+
+        def api_get(endpoint: str) -> dict[str, Any]:
+            payload = self.fetcher.request(
+                endpoint,
+                deadline=deadline,
+                headers=api_headers,
+                max_bytes=min(self.max_download_bytes, 1_000_000),
+                allowed_hosts={BILIBILI_API_HOST},
+                allowed_schemes={"https"},
+            )
+            # 412 是 B站风控拦截页，body 是 HTML，绝不能当 JSON/标题用。
+            if payload.status == 412:
+                raise LinkPreviewError("bilibili risk-control interstitial")
+            if payload.status < 200 or payload.status >= 300:
+                raise LinkPreviewError("bilibili API returned non-success status")
+            try:
+                data = json.loads(payload.body.decode("utf-8"))
+            except Exception as exc:
+                raise LinkPreviewError("bilibili API returned invalid JSON") from exc
+            if not isinstance(data, dict) or data.get("code") != 0 or not isinstance(data.get("data"), dict):
+                raise LinkPreviewError("bilibili API returned an error code")
+            return data["data"]
+
+        bvid = self._bilibili_bvid_from_url(url)
+        if not bvid:
+            # b23.tv 等短链/分享链接先由安全抓取器跟随重定向拿到 BV 号。
+            payload = self.fetcher.request(
+                url,
+                deadline=deadline,
+                headers=api_headers,
+                max_bytes=200_000,
+                truncate_at_limit=True,
+                allowed_hosts=set(BILIBILI_HOSTS),
+                allowed_schemes={"https"},
+            )
+            if payload.status == 412:
+                raise LinkPreviewError("bilibili risk-control interstitial")
+            bvid = self._bilibili_bvid_from_url(payload.url)
+        if not bvid:
+            raise LinkPreviewError("bilibili BV id was not available")
+
+        view = api_get(f"https://{BILIBILI_API_HOST}/x/web-interface/view?bvid={bvid}")
+        title = _metadata_text(view.get("title"), MAX_TITLE)
+        if not title:
+            raise LinkPreviewError("bilibili view had no title")
+        description = _metadata_text(view.get("desc"), MAX_DESCRIPTION)
+        owner = view.get("owner") if isinstance(view.get("owner"), dict) else {}
+        author = _metadata_text(owner.get("name"), 100)
+        stat_block = view.get("stat") if isinstance(view.get("stat"), dict) else {}
+        aid = view.get("aid")
+        cover = _safe_image_url(view.get("pic") or "", f"https://www.bilibili.com/video/{bvid}")
+
+        body_sections: list[str] = []
+        if author:
+            body_sections.append(f"作者：{author}")
+        stats: list[str] = []
+        for label, field in (
+            ("播放", "view"), ("弹幕", "danmaku"), ("评论", "reply"),
+            ("点赞", "like"), ("投币", "coin"), ("收藏", "favorite"), ("分享", "share"),
+        ):
+            value = stat_block.get(field)
+            if isinstance(value, int):
+                stats.append(f"{label} {value}")
+        if stats:
+            body_sections.append(" · ".join(stats))
+        if description:
+            body_sections.append(f"简介：{description}")
+        body_text = "\n".join(body_sections)
+
+        comments = ""
+        comments_fetched = False
+        comments_complete = False
+        if isinstance(aid, int) and aid > 0 and time.monotonic() < deadline:
+            try:
+                reply = api_get(
+                    f"https://{BILIBILI_API_HOST}/x/v2/reply?type=1&oid={aid}&sort=1&ps=20"
+                )
+                lines: list[str] = []
+                for item in (reply.get("replies") or [])[:20]:
+                    if not isinstance(item, dict):
+                        continue
+                    member = item.get("member") if isinstance(item.get("member"), dict) else {}
+                    content = item.get("content") if isinstance(item.get("content"), dict) else {}
+                    message = str(content.get("message") or "").strip()
+                    if not message:
+                        continue
+                    name = str(member.get("uname") or "").strip()[:100]
+                    lines.append(f"{name}：{message}" if name else message)
+                comments = "\n".join(lines)
+                page_info = reply.get("page") if isinstance(reply.get("page"), dict) else {}
+                try:
+                    comments_complete = (
+                        int(page_info.get("num", 1)) * int(page_info.get("size", 20))
+                        >= int(page_info.get("count", 0))
+                    )
+                except (TypeError, ValueError):
+                    comments_complete = False
+                comments_fetched = True
+            except LinkPreviewError:
+                # 评论接口被风控只影响评论，视频详情仍然可用。
+                pass
+        return ExtractedPage(
+            requested_url=url,
+            final_url=f"https://www.bilibili.com/video/{bvid}",
+            title=title,
+            description=description,
+            site_name="哔哩哔哩",
+            image_url=cover,
+            body_text=body_text[: self.max_text_chars],
+            image_urls=(cover,) if cover else (),
+            comments=comments[: self.max_text_chars],
+            comments_fetched=comments_fetched or bool(comments),
+            comments_complete=comments_complete and bool(comments),
+            provider="bilibili-api",
+        )
+
+    @staticmethod
     def _is_xiachufang_recipe(url: str) -> bool:
         """Accept only public recipe detail URLs, never credentials or lookalikes."""
         try:
@@ -2642,6 +2925,13 @@ class LinkPreviewService:
             # persist it as article content.  A failed mobile fetch simply
             # degrades to no preview.
             return self._fetch_wechat_page(url, deadline)
+        if self._is_bilibili(url):
+            # B站视频页优先走免登录公开 API（详情 + 评论）。API 被风控时落回
+            # 通用抓取；412「出错啦!」拦截页由 extract_html_page 拒绝入库。
+            try:
+                return self._fetch_bilibili_page(url, deadline)
+            except LinkPreviewError:
+                pass
         # The cookie/API-backed XHS adapter is preferred when explicitly
         # configured.  No cookie path is guessed and an unavailable adapter
         # falls through to safe plain HTTP extraction.
@@ -2776,6 +3066,7 @@ class LinkPreviewService:
         key = self._url_key(url)
         is_xhs = self._is_xhs(url) or self._is_xhs(page.final_url)
         is_wechat = self._is_wechat(url) or self._is_wechat(page.final_url)
+        is_bilibili = self._is_bilibili(url) or self._is_bilibili(page.final_url)
         is_xiachufang_recipe = self._is_xiachufang_recipe(url) or self._is_xiachufang_recipe(page.final_url)
         remote_image_urls = list(page.image_urls or ((page.image_url,) if page.image_url else ()))[:MAX_PAGE_IMAGES]
         source_urls = (url, page.final_url, *remote_image_urls)
@@ -2819,6 +3110,14 @@ class LinkPreviewService:
                 sections.extend(["", "评论抓取状态：已抓取首批但返回为空，可能仍有更多评论。"])
         elif is_xhs:
             sections.extend(["", "评论抓取状态：未抓取；不得据此声称评论或帖子内容完整。"])
+        # 评论配图链接写进全文 txt：即使图片下载失败，AI 仍能看到链接清单。
+        safe_comment_image_urls = [
+            _redact_url_echoes(_metadata_url(item), *source_urls)
+            for item in (page.comment_image_urls or ())[:MAX_PAGE_IMAGES]
+        ]
+        safe_comment_image_urls = [item for item in safe_comment_image_urls if item]
+        if safe_comment_image_urls:
+            sections.extend(["", "评论配图链接：", *safe_comment_image_urls])
         content = "\n".join(sections).strip() + "\n"
         if len(content) > self.max_text_chars * 2:
             content = content[: self.max_text_chars * 2] + "\n[内容已按上限截断]\n"
@@ -2842,6 +3141,8 @@ class LinkPreviewService:
                 if is_xhs
                 else WECHAT_CACHE_SCHEMA_VERSION
                 if is_wechat
+                else BILIBILI_CACHE_SCHEMA_VERSION
+                if is_bilibili
                 else XIACHUFANG_CACHE_SCHEMA_VERSION
                 if is_xiachufang_recipe
                 else GENERIC_CACHE_SCHEMA_VERSION
@@ -2864,9 +3165,9 @@ class LinkPreviewService:
                 else "login_required"
                 if is_xhs and page.comments_auth_required
                 else "fetched_empty"
-                if is_xhs and page.comments_fetched and page.comments_complete
+                if (is_xhs or is_bilibili) and page.comments_fetched and page.comments_complete
                 else "fetched_empty_partial"
-                if is_xhs and page.comments_fetched
+                if (is_xhs or is_bilibili) and page.comments_fetched
                 else "not_fetched"
                 if is_xhs
                 else "not_applicable"
@@ -3092,13 +3393,13 @@ class LinkPreviewService:
             elif item.get("comments_status") == "included_partial":
                 lines.append(
                     "- 评论已抓取并保存在上面的全文 .txt 文件中；必须先读取该全文文件后再回答。"
-                    "内容图片只是帖子配图，不能根据图片中没有评论而声称评论未抓取。"
+                    "内容图片是帖子配图（小红书评论配图也会一并列出），不能根据图片中没有评论而声称评论未抓取。"
                     "抓取范围仅为首批，可能有更多评论或楼中楼。"
                 )
             elif item.get("comments_status") == "included":
                 lines.append(
                     "- 评论已抓取并保存在上面的全文 .txt 文件中；必须先读取该全文文件后再回答。"
-                    "内容图片只是帖子配图，不能根据图片中没有评论而声称评论未抓取。"
+                    "内容图片是帖子配图（小红书评论配图也会一并列出），不能根据图片中没有评论而声称评论未抓取。"
                 )
             elif item.get("comments_status") == "fetched_empty":
                 lines.append("- 抓取范围：评论已抓取，当前返回为空。")

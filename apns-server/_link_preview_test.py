@@ -1852,7 +1852,7 @@ class LinkPreviewTests(unittest.TestCase):
             self.assertIn(str(content_path), rebuilt)
             self.assertIn("不可信", rebuilt)
             self.assertIn("必须先读取该全文文件", rebuilt)
-            self.assertIn("内容图片只是帖子配图", rebuilt)
+            self.assertIn("不能根据图片中没有评论而声称评论未抓取", rebuilt)
             rebuilt_images = handler._link_context_from_record({
                 "metadata": {
                     "link_previews": [{
@@ -2154,7 +2154,7 @@ class LinkPreviewTests(unittest.TestCase):
         self.assertEqual(bundle.previews[0]["provider"], "xhs-cli")
         self.assertEqual(bundle.previews[0]["comments_status"], "included")
         self.assertIn("必须先读取该全文文件", bundle.prompt_context)
-        self.assertIn("内容图片只是帖子配图", bundle.prompt_context)
+        self.assertIn("不能根据图片中没有评论而声称评论未抓取", bundle.prompt_context)
         self.assertNotIn("xhslink", " ".join(command))
 
     def test_xhs_cli_adapter_accepts_cn_short_url_and_upgrades_http(self):
@@ -2383,7 +2383,7 @@ class LinkPreviewTests(unittest.TestCase):
         self.assertIn("仅抓取首批", content)
         self.assertIn("可能有更多评论或楼中楼", bundle.prompt_context)
         self.assertIn("必须先读取该全文文件", bundle.prompt_context)
-        self.assertIn("内容图片只是帖子配图", bundle.prompt_context)
+        self.assertIn("不能根据图片中没有评论而声称评论未抓取", bundle.prompt_context)
 
         false_string = link_preview.HTTPPayload(
             "xhs-cli://adapter", 200, {"content-type": "application/json"},
@@ -2647,7 +2647,8 @@ class LinkPreviewTests(unittest.TestCase):
                 "image_paths": [],
             }))
             self.assertIsNone(service._load_cache(url, time.monotonic() + 1))
-        self.assertEqual(link_preview.XHS_CACHE_SCHEMA_VERSION, 8)
+        # 版本 9 起评论可携带配图，旧 schema 的缓存必须整体失效重抓。
+        self.assertEqual(link_preview.XHS_CACHE_SCHEMA_VERSION, 9)
 
     def test_xiachufang_recipe_url_validation_and_mobile_rewrite(self):
         allowed = (
@@ -2906,6 +2907,202 @@ class LinkPreviewTests(unittest.TestCase):
             }))
             self.assertIsNone(service._load_cache(url, time.monotonic() + 1))
         self.assertEqual(link_preview.XIACHUFANG_CACHE_SCHEMA_VERSION, 1)
+
+    def test_share_boilerplate_removed_but_url_and_user_words_survive(self):
+        cleaned = link_preview.clean_shared_link_text(
+            "87 撒欢儿发布了一篇小红书笔记，快来看吧！ 😆 eWpX 😆 "
+            "https://xhslink.cn/o/abc123，复制本条信息，打开【小红书】App查看精彩内容！"
+        )
+        self.assertIn("https://xhslink.cn/o/abc123", cleaned)
+        self.assertNotIn("快来看吧", cleaned)
+        self.assertNotIn("复制本条信息", cleaned)
+        douyin = link_preview.clean_shared_link_text(
+            "7.94 复制打开抖音，看看【张三的作品】好内容不容错过！ "
+            "https://v.douyin.com/abc123/ 这个讲得不错"
+        )
+        self.assertIn("https://v.douyin.com/abc123/", douyin)
+        self.assertIn("这个讲得不错", douyin)
+        self.assertNotIn("复制打开抖音", douyin)
+        self.assertNotIn("好内容不容错过", douyin)
+
+    def test_share_boilerplate_never_touches_plain_text_or_empty_result(self):
+        plain = "快来看吧 复制打开抖音，看看【我的作品】"
+        self.assertEqual(link_preview.clean_shared_link_text(plain), plain)
+        only_boilerplate = "好内容不容错过！ https://v.douyin.com/abc/"
+        self.assertEqual(
+            link_preview.clean_shared_link_text(only_boilerplate),
+            "https://v.douyin.com/abc/",
+        )
+
+    def test_share_boilerplate_never_eats_quoted_phrase_inside_user_prose(self):
+        # 审核案例：「好内容不容错过」前是用户正文的字时绝不动它。
+        prose = "我觉得这个 https://example.com 真的好内容不容错过！"
+        self.assertEqual(link_preview.clean_shared_link_text(prose), prose)
+
+    def test_share_boilerplate_cleanup_preserves_intentional_blank_lines(self):
+        text = (
+            "87 撒欢儿发布了一篇小红书笔记，快来看吧！\n"
+            "\n"
+            "https://xhslink.cn/o/abc123 这个教程讲得不错"
+        )
+        self.assertEqual(
+            link_preview.clean_shared_link_text(text),
+            "https://xhslink.cn/o/abc123 这个教程讲得不错",
+        )
+        spaced = "https://xhslink.cn/o/abc123\n\n我自己留的空行下面还有话"
+        self.assertEqual(link_preview.clean_shared_link_text(spaced), spaced)
+
+    def test_xhs_adapter_comment_images_merge_and_land_in_fulltext(self):
+        adapter = link_preview.HTTPPayload(
+            "https://adapter.example/preview",
+            200,
+            {"content-type": "application/json"},
+            json.dumps({
+                "title": "note",
+                "desc": "caption",
+                "image_urls": ["https://sns-webpic-qc.xhscdn.com/a/note-cover"],
+                "comments": ["作者：（图片评论） [图片x1]"],
+                "comment_image_urls": [
+                    "https://sns-webpic-qc.xhscdn.com/b/comment-pic-1",
+                    "https://evil.example.com/not-allowed.jpg",
+                ],
+                "comments_fetched": True,
+                "comments_complete": True,
+            }, ensure_ascii=False).encode(),
+        )
+        fetcher = QueueFetcher([adapter])
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(
+                td, xhs_api_url="https://adapter.example/preview", fetcher=fetcher
+            )
+            bundle = service.enrich("https://xhslink.com/abc")
+            preview = bundle.previews[0]
+            self.assertEqual(preview["comments_status"], "included")
+            self.assertIn(
+                "https://sns-webpic-qc.xhscdn.com/b/comment-pic-1", preview["image_urls"]
+            )
+            fulltext = Path(preview["content_path"]).read_text()
+            self.assertIn("（图片评论） [图片x1]", fulltext)
+            self.assertIn("评论配图链接：", fulltext)
+            self.assertIn("https://sns-webpic-qc.xhscdn.com/b/comment-pic-1", fulltext)
+            self.assertNotIn("evil.example.com", fulltext)
+
+    def test_bilibili_api_page_builds_card_and_first_page_comments(self):
+        view = link_preview.HTTPPayload(
+            "https://api.bilibili.com/x/web-interface/view?bvid=BV1xx411c7mD",
+            200,
+            {"content-type": "application/json"},
+            json.dumps({
+                "code": 0,
+                "data": {
+                    "bvid": "BV1xx411c7mD",
+                    "aid": 170001,
+                    "title": "仿微信分享卡教程",
+                    "desc": "教程简介",
+                    "pic": "https://i0.hdslb.com/bfs/archive/cover.jpg",
+                    "owner": {"name": "Blaze"},
+                    "stat": {"view": 1234, "reply": 2, "like": 56},
+                },
+            }).encode(),
+        )
+        reply = link_preview.HTTPPayload(
+            "https://api.bilibili.com/x/v2/reply?type=1&oid=170001&sort=1&ps=20",
+            200,
+            {"content-type": "application/json"},
+            json.dumps({
+                "code": 0,
+                "data": {
+                    "page": {"num": 1, "size": 20, "count": 2},
+                    "replies": [
+                        {"member": {"uname": "路人甲"}, "content": {"message": "学到了"}},
+                        {"member": {"uname": "路人乙"}, "content": {"message": "收藏了"}},
+                    ],
+                },
+            }).encode(),
+        )
+        fetcher = QueueFetcher([view, reply])
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(td, fetcher=fetcher)
+            page = service._fetch_bilibili_page(
+                "https://www.bilibili.com/video/BV1xx411c7mD", time.monotonic() + 10
+            )
+            self.assertEqual(page.title, "仿微信分享卡教程")
+            self.assertIn("作者：Blaze", page.body_text)
+            self.assertIn("路人甲：学到了", page.comments)
+            self.assertTrue(page.comments_fetched)
+            self.assertTrue(page.comments_complete)
+            self.assertEqual(page.provider, "bilibili-api")
+            # API 只允许 api.bilibili.com，且不走别的域。
+            for api_url, kwargs in fetcher.calls:
+                self.assertEqual(kwargs["allowed_hosts"], {"api.bilibili.com"})
+                self.assertEqual(kwargs["allowed_schemes"], {"https"})
+
+    def test_bilibili_short_link_resolves_bvid_within_bilibili_hosts(self):
+        redirect_landing = link_preview.HTTPPayload(
+            "https://www.bilibili.com/video/BV1xx411c7mD/", 200, {}, b"<html></html>"
+        )
+        fetcher = QueueFetcher([redirect_landing, link_preview.LinkPreviewError("boom")])
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(td, fetcher=fetcher)
+            with self.assertRaises(link_preview.LinkPreviewError):
+                # 队列里只有重定向落点，API 阶段直接失败；但 BV 号解析必须先
+                # 成功走到那一步，且重定向只允许在 B站域内。
+                service._fetch_bilibili_page("https://b23.tv/abc", time.monotonic() + 10)
+            self.assertEqual(fetcher.calls[0][1]["allowed_hosts"], set(link_preview.BILIBILI_HOSTS))
+            self.assertEqual(
+                fetcher.calls[1][0],
+                "https://api.bilibili.com/x/web-interface/view?bvid=BV1xx411c7mD",
+            )
+
+    def test_bilibili_412_interstitial_never_becomes_a_title(self):
+        payload = link_preview.HTTPPayload(
+            "https://www.bilibili.com/video/BV1xx411c7mD",
+            200,
+            {"content-type": "text/html"},
+            "<html><head><title>出错啦!</title></head><body>出错啦!</body></html>".encode(),
+        )
+        with self.assertRaises(link_preview.LinkPreviewError):
+            link_preview.extract_html_page(
+                "https://www.bilibili.com/video/BV1xx411c7mD", payload, max_text_chars=1000
+            )
+        api_412 = link_preview.HTTPPayload(
+            "https://api.bilibili.com/x/web-interface/view?bvid=BV1xx411c7mD",
+            412, {}, "<html><title>出错啦!</title></html>".encode(),
+        )
+        fetcher = QueueFetcher([api_412])
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(td, fetcher=fetcher)
+            with self.assertRaises(link_preview.LinkPreviewError):
+                service._fetch_bilibili_page(
+                    "https://www.bilibili.com/video/BV1xx411c7mD", time.monotonic() + 10
+                )
+
+    def test_x_twitter_relayout_promotes_body_and_keeps_author_line(self):
+        title, description, body = link_preview._x_twitter_relayout(
+            "Blaze & Wren (@blazewren) on X",
+            "首段当标题。\n\n第二段是正文补充。",
+            "JavaScript is not available.",
+        )
+        self.assertEqual(title, "首段当标题。")
+        self.assertTrue(body.startswith("作者：Blaze & Wren (@blazewren)\n\n首段当标题。"))
+        self.assertNotIn("JavaScript", body)
+        self.assertIn("第二段", description)
+        sentence, _, _ = link_preview._x_twitter_relayout(
+            "A (@a) on X", "没有分段但有句号。后面的内容", ""
+        )
+        self.assertEqual(sentence, "没有分段但有句号。")
+        long_tweet, _, _ = link_preview._x_twitter_relayout("A (@a) on X", "长" * 100, "")
+        self.assertTrue(long_tweet.endswith("…"))
+        self.assertEqual(len(long_tweet), 61)
+        short_tweet, _, _ = link_preview._x_twitter_relayout("A (@a) on X", "很短", "")
+        self.assertEqual(short_tweet, "很短")
+        passthrough = link_preview._x_twitter_relayout("普通标题", "desc", "body")
+        self.assertEqual(passthrough, ("普通标题", "desc", "body"))
+        # 缩写里的句点（e.g.）不算句末，标题不被截在缩写处。
+        abbrev, _, _ = link_preview._x_twitter_relayout(
+            "A (@a) on X", "LLMs (e.g. Cursor Composer) are getting too good. 后面的内容", ""
+        )
+        self.assertEqual(abbrev, "LLMs (e.g. Cursor Composer) are getting too good.")
 
 
 if __name__ == "__main__":
