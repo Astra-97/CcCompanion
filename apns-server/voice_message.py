@@ -26,7 +26,7 @@ VOICE_MESSAGE_AUDIO_EXTENSIONS = frozenset({
     ".amr", ".flac",
 })
 VOICE_MESSAGE_MAX_DURATION_MS = 10 * 60 * 1000
-DEFAULT_ASR_TIMEOUT_SEC = 60.0
+DEFAULT_ASR_TIMEOUT_SEC = 120.0
 
 _TAG_RE = re.compile(r"<\|([A-Za-z0-9_]+)\|>")
 
@@ -38,6 +38,17 @@ _EVENTS = frozenset({
     "Speech", "Applause", "BGM", "Laughter", "Cry", "Sneeze", "Breath",
     "Cough",
 })
+
+# SiliconFlow 的 SenseVoice 走了 FunASR 富转写后处理：<|TAG|> 常被替换成
+# emoji。两种形态都解析，统一输出大写英文标签。
+_EMOJI_EMOTIONS = {
+    "😊": "HAPPY", "😢": "SAD", "😡": "ANGRY", "😰": "FEARFUL",
+    "🤢": "DISGUSTED", "😮": "SURPRISED",
+}
+_EMOJI_EVENTS = {
+    "🎼": "BGM", "👏": "Applause", "😀": "Laughter", "😭": "Cry",
+    "🤧": "Sneeze", "😷": "Cough",
+}
 
 
 class VoiceAsrError(RuntimeError):
@@ -62,7 +73,16 @@ def parse_sensevoice_output(raw: Any) -> dict[str, Any]:
             emotion = tag
         elif tag in _EVENTS and tag not in events and tag != "Speech":
             events.append(tag)
-    clean = _TAG_RE.sub("", text).strip()
+    for emoji, label in _EMOJI_EMOTIONS.items():
+        if not emotion and emoji in text:
+            emotion = label
+    for emoji, label in _EMOJI_EVENTS.items():
+        if emoji in text and label not in events:
+            events.append(label)
+    clean = _TAG_RE.sub("", text)
+    for emoji in {**_EMOJI_EMOTIONS, **_EMOJI_EVENTS}:
+        clean = clean.replace(emoji, "")
+    clean = clean.strip()
     return {
         "text": clean,
         "language": language,
@@ -113,4 +133,7 @@ def transcribe_voice_audio(
     raw_text = payload.get("text") if isinstance(payload, dict) else None
     if not isinstance(raw_text, str) or not raw_text.strip():
         raise VoiceAsrError("siliconflow_empty_transcript")
-    return parse_sensevoice_output(raw_text)
+    result = parse_sensevoice_output(raw_text)
+    if not result["language"] and isinstance(payload, dict):
+        result["language"] = str(payload.get("language") or "")
+    return result

@@ -62,6 +62,13 @@ class SenseVoiceParseTest(unittest.TestCase):
         self.assertEqual(result["emotion"], "SAD")
         self.assertEqual(result["events"], [])
 
+    def test_emoji_form_from_funasr_postprocess(self) -> None:
+        # SiliconFlow 实测返回 FunASR 后处理形态：情绪/事件是 emoji 而非 <|TAG|>。
+        result = voice_message.parse_sensevoice_output("😊今天真的太开心啦🎼")
+        self.assertEqual(result["text"], "今天真的太开心啦")
+        self.assertEqual(result["emotion"], "HAPPY")
+        self.assertEqual(result["events"], ["BGM"])
+
 
 class TranscribeTest(unittest.TestCase):
     def setUp(self) -> None:
