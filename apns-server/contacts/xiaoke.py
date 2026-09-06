@@ -11,6 +11,7 @@ CONTACT = {
     "capabilities": [
         "chat", "history", "draft", "busy", "stop", "attachments", "terminal",
         "forward", "group_member", "group_reply", "realtime", "ai_reading_continue",
+        "voice_message",
     ],
     "group_display_name": "小克（螃蟹版）",
     "group_mention": "@小克",

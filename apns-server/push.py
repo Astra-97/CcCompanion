@@ -127,6 +127,7 @@ from voice_protocol import (
     parse_spoken_voice_reply,
     sanitize_voice_metadata,
 )
+import voice_message
 from health_records import (
     PERIOD_RECORD_TYPES,
     format_health_context_prompt,
@@ -7484,6 +7485,10 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/voice-call/asr"):
             self._handle_voice_call_asr()
             return
+        # 语音消息：raw audio body + query string，服务端 ASR 后注入 AI 会话
+        if self.path.startswith("/chat/voice"):
+            self._handle_chat_voice()
+            return
         if self.path == "/diary/upload":
             self._handle_diary_upload()
             return
@@ -11449,6 +11454,46 @@ class PushHandler(BaseHTTPRequestHandler):
                 })
                 return
             chat = self._chat_for_contact(contact_id)
+            if precommitted_record is not None:
+                # 内部调用方（/chat/voice）已把含语音附件元数据的记录入库；
+                # 忙时入队复用该记录，与直达路径一样绝不重复 append。
+                rec = precommitted_record
+                attachments_committed = True
+                position = self._enqueue_kimi_chat_turn({
+                    "kind": "web",
+                    "contact_id": contact_id,
+                    "text": text,
+                    "quoted_ts": quoted_ts,
+                    "metadata": metadata,
+                    "record": rec,
+                    "staged_attachments": staged_attachments,
+                    "attempts": 0,
+                    "queued_at": str(rec.get("ts") or ""),
+                })
+                if position is None:
+                    self._set_chat_failed(contact_id, user_ts=rec["ts"], source="kimi-web:queue-full")
+                    self._send_json(429, {
+                        "ok": False,
+                        "error": "kimi_queue_full",
+                        "reason": "排队消息过多，请等当前回复完成后再发。",
+                        "record": rec,
+                    })
+                    return
+                self._set_chat_queued(
+                    contact_id,
+                    user_ts=str(rec.get("ts") or ""),
+                    queued_at=str(rec.get("ts") or ""),
+                    queue_position=position,
+                    source="cc-app:kimi-web",
+                )
+                self._send_json(200, {
+                    "ok": True,
+                    "queued": True,
+                    "record": rec,
+                    "queue_position": position,
+                    "reason": reason,
+                })
+                return
             primary_attachment = staged_attachments[0] if staged_attachments else {}
             try:
                 rec = chat.append(
@@ -20126,6 +20171,226 @@ class PushHandler(BaseHTTPRequestHandler):
             })
 
         self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec})
+
+    def _handle_chat_voice(self):
+        """语音消息：raw audio -> 附件落盘 + SenseVoice ASR -> 注入 AI 会话。
+
+        Query: ?contact_id=...&filename=voice.m4a&duration_ms=1234&quoted_ts=...
+        Body: raw audio bytes（仅音频，max 10MB）。
+
+        与 /chat/upload 非暂存分支同构：附件 UUID 命名进 attachments_dir、
+        历史记录先行（attachment_type=audio + metadata.type=voice，App 直接
+        渲染成可播放语音气泡），再把「转写+情绪+事件」注入对应 AI 管线。
+        ASR 失败降级为无转写注入，消息本身绝不因识别失败丢失。
+        """
+        import mimetypes
+        import uuid as _uuid
+        from urllib.parse import urlparse, parse_qs, unquote
+
+        qs = parse_qs(urlparse(self.path).query)
+        contact_id = self._clean_contact_id(qs.get("contact_id", qs.get("contactId", ["xiaoke"]))[0])
+        filename = qs.get("filename", ["voice.m4a"])[0] or "voice.m4a"
+        try:
+            filename = unquote(filename)
+        except Exception:
+            pass
+        filename = str(filename or "")
+        # 与 /chat/upload 相同：展示名可以是中文，但绝不能带路径/控制字符。
+        if (
+            not filename
+            or len(filename.encode("utf-8", errors="ignore")) > 240
+            or Path(filename).name != filename
+            or "\\" in filename
+            or any(ord(char) < 32 or ord(char) == 127 for char in filename)
+        ):
+            self._send_json(400, {"ok": False, "error": "invalid filename"})
+            return
+        quoted_ts = qs.get("quoted_ts", [None])[0] or None
+        try:
+            duration_ms = int(float(qs.get("duration_ms", ["0"])[0] or 0))
+        except (TypeError, ValueError):
+            duration_ms = 0
+        duration_ms = max(0, min(duration_ms, voice_message.VOICE_MESSAGE_MAX_DURATION_MS))
+
+        advertised = {
+            str(contact.get("id") or ""): set(contact.get("capabilities") or [])
+            for contact in self._chat_contact_directory()
+        }
+        if "voice_message" not in advertised.get(contact_id, set()):
+            self._send_json(501, {"ok": False, "error": f"contact does not accept voice messages: {contact_id}"})
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except Exception:
+            length = 0
+        if length <= 0 or length > voice_message.VOICE_MESSAGE_MAX_BYTES:
+            self._send_json(400, {"ok": False, "error": "invalid content-length (max 10MB)"})
+            return
+
+        ext = Path(filename).suffix.lower()
+        if ext not in voice_message.VOICE_MESSAGE_AUDIO_EXTENSIONS:
+            self._send_json(415, {"ok": False, "error": "unsupported_audio_type"})
+            return
+        media_type = str(self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if not re.fullmatch(r"[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+", media_type):
+            media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        # Android MediaRecorder 的 m4a 容器常报 video/mp4，与 audio/* 一并放行。
+        if not (
+            media_type.startswith("audio/")
+            or media_type in {"application/octet-stream", "video/mp4"}
+        ):
+            self._send_json(415, {"ok": False, "error": "unsupported_audio_type"})
+            return
+
+        stored_name = f"{_uuid.uuid4().hex}{ext}"
+        stored_path = self.state.attachments_dir / stored_name
+        try:
+            with stored_path.open("wb") as f:
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, 65536))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+        except Exception as e:
+            logger.exception("voice message write fail")
+            self._send_json(500, {"ok": False, "error": f"write fail: {e}"})
+            return
+        attachment_url = f"/attachments/{stored_name}"
+
+        asr_status = "failed"
+        asr: dict[str, Any] = {"text": "", "language": "", "emotion": "", "events": [], "raw": ""}
+        try:
+            asr = voice_message.transcribe_voice_audio(
+                stored_path,
+                api_key=voice_message.voice_message_api_key(),
+            )
+            asr_status = "ok"
+        except Exception as exc:
+            logger.warning("voice message ASR failed contact_id=%s: %s", contact_id, exc)
+
+        transcript = str(asr.get("text") or "").strip()
+        emotion = str(asr.get("emotion") or "")
+        events = [str(item) for item in (asr.get("events") or [])]
+        display_text = transcript or ("[语音消息]" if asr_status == "ok" else "[语音消息] 语音识别失败")
+
+        voice_meta = {
+            "type": "voice",
+            "audio_url": attachment_url,
+            "mime_type": media_type,
+            "bytes": length,
+            "duration_ms": duration_ms,
+            "transcript": transcript,
+            "emotion": emotion,
+            "events": events,
+            "asr": asr_status,
+        }
+        chat = self._chat_for_contact(contact_id)
+        try:
+            rec = chat.append(
+                role="user",
+                text=display_text,
+                source=self._source_for_request(contact_id),
+                quoted_ts=quoted_ts,
+                attachment_url=attachment_url,
+                attachment_type="audio",
+                attachment_filename=filename,
+                metadata=voice_meta,
+            )
+        except Exception as e:
+            logger.exception("voice message chat append fail")
+            self._send_json(500, {"ok": False, "error": f"chat append fail: {e}"})
+            return
+
+        duration_label = f"{duration_ms / 1000.0:.1f}s" if duration_ms > 0 else "时长未知"
+        hint_lines = [f"[用户发来一条语音消息 (时长 {duration_label})]"]
+        hint_lines.append(f"转写: {transcript}" if transcript else "转写: （语音识别失败，可播放音频原文）")
+        if emotion:
+            hint_lines.append(f"情绪: {emotion}")
+        if events:
+            hint_lines.append(f"声音事件: {', '.join(events)}")
+
+        if contact_id == "kimi":
+            # Kimi Web 是纯文本通道：语音内容以「转写+情绪」文本注入，历史
+            # 记录已在上面入库（precommitted 防止 kimi 管线重复 append）。
+            self._handle_kimi_chat_send({
+                "text": "\n".join(hint_lines),
+                "quoted_ts": quoted_ts,
+                "_kimi_precommitted_record": rec,
+            }, contact_id)
+            return
+
+        # xiaoke 运行在服务端本地，沿用 /chat/upload 的附件 hint 形状，
+        # 让 chain 可以按需直接读音频文件。
+        hint = "\n".join(hint_lines) + f"\n本地路径: {stored_path}"
+        if rec.get("quoted_text"):
+            hint = f"[引用 \"{rec['quoted_text']}\"]\n" + hint
+        if self._channel_transport_enabled_for(contact_id):
+            attach_meta = {
+                **voice_meta,
+                "transport": "channel",
+                "user_record_ts": rec.get("ts"),
+                "attachment_type": "audio",
+                "attachment_filename": filename,
+                "attachment_url": attachment_url,
+                "attachment_path": str(stored_path),
+            }
+            message_id = self._channel_message_id({}, contact_id, hint, quoted_ts)
+            ok, err, _channel_response = self._send_to_channel_transport(
+                message_id=message_id,
+                contact_id=contact_id,
+                text=hint,
+                quoted_ts=quoted_ts,
+                user_record={**rec, "metadata": attach_meta},
+            )
+            if ok:
+                self._send_json(200, {
+                    "ok": True,
+                    "contact_id": contact_id,
+                    "record": rec,
+                    "transport": "channel",
+                    "message_id": message_id,
+                    "asr": asr_status,
+                    "transcript": transcript,
+                    "emotion": emotion,
+                    "events": events,
+                })
+                return
+            logger.warning(
+                "channel transport voice message failed contact_id=%s message_id=%s error=%s",
+                contact_id, message_id, err,
+            )
+            if not self.state.channel_transport_fallback_to_tmux:
+                self._send_json(502, {
+                    "ok": False,
+                    "error": f"channel transport voice message failed: {err}",
+                    "record": rec,
+                    "asr": asr_status,
+                })
+                return
+            # fallback 继续走 tmux 注入
+        target_session = (self.state.active_session or self.state.default_session).strip()
+        ok, err = self._inject_to_session(target_session, hint, source=self._source_for_request(), sender="iphone")
+        if not ok:
+            # 音频已存盘 + 历史已 append 但注入失败 — 502 surface
+            self._send_json(502, {
+                "ok": False,
+                "error": f"inject voice message hint to '{target_session}' failed: {err}",
+                "record": rec,
+                "asr": asr_status,
+            })
+            return
+        self._send_json(200, {
+            "ok": True,
+            "contact_id": contact_id,
+            "record": rec,
+            "asr": asr_status,
+            "transcript": transcript,
+            "emotion": emotion,
+            "events": events,
+        })
 
     def _run_stackchan_voice_helper(self, args: list[str], *, timeout: int) -> tuple[bool, dict[str, Any]]:
         helper = HERE / "stackchan_voice_call.py"
