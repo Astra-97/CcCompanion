@@ -42,7 +42,7 @@ _EVENTS = frozenset({
 # SiliconFlow 的 SenseVoice 走了 FunASR 富转写后处理：<|TAG|> 常被替换成
 # emoji。两种形态都解析，统一输出大写英文标签。
 _EMOJI_EMOTIONS = {
-    "😊": "HAPPY", "😢": "SAD", "😡": "ANGRY", "😰": "FEARFUL",
+    "😊": "HAPPY", "😔": "SAD", "😢": "SAD", "😡": "ANGRY", "😰": "FEARFUL",
     "🤢": "DISGUSTED", "😮": "SURPRISED",
 }
 _EMOJI_EVENTS = {

@@ -69,6 +69,14 @@ class SenseVoiceParseTest(unittest.TestCase):
         self.assertEqual(result["emotion"], "HAPPY")
         self.assertEqual(result["events"], ["BGM"])
 
+    def test_funasr_sad_emoji_is_pensive_face(self) -> None:
+        # FunASR 后处理把 <|SAD|> 替换成 😔（不是 😢）——2026-09-07 实机样本确认：
+        # 「那你能听出来我的情绪吗？还有我的嗓子有没有鼻音？😔」情绪字段曾因此落空。
+        result = voice_message.parse_sensevoice_output("那你能听出来我的情绪吗😔")
+        self.assertEqual(result["text"], "那你能听出来我的情绪吗")
+        self.assertEqual(result["emotion"], "SAD")
+        self.assertEqual(result["events"], [])
+
 
 class TranscribeTest(unittest.TestCase):
     def setUp(self) -> None:
