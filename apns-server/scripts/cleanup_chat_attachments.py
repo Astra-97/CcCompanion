@@ -26,6 +26,11 @@ from typing import Callable
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[1] / "tokens" / "attachments"
 NANOSECONDS_PER_DAY = 86_400 * 1_000_000_000
+# 语音消息等纯音频附件适用更短的 TTL（10 天）；.mp4/.webm 容器可能是视频，
+# 不在此列，维持通用 TTL。
+AUDIO_ATTACHMENT_EXTENSIONS = frozenset({
+    ".m4a", ".aac", ".wav", ".mp3", ".ogg", ".opus", ".amr", ".flac",
+})
 QUARANTINE_PREFIX = ".cc-attachment-cleanup-quarantine-"
 JOURNAL_PREFIX = ".cc-attachment-cleanup-journal-"
 RENAME_NOREPLACE = 1
@@ -343,6 +348,7 @@ def cleanup(
     root: Path,
     *,
     older_than_days: int = 30,
+    audio_older_than_days: int | None = None,
     apply: bool = False,
     max_files: int = 1_000,
     max_scan: int = 100_000,
@@ -354,13 +360,24 @@ def cleanup(
     _after_rename: Callable[[int, str, str, str], None] | None = None,
     _after_delete: Callable[[int, str, str], None] | None = None,
 ) -> CleanupSummary:
-    """Find or remove stale top-level regular files inside ``root``."""
+    """Find or remove stale top-level regular files inside ``root``.
+
+    ``audio_older_than_days`` applies a separate, typically shorter TTL to
+    pure-audio attachments (see ``AUDIO_ATTACHMENT_EXTENSIONS``).
+    """
     if older_than_days < 1:
         raise ValueError("older_than_days must be at least 1")
+    if audio_older_than_days is not None and audio_older_than_days < 1:
+        raise ValueError("audio_older_than_days must be at least 1")
     if min(max_files, max_scan, max_recovery) < 1:
         raise ValueError("cleanup limits must be at least 1")
     now_ns = time.time_ns() if now_ns is None else now_ns
     cutoff_ns = now_ns - older_than_days * NANOSECONDS_PER_DAY
+    audio_cutoff_ns = (
+        now_ns - audio_older_than_days * NANOSECONDS_PER_DAY
+        if audio_older_than_days is not None
+        else cutoff_ns
+    )
     summary = CleanupSummary()
     root_fd = _open_checked_root(root)
     try:
@@ -387,7 +404,12 @@ def cleanup(
                 if not stat.S_ISREG(initial.st_mode):
                     summary.skipped_non_regular += 1
                     continue
-                if max(initial.st_mtime_ns, initial.st_ctime_ns) >= cutoff_ns:
+                entry_cutoff_ns = (
+                    audio_cutoff_ns
+                    if Path(entry.name).suffix.lower() in AUDIO_ATTACHMENT_EXTENSIONS
+                    else cutoff_ns
+                )
+                if max(initial.st_mtime_ns, initial.st_ctime_ns) >= entry_cutoff_ns:
                     continue
                 summary.candidates += 1
                 summary.candidate_bytes += initial.st_size
@@ -494,6 +516,12 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Clean old CcCompanion chat attachments.")
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--older-than-days", type=int, default=30)
+    parser.add_argument(
+        "--audio-older-than-days",
+        type=int,
+        default=None,
+        help="separate TTL for pure-audio attachments (voice messages)",
+    )
     parser.add_argument("--max-files", type=int, default=1_000)
     parser.add_argument("--max-scan", type=int, default=100_000)
     parser.add_argument("--max-recovery", type=int, default=1_000)
@@ -507,6 +535,7 @@ def main(argv: list[str] | None = None) -> int:
         summary = cleanup(
             args.root,
             older_than_days=args.older_than_days,
+            audio_older_than_days=args.audio_older_than_days,
             apply=args.apply,
             max_files=args.max_files,
             max_scan=args.max_scan,

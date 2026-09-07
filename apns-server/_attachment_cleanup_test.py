@@ -102,6 +102,54 @@ class AttachmentCleanupTest(unittest.TestCase):
         self.assertTrue(result.delete_limit_reached)
         self.assertEqual(len(list(self.root.iterdir())), 1)
 
+    def test_audio_attachments_use_shorter_ttl(self):
+        # 15 天前：超过音频 10 天 TTL，但未超过通用 30 天 TTL。
+        fifteen_days_ago = self.future_now - 15 * NANOSECONDS_PER_DAY
+        old_audio = self.make_file("voice.m4a", b"voice")
+        os.utime(old_audio, ns=(fifteen_days_ago, fifteen_days_ago))
+        old_image = self.make_file("photo.jpg", b"photo")
+        os.utime(old_image, ns=(fifteen_days_ago, fifteen_days_ago))
+        old_video_container = self.make_file("clip.mp4", b"video")
+        os.utime(old_video_container, ns=(fifteen_days_ago, fifteen_days_ago))
+
+        result = cleanup(
+            self.root, apply=True, audio_older_than_days=10, now_ns=self.future_now
+        )
+
+        self.assertEqual(result.removed, 1)
+        self.assertFalse(old_audio.exists())
+        # 图片与 .mp4 容器（可能是视频）维持 30 天 TTL。
+        self.assertTrue(old_image.exists())
+        self.assertTrue(old_video_container.exists())
+
+    def test_audio_ttl_defaults_to_general_ttl(self):
+        old_audio = self.make_file("voice.mp3", b"voice")
+
+        result = cleanup(self.root, apply=True, now_ns=self.future_now)
+
+        self.assertEqual(result.removed, 1)
+        self.assertFalse(old_audio.exists())
+
+    def test_audio_older_than_days_must_be_positive(self):
+        with self.assertRaises(ValueError):
+            cleanup(self.root, audio_older_than_days=0, now_ns=self.future_now)
+
+    def test_all_pure_audio_extensions_covered(self):
+        forty_days_ago = self.future_now - 40 * NANOSECONDS_PER_DAY
+        for ext in (".m4a", ".aac", ".wav", ".mp3", ".ogg", ".opus", ".amr", ".flac"):
+            path = self.make_file(f"voice{ext}", b"voice")
+            os.utime(path, ns=(forty_days_ago, forty_days_ago))
+        kept = self.make_file("voice.webm", b"maybe-video")
+        os.utime(kept, ns=(self.future_now, self.future_now))
+
+        result = cleanup(
+            self.root, apply=True, older_than_days=30, audio_older_than_days=10,
+            now_ns=self.future_now,
+        )
+
+        self.assertEqual(result.removed, 8)
+        self.assertTrue(kept.exists())
+
     def test_scan_count_is_bounded(self):
         for number in range(3):
             self.make_file(f"{number}.bin")

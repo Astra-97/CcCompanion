@@ -127,6 +127,8 @@ from voice_protocol import (
     parse_spoken_voice_reply,
     sanitize_voice_metadata,
 )
+import voice_acoustics
+import voice_gemini
 import voice_message
 from health_records import (
     PERIOD_RECORD_TYPES,
@@ -20180,8 +20182,8 @@ class PushHandler(BaseHTTPRequestHandler):
 
         与 /chat/upload 非暂存分支同构：附件 UUID 命名进 attachments_dir、
         历史记录先行（attachment_type=audio + metadata.type=voice，App 直接
-        渲染成可播放语音气泡），再把「转写+情绪+事件」注入对应 AI 管线。
-        ASR 失败降级为无转写注入，消息本身绝不因识别失败丢失。
+        渲染成可播放语音气泡），再把「转写+情绪+事件+声学+精听」注入对应
+        AI 管线。ASR/声学/精听任一失败都降级注入，消息本身绝不因识别失败丢失。
         """
         import mimetypes
         import uuid as _uuid
@@ -20276,6 +20278,26 @@ class PushHandler(BaseHTTPRequestHandler):
         events = [str(item) for item in (asr.get("events") or [])]
         display_text = transcript or ("[语音消息]" if asr_status == "ok" else "[语音消息] 语音识别失败")
 
+        # 增强：声学分析（音高/语速/停顿）+ Gemini 精听。与 ASR 同策略——
+        # 任何一步失败（超时/余额/转换失败）都静默降级为空字段，绝不影响
+        # 语音消息主流程。精听同步放在注入前，超时上限 60s（实测 ~10-20s）。
+        acoustics: dict[str, Any] = {}
+        try:
+            acoustics = voice_acoustics.analyze_voice_acoustics(stored_path, transcript)
+        except Exception as exc:
+            logger.warning("voice message acoustics failed contact_id=%s: %s", contact_id, exc)
+        acoustics_summary = str(acoustics.get("summary") or "")
+
+        listen: dict[str, str] = {}
+        if voice_gemini.openrouter_api_key():
+            try:
+                listen = voice_gemini.listen_voice_audio(
+                    stored_path,
+                    api_key=voice_gemini.openrouter_api_key(),
+                )
+            except Exception as exc:
+                logger.warning("voice message gemini listen failed contact_id=%s: %s", contact_id, exc)
+
         voice_meta = {
             "type": "voice",
             "audio_url": attachment_url,
@@ -20286,6 +20308,10 @@ class PushHandler(BaseHTTPRequestHandler):
             "emotion": emotion,
             "events": events,
             "asr": asr_status,
+            "acoustics": acoustics_summary,
+            "acoustic_detail": {key: value for key, value in acoustics.items() if key != "summary"},
+            "listen": listen,
+            "listen_summary": str(listen.get("summary") or ""),
         }
         chat = self._chat_for_contact(contact_id)
         try:
@@ -20311,6 +20337,19 @@ class PushHandler(BaseHTTPRequestHandler):
             hint_lines.append(f"情绪: {emotion}")
         if events:
             hint_lines.append(f"声音事件: {', '.join(events)}")
+        if acoustics_summary:
+            hint_lines.append(f"声学: {acoustics_summary}")
+        if listen:
+            listen_transcript = str(listen.get("transcript_check") or "")
+            if listen_transcript and listen_transcript != "无法辨认" and listen_transcript != transcript:
+                hint_lines.append(f"转写核对: {listen_transcript}")
+            if listen.get("emotion_detail"):
+                hint_lines.append(f"细粒度情绪: {listen['emotion_detail']}")
+            acoustic_desc = str(listen.get("acoustic_desc") or "")
+            if acoustic_desc and acoustic_desc != "无明显特征":
+                hint_lines.append(f"声学特征: {acoustic_desc}")
+            if listen.get("summary"):
+                hint_lines.append(f"精听总结: {listen['summary']}")
 
         if contact_id == "kimi":
             # Kimi Web 是纯文本通道：语音内容以「转写+情绪」文本注入，历史
@@ -20356,6 +20395,8 @@ class PushHandler(BaseHTTPRequestHandler):
                     "transcript": transcript,
                     "emotion": emotion,
                     "events": events,
+                    "acoustics": acoustics_summary,
+                    "listen_summary": str(listen.get("summary") or ""),
                 })
                 return
             logger.warning(
@@ -20390,6 +20431,8 @@ class PushHandler(BaseHTTPRequestHandler):
             "transcript": transcript,
             "emotion": emotion,
             "events": events,
+            "acoustics": acoustics_summary,
+            "listen_summary": str(listen.get("summary") or ""),
         })
 
     def _run_stackchan_voice_helper(self, args: list[str], *, timeout: int) -> tuple[bool, dict[str, Any]]:

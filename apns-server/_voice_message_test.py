@@ -313,8 +313,112 @@ class VoiceMessageHandlerTest(unittest.TestCase):
         self.assertEqual(meta["attachment_type"], "audio")
         self.assertTrue(meta["attachment_path"].endswith(".m4a"))
 
-    # ── kimi pipeline ──
+    # ── 增强：声学分析 + Gemini 精听 ──
 
+    def _acoustics_ok(self):
+        return {
+            "pitch_hz": 210.0,
+            "pitch_label": "正常",
+            "speech_rate_cps": 2.6,
+            "speech_chars": 11,
+            "pauses": 0,
+            "voiced_sec": 4.2,
+            "duration_sec": 4.2,
+            "summary": "音高正常，语速2.6字/秒，停顿0次",
+        }
+
+    def _listen_ok(self):
+        return {
+            "transcript_check": "今天真的太开心啦，哈哈！",
+            "emotion_detail": "能量高、尾音上扬，带笑意",
+            "acoustic_desc": "嗓音清亮",
+            "summary": "心情很好地在分享日常",
+            "raw": "…",
+        }
+
+    def test_enrichment_fields_reach_hint_meta_and_response(self) -> None:
+        h = self.handler(
+            b"audio-bytes",
+            "contact_id=xiaoke&filename=voice.m4a&duration_ms=4200",
+        )
+        injected: list[str] = []
+        h._channel_transport_enabled_for = lambda contact_id: False
+        h._inject_to_session = lambda session, text, source=None, sender=None: (
+            injected.append(text) or (True, "")
+        )
+        with patch.object(voice_message, "transcribe_voice_audio", return_value=self._asr_ok()), \
+             patch.object(voice_message, "voice_message_api_key", return_value="sk-test"), \
+             patch.object(push.voice_acoustics, "analyze_voice_acoustics", return_value=self._acoustics_ok()), \
+             patch.object(push.voice_gemini, "openrouter_api_key", return_value="sk-or-test"), \
+             patch.object(push.voice_gemini, "listen_voice_audio", return_value=self._listen_ok()):
+            h._handle_chat_voice()
+        status, payload = self.responses[0]
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["acoustics"], "音高正常，语速2.6字/秒，停顿0次")
+        self.assertEqual(payload["listen_summary"], "心情很好地在分享日常")
+
+        metadata = payload["record"]["metadata"]
+        self.assertEqual(metadata["acoustics"], "音高正常，语速2.6字/秒，停顿0次")
+        self.assertEqual(metadata["acoustic_detail"]["pitch_hz"], 210.0)
+        self.assertNotIn("summary", metadata["acoustic_detail"])
+        self.assertEqual(metadata["listen"]["emotion_detail"], "能量高、尾音上扬，带笑意")
+        self.assertEqual(metadata["listen_summary"], "心情很好地在分享日常")
+
+        hint = injected[0]
+        self.assertIn("声学: 音高正常，语速2.6字/秒，停顿0次", hint)
+        self.assertIn("细粒度情绪: 能量高、尾音上扬，带笑意", hint)
+        self.assertIn("声学特征: 嗓音清亮", hint)
+        self.assertIn("精听总结: 心情很好地在分享日常", hint)
+        # 精听转写与 ASR 一致时不重复注入「转写核对」。
+        self.assertNotIn("转写核对", hint)
+
+    def test_enrichment_failure_degrades_silently(self) -> None:
+        h = self.handler(b"audio-bytes", "contact_id=xiaoke&filename=voice.m4a")
+        injected: list[str] = []
+        h._channel_transport_enabled_for = lambda contact_id: False
+        h._inject_to_session = lambda session, text, source=None, sender=None: (
+            injected.append(text) or (True, "")
+        )
+        with patch.object(voice_message, "transcribe_voice_audio", return_value=self._asr_ok()), \
+             patch.object(voice_message, "voice_message_api_key", return_value="sk-test"), \
+             patch.object(
+                 push.voice_acoustics, "analyze_voice_acoustics",
+                 side_effect=push.voice_acoustics.VoiceAcousticsError("ffmpeg_convert_failed"),
+             ), \
+             patch.object(push.voice_gemini, "openrouter_api_key", return_value="sk-or-test"), \
+             patch.object(
+                 push.voice_gemini, "listen_voice_audio",
+                 side_effect=push.voice_gemini.VoiceListenError("openrouter_http_402"),
+             ):
+            h._handle_chat_voice()
+        status, payload = self.responses[0]
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["asr"], "ok")
+        metadata = payload["record"]["metadata"]
+        self.assertEqual(metadata["acoustics"], "")
+        self.assertEqual(metadata["acoustic_detail"], {})
+        self.assertEqual(metadata["listen"], {})
+        self.assertEqual(metadata["listen_summary"], "")
+        hint = injected[0]
+        self.assertNotIn("声学:", hint)
+        self.assertNotIn("精听", hint)
+        # 主流程字段不受增强失败影响。
+        self.assertIn("转写: 今天真的太开心啦，哈哈！", hint)
+
+    def test_listen_skipped_without_openrouter_key(self) -> None:
+        h = self.handler(b"audio-bytes", "contact_id=xiaoke&filename=voice.m4a")
+        h._channel_transport_enabled_for = lambda contact_id: False
+        h._inject_to_session = lambda session, text, source=None, sender=None: (True, "")
+        with patch.object(voice_message, "transcribe_voice_audio", return_value=self._asr_ok()), \
+             patch.object(voice_message, "voice_message_api_key", return_value="sk-test"), \
+             patch.object(push.voice_acoustics, "analyze_voice_acoustics", return_value=self._acoustics_ok()), \
+             patch.object(push.voice_gemini, "openrouter_api_key", return_value=""), \
+             patch.object(push.voice_gemini, "listen_voice_audio") as listen:
+            h._handle_chat_voice()
+        listen.assert_not_called()
+        self.assertEqual(self.responses[0][0], 200)
+
+    # ── kimi pipeline ──
     def test_kimi_voice_message_delegates_with_precommitted_record(self) -> None:
         h = self.handler(b"audio-bytes", "contact_id=kimi&filename=voice.m4a&duration_ms=2000")
         captured: list[dict] = []
