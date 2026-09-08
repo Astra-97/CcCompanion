@@ -208,27 +208,6 @@ def translate_text(
 # ---------------------------------------------------------------------------
 
 
-def _mostly_english(text: str) -> bool:
-    """ASCII 字母占比启发：英文为主才值得翻，中文/纯符号直接跳过省钱。"""
-
-    sample = text[:4000]
-    nonspace = letters = cjk = 0
-    for ch in sample:
-        if ch.isspace():
-            continue
-        nonspace += 1
-        if ch.isascii() and ch.isalpha():
-            letters += 1
-        elif "一" <= ch <= "鿿":
-            cjk += 1
-    if nonspace < 20:
-        return False
-    # CJK 超过 15% 视为已经是中文；字母占非空白字符不足一半不翻（代码/路径等）。
-    # 15% 而非 2%：英文思考链常引用中文对话原文（实测样本 CJK 10%、字母 82%），
-    # 2% 会漏翻；真中文思考 CJK 通常过半，15% 仍安全跳过。
-    return cjk * 100 <= nonspace * 15 and letters * 2 >= nonspace
-
-
 def translate_thinking_auto(
     text: str,
     *,
@@ -238,12 +217,15 @@ def translate_thinking_auto(
     """Auto-translate one thinking chain before it lands in chat history.
 
     Returns ``(display_text, original_or_None)``: 译成中文时给出原文让调用方
-    存进 metadata.thinking_original；非英文 / 失败 / 超时一律静默返回
-    ``(原文, None)``，消息绝不因翻译丢失或久等。重复内容走磁盘缓存零成本。
+    存进 metadata.thinking_original；失败 / 超时一律静默返回 ``(原文, None)``，
+    消息绝不因翻译丢失或久等。重复内容走磁盘缓存零成本。
+
+    不设语言预判门控（Astra 2026-09-08 拍板：全部翻译，别有预置）——
+    已经是中文的输入经 qwen 直译为近似恒等，成本可忽略。
     """
 
     source = str(text or "")
-    if not source.strip() or not _mostly_english(source):
+    if not source.strip():
         return text, None
     try:
         result = translate_text(source, timeout=timeout, **kwargs)

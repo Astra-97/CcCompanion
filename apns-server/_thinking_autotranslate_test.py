@@ -32,19 +32,6 @@ ZH_THINKING = "让我先看一下配置文件，然后把超时时间调成三�
 ZH_TRANSLATION = "让我先检查配置文件，然后调整超时时间。\n\n当前超时是三十秒，应该够用。"
 
 
-class MostlyEnglishTest(unittest.TestCase):
-    def test_english_dominant(self) -> None:
-        self.assertTrue(translate_api._mostly_english(EN_THINKING))
-
-    def test_chinese_skipped(self) -> None:
-        self.assertFalse(translate_api._mostly_english(ZH_THINKING))
-
-    def test_short_or_symbolic_skipped(self) -> None:
-        self.assertFalse(translate_api._mostly_english(""))
-        self.assertFalse(translate_api._mostly_english("```\n{}\n```"))
-        self.assertFalse(translate_api._mostly_english("ok"))
-
-
 class TranslateThinkingAutoTest(unittest.TestCase):
     def test_english_triggers_translation(self) -> None:
         with patch.object(
@@ -58,12 +45,16 @@ class TranslateThinkingAutoTest(unittest.TestCase):
         # 自动预翻译必须带 30s 上限，不拖累聊天入库
         self.assertEqual(mock_translate.call_args.kwargs["timeout"], translate_api.AUTO_TIMEOUT_SEC)
 
-    def test_chinese_skips_api(self) -> None:
-        with patch.object(translate_api, "translate_text") as mock_translate:
+    def test_chinese_also_translated(self) -> None:
+        # Astra 2026-09-08 拍板：不设语言门控，全部翻译；中文输入经 qwen 近似恒等
+        with patch.object(
+            translate_api, "translate_text",
+            return_value={"translated": ZH_THINKING + "（译）", "cached": False},
+        ) as mock_translate:
             display, original = translate_api.translate_thinking_auto(ZH_THINKING)
-        mock_translate.assert_not_called()
-        self.assertEqual(display, ZH_THINKING)
-        self.assertIsNone(original)
+        mock_translate.assert_called_once()
+        self.assertEqual(display, ZH_THINKING + "（译）")
+        self.assertEqual(original, ZH_THINKING)
 
     def test_failure_falls_back_to_original(self) -> None:
         with patch.object(
@@ -145,22 +136,23 @@ class ChatAppendAutoTranslateTest(unittest.TestCase):
         self.assertEqual(stored[0]["thinking"], ZH_TRANSLATION)
         self.assertEqual(stored[0]["metadata"]["thinking_original"], EN_THINKING)
 
-    def test_chinese_thinking_stored_verbatim_without_api_call(self) -> None:
+    def test_chinese_thinking_also_goes_through_translation(self) -> None:
+        # 无门控：中文思考链同样过翻译管线（qwen 对中文近似恒等，原文仍留底）
         handler = self.append_handler()
-        with patch.object(translate_api, "translate_text") as mock_translate:
+        with patch.object(translate_api, "translate_text", side_effect=self._translated) as mock_translate:
             handler._handle_chat_append({
                 "contact_id": "xiaoke",
                 "role": "assistant",
                 "source": "claude-code",
-                "text": "中文思考链原样入库。",
+                "text": "中文思考链也走翻译。",
                 "thinking": ZH_THINKING,
             })
-        mock_translate.assert_not_called()
+        mock_translate.assert_called_once()
         status, payload = handler.responses[-1]
         self.assertEqual(status, 200, payload)
         rec = payload["record"]
-        self.assertEqual(rec["thinking"], ZH_THINKING)
-        self.assertNotIn("thinking_original", rec.get("metadata") or {})
+        self.assertEqual(rec["thinking"], ZH_TRANSLATION)
+        self.assertEqual(rec["metadata"]["thinking_original"], ZH_THINKING)
 
     def test_translation_failure_keeps_english_and_still_appends(self) -> None:
         handler = self.append_handler()
