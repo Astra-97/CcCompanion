@@ -306,8 +306,17 @@ class ChatHistory:
             logger.warning("update_audio fail: %s", e)
             return False
 
-    def merge_thinking_to_last_assistant(self, thinking: str, tools: str = "") -> bool:
-        """Merge thinking/tools into the most recent assistant record."""
+    def merge_thinking_to_last_assistant(
+        self,
+        thinking: str,
+        tools: str = "",
+        thinking_original: str | None = None,
+    ) -> bool:
+        """Merge thinking/tools into the most recent assistant record.
+
+        思考链自动预翻译 (2026-09-08): ``thinking_original`` 非空时把英文原文
+        留进该条记录的 metadata.thinking_original，显示文本 thinking 存译文。
+        """
         if not self.path.exists():
             return False
         try:
@@ -327,6 +336,11 @@ class ChatHistory:
                 rec = json.loads(lines[target_idx])
                 if thinking:
                     rec["thinking"] = thinking
+                    if thinking_original:
+                        meta = rec.get("metadata")
+                        if not isinstance(meta, dict):
+                            meta = {}
+                        rec["metadata"] = {**meta, "thinking_original": thinking_original}
                 if tools:
                     rec["tools"] = tools
                 lines[target_idx] = json.dumps(rec, ensure_ascii=False)

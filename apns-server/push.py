@@ -127,6 +127,7 @@ from voice_protocol import (
     parse_spoken_voice_reply,
     sanitize_voice_metadata,
 )
+import translate_api
 import voice_acoustics
 import voice_gemini
 import voice_message
@@ -7648,6 +7649,10 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_pet_activity_post(body)
         elif self.path == "/chat/append":
             self._handle_chat_append(body)
+        elif self.path == "/chat/translate":
+            # ── 思考链一键翻译 (2026-09-08 卡拉米会话) ── 鉴权沿用 do_POST
+            # 顶部的 _require_write_auth；失败返回错误码由 app 静默降级。
+            self._handle_chat_translate(body)
         elif self.path == "/chat/stream_chunk":
             self._handle_chat_stream_chunk(body)
         elif self.path == "/chain/abort":
@@ -19412,6 +19417,30 @@ class PushHandler(BaseHTTPRequestHandler):
             "rolled_back_to": user_ts,
         })
 
+    def _handle_chat_translate(self, body: dict[str, Any]):
+        """POST /chat/translate — 思考链一键翻译 (2026-09-08 卡拉米会话)。
+
+        入参 {"text": "..."}（服务端截断到 translate_api.MAX_TEXT_CHARS），
+        出参 {"ok", "translated", "cached", "truncated"}。OpenRouter 失败
+        返回 502 + 稳定错误码，app 端静默降级；绝不影响聊天主流程。
+        """
+        try:
+            result = translate_api.translate_text(str(body.get("text") or ""))
+        except translate_api.TranslateError as exc:
+            status = 400 if str(exc) == "empty_text" else 502
+            self._send_json(status, {"ok": False, "error": str(exc)})
+            return
+        except Exception:
+            logger.exception("chat translate unexpected failure")
+            self._send_json(500, {"ok": False, "error": "translate_internal_error"})
+            return
+        self._send_json(200, {
+            "ok": True,
+            "translated": result["translated"],
+            "cached": result["cached"],
+            "truncated": result["truncated"],
+        })
+
     def _handle_chat_append(self, body: dict[str, Any]):
         """bus_stop_hook 抓到回复后调 → 写 assistant 条 + push spoke 状态
         也支持从 mac mini 这边发图/文件 给 iPhone:
@@ -19616,6 +19645,12 @@ class PushHandler(BaseHTTPRequestHandler):
         thinking = body.get("thinking") or ""
         if isinstance(thinking, str) and len(thinking) > 5000:
             thinking = thinking[:5000]
+        # 思考链自动预翻译 (2026-09-08): 小克英文思考链入库前同步翻成中文
+        # (30s 上限 + sha256 磁盘缓存), 英文原文留 metadata.thinking_original,
+        # 显示文本存译文; 非英文/失败/超时静默存原文, 绝不因翻译丢消息或久等。
+        thinking_original = None
+        if thinking and role == "assistant":
+            thinking, thinking_original = translate_api.translate_thinking_auto(thinking)
         tools = body.get("tools") or ""
         if isinstance(tools, str) and len(tools) > 5000:
             tools = tools[:5000]
@@ -19663,7 +19698,10 @@ class PushHandler(BaseHTTPRequestHandler):
             return
 
         if not text and not attachment_url and (thinking or tools):
-            ok = chat.merge_thinking_to_last_assistant(thinking, tools)
+            # 思考链自动预翻译 (2026-09-08): 译文合入上一条 assistant, 原文随行
+            ok = chat.merge_thinking_to_last_assistant(
+                thinking, tools, thinking_original=thinking_original
+            )
             if ok:
                 self._send_json(200, {"ok": True, "merged": True})
             else:
@@ -19735,6 +19773,10 @@ class PushHandler(BaseHTTPRequestHandler):
         metadata = body.get("metadata") or None
         if metadata and not isinstance(metadata, dict):
             metadata = None
+        # 思考链自动预翻译 (2026-09-08): 英文原文留 metadata.thinking_original,
+        # thinking 字段本身已是中文译文 (上面的 translate_thinking_auto)。
+        if thinking_original:
+            metadata = {**(metadata or {}), "thinking_original": thinking_original}
         # 2026-07-18 互动卡片: metadata.card_title (可选字符串) 标记这条附件是
         # 互动卡片, app 端据此渲染卡片样式并在点开时用 WebView 打开 attachment_url。
         # metadata 本身走 chat_history 原样入库 + /chat/poll /chat/history 原样下发

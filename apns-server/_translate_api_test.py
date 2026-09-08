@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Regression tests for translate_api + POST /chat/translate handler."""
+
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import push
+import translate_api
+from push import PushHandler
+
+
+SAMPLE_THINKING = "Let me check the config file first.\n\n```bash\ncat config.toml\n```\n\nThe timeout is 30s."
+
+
+def _ok_response(translated: str = "让我先看一下配置文件。", prompt_tokens: int = 120, completion_tokens: int = 60):
+    return types.SimpleNamespace(
+        status_code=200,
+        json=lambda: {
+            "choices": [{"message": {"content": translated}}],
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
+        },
+    )
+
+
+class TranslateTextTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cache_dir = Path(self.tmp.name) / "cache"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _call(self, text: str = SAMPLE_THINKING, **kwargs):
+        kwargs.setdefault("cache_dir", self.cache_dir)
+        kwargs.setdefault("api_key", "sk-test")
+        return translate_api.translate_text(text, **kwargs)
+
+    def test_missing_api_key_raises(self) -> None:
+        with patch.object(translate_api, "openrouter_api_key", return_value=""):
+            with self.assertRaises(translate_api.TranslateError) as ctx:
+                self._call(api_key=None)
+        self.assertEqual(str(ctx.exception), "openrouter_api_key_missing")
+
+    def test_empty_text_raises(self) -> None:
+        for raw in ("", "   "):
+            with self.assertRaises(translate_api.TranslateError) as ctx:
+                self._call(raw)
+            self.assertEqual(str(ctx.exception), "empty_text")
+
+    def test_successful_translation(self) -> None:
+        with patch.object(translate_api.httpx, "post", return_value=_ok_response()) as post:
+            result = self._call()
+        self.assertEqual(result["translated"], "让我先看一下配置文件。")
+        self.assertFalse(result["cached"])
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["usage"]["prompt_tokens"], 120)
+        _, kwargs = post.call_args
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer sk-test")
+        self.assertEqual(kwargs["json"]["model"], translate_api.TRANSLATE_MODEL)
+        self.assertEqual(kwargs["json"]["messages"][0]["role"], "system")
+        self.assertEqual(kwargs["json"]["messages"][1]["content"], SAMPLE_THINKING)
+
+    def test_cache_hit_skips_api(self) -> None:
+        with patch.object(translate_api.httpx, "post", return_value=_ok_response()) as post:
+            first = self._call()
+            second = self._call()
+        self.assertEqual(post.call_count, 1)
+        self.assertFalse(first["cached"])
+        self.assertTrue(second["cached"])
+        self.assertEqual(second["translated"], first["translated"])
+
+    def test_cache_ignored_for_other_model(self) -> None:
+        with patch.object(translate_api.httpx, "post", return_value=_ok_response()) as post:
+            self._call()
+            result = self._call(model="qwen/qwen3-14b")
+        self.assertEqual(post.call_count, 2)
+        self.assertFalse(result["cached"])
+
+    def test_cache_survives_corrupt_file(self) -> None:
+        key = translate_api._cache_key(SAMPLE_THINKING)
+        self.cache_dir.mkdir(parents=True)
+        (self.cache_dir / f"{key}.json").write_text("{not json", encoding="utf-8")
+        with patch.object(translate_api.httpx, "post", return_value=_ok_response()) as post:
+            result = self._call()
+        self.assertEqual(post.call_count, 1)
+        self.assertFalse(result["cached"])
+        self.assertEqual(result["translated"], "让我先看一下配置文件。")
+
+    def test_http_error_raises_stable_code(self) -> None:
+        response = types.SimpleNamespace(status_code=402, json=lambda: {})
+        with patch.object(translate_api.httpx, "post", return_value=response):
+            with self.assertRaises(translate_api.TranslateError) as ctx:
+                self._call()
+        self.assertEqual(str(ctx.exception), "openrouter_http_402")
+
+    def test_network_error_degrades(self) -> None:
+        with patch.object(translate_api.httpx, "post", side_effect=TimeoutError("boom")):
+            with self.assertRaises(translate_api.TranslateError) as ctx:
+                self._call()
+        self.assertTrue(str(ctx.exception).startswith("openrouter_request_failed"))
+
+    def test_empty_reply_raises_and_is_not_cached(self) -> None:
+        with patch.object(translate_api.httpx, "post", return_value=_ok_response("  ")) as post:
+            with self.assertRaises(translate_api.TranslateError):
+                self._call()
+            with self.assertRaises(translate_api.TranslateError):
+                self._call()
+        self.assertEqual(post.call_count, 2)
+
+    def test_overlong_text_is_truncated(self) -> None:
+        long_text = "word " * 6000  # 30000 chars > MAX_TEXT_CHARS
+        captured: dict = {}
+        response = _ok_response()
+
+        def _post(url, **kwargs):
+            captured.update(kwargs)
+            return response
+
+        with patch.object(translate_api.httpx, "post", side_effect=_post):
+            result = self._call(long_text)
+        self.assertTrue(result["truncated"])
+        sent = captured["json"]["messages"][1]["content"]
+        self.assertEqual(len(sent), translate_api.MAX_TEXT_CHARS)
+
+    def test_env_file_fallback_reads_systemd_override(self) -> None:
+        fake = Path(self.tmp.name) / "openrouter.conf"
+        fake.write_text('[Service]\nEnvironment="OPENROUTER_API_KEY=sk-from-file"\n', encoding="utf-8")
+        with patch.dict("os.environ", {}, clear=True), \
+             patch.object(translate_api, "SERVICE_ENV_FILE", fake):
+            self.assertEqual(translate_api.openrouter_api_key(), "sk-from-file")
+
+    def test_env_var_wins_over_file(self) -> None:
+        fake = Path(self.tmp.name) / "openrouter.conf"
+        fake.write_text('Environment="OPENROUTER_API_KEY=sk-from-file"\n', encoding="utf-8")
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "sk-from-env"}), \
+             patch.object(translate_api, "SERVICE_ENV_FILE", fake):
+            self.assertEqual(translate_api.openrouter_api_key(), "sk-from-env")
+
+
+class ChatTranslateHandlerTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.responses: list[tuple[int, dict]] = []
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def handler(self) -> PushHandler:
+        h = object.__new__(PushHandler)
+        h._send_json = lambda status, payload: self.responses.append((status, payload))
+        return h
+
+    def test_success_payload_shape(self) -> None:
+        with patch.object(
+            translate_api, "translate_text",
+            return_value={"translated": "译文", "cached": False, "truncated": False},
+        ):
+            self.handler()._handle_chat_translate({"text": SAMPLE_THINKING})
+        status, payload = self.responses[0]
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["translated"], "译文")
+        self.assertFalse(payload["cached"])
+        self.assertFalse(payload["truncated"])
+
+    def test_empty_text_is_400(self) -> None:
+        self.handler()._handle_chat_translate({"text": "  "})
+        status, payload = self.responses[0]
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "empty_text")
+
+    def test_upstream_failure_is_502_with_stable_code(self) -> None:
+        with patch.object(
+            translate_api, "translate_text",
+            side_effect=translate_api.TranslateError("openrouter_http_402"),
+        ):
+            self.handler()._handle_chat_translate({"text": SAMPLE_THINKING})
+        status, payload = self.responses[0]
+        self.assertEqual(status, 502)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "openrouter_http_402")
+
+    def test_unexpected_failure_is_500_and_does_not_raise(self) -> None:
+        with patch.object(translate_api, "translate_text", side_effect=RuntimeError("boom")):
+            self.handler()._handle_chat_translate({"text": SAMPLE_THINKING})
+        status, payload = self.responses[0]
+        self.assertEqual(status, 500)
+        self.assertFalse(payload["ok"])
+
+
+if __name__ == "__main__":
+    unittest.main()
