@@ -223,8 +223,10 @@ def _mostly_english(text: str) -> bool:
             cjk += 1
     if nonspace < 20:
         return False
-    # CJK 超过 2% 视为已经是中文；字母占非空白字符不足一半不翻（代码/路径等）。
-    return cjk * 50 <= nonspace and letters * 2 >= nonspace
+    # CJK 超过 15% 视为已经是中文；字母占非空白字符不足一半不翻（代码/路径等）。
+    # 15% 而非 2%：英文思考链常引用中文对话原文（实测样本 CJK 10%、字母 82%），
+    # 2% 会漏翻；真中文思考 CJK 通常过半，15% 仍安全跳过。
+    return cjk * 100 <= nonspace * 15 and letters * 2 >= nonspace
 
 
 def translate_thinking_auto(
