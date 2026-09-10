@@ -160,6 +160,14 @@ allowed_ips = []
 # tail、退回纯摘要 seed。原文节整体另有 64 KB 字节上限（超出从最老的开始
 # 丢，保最新）；读取会话存档失败时降级为纯摘要，不会让 forge 失败。
 # kimi_forge_seed_retain_messages = 80
+# kiro 桥接 (2026-09-09) — Kiro 是独立的文本联系人（Phase 1：文本聊天 +
+# 会话连续），走 `kiro-cli acp` stdio JSON-RPC 常驻进程，session 指针私下
+# 存放在 chat 历史旁边的 kiro_acp_session.json。需要先在服务器上完成一次
+# `kiro-cli login`（或 KIRO_API_KEY），否则所有消息会得到明确的未登录提示。
+# kiro_bin = "~/.local/bin/kiro-cli"
+# kiro_cwd = "/root/Karami-Workspace"
+# kiro_acp_request_timeout_seconds = 30
+# kiro_acp_prompt_timeout_seconds = 900
 # Kairos App turns auto-forge after the completed reply has been persisted.
 # The old session is claimed at most once across service restarts.
 # codex_auto_forge_enabled = true

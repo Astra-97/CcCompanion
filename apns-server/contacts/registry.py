@@ -4,10 +4,10 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from . import kairos, kimi, xiaoke
+from . import kairos, kimi, kiro, xiaoke
 
-
-_CONTACT_MODULES = {"xiaoke": xiaoke, "kairos": kairos, "kimi": kimi}
+# kiro 桥接 (2026-09-09): ACP text chat contact, Phase 1.
+_CONTACT_MODULES = {"xiaoke": xiaoke, "kairos": kairos, "kimi": kimi, "kiro": kiro}
 _OTHER_CONTACTS = (
     {
         "id": "hajiki", "display_name": "哈基米", "provider": "contact-local",
@@ -40,7 +40,7 @@ _LEGACY_FALLBACK_ROUTES = {
     "apples": {"send_handler": "apples", "capabilities": ["chat", "history", "draft", "busy", "attachments", "forward", "group_chat", "realtime"]},
     "toolbot": {"capabilities": ["history", "realtime"]},
 }
-_SEND_HANDLERS = frozenset({"xiaoke", "kairos", "kimi", "apples"})
+_SEND_HANDLERS = frozenset({"xiaoke", "kairos", "kimi", "apples", "kiro"})
 _GROUP_DISPATCHERS = frozenset({"xiaoke", "kairos", "kimi"})
 
 

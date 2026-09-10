@@ -168,6 +168,16 @@ from kimi_preferences import (
     effective_kimi_effort,
 )
 from kimi_terminal_observer import KimiTerminalObserver
+# kiro 桥接 (2026-09-09): ACP 文本聊天联系人，Phase 1。
+from kiro_acp import (
+    DEFAULT_KIRO_CWD,
+    KiroACPAuthRequired,
+    KiroACPBusy,
+    KiroACPCancelled,
+    KiroACPClient,
+    KiroACPError,
+    KiroACPQuotaExceeded,
+)
 from reader_themes import load_reader_themes, reader_themes_config_path
 from kimi_web_client import KimiWebClient, KimiWebError, KimiWebRecoveryConflict, KimiWebSessionBusy
 from contacts import (
@@ -4074,6 +4084,8 @@ class ServerState:
             "xiaoke": self.chat,
             "kairos": ChatHistory(contact_history_dir / "chat_history_kairos.jsonl"),
             "kimi": ChatHistory(contact_history_dir / "chat_history_kimi.jsonl"),
+            # kiro 桥接 (2026-09-09)
+            "kiro": ChatHistory(contact_history_dir / "chat_history_kiro.jsonl"),
             "hajiki": ChatHistory(contact_history_dir / "chat_history_hajiki.jsonl"),
             "apples": ChatHistory(contact_history_dir / "chat_history_apples.jsonl"),
             # 小克·工具版 (toolbot) — 只读派活存档窗口。scheduler 往这里写派活记录，
@@ -4223,6 +4235,7 @@ class ServerState:
             "xiaoke": self.typing_state,
             "kairos": {"is_typing": False, "since": None},
             "kimi": {"is_typing": False, "since": None},
+            "kiro": {"is_typing": False, "since": None},  # kiro 桥接 (2026-09-09)
             "hajiki": {"is_typing": False, "since": None},
             "apples": {"is_typing": False, "since": None},
             "toolbot": {"is_typing": False, "since": None},
@@ -4272,6 +4285,20 @@ class ServerState:
             logger=logger,
             request_timeout=float(server_cfg.get("kimi_acp_request_timeout_seconds", 30)),
             prompt_timeout=float(server_cfg.get("kimi_acp_prompt_timeout_seconds", 900)),
+        )
+        # kiro 桥接 (2026-09-09) — Phase 1：文本聊天 + ACP 常驻进程 + 会话连续。
+        # ACP 是 Kiro 的主力（也是唯一）通道；进程跨轮常驻，仅在失败时重置。
+        # 与 Kimi 的 session 指针、turn 锁、历史文件全部独立，互不共享。
+        self.kiro_turn_lock = threading.RLock()
+        self.kiro_active_turn: dict[str, Any] = {}
+        self.kiro_prepare_token = ""
+        self.kiro_acp = KiroACPClient(
+            command=server_cfg.get("kiro_bin", str(Path.home() / ".local" / "bin" / "kiro-cli")),
+            cwd=server_cfg.get("kiro_cwd", DEFAULT_KIRO_CWD),
+            state_path=contact_history_dir / "kiro_acp_session.json",
+            logger=logger,
+            request_timeout=float(server_cfg.get("kiro_acp_request_timeout_seconds", 30)),
+            prompt_timeout=float(server_cfg.get("kiro_acp_prompt_timeout_seconds", 900)),
         )
         self.kimi_web = KimiWebClient(
             command=server_cfg.get("kimi_bin", "/root/.kimi-code/bin/kimi"),
@@ -10373,6 +10400,14 @@ class PushHandler(BaseHTTPRequestHandler):
                 "reason": "Kimi 当前只接受直接发送的文字消息。",
             })
             return
+        # kiro 桥接 (2026-09-09)：Phase 1 仅文本，附件/语音/卡片在入口拒绝。
+        if contact_id == "kiro" and self._kiro_inbound_not_text_only(body):
+            self._send_json(415, {
+                "ok": False,
+                "error": "kiro_text_only",
+                "reason": "Kiro 当前只接受直接发送的文字消息。",
+            })
+            return
         # Group attachment ownership is deliberately narrow: one human turn
         # may attach a batch only when Kimi is its sole routed member. Other
         # agents still lack a shared multi-recipient attachment contract.
@@ -10755,6 +10790,12 @@ class PushHandler(BaseHTTPRequestHandler):
         # Compatibility shim for focused tests and old call sites.  The
         # policy itself is contact-owned in contacts/kimi.py.
         from contacts.kimi import rejects_inbound
+        return rejects_inbound(body)
+
+    @staticmethod
+    def _kiro_inbound_not_text_only(body: dict[str, Any]) -> bool:
+        # kiro 桥接 (2026-09-09)。策略本体在 contacts/kiro.py。
+        from contacts.kiro import rejects_inbound
         return rejects_inbound(body)
 
     def _kimi_link_bundle(self, text: str) -> LinkPreviewBundle:
@@ -12914,6 +12955,309 @@ class PushHandler(BaseHTTPRequestHandler):
                 "transport": "kimi-acp",
             },
         })
+
+    # ---------- kiro 桥接 (2026-09-09) — Phase 1：文本聊天 + 会话连续 ----------
+    # 对照 Kimi ACP 回滚通道的收发骨架，刻意简化：无队列（忙时 409）、无终端
+    # 仲裁（Kiro 侧没有第二写者）、无记忆召回/链接预览/登录卡。ACP 常驻进程
+    # 跨轮复用，仅在失败路径 close 重置；session 指针持久化在
+    # tokens/kiro_acp_session.json，重启后经 session/load 续会话。
+
+    def _handle_kiro_chat_send(self, body: dict[str, Any], contact_id: str) -> None:
+        """Queue-free text turn into Kiro's own ACP session."""
+        text = str(body.get("text") or "").strip()
+        quoted_ts = body.get("quoted_ts") or None
+        if not text:
+            self._send_json(400, {"ok": False, "error": "text required"})
+            return
+
+        with self.state.kiro_turn_lock:
+            if self.state.kiro_active_turn or self.state.kiro_prepare_token:
+                self._send_json(409, {
+                    "ok": False,
+                    "error": "kiro_turn_active",
+                    "reason": "Kiro 正在回复上一条消息，请等它完成后再发。",
+                })
+                return
+            prepare_token = secrets.token_hex(16)
+            self.state.kiro_prepare_token = prepare_token
+
+        try:
+            session_id = self.state.kiro_acp.prepare_session()
+        except KiroACPAuthRequired:
+            self._release_kiro_prepare(prepare_token)
+            self.state.kiro_acp.close()
+            self._send_json(503, {
+                "ok": False,
+                "error": "kiro_auth_required",
+                "reason": "Kiro 还没有完成登录。请先在服务器上完成 Kiro 登录后再发。",
+            })
+            return
+        except KiroACPQuotaExceeded:
+            self._release_kiro_prepare(prepare_token)
+            self.state.kiro_acp.close()
+            self._send_json(503, {
+                "ok": False,
+                "error": "kiro_quota_exceeded",
+                "reason": "Kiro 额度已用完。请充值或等待额度重置后再发。",
+            })
+            return
+        except (KiroACPBusy, KiroACPError) as exc:
+            self._release_kiro_prepare(prepare_token)
+            logger.warning("Kiro ACP prepare failed: %s", type(exc).__name__)
+            self.state.kiro_acp.close()
+            self._send_json(503, {
+                "ok": False,
+                "error": "kiro_unavailable",
+                "reason": "Kiro 暂时不可用，请稍后重试；本次消息未发送。",
+            })
+            return
+        except Exception:
+            self._release_kiro_prepare(prepare_token)
+            logger.exception("Kiro ACP prepare crashed")
+            self.state.kiro_acp.close()
+            self._send_json(503, {
+                "ok": False,
+                "error": "kiro_unavailable",
+                "reason": "Kiro 暂时不可用，请稍后重试；本次消息未发送。",
+            })
+            return
+
+        with self.state.kiro_turn_lock:
+            if self.state.kiro_prepare_token != prepare_token or self.state.kiro_active_turn:
+                self._release_kiro_prepare(prepare_token)
+                self._send_json(409, {
+                    "ok": False,
+                    "error": "kiro_turn_active",
+                    "reason": "Kiro 正在回复上一条消息，请等它完成后再发。",
+                })
+                return
+            chat = self._chat_for_contact(contact_id)
+            try:
+                rec = chat.append(
+                    role="user",
+                    text=text,
+                    source=self._source_for_request("kiro"),
+                    quoted_ts=quoted_ts,
+                )
+            except Exception:
+                logger.exception("Kiro history append failed")
+                self._release_kiro_prepare(prepare_token)
+                self._send_json(500, {"ok": False, "error": "kiro_history_unavailable"})
+                return
+            cancel_event = threading.Event()
+            self.state.kiro_active_turn = {
+                "user_ts": str(rec.get("ts") or ""),
+                "cancel_event": cancel_event,
+                "session_id": session_id,
+            }
+            self.state.kiro_prepare_token = ""
+            self._set_typing_for_contact(contact_id, {
+                "is_typing": True,
+                "since": rec["ts"],
+                "transport": "kiro-acp",
+            })
+            self._set_chat_generating(
+                contact_id,
+                user_ts=rec["ts"],
+                queued_at=rec["ts"],
+                source="cc-app:kiro",
+                session_id=session_id,
+            )
+
+        def worker() -> None:
+            chunks: list[str] = []
+            last_published = 0.0
+            terminalized = False
+            activity_count = 0
+            activity_items: list[str] = []
+            activity_labels_seen: set[str] = set()
+
+            def append_assistant_safely(message: str, source: str) -> str:
+                try:
+                    final = chat.append(
+                        role="assistant",
+                        text=message,
+                        source=source,
+                        metadata={
+                            "kiro_user_ts": str(rec.get("ts") or ""),
+                            "turn_terminal": True,
+                            "turn_message_kind": "terminal_answer",
+                        },
+                    )
+                    self._publish_persisted_assistant_completion(contact_id, final)
+                    return str(final.get("ts") or "")
+                except Exception:
+                    logger.exception("Kiro assistant history append failed")
+                    return ""
+
+            def set_completed(message: str, source: str, *, status: str = "completed") -> None:
+                nonlocal terminalized
+                final_ts = append_assistant_safely(message, source)
+                self._set_chat_completed(
+                    contact_id,
+                    user_ts=rec["ts"],
+                    final_ts=final_ts,
+                    source=source,
+                    session_id=session_id,
+                )
+                terminalized = True
+
+            def on_update(delta: str) -> None:
+                nonlocal last_published
+                chunks.append(delta)
+                now = time.monotonic()
+                if now - last_published >= 0.08:
+                    self._set_chat_draft(
+                        contact_id,
+                        "".join(chunks),
+                        source="cc-app:kiro",
+                        session_id=session_id,
+                        user_ts=rec["ts"],
+                        queued_at=rec["ts"],
+                        activity_text=activity_items[-1] if activity_items else "",
+                        activity_count=activity_count,
+                        activity_items=activity_items,
+                    )
+                    last_published = now
+
+            def on_activity(event: dict[str, Any]) -> None:
+                nonlocal activity_count
+                if not isinstance(event, dict):
+                    return
+                label = str(event.get("label") or "")
+                if label not in {"正在思考", "正在使用工具"}:
+                    return
+                activity_count += 1
+                if label not in activity_labels_seen:
+                    activity_labels_seen.add(label)
+                    activity_items.append(label)
+                self._set_chat_activity(
+                    contact_id,
+                    activity_text=label,
+                    activity_count=activity_count,
+                    activity_items=activity_items,
+                    user_ts=rec["ts"],
+                )
+
+            try:
+                self.state.kiro_acp.prompt_existing(
+                    text,
+                    session_id=session_id,
+                    turn_id=str(rec.get("ts") or ""),
+                    on_update=on_update,
+                    on_activity=on_activity,
+                    cancel_event=cancel_event,
+                )
+                answer = "".join(chunks).strip() or "Kiro 没有返回可展示内容。"
+                set_completed(answer, "kiro-acp")
+            except KiroACPCancelled:
+                partial = "".join(chunks).strip()
+                final_ts = append_assistant_safely(
+                    partial + "\n\n**[已停止生成]**" if partial else "已中断当前生成。",
+                    "kiro-acp:interrupted",
+                )
+                self._set_chat_interrupted(
+                    contact_id,
+                    user_ts=rec["ts"],
+                    final_ts=final_ts,
+                    source="kiro-acp",
+                    session_id=session_id,
+                )
+                terminalized = True
+            except KiroACPAuthRequired:
+                # 未登录是预期缺口：回复一条明确指引，不让用户消息石沉大海。
+                set_completed(
+                    "Kiro 还没有完成登录。请先在服务器上完成 Kiro 登录（kiro-cli login）后再发一次。",
+                    "kiro-acp:auth-required",
+                )
+                self.state.kiro_acp.close()
+            except KiroACPQuotaExceeded:
+                set_completed(
+                    "Kiro 的额度已用完。请充值或等待额度重置后再发一次；原消息已经保留。",
+                    "kiro-acp:quota-exceeded",
+                )
+            except (KiroACPBusy, KiroACPError) as exc:
+                logger.warning("Kiro ACP turn failed: %s", type(exc).__name__)
+                set_completed("Kiro 这次没有成功回复。请稍后重试；原消息已经保留。", "kiro-acp:error")
+                self.state.kiro_acp.close()
+            except Exception:
+                logger.exception("Kiro ACP worker failed")
+                set_completed("Kiro 接入进程异常退出。请稍后重试；原消息已经保留。", "kiro-acp:error")
+                self.state.kiro_acp.close()
+            finally:
+                if not terminalized:
+                    try:
+                        self._set_chat_failed(
+                            contact_id,
+                            user_ts=rec["ts"],
+                            source="kiro-acp:error",
+                            session_id=session_id,
+                        )
+                    except Exception:
+                        logger.exception("Kiro terminal reply state cleanup failed")
+                        self._clear_chat_draft(contact_id)
+                with self.state.kiro_turn_lock:
+                    current = dict(self.state.kiro_active_turn)
+                    if str(current.get("user_ts") or "") == str(rec.get("ts") or ""):
+                        self.state.kiro_active_turn = {}
+                self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
+
+        threading.Thread(target=worker, name="kiro-acp-chat-turn", daemon=True).start()
+        self._send_json(200, {
+            "ok": True,
+            "contact_id": contact_id,
+            "record": rec,
+            "queued": True,
+            "turn": {
+                "contact_id": contact_id,
+                "user_ts": rec["ts"],
+                "session_id": session_id,
+                "transport": "kiro-acp",
+            },
+        })
+
+    def _release_kiro_prepare(self, prepare_token: str) -> None:
+        with self.state.kiro_turn_lock:
+            if self.state.kiro_prepare_token == prepare_token:
+                self.state.kiro_prepare_token = ""
+
+    def _handle_kiro_new_session(self, body: dict[str, Any]) -> None:
+        """Explicit recovery: abandon the persisted pointer, start fresh.
+
+        session/load failing closed is the correct default, but without this
+        endpoint one unrecoverable pointer would brick the contact forever.
+        """
+        with self.state.kiro_turn_lock:
+            if self.state.kiro_active_turn or self.state.kiro_prepare_token:
+                self._send_json(409, {
+                    "ok": False,
+                    "error": "kiro_turn_active",
+                    "reason": "Kiro 正在回复，等当前回复结束后再开新会话。",
+                })
+                return
+        try:
+            session_id = self.state.kiro_acp.new_session()
+        except KiroACPAuthRequired:
+            self.state.kiro_acp.close()
+            self._send_json(503, {"ok": False, "error": "kiro_auth_required"})
+            return
+        except Exception as exc:
+            logger.warning("Kiro new session failed: %s", type(exc).__name__)
+            self.state.kiro_acp.close()
+            self._send_json(503, {"ok": False, "error": "kiro_unavailable"})
+            return
+        try:
+            self._chat_for_contact("kiro").append(
+                role="assistant",
+                text="已开启新的 Kiro 会话，之前的上下文不再延续。",
+                source="kiro-acp:new-session",
+                metadata={"turn_terminal": True, "turn_message_kind": "session_reset"},
+            )
+        except Exception:
+            logger.exception("Kiro new-session notice append failed")
+        self._send_json(200, {"ok": True, "session_id": session_id})
+
+    # ---------- kiro 桥接 (2026-09-09) 结束 ----------
 
     def _kimi_context_usage(self, session_id: str) -> float:
         """Return current Kimi context usage ratio, or 0.0 if unavailable."""
