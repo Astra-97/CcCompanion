@@ -1018,5 +1018,201 @@ class KimiACPMemoryWriteProjectionTest(unittest.TestCase):
         self.assertEqual("", event["memory_id"])
 
 
+class KimiACPBashMemoryWriteTest(unittest.TestCase):
+    """Bash 直连记忆 REST API 的写操作也要投 memory_write 事件。
+
+    真实 ACP 流（2026-09-10 实机探测）：命令只出现在 pending/in_progress
+    update 的 rawInput.command（title 为 "Running: <cmd>"），终态 completed
+    update 不带 title/rawInput，输出在 content 块和 rawOutput 里，必须按
+    toolCallId 跨 update 关联。
+    """
+
+    def _client(self) -> KimiACPClient:
+        return KimiACPClient(state_path="/tmp/unused-kimi-bash-memory-test")
+
+    @staticmethod
+    def _in_progress(tool_call_id: str, command: str) -> dict:
+        return {
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": tool_call_id,
+                "title": "Running: " + command[:60],
+                "kind": "execute",
+                "status": "in_progress",
+                "rawInput": {"command": command},
+            },
+        }
+
+    @staticmethod
+    def _completed(tool_call_id: str, output: str) -> dict:
+        return {
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": tool_call_id,
+                "status": "completed",
+                "content": [
+                    {"type": "content", "content": {"type": "text", "text": output}},
+                ],
+                "rawOutput": output,
+            },
+        }
+
+    def test_curl_post_new_memory_projects_card_event(self):
+        client = self._client()
+        command = (
+            "curl -sS -X POST https://memory.xiaonancaleb.xyz/api/memories "
+            "-H 'Authorization: Bearer FAKE-TEST-TOKEN' "
+            "-d '{\"content\": \"卡拉米工作区规矩\\n\\n只用于卡拉米会话\", "
+            "\"category\": \"workflow\", \"subcategory\": \"规矩\"}'"
+        )
+        self.assertIsNone(
+            client._bash_memory_write_from_update(self._in_progress("call-b1", command))
+        )
+        event = client._bash_memory_write_from_update(self._completed(
+            "call-b1",
+            '{"id": "bee5817d", "createdAt": "2026-09-10T05:00:00Z", "ok": true}',
+        ))
+        self.assertIsNotNone(event)
+        self.assertEqual("memory_write", event["kind"])
+        self.assertEqual("write", event["action"])
+        self.assertEqual("call-b1", event["tool_call_id"])
+        self.assertEqual("bee5817d", event["memory_id"])
+        self.assertEqual("workflow", event["category"])
+        self.assertEqual("规矩", event["subcategory"])
+        self.assertEqual("卡拉米工作区规矩", event["title"])
+        self.assertLessEqual(len(event["snippet"]), 80)
+
+    def test_curl_data_without_explicit_method_is_post(self):
+        client = self._client()
+        command = (
+            "curl -s https://memory.xiaonancaleb.xyz/api/memories "
+            "--data '{\"content\": \"隐式 POST\"}'"
+        )
+        client._bash_memory_write_from_update(self._in_progress("call-b2", command))
+        event = client._bash_memory_write_from_update(self._completed(
+            "call-b2", '{"id": "a1b2c3d4", "createdAt": "2026-09-10"}',
+        ))
+        self.assertEqual("write", event["action"])
+        self.assertEqual("a1b2c3d4", event["memory_id"])
+
+    def test_curl_put_update_takes_id_from_url(self):
+        client = self._client()
+        command = (
+            "curl -sS -X PUT https://memory.xiaonancaleb.xyz/api/memories/7b64ed1e "
+            "-H 'Authorization: Bearer FAKE-TEST-TOKEN' "
+            "-d '{\"append\": \"补充一行事实\", \"category\": \"daily\"}'"
+        )
+        client._bash_memory_write_from_update(self._in_progress("call-b3", command))
+        event = client._bash_memory_write_from_update(self._completed(
+            "call-b3",
+            '{"id": "7b64ed1e", "updatedAt": "2026-09-10T05:30:00Z"}',
+        ))
+        self.assertEqual("update", event["action"])
+        self.assertEqual("7b64ed1e", event["memory_id"])
+        self.assertEqual("补充一行事实", event["title"])
+        self.assertEqual("daily", event["category"])
+
+    def test_python_urllib_put_with_fstring_url_falls_back_to_uuid_literal(self):
+        client = self._client()
+        command = (
+            "python3 -c \"\n"
+            "import json, urllib.request\n"
+            "mid = 'a9e9c390-1234-4abc-8def-0123456789ab'\n"
+            "req = urllib.request.Request(\n"
+            "    'https://memory.xiaonancaleb.xyz/api/memories/' + mid,\n"
+            "    data=json.dumps({'append': 'urllib 追加'}).encode(),\n"
+            "    method='PUT')\n"
+            "print(urllib.request.urlopen(req).read().decode())\n\""
+        )
+        client._bash_memory_write_from_update(self._in_progress("call-b4", command))
+        event = client._bash_memory_write_from_update(self._completed(
+            "call-b4", '{"id": "a9e9c390-1234-4abc-8def-0123456789ab", "updatedAt": "2026-09-10"}',
+        ))
+        self.assertEqual("update", event["action"])
+        self.assertEqual("a9e9c390-1234-4abc-8def-0123456789ab", event["memory_id"])
+        self.assertEqual("urllib 追加", event["title"])
+
+    def test_http_400_output_never_projects(self):
+        client = self._client()
+        command = (
+            "curl -sS -i -X POST https://memory.xiaonancaleb.xyz/api/memories "
+            "-d '{\"content\": \"会失败的写入\"}'"
+        )
+        client._bash_memory_write_from_update(self._in_progress("call-b5", command))
+        self.assertIsNone(client._bash_memory_write_from_update(self._completed(
+            "call-b5",
+            "HTTP/1.1 400 Bad Request\n{\"error\": \"content is required\"}",
+        )))
+
+    def test_success_false_output_never_projects(self):
+        client = self._client()
+        command = (
+            "curl -sS -X PUT https://memory.xiaonancaleb.xyz/api/memories/deadbeef "
+            "-d '{\"append\": \"x\"}'"
+        )
+        client._bash_memory_write_from_update(self._in_progress("call-b6", command))
+        self.assertIsNone(client._bash_memory_write_from_update(self._completed(
+            "call-b6", '{"success": false, "message": "记忆不存在"}',
+        )))
+
+    def test_unrelated_bash_commands_never_project(self):
+        client = self._client()
+        for tool_call_id, command in (
+            ("call-b7", "ls -la /tmp"),
+            ("call-b8", "curl -sS https://memory.xiaonancaleb.xyz/api/memories?limit=1"),
+            ("call-b9", "curl -sS -X POST https://example.com/api/memories -d '{}'"),
+        ):
+            with self.subTest(command=command):
+                client._bash_memory_write_from_update(self._in_progress(tool_call_id, command))
+                self.assertIsNone(client._bash_memory_write_from_update(self._completed(
+                    tool_call_id, '{"id": "bee5817d", "createdAt": "2026-09-10"}',
+                )))
+
+    def test_failed_or_pending_terminal_status_never_projects(self):
+        client = self._client()
+        command = (
+            "curl -sS -X POST https://memory.xiaonancaleb.xyz/api/memories "
+            "-d '{\"content\": \"x\"}'"
+        )
+        client._bash_memory_write_from_update(self._in_progress("call-b10", command))
+        for status in ("failed", "in_progress", "pending"):
+            with self.subTest(status=status):
+                update = self._completed("call-b10", '{"id": "bee5817d", "createdAt": "2026-09-10"}')
+                update["update"]["status"] = status
+                self.assertIsNone(client._bash_memory_write_from_update(update))
+
+    def test_event_never_contains_authorization_token(self):
+        client = self._client()
+        secret = "FAKE-TEST-TOKEN-never-leak"
+        command = (
+            "curl -sS -X POST https://memory.xiaonancaleb.xyz/api/memories "
+            "-H 'Authorization: Bearer " + secret + "' "
+            "-H 'User-Agent: curl/7.81.0' "
+            "-d '{\"content\": \"token 泄漏检查\"}'"
+        )
+        client._bash_memory_write_from_update(self._in_progress("call-b11", command))
+        event = client._bash_memory_write_from_update(self._completed(
+            "call-b11", '{"id": "bee5817d", "createdAt": "2026-09-10"}',
+        ))
+        self.assertIsNotNone(event)
+        self.assertNotIn(secret, json.dumps(event, ensure_ascii=False))
+        self.assertEqual(
+            {"kind", "action", "tool_call_id", "memory_id", "title",
+             "category", "subcategory", "snippet"},
+            set(event.keys()),
+        )
+
+    def test_pending_command_state_is_bounded_and_cleared_per_turn(self):
+        client = self._client()
+        for index in range(40):
+            client._bash_memory_write_from_update(
+                self._in_progress("call-flood-%d" % index, "echo %d" % index)
+            )
+        self.assertLessEqual(len(client._bash_tool_commands), 32)
+        with client._active_lock:
+            client._bash_tool_commands.clear()
+        self.assertEqual({}, client._bash_tool_commands)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,7 @@ session, lifecycle and cancellation boundary.
 """
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -242,6 +243,168 @@ def _memory_write_from_update(params: Any) -> dict[str, Any] | None:
     }
 
 
+# Bash calls that write the memory REST API directly (curl / python urllib)
+# bypass the memory MCP server but must feed the same chat card.  Detection is
+# ported from the Claude-side hook memory_write_collect.py: host + path gate,
+# explicit write method, failure markers, and a createdAt/updatedAt success
+# echo.  Misses are acceptable; false cards are not.
+_BASH_MEMORY_HOST_RE = re.compile(r"memory\.xiaonancaleb\.xyz")
+_BASH_MEMORY_API_PATH = "/api/memories"
+_BASH_MEMORY_URL_ID_RE = re.compile(
+    r"/api/memories/([A-Za-z0-9][A-Za-z0-9_-]{0,127})"
+)
+# Variable/f-string assembled URLs ("/api/memories/{mid}") hide the id; fall
+# back to a quoted UUID literal in the command body.
+_BASH_MEMORY_UUID_RE = re.compile(
+    r"[\"']([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})[\"']"
+)
+# Success evidence: the API JSON response echoes createdAt/updatedAt
+# (double-quoted JSON, single-quoted python dict, or bare print forms).
+_BASH_MEMORY_DATE_RE = re.compile(
+    r"[\"']?(?:createdAt|updatedAt)[\"']?\s*[:=]\s*[\"']?(\d{4}-\d{2}-\d{2})"
+)
+# Failure markers: curl exits 0 on HTTP 4xx/5xx unless --fail is passed, so
+# the output itself must be screened.  A hit drops the event entirely.
+_BASH_MEMORY_FAILURE_RE = re.compile(
+    r"[\"']success[\"']\s*:\s*(?:false|False)"
+    r"|HTTP(?:/[0-9.]+)?\s+[45]\d\d"
+    r"|Traceback \(most recent call last\)"
+    r"|[\"']error[\"']\s*:"
+)
+# curl -d/--data* followed by a shell-quoted JSON body.
+_BASH_MEMORY_CURL_DATA_RE = re.compile(
+    r"(?:-d|--data(?:-raw|-binary|-ascii)?)(?:\s+|=)"
+    r"(?:'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\")"
+)
+# python dict literal containing a content/append key.
+_BASH_MEMORY_PY_DICT_RE = re.compile(r"\{[^{}]*[\"'](?:content|append)[\"'][^{}]*\}")
+_BASH_MEMORY_MAX_PENDING = 32
+_BASH_MEMORY_MAX_COMMAND = 8192
+
+
+def _bash_memory_action(command: str) -> str | None:
+    """Classify a Bash command's write method: PUT→update, POST→write.
+
+    Unrecognized commands (GET/DELETE/unrelated) return None; PUT wins over
+    POST when both spellings appear.
+    """
+    if re.search(r"-X\s*PUT|-XPUT|--request[ =]PUT\b", command, re.I):
+        return "update"
+    if re.search(r"-X\s*POST|-XPOST|--request[ =]POST\b", command, re.I):
+        return "write"
+    # python urllib: Request(..., method='PUT') or a positional 'PUT'.
+    if re.search(r"method\s*=\s*'PUT'|method\s*=\s*\"PUT\"", command):
+        return "update"
+    if re.search(r"method\s*=\s*'POST'|method\s*=\s*\"POST\"", command):
+        return "write"
+    if re.search(r"[(,]\s*'PUT'|[(,]\s*\"PUT\"", command):
+        return "update"
+    if re.search(r"[(,]\s*'POST'|[(,]\s*\"POST\"", command):
+        return "write"
+    # curl with a body and no explicit -X defaults to POST.
+    if re.search(r"\bcurl\b", command) and re.search(r"-d\b|--data", command):
+        return "write"
+    return None
+
+
+def _bash_memory_body(command: str) -> dict[str, Any]:
+    """Best-effort request body from curl -d or python dict literals.
+
+    Returns the first parsed dict carrying a content/append key, else {} —
+    missing titles are tolerated rather than guessed.
+    """
+    candidates: list[str] = []
+    for match in _BASH_MEMORY_CURL_DATA_RE.finditer(command):
+        candidates.append(match.group(1) if match.group(1) is not None else match.group(2))
+    for match in _BASH_MEMORY_PY_DICT_RE.finditer(command):
+        candidates.append(match.group(0))
+    for raw in candidates:
+        payload = None
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            try:
+                payload = ast.literal_eval(raw)
+            except (SyntaxError, ValueError, MemoryError):
+                payload = None
+        if isinstance(payload, dict) and ("content" in payload or "append" in payload):
+            return payload
+    return {}
+
+
+def _bash_memory_output_texts(update: dict[str, Any]) -> list[str]:
+    """All output text of a completed Bash call (content blocks + rawOutput)."""
+    texts: list[str] = []
+    output = update.get("output")
+    if isinstance(output, str):
+        texts.append(output)
+    raw_output = update.get("rawOutput")
+    if isinstance(raw_output, str):
+        texts.append(raw_output)
+    content = update.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            inner = block.get("content")
+            if isinstance(inner, dict) and inner.get("type") == "text":
+                texts.append(str(inner.get("text") or ""))
+            elif block.get("type") == "text":
+                texts.append(str(block.get("text") or ""))
+    return texts
+
+
+def _bash_memory_write_event(
+    update: dict[str, Any], command: str
+) -> dict[str, Any] | None:
+    """Project a completed Bash memory-API write to the bounded card event.
+
+    ``command`` and the raw output never leave this function: only the same
+    truncated whitelist as the MCP path survives, so an Authorization header
+    in the command line can never leak into the event.
+    """
+    if not command:
+        return None
+    if not (_BASH_MEMORY_HOST_RE.search(command) and _BASH_MEMORY_API_PATH in command):
+        return None
+    action = _bash_memory_action(command)
+    if action is None:
+        return None
+    texts = _bash_memory_output_texts(update)
+    if any(_BASH_MEMORY_FAILURE_RE.search(text) for text in texts):
+        return None
+    if not any(_BASH_MEMORY_DATE_RE.search(text) for text in texts):
+        return None
+    body = _bash_memory_body(command)
+    title, snippet = _memory_write_title_snippet(
+        str(body.get("content") or body.get("append") or "")
+    )
+    memory_id = ""
+    if action == "update":
+        match = _BASH_MEMORY_URL_ID_RE.search(command) or _BASH_MEMORY_UUID_RE.search(command)
+        if match:
+            memory_id = match.group(1)
+    if not memory_id:
+        for text in texts:
+            match = _MEMORY_WRITE_OUTPUT_ID_RE.search(text)
+            if match:
+                memory_id = match.group(1)
+                break
+    if not _MEMORY_WRITE_ID_RE.fullmatch(memory_id):
+        memory_id = ""
+    return {
+        "kind": "memory_write",
+        "action": action,
+        "tool_call_id": str(update.get("toolCallId") or "").strip()[:80],
+        "memory_id": memory_id,
+        "title": title[:60],
+        "category": str(body.get("category") or "").strip()[:20],
+        "subcategory": str(body.get("subcategory") or "").strip()[:20],
+        "snippet": snippet[:80],
+    }
+
+
 class KimiACPClient:
     def __init__(
         self,
@@ -278,6 +441,10 @@ class KimiACPClient:
         self._active_update: Callable[[str], None] | None = None
         self._active_activity: Callable[[dict[str, Any]], None] | None = None
         self._active_memory_write: Callable[[dict[str, Any]], None] | None = None
+        # Bash commands seen in transient rawInput.command updates, keyed by
+        # toolCallId; the terminal Bash update carries no rawInput, so the
+        # command must be remembered here and evaluated on completion.
+        self._bash_tool_commands: dict[str, str] = {}
         self._reader: threading.Thread | None = None
         self._stderr_reader: threading.Thread | None = None
         self._initialized = False
@@ -589,6 +756,8 @@ class KimiACPClient:
                         except Exception:
                             self.logger.warning("Kimi ACP activity callback failed", exc_info=True)
                     memory_write = _memory_write_from_update(params)
+                    if memory_write is None:
+                        memory_write = self._bash_memory_write_from_update(params)
                     if memory_write_callback is not None and memory_write is not None:
                         try:
                             memory_write_callback(memory_write)
@@ -608,6 +777,42 @@ class KimiACPClient:
             for event, bucket, _pending_generation in pending:
                 bucket.setdefault("failure", "Kimi ACP exited")
                 event.set()
+
+    def _bash_memory_write_from_update(self, params: Any) -> dict[str, Any] | None:
+        """Project a completed Bash memory-API write, tracking commands by call.
+
+        Kimi streams the Bash command in the transient ``rawInput.command`` of
+        pending/in-progress updates; the terminal update carries neither title
+        nor rawInput, so the command is remembered per toolCallId and evaluated
+        only once the call completes successfully.
+        """
+        if not isinstance(params, dict):
+            return None
+        update = params.get("update")
+        if not isinstance(update, dict):
+            return None
+        kind = str(update.get("sessionUpdate") or "").strip().lower()
+        if kind not in {"tool_call", "tool_call_update"}:
+            return None
+        tool_call_id = str(update.get("toolCallId") or "").strip()
+        if not tool_call_id:
+            return None
+        raw_input = update.get("rawInput")
+        command = ""
+        if isinstance(raw_input, dict):
+            command = str(raw_input.get("command") or "")
+        with self._active_lock:
+            if command:
+                self._bash_tool_commands[tool_call_id] = command[:_BASH_MEMORY_MAX_COMMAND]
+                while len(self._bash_tool_commands) > _BASH_MEMORY_MAX_PENDING:
+                    self._bash_tool_commands.pop(next(iter(self._bash_tool_commands)))
+            status = str(update.get("status") or "").strip().lower()
+            if status not in {"completed", "success", "succeeded"}:
+                return None
+            if not command:
+                command = self._bash_tool_commands.get(tool_call_id, "")
+            self._bash_tool_commands.pop(tool_call_id, None)
+        return _bash_memory_write_event(update, command)
 
     def _answer_permission(self, message: dict[str, Any]) -> None:
         params = message.get("params")
@@ -1028,6 +1233,7 @@ class KimiACPClient:
                 self._active_update = on_update
                 self._active_activity = on_activity
                 self._active_memory_write = on_memory_write
+                self._bash_tool_commands.clear()
             if cancel_event is not None and cancel_event.is_set():
                 raise KimiACPCancelled("Kimi generation cancelled before prompt")
             finished = threading.Event()
@@ -1079,6 +1285,7 @@ class KimiACPClient:
                 self._active_update = None
                 self._active_activity = None
                 self._active_memory_write = None
+                self._bash_tool_commands.clear()
             self._turn_lock.release()
 
     def _prompt_and_collect_text(
