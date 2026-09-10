@@ -1202,6 +1202,68 @@ class KimiACPBashMemoryWriteTest(unittest.TestCase):
             set(event.keys()),
         )
 
+    def test_get_piped_into_bare_put_literal_never_projects(self):
+        # 审核复现的构造性误报：纯 GET 管道后段打印 'PUT'，输出含 createdAt
+        # 时曾投出 action="update"、字段全空的假卡片。
+        client = self._client()
+        command = (
+            "curl -s 'https://memory.xiaonancaleb.xyz/api/memories?limit=1' "
+            "| python3 -c \"print('PUT')\""
+        )
+        client._bash_memory_write_from_update(self._in_progress("call-b12", command))
+        self.assertIsNone(client._bash_memory_write_from_update(self._completed(
+            "call-b12",
+            'PUT\n[{"id": "bee5817d", "createdAt": "2026-09-10"}]',
+        )))
+
+    def test_update_without_memory_id_never_projects(self):
+        # update 类事件必须解析出非空 memory_id（卡片跳转目标），否则不投。
+        client = self._client()
+        command = (
+            "curl -sS -X PUT https://memory.xiaonancaleb.xyz/api/memories "
+            "-d '{\"append\": \"x\"}'"
+        )
+        client._bash_memory_write_from_update(self._in_progress("call-b13", command))
+        self.assertIsNone(client._bash_memory_write_from_update(self._completed(
+            "call-b13", '{"updatedAt": "2026-09-10T06:00:00Z"}',
+        )))
+
+    def test_positional_put_literal_inside_urllib_context_still_projects(self):
+        client = self._client()
+        command = (
+            "python3 -c \"import urllib.request; "
+            "print(urllib.request.urlopen(urllib.request.Request("
+            "'https://memory.xiaonancaleb.xyz/api/memories/7b64ed1e', "
+            "data=b'{}', headers={}, origin_req_host=None, method=None) "
+            "if False else urllib.request.Request("
+            "'https://memory.xiaonancaleb.xyz/api/memories/7b64ed1e', b'{}', {}, None, 'PUT')"
+            ").read().decode())\""
+        )
+        client._bash_memory_write_from_update(self._in_progress("call-b14", command))
+        event = client._bash_memory_write_from_update(self._completed(
+            "call-b14", '{"id": "7b64ed1e", "updatedAt": "2026-09-10"}',
+        ))
+        self.assertIsNotNone(event)
+        self.assertEqual("update", event["action"])
+        self.assertEqual("7b64ed1e", event["memory_id"])
+
+    def test_failed_terminal_status_pops_remembered_command(self):
+        client = self._client()
+        command = (
+            "curl -sS -X POST https://memory.xiaonancaleb.xyz/api/memories "
+            "-d '{\"content\": \"x\"}'"
+        )
+        client._bash_memory_write_from_update(self._in_progress("call-b15", command))
+        self.assertIn("call-b15", client._bash_tool_commands)
+        self.assertIsNone(client._bash_memory_write_from_update({
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-b15",
+                "status": "failed",
+            },
+        }))
+        self.assertNotIn("call-b15", client._bash_tool_commands)
+
     def test_pending_command_state_is_bounded_and_cleared_per_turn(self):
         client = self._client()
         for index in range(40):

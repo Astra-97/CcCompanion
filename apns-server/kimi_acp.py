@@ -247,7 +247,10 @@ def _memory_write_from_update(params: Any) -> dict[str, Any] | None:
 # bypass the memory MCP server but must feed the same chat card.  Detection is
 # ported from the Claude-side hook memory_write_collect.py: host + path gate,
 # explicit write method, failure markers, and a createdAt/updatedAt success
-# echo.  Misses are acceptable; false cards are not.
+# echo.  Misses are acceptable; false cards are not.  Known miss surface
+# (deliberate, reviewed 2026-09-10): uppercase HOST spellings, wget /
+# python requests / httpx, and shell-quoting variants of the -d body that
+# defeat the curl/python literal extraction.
 _BASH_MEMORY_HOST_RE = re.compile(r"memory\.xiaonancaleb\.xyz")
 _BASH_MEMORY_API_PATH = "/api/memories"
 _BASH_MEMORY_URL_ID_RE = re.compile(
@@ -293,15 +296,19 @@ def _bash_memory_action(command: str) -> str | None:
         return "update"
     if re.search(r"-X\s*POST|-XPOST|--request[ =]POST\b", command, re.I):
         return "write"
-    # python urllib: Request(..., method='PUT') or a positional 'PUT'.
+    # python urllib: Request(..., method='PUT') is context-bound, but a bare
+    # positional 'PUT'/'POST' literal only counts when a urllib request is
+    # actually being built — otherwise `curl GET ... | python3 -c
+    # "print('PUT')"` would project a phantom update (review false positive).
     if re.search(r"method\s*=\s*'PUT'|method\s*=\s*\"PUT\"", command):
         return "update"
     if re.search(r"method\s*=\s*'POST'|method\s*=\s*\"POST\"", command):
         return "write"
-    if re.search(r"[(,]\s*'PUT'|[(,]\s*\"PUT\"", command):
-        return "update"
-    if re.search(r"[(,]\s*'POST'|[(,]\s*\"POST\"", command):
-        return "write"
+    if re.search(r"urllib|Request\s*\(", command):
+        if re.search(r"[(,]\s*'PUT'|[(,]\s*\"PUT\"", command):
+            return "update"
+        if re.search(r"[(,]\s*'POST'|[(,]\s*\"POST\"", command):
+            return "write"
     # curl with a body and no explicit -X defaults to POST.
     if re.search(r"\bcurl\b", command) and re.search(r"-d\b|--data", command):
         return "write"
@@ -393,6 +400,10 @@ def _bash_memory_write_event(
                 break
     if not _MEMORY_WRITE_ID_RE.fullmatch(memory_id):
         memory_id = ""
+    # An update without a resolvable memory_id has no jump target and is the
+    # shape of the pipeline false positive; writes keep id-less tolerance.
+    if action == "update" and not memory_id:
+        return None
     return {
         "kind": "memory_write",
         "action": action,
@@ -808,6 +819,11 @@ class KimiACPClient:
                     self._bash_tool_commands.pop(next(iter(self._bash_tool_commands)))
             status = str(update.get("status") or "").strip().lower()
             if status not in {"completed", "success", "succeeded"}:
+                # Failed/cancelled calls never project, but their remembered
+                # command is dead weight — pop it instead of waiting for the
+                # turn-end clear or the FIFO eviction.
+                if status in {"failed", "cancelled", "canceled", "error"}:
+                    self._bash_tool_commands.pop(tool_call_id, None)
                 return None
             if not command:
                 command = self._bash_tool_commands.get(tool_call_id, "")
