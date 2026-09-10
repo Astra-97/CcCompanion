@@ -1,12 +1,19 @@
-"""Per-App model selection for the CcCompanion Kiro contact (kiro 切模型 2026-09-10).
+"""Per-App model + effort selection for the CcCompanion Kiro contact (kiro 切模型 2026-09-10).
 
-Mirrors kimi_preferences.py but model-only: Kiro's ACP exposes
-``session/set_model`` and a dynamic ``availableModels`` catalog instead of a
-local config allowlist.  The catalog is owned by ``KiroACPClient`` (captured
-from session/new|session/load, cached on disk); this store treats it as the
-closed world: an Android caller can only pick an id Kiro itself offered.
-The selection persists across restarts and is re-pinned on every ACP
-prepare, because Kiro does not persist set_model across session/load.
+Mirrors kimi_preferences.py: Kiro's ACP exposes ``session/set_model`` and a
+dynamic ``availableModels`` catalog instead of a local config allowlist.  The
+catalog is owned by ``KiroACPClient`` (captured from session/new|session/load,
+cached on disk); this store treats it as the closed world: an Android caller
+can only pick an id Kiro itself offered.  The selection persists across
+restarts and is re-pinned on every ACP prepare, because Kiro does not persist
+set_model across session/load.
+
+kiro 推理强度 (2026-09-10): the effort dimension is validated against a closed
+five-level set (low/medium/high/xhigh/max).  Kiro's own options list is
+model-conditional and empty on every model this account is offered, so it
+cannot act as the allowlist; the pin is applied via the
+``_kiro.dev/commands/execute`` TuiCommand bridge at every prepare and simply
+no-ops on models without effort support.
 """
 from __future__ import annotations
 
@@ -20,6 +27,11 @@ from typing import Any, Callable
 
 
 KIRO_APP_DEFAULT_MODEL = "auto"
+KIRO_APP_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# kiro 推理强度 (2026-09-10): 默认空串 = 不 pin 不重放，跟随 Kiro 自己的每模型
+# 默认档位。只有用户显式选择过才持久化并参与 prepare 重放——避免将来 thinking
+# 模型上线时在无用户动作的情况下覆写 Kiro 默认。
+KIRO_APP_DEFAULT_EFFORT = ""
 
 
 class KiroPreferenceError(ValueError):
@@ -31,7 +43,7 @@ class KiroPreferencePersistenceError(RuntimeError):
 
 
 class KiroPreferenceStore:
-    """Thread-safe atomic 0600 model store validated against a live catalog."""
+    """Thread-safe atomic 0600 model+effort store validated against a live catalog."""
 
     MAX_BYTES = 16 * 1024
 
@@ -41,12 +53,14 @@ class KiroPreferenceStore:
         *,
         catalog_loader: Callable[[], tuple[str, ...]] | None = None,
         default_model: str = KIRO_APP_DEFAULT_MODEL,
+        default_effort: str = KIRO_APP_DEFAULT_EFFORT,
     ) -> None:
         self.path = Path(path).expanduser()
         self._lock = threading.RLock()
         self._catalog_loader = catalog_loader
         self._default_model = default_model
-        self._selection = default_model
+        self._default_effort = default_effort
+        self._selection = (default_model, default_effort)
         loaded = self._load()
         if loaded is not None:
             self._selection = loaded
@@ -60,9 +74,15 @@ class KiroPreferenceStore:
         except Exception:
             return ()
 
-    def snapshot(self) -> str:
+    def snapshot(self) -> tuple[str, str]:
         with self._lock:
             return self._selection
+
+    def snapshot_model(self) -> str:
+        return self.snapshot()[0]
+
+    def snapshot_effort(self) -> str:
+        return self.snapshot()[1]
 
     def validate(self, model: Any) -> str:
         selected = str(model or "").strip()
@@ -75,14 +95,23 @@ class KiroPreferenceStore:
             raise KiroPreferenceError("model is not in the Kiro available catalog")
         return selected
 
-    def save_validated(self, model: Any) -> str:
-        selection = self.validate(model)
-        with self._lock:
-            self._persist(selection)
-            self._selection = selection
-            return selection
+    def validate_effort(self, effort: Any) -> str:
+        selected = str(effort or "").strip().lower()
+        if selected not in KIRO_APP_EFFORTS:
+            raise KiroPreferenceError("effort is not in the Kiro supported levels")
+        return selected
 
-    def _load(self) -> str | None:
+    def save_validated(self, model: Any = None, effort: Any = None) -> tuple[str, str]:
+        """Validate and persist; ``None`` keeps the current dimension."""
+        with self._lock:
+            current_model, current_effort = self._selection
+            next_model = self.validate(model) if model is not None else current_model
+            next_effort = self.validate_effort(effort) if effort is not None else current_effort
+            self._persist((next_model, next_effort))
+            self._selection = (next_model, next_effort)
+            return self._selection
+
+    def _load(self) -> tuple[str, str] | None:
         try:
             info = self.path.lstat()
             if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_size > self.MAX_BYTES:
@@ -100,11 +129,18 @@ class KiroPreferenceStore:
             # down, cache absent); drop one the live catalog disproves.
             if ids and selected not in ids:
                 return None
-            return selected
+            # kiro 推理强度 (2026-09-10): a missing/unknown effort (file from
+            # before this dimension existed, or hand-edited) falls back to the
+            # default instead of discarding the whole record.
+            try:
+                effort = self.validate_effort(raw.get("effort"))
+            except KiroPreferenceError:
+                effort = self._default_effort
+            return selected, effort
         except (json.JSONDecodeError, OSError, UnicodeError):
             return None
 
-    def _persist(self, selection: str) -> None:
+    def _persist(self, selection: tuple[str, str]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp = self.path.with_name(f".{self.path.name}.tmp-{os.getpid()}-{secrets.token_hex(6)}")
         fd = -1
@@ -118,7 +154,8 @@ class KiroPreferenceStore:
                 fd = -1
                 handle.write(json.dumps({
                     "version": 1,
-                    "model": selection,
+                    "model": selection[0],
+                    "effort": selection[1],
                 }, ensure_ascii=False, separators=(",", ":")) + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())

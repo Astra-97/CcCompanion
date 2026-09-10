@@ -23,11 +23,15 @@ from kiro_acp import (
     KiroACPQuotaExceeded,
     _activity_from_update,
     _classified_rpc_error,
+    _metadata_context_percent,
+    _metadata_effort,
     _text_from_update,
 )
-# kiro 切模型 (2026-09-10)
+# kiro 切模型 (2026-09-10) + kiro 推理强度 (2026-09-10)
 from kiro_preferences import (
+    KIRO_APP_DEFAULT_EFFORT,
     KIRO_APP_DEFAULT_MODEL,
+    KIRO_APP_EFFORTS,
     KiroPreferenceError,
     KiroPreferenceStore,
 )
@@ -278,6 +282,58 @@ class KiroACPProtocolTest(unittest.TestCase):
         prompt = process.requests[-1]
         self.assertEqual("session/prompt", prompt["method"])
         self.assertEqual([{"type": "text", "text": "hello"}], prompt["params"]["prompt"])
+
+    # kiro 状态栏 (2026-09-10)
+    def test_metadata_notification_caches_latest_context_usage(self):
+        def handle(_process, message):
+            if message.get("method") != "session/prompt":
+                return _basic_handler()(_process, message)
+            request_id = message["id"]
+            session_id = message["params"]["sessionId"]
+            return [
+                {"jsonrpc": "2.0", "method": "_kiro.dev/metadata", "params": {
+                    "sessionId": session_id, "contextUsagePercentage": 17.25}},
+                # A foreign session's metadata must never overwrite ours.
+                {"jsonrpc": "2.0", "method": "_kiro.dev/metadata", "params": {
+                    "sessionId": "someone-else", "contextUsagePercentage": 88.8}},
+                # Tolerate a nested metadata envelope and the bare spelling.
+                {"jsonrpc": "2.0", "method": "kiro.dev/metadata", "params": {
+                    "metadata": {"contextUsagePercentage": 23.5}}},
+                # Malformed values must never overwrite the last good one.
+                {"jsonrpc": "2.0", "method": "_kiro.dev/metadata", "params": {
+                    "contextUsagePercentage": "junk"}},
+                {"jsonrpc": "2.0", "method": "_kiro.dev/metadata", "params": {
+                    "contextUsagePercentage": 412}},
+                {"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}},
+            ]
+
+        process = FakeKiroACPProcess(handle)
+        client = self._client(_scripted_factory([process]))
+        session_id = client.prepare_session()
+        self.assertIsNone(client.context_usage_percent())
+
+        client.prompt_existing("hello", session_id=session_id, turn_id="turn-1")
+
+        self.assertEqual(23.5, client.context_usage_percent())
+
+    def test_metadata_context_percent_extraction_is_bounded(self):
+        self.assertEqual(0.0, _metadata_context_percent({"contextUsagePercentage": 0}))
+        self.assertEqual(100.0, _metadata_context_percent({"contextUsagePercentage": 100}))
+        self.assertEqual(
+            12.5,
+            _metadata_context_percent({"data": {"contextUsagePercentage": "12.5"}}),
+        )
+        for bad in (
+            None,
+            "12",
+            {"contextUsagePercentage": True},
+            {"contextUsagePercentage": -1},
+            {"contextUsagePercentage": 100.5},
+            {"contextUsagePercentage": "nope"},
+            {"metadata": {"contextUsagePercentage": None}},
+        ):
+            with self.subTest(bad=bad):
+                self.assertIsNone(_metadata_context_percent(bad))
 
     def test_process_crash_fails_turn_then_restart_resumes_persisted_session(self):
         def crashing_handler(process, message):
@@ -899,6 +955,213 @@ class KiroModelCatalogTest(unittest.TestCase):
         self.assertEqual("fresh", client.load_session_id())
 
 
+# ---------------------------------------------------------------------------
+# kiro 推理强度 (2026-09-10): TuiCommand bridge, pin replay, metadata read-back
+# ---------------------------------------------------------------------------
+
+def _effort_handler(session_id="kiro-session-1", *, supported=True):
+    """Catalog handler answering the /effort TuiCommand bridge like 2.21.2."""
+    base = _catalog_handler(session_id)
+
+    def handle(process, message):
+        if message.get("method") == "_kiro.dev/commands/execute":
+            command = (message.get("params") or {}).get("command") or {}
+            if command.get("command") == "effort":
+                value = str((command.get("args") or {}).get("value") or "")
+                if supported and value in ("low", "medium", "high", "xhigh", "max"):
+                    return [{"jsonrpc": "2.0", "id": message["id"], "result": {"success": True}}]
+                return [{"jsonrpc": "2.0", "id": message["id"], "result": {
+                    "success": False,
+                    "message": "Effort configuration is currently not available — provider private detail",
+                }}]
+            return [{"jsonrpc": "2.0", "id": message["id"], "result": {"success": False}}]
+        return base(process, message)
+
+    return handle
+
+
+def _effort_execute_calls(process):
+    return [
+        r for r in process.requests
+        if r.get("method") == "_kiro.dev/commands/execute"
+        and (r.get("params", {}).get("command") or {}).get("command") == "effort"
+    ]
+
+
+class KiroEffortTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state_path = str(Path(self.tmp.name) / "kiro_acp_session.json")
+
+    def _client(self, factory):
+        return KiroACPClient(
+            command="/fake/kiro-cli",
+            cwd=self.tmp.name,
+            state_path=self.state_path,
+            request_timeout=5,
+            prompt_timeout=10,
+            popen_factory=factory,
+        )
+
+    def test_set_effort_sends_tui_command_bridge_shape(self):
+        process = FakeKiroACPProcess(_effort_handler())
+        client = self._client(_scripted_factory([process]))
+        client.prepare_session()
+
+        self.assertEqual("high", client.set_effort("high"))
+
+        calls = _effort_execute_calls(process)
+        self.assertEqual(1, len(calls))
+        self.assertEqual(
+            {"sessionId": "kiro-session-1", "command": {"command": "effort", "args": {"value": "high"}}},
+            calls[0]["params"],
+        )
+        self.assertEqual("high", client.current_effort())
+        # 已确认在线：再次 prepare 不重复发送。
+        client.prepare_session()
+        self.assertEqual(1, len(_effort_execute_calls(process)))
+
+    def test_pin_effort_validates_closed_set(self):
+        client = self._client(_scripted_factory([]))
+        for bad in ("", "bogus", "HIGHx", "../high"):
+            with self.assertRaisesRegex(KiroACPError, "invalid Kiro effort", msg=bad):
+                client.pin_effort(bad)
+        self.assertEqual("xhigh", client.pin_effort(" XHigh "))
+
+    def test_set_effort_refusal_raises_without_provider_message(self):
+        process = FakeKiroACPProcess(_effort_handler(supported=False))
+        client = self._client(_scripted_factory([process]))
+        client.prepare_session()
+
+        with self.assertRaises(KiroACPError) as ctx:
+            client.set_effort("high")
+        self.assertNotIn("private", str(ctx.exception))
+        self.assertEqual("", client.current_effort())
+        # 钉选仍然记下，供后续 prepare 重放。
+        self.assertEqual("high", client._pinned_effort)
+
+    def test_prepare_replays_effort_after_model_pin(self):
+        process = FakeKiroACPProcess(_effort_handler())
+        client = self._client(_scripted_factory([process]))
+
+        client.prepare_session(model="claude-sonnet-4.5", effort="max")
+
+        methods = [r.get("method") for r in process.requests]
+        self.assertLess(methods.index("session/set_model"), methods.index("_kiro.dev/commands/execute"))
+        self.assertEqual("max", client.current_effort())
+
+    def test_effort_refusal_defers_until_model_or_session_changes(self):
+        process = FakeKiroACPProcess(_effort_handler(supported=False))
+        client = self._client(_scripted_factory([process]))
+        client.prepare_session(model="auto", effort="high")
+        self.assertEqual(1, len(_effort_execute_calls(process)))
+
+        # 同一 (session, model, effort) 组合下不再每轮重试、不再刷告警。
+        client.prepare_session(model="auto", effort="high")
+        self.assertEqual(1, len(_effort_execute_calls(process)))
+
+        # 换了模型（可能支持 effort）立即重试。
+        client.prepare_session(model="claude-sonnet-4.5", effort="high")
+        self.assertEqual(2, len(_effort_execute_calls(process)))
+
+    def test_effort_pin_survives_restart_and_replays_after_load(self):
+        Path(self.state_path).write_text(
+            json.dumps({"version": 2, "session_id": "durable", "cwd": str(Path(self.tmp.name).resolve())}),
+            encoding="utf-8",
+        )
+        first = FakeKiroACPProcess(_effort_handler(session_id="durable"))
+        client = self._client(_scripted_factory([first]))
+        client.prepare_session(effort="low")
+        self.assertEqual("low", client.current_effort())
+        client.close()
+
+        second = FakeKiroACPProcess(_effort_handler(session_id="durable"))
+        client._popen_factory = _scripted_factory([second])
+        self.assertEqual("durable", client.prepare_session())
+        calls = _effort_execute_calls(second)
+        self.assertEqual(1, len(calls))
+        self.assertEqual("low", calls[0]["params"]["command"]["args"]["value"])
+
+    def test_new_session_same_process_clears_readback_and_replays(self):
+        """审核修复 (2026-09-10)：session/new 是否保留 effort 未经证实，客户端
+        保守地在会话切换时清读回缓存，钉选必须重放而不是走"已是当前值"捷径。"""
+        process = FakeKiroACPProcess(_effort_handler())
+        client = self._client(_scripted_factory([process]))
+        client.prepare_session(effort="high")
+        self.assertEqual("high", client.current_effort())
+        self.assertEqual(1, len(_effort_execute_calls(process)))
+
+        # 同进程新会话（进程没有重启，_start 不会清缓存）。
+        def new_handler(_p, message):
+            if message.get("method") == "session/new":
+                return [{"jsonrpc": "2.0", "id": message["id"], "result": {
+                    "sessionId": "fresh-2", "models": _KIRO_MODELS_BLOCK,
+                }}]
+            return _effort_handler()(_p, message)
+
+        process._handler = new_handler
+        self.assertEqual("fresh-2", client.new_session())
+        # 重放已在新会话上发生：execute 带着新 sessionId 再发一次。
+        calls = _effort_execute_calls(process)
+        self.assertEqual(2, len(calls))
+        self.assertEqual("fresh-2", calls[-1]["params"]["sessionId"])
+        self.assertEqual("high", calls[-1]["params"]["command"]["args"]["value"])
+        self.assertEqual("high", client.current_effort())
+
+    def test_session_load_transition_clears_readback_and_replays(self):
+        """session/load 同理：读回缓存按会话围栏，load 之后钉选重放。"""
+        first = FakeKiroACPProcess(_effort_handler())
+        client = self._client(_scripted_factory([first]))
+        client.prepare_session(effort="max")
+        self.assertEqual("max", client.current_effort())
+        client._save_session_id("kiro-session-1")
+        client._loaded_session_id = ""  # 强制下一轮 prepare 走 load 而非快车道
+        # 进程仍存活（同进程 load），_start 不会清缓存。
+        self.assertEqual("kiro-session-1", client.prepare_session())
+        self.assertEqual("max", client.current_effort())
+        calls = _effort_execute_calls(first)
+        self.assertEqual(2, len(calls))
+        self.assertEqual("max", calls[-1]["params"]["command"]["args"]["value"])
+
+    def test_metadata_effort_read_back_is_validated_and_session_fenced(self):
+        self.assertEqual("high", _metadata_effort({"effort": "high"}))
+        self.assertEqual("max", _metadata_effort({"effort": " Max "}))
+        for bad in (None, {}, {"effort": "bogus"}, {"effort": 3}, {"effort": True}):
+            self.assertEqual("", _metadata_effort(bad))
+
+        def handle(_process, message):
+            if message.get("method") != "session/prompt":
+                return _basic_handler()(_process, message)
+            request_id = message["id"]
+            session_id = message["params"]["sessionId"]
+            return [
+                {"jsonrpc": "2.0", "method": "_kiro.dev/metadata", "params": {
+                    "sessionId": session_id, "effort": "xhigh"}},
+                {"jsonrpc": "2.0", "method": "_kiro.dev/metadata", "params": {
+                    "sessionId": "someone-else", "effort": "low"}},
+                {"jsonrpc": "2.0", "method": "_kiro.dev/metadata", "params": {
+                    "sessionId": session_id, "effort": "bogus"}},
+                {"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}},
+            ]
+
+        process = FakeKiroACPProcess(handle)
+        client = self._client(_scripted_factory([process]))
+        session_id = client.prepare_session()
+        self.assertEqual("", client.current_effort())
+
+        client.prompt_existing("hello", session_id=session_id, turn_id="turn-1")
+
+        self.assertEqual("xhigh", client.current_effort())
+
+    def test_new_session_applies_effort(self):
+        process = FakeKiroACPProcess(_effort_handler(session_id="fresh"))
+        client = self._client(_scripted_factory([process]))
+        self.assertEqual("fresh", client.new_session(model="auto", effort="medium"))
+        calls = _effort_execute_calls(process)
+        self.assertEqual(1, len(calls))
+        self.assertEqual("medium", calls[0]["params"]["command"]["args"]["value"])
+
 class KiroPreferenceStoreTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -910,14 +1173,16 @@ class KiroPreferenceStoreTest(unittest.TestCase):
 
     def test_default_is_auto_and_persists_across_instances(self):
         store = self._store()
-        self.assertEqual(KIRO_APP_DEFAULT_MODEL, store.snapshot())
-        self.assertEqual("claude-haiku-4.5", store.save_validated("claude-haiku-4.5"))
+        self.assertEqual(KIRO_APP_DEFAULT_MODEL, store.snapshot_model())
+        self.assertEqual((KIRO_APP_DEFAULT_MODEL, KIRO_APP_DEFAULT_EFFORT), store.snapshot())
+        self.assertEqual(("claude-haiku-4.5", KIRO_APP_DEFAULT_EFFORT),
+                         store.save_validated("claude-haiku-4.5"))
         self.assertEqual(0o600, self.path.stat().st_mode & 0o777)
-        self.assertEqual("claude-haiku-4.5", self._store().snapshot())
+        self.assertEqual("claude-haiku-4.5", self._store().snapshot_model())
 
     def test_empty_catalog_fails_closed(self):
         store = self._store(catalog=())
-        self.assertEqual("auto", store.snapshot())
+        self.assertEqual("auto", store.snapshot_model())
         with self.assertRaises(KiroPreferenceError):
             store.save_validated("auto")
         self.assertFalse(self.path.exists())
@@ -927,16 +1192,49 @@ class KiroPreferenceStoreTest(unittest.TestCase):
         for bad in ("gpt-99", "", "../escape", "a" * 300):
             with self.assertRaises(KiroPreferenceError, msg=bad):
                 store.save_validated(bad)
-        self.assertEqual("auto", store.snapshot())
+        self.assertEqual("auto", store.snapshot_model())
 
     def test_catalog_contradiction_drops_persisted_model(self):
         store = self._store()
         store.save_validated("claude-haiku-4.5")
         shrunk = KiroPreferenceStore(self.path, catalog_loader=lambda: ("auto",))
-        self.assertEqual("auto", shrunk.snapshot())
+        self.assertEqual("auto", shrunk.snapshot_model())
         # An unavailable catalog cannot disprove a persisted selection.
         offline = KiroPreferenceStore(self.path, catalog_loader=lambda: ())
-        self.assertEqual("claude-haiku-4.5", offline.snapshot())
+        self.assertEqual("claude-haiku-4.5", offline.snapshot_model())
+
+    # kiro 推理强度 (2026-09-10)
+    def test_effort_defaults_persists_and_validates_closed_set(self):
+        store = self._store()
+        self.assertEqual(KIRO_APP_DEFAULT_EFFORT, store.snapshot_effort())
+        self.assertEqual(("auto", "xhigh"), store.save_validated(effort="XHigh"))
+        self.assertEqual(("auto", "xhigh"), self._store().snapshot())
+        persisted = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual({"version": 1, "model": "auto", "effort": "xhigh"}, persisted)
+        for bad in ("", "bogus", " ultra ", "high;"):
+            with self.assertRaises(KiroPreferenceError, msg=bad):
+                self._store().save_validated(effort=bad)
+        self.assertEqual(("auto", "xhigh"), self._store().snapshot())
+
+    def test_effort_only_save_keeps_model_and_needs_no_catalog(self):
+        store = self._store()
+        store.save_validated("claude-haiku-4.5")
+        # effort 校验不依赖动态目录：目录为空时也能单独保存 effort。
+        offline = KiroPreferenceStore(self.path, catalog_loader=lambda: ())
+        self.assertEqual(("claude-haiku-4.5", "low"), offline.save_validated(effort="low"))
+
+    def test_legacy_file_without_effort_gets_default(self):
+        self.path.write_text(
+            json.dumps({"version": 1, "model": "claude-haiku-4.5"}), encoding="utf-8"
+        )
+        store = self._store()
+        self.assertEqual(("claude-haiku-4.5", KIRO_APP_DEFAULT_EFFORT), store.snapshot())
+
+    def test_unknown_persisted_effort_falls_back_to_default(self):
+        self.path.write_text(
+            json.dumps({"version": 1, "model": "auto", "effort": "ludicrous"}), encoding="utf-8"
+        )
+        self.assertEqual(("auto", KIRO_APP_DEFAULT_EFFORT), self._store().snapshot())
 
 
 class KiroPreferencesHandlerTest(unittest.TestCase):
@@ -965,6 +1263,10 @@ class KiroPreferencesHandlerTest(unittest.TestCase):
             available_model_ids=lambda: models,
             set_model=lambda m: calls.append(("set_model", m)) or m,
             pin_model=lambda m: calls.append(("pin_model", m)) or m,
+            # kiro 推理强度 (2026-09-10)
+            set_effort=lambda e: calls.append(("set_effort", e)) or e,
+            pin_effort=lambda e: calls.append(("pin_effort", e)) or e,
+            current_effort=lambda: "",
             busy=False,
         )
 
@@ -986,6 +1288,51 @@ class KiroPreferencesHandlerTest(unittest.TestCase):
         self.assertEqual("live", payload["catalog_source"])
         self.assertFalse(payload["busy"])
         self.assertEqual("next_turn", payload["applies_from"])
+        # kiro 推理强度 (2026-09-10)：当前值 + 封闭五档表 + wire 读回。
+        self.assertEqual(KIRO_APP_DEFAULT_EFFORT, payload["effort"])
+        self.assertEqual(KIRO_APP_DEFAULT_EFFORT, payload["selection"]["effort"])
+        self.assertEqual(list(KIRO_APP_EFFORTS), payload["available_efforts"])
+        self.assertEqual("", payload["current_effort"])
+
+    # kiro 状态栏 (2026-09-10)
+    def test_get_payload_includes_header_status_display(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            acp = self._acp(calls)
+            acp.current_model_id = lambda: "claude-haiku-4.5"
+            acp.context_usage_percent = lambda: 42.4
+            handler, _kiro = self._handler(acp, self._store(tmp))
+            handler._handle_kiro_preferences_get()
+        status, payload = handler.responses[-1]
+        self.assertEqual(200, status)
+        self.assertEqual("claude-haiku-4.5", payload["current_model"])
+        self.assertEqual(42.4, payload["context_usage_percent"])
+        display = payload["header_display"]
+        self.assertEqual(1, display["version"])
+        self.assertEqual("claude-haiku-4.5", display["model"])
+        self.assertEqual(42.4, display["context_percent"])
+        self.assertEqual("claude-haiku-4.5 · 42%", display["text"])
+        self.assertEqual("Kiro 状态加载中", display["loading_text"])
+        self.assertEqual("Kiro 状态暂不可用", display["unavailable_text"])
+
+    def test_get_payload_header_degrades_gracefully_without_wire_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            acp = self._acp(calls)
+            acp.current_model_id = lambda: ""
+            acp.context_usage_percent = lambda: None
+            handler, _kiro = self._handler(acp, self._store(tmp))
+            handler._handle_kiro_preferences_get()
+        status, payload = handler.responses[-1]
+        self.assertEqual(200, status)
+        # 钉选（auto）兜底为当前模型；百分比未知时是 null 而不是假数字，
+        # 顶栏只显示模型名（优雅降级，不伪造“加载中”）。
+        self.assertEqual("auto", payload["current_model"])
+        self.assertIsNone(payload["context_usage_percent"])
+        display = payload["header_display"]
+        self.assertEqual("auto", display["model"])
+        self.assertIsNone(display["context_percent"])
+        self.assertEqual("auto", display["text"])
 
     def test_post_valid_model_persists_applies_and_notifies(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1002,7 +1349,7 @@ class KiroPreferencesHandlerTest(unittest.TestCase):
             self.assertIn("已切到 claude-haiku-4.5 模型", kiro.records[-1]["text"])
             self.assertEqual("system:kiro-model-switch", kiro.records[-1]["source"])
             # 选择跨重启保留。
-            self.assertEqual("claude-haiku-4.5", self._store(tmp).snapshot())
+            self.assertEqual("claude-haiku-4.5", self._store(tmp).snapshot_model())
 
     def test_post_same_model_does_not_notify(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1073,12 +1420,12 @@ class KiroPreferencesHandlerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             calls = []
             acp = self._acp(calls)
-            acp.prepare_session = lambda **kw: calls.append(("prepare", kw.get("model"))) or "s1"
+            acp.prepare_session = lambda **kw: calls.append(("prepare", kw.get("model"), kw.get("effort"))) or "s1"
             acp.prompt_existing = lambda text, *, on_update=None, **_kw: on_update and on_update("好")
             acp.cancel = lambda *_a: True
             acp.close = lambda: None
             store = self._store(tmp)
-            store.save_validated("claude-haiku-4.5")
+            store.save_validated("claude-haiku-4.5", "xhigh")
             handler, kiro = self._handler(acp, store)
             state = handler.state
             # chat send 需要的状态件补齐。
@@ -1092,7 +1439,133 @@ class KiroPreferencesHandlerTest(unittest.TestCase):
             with patch("push.threading.Thread", _immediate_thread):
                 handler._handle_kiro_chat_send({"text": "你好"}, "kiro")
             self.assertEqual(200, handler.responses[-1][0])
-            self.assertEqual(("prepare", "claude-haiku-4.5"), calls[0])
+            self.assertEqual(("prepare", "claude-haiku-4.5", "xhigh"), calls[0])
+
+    # kiro 推理强度 (2026-09-10) — POST 的 effort 维度
+    def test_post_effort_only_persists_applies_and_needs_no_catalog(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            handler, kiro = self._handler(self._acp(calls), self._store(tmp))
+            handler._handle_kiro_preferences_post({"effort": "xhigh"})
+            status, payload = handler.responses[-1]
+            self.assertEqual(200, status)
+            self.assertTrue(payload["applied_immediately"])
+            self.assertEqual("xhigh", payload["effort"])
+            self.assertEqual("auto", payload["model"])
+            self.assertEqual([("set_effort", "xhigh")], calls)
+            persisted = json.loads((Path(tmp) / "kiro_preferences.json").read_text(encoding="utf-8"))
+            self.assertEqual({"version": 1, "model": "auto", "effort": "xhigh"}, persisted)
+            self.assertIn("推理强度设为 xhigh", kiro.records[-1]["text"])
+            self.assertEqual("system:kiro-effort-switch", kiro.records[-1]["source"])
+            # 跨重启保留。
+            self.assertEqual(("auto", "xhigh"), self._store(tmp).snapshot())
+
+    def test_post_effort_invalid_and_missing_fields_are_400(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            handler, kiro = self._handler(self._acp(calls), self._store(tmp))
+            for body in ({"effort": "bogus"}, {"effort": ""}, {}):
+                handler._handle_kiro_preferences_post(body)
+                self.assertEqual(400, handler.responses[-1][0], body)
+                self.assertEqual("invalid_kiro_selection", handler.responses[-1][1]["error"])
+            self.assertEqual([], calls)
+            self.assertEqual([], kiro.records)
+            self.assertFalse((Path(tmp) / "kiro_preferences.json").exists())
+
+    def test_post_effort_while_busy_pins_without_execute(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            acp = self._acp(calls)
+            acp.busy = True
+            handler, kiro = self._handler(acp, self._store(tmp))
+            handler.state.kiro_active_turn = {"user_ts": "t", "cancel_event": threading.Event(), "session_id": "s"}
+            handler._handle_kiro_preferences_post({"effort": "low"})
+            status, payload = handler.responses[-1]
+            self.assertEqual(200, status)
+            self.assertFalse(payload["applied_immediately"])
+            self.assertEqual([("pin_effort", "low")], calls)
+            self.assertIn("暂不生效", kiro.records[-1]["text"])
+
+    def test_post_effort_refusal_degrades_without_blocking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            acp = self._acp(calls)
+
+            def refused_set(effort):
+                calls.append(("set_effort", effort))
+                raise KiroACPError("Kiro effort is not available on the current model")
+
+            acp.set_effort = refused_set
+            handler, kiro = self._handler(acp, self._store(tmp))
+            handler._handle_kiro_preferences_post({"effort": "max"})
+            status, payload = handler.responses[-1]
+            self.assertEqual(200, status)
+            self.assertFalse(payload["applied_immediately"])
+            self.assertEqual("max", payload["effort"])
+            self.assertIn("暂不生效", kiro.records[-1]["text"])
+            self.assertNotIn("not available", kiro.records[-1]["text"])
+
+    def test_post_model_and_effort_together(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            handler, kiro = self._handler(self._acp(calls), self._store(tmp))
+            handler._handle_kiro_preferences_post({"model": "claude-haiku-4.5", "effort": "medium"})
+            status, payload = handler.responses[-1]
+            self.assertEqual(200, status)
+            self.assertTrue(payload["applied_immediately"])
+            self.assertEqual(
+                [("set_model", "claude-haiku-4.5"), ("set_effort", "medium")], calls
+            )
+            self.assertEqual(("claude-haiku-4.5", "medium"), self._store(tmp).snapshot())
+            notices = [r["text"] for r in kiro.records]
+            self.assertTrue(any("已切到 claude-haiku-4.5 模型" in text for text in notices))
+            self.assertTrue(any("推理强度设为 medium" in text for text in notices))
+
+    def test_post_same_effort_does_not_notify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            store = self._store(tmp)
+            store.save_validated(effort="high")
+            handler, kiro = self._handler(self._acp(calls), store)
+            handler._handle_kiro_preferences_post({"effort": "high"})
+            self.assertEqual(200, handler.responses[-1][0])
+            self.assertEqual([], kiro.records)
+
+    def test_post_explicit_null_is_400_like_the_old_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            handler, kiro = self._handler(self._acp(calls), self._store(tmp))
+            for body in ({"model": None}, {"effort": None}, {"model": None, "effort": "high"}):
+                handler._handle_kiro_preferences_post(body)
+                self.assertEqual(400, handler.responses[-1][0], body)
+                self.assertEqual("invalid_kiro_selection", handler.responses[-1][1]["error"])
+            self.assertEqual([], calls)
+            self.assertEqual([], kiro.records)
+            self.assertFalse((Path(tmp) / "kiro_preferences.json").exists())
+
+    def test_chat_prepare_omits_effort_when_never_chosen(self):
+        # kiro 推理强度 (2026-09-10)：默认空档不 pin——prepare 收到 effort=None，
+        # Kiro 自己的每模型默认档位不被覆写。
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            acp = self._acp(calls)
+            acp.prepare_session = lambda **kw: calls.append(("prepare", kw.get("model"), kw.get("effort"))) or "s1"
+            acp.prompt_existing = lambda text, *, on_update=None, **_kw: on_update and on_update("好")
+            acp.cancel = lambda *_a: True
+            acp.close = lambda: None
+            handler, kiro = self._handler(acp, self._store(tmp))
+            state = handler.state
+            state.contact_typing_states = {"kiro": {"is_typing": False, "since": None}}
+            state.chat_draft_lock = threading.Lock()
+            state.chat_drafts = {}
+            state.chat_reply_states = {}
+            state.chat_stream_revisions = {}
+            state.chat_stream_bus = ChatStreamBus()
+            handler._source_for_request = lambda suffix="": f"android-app:{suffix}"
+            with patch("push.threading.Thread", _immediate_thread):
+                handler._handle_kiro_chat_send({"text": "你好"}, "kiro")
+            self.assertEqual(200, handler.responses[-1][0])
+            self.assertEqual(("prepare", "auto", None), calls[0])
 
 
 if __name__ == "__main__":

@@ -179,8 +179,11 @@ from kiro_acp import (
     KiroACPQuotaExceeded,
 )
 # kiro 切模型 (2026-09-10): App 模型选择持久化，allowlist 来自 ACP 动态目录。
+# kiro 推理强度 (2026-09-10): effort 走封闭五档，不依赖动态目录。
 from kiro_preferences import (
+    KIRO_APP_DEFAULT_EFFORT,
     KIRO_APP_DEFAULT_MODEL,
+    KIRO_APP_EFFORTS,
     KiroPreferenceError,
     KiroPreferencePersistenceError,
     KiroPreferenceStore,
@@ -12999,7 +13002,14 @@ class PushHandler(BaseHTTPRequestHandler):
         try:
             # kiro 切模型 (2026-09-10)：每轮 prepare 重新钉住 App 选择的模型
             # （Kiro 不持久化 set_model，session/load 会回到默认）。
-            session_id = self.state.kiro_acp.prepare_session(model=self._kiro_model_selection())
+            # kiro 推理强度 (2026-09-10)：effort 钉选同理，模型钉选之后重放
+            # （effort 支持是模型条件化的），失败只降级不阻断本轮。
+            session_id = self.state.kiro_acp.prepare_session(
+                model=self._kiro_model_selection(),
+                # kiro 推理强度 (2026-09-10)：空档（用户从未显式选择）不 pin，
+                # 跟随 Kiro 自己的每模型默认。
+                effort=self._kiro_effort_selection() or None,
+            )
         except KiroACPAuthRequired:
             self._release_kiro_prepare(prepare_token)
             self.state.kiro_acp.close()
@@ -13253,7 +13263,12 @@ class PushHandler(BaseHTTPRequestHandler):
                 })
                 return
         try:
-            session_id = self.state.kiro_acp.new_session(model=self._kiro_model_selection())
+            # kiro 推理强度 (2026-09-10)：新会话同样重放模型与 effort 钉选；
+            # effort 空档不 pin。
+            session_id = self.state.kiro_acp.new_session(
+                model=self._kiro_model_selection(),
+                effort=self._kiro_effort_selection() or None,
+            )
         except KiroACPAuthRequired:
             self.state.kiro_acp.close()
             self._send_json(503, {"ok": False, "error": "kiro_auth_required"})
@@ -13275,18 +13290,29 @@ class PushHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True, "session_id": session_id})
 
     # ---------- kiro 切模型 (2026-09-10) — /kiro/preferences ----------
-    # 契约对照 /kimi/preferences（_kimi_preferences_payload），刻意更窄：Kiro
-    # 没有 effort 概念（ACP set_model 只收 modelId），模型目录来自 ACP
-    # session/new|load 的 availableModels，落盘缓存保证进程挂了也能回答 GET。
+    # 契约对照 /kimi/preferences（_kimi_preferences_payload），刻意更窄：模型
+    # 目录来自 ACP session/new|load 的 availableModels，落盘缓存保证进程挂了
+    # 也能回答 GET。
+    # kiro 推理强度 (2026-09-10)：effort 是封闭五档（low/medium/high/xhigh/
+    # max），经 _kiro.dev/commands/execute 的 TuiCommand 桥应用到会话；档位表
+    # 不依赖模型目录（Kiro 的 options 列表是模型条件化的，当前目录全为空），
+    # 当前模型不支持时应用失败只降级不阻断。
 
     def _kiro_model_selection(self) -> str:
         store = getattr(self.state, "kiro_preferences", None)
-        snapshot = getattr(store, "snapshot", None)
-        if callable(snapshot):
-            return str(snapshot() or KIRO_APP_DEFAULT_MODEL)
+        snapshot_model = getattr(store, "snapshot_model", None)
+        if callable(snapshot_model):
+            return str(snapshot_model() or KIRO_APP_DEFAULT_MODEL)
         # Compatibility for minimal in-process test doubles only. The real
         # ServerState always constructs KiroPreferenceStore above.
         return KIRO_APP_DEFAULT_MODEL
+
+    def _kiro_effort_selection(self) -> str:
+        store = getattr(self.state, "kiro_preferences", None)
+        snapshot_effort = getattr(store, "snapshot_effort", None)
+        if callable(snapshot_effort):
+            return str(snapshot_effort() or KIRO_APP_DEFAULT_EFFORT)
+        return KIRO_APP_DEFAULT_EFFORT
 
     def _kiro_busy(self) -> bool:
         acp = getattr(self.state, "kiro_acp", None)
@@ -13297,40 +13323,104 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _kiro_preferences_payload(self) -> dict[str, Any]:
         model = self._kiro_model_selection()
+        effort = self._kiro_effort_selection()
         entries, source = self.state.kiro_acp.available_models()
+        # kiro 状态栏 (2026-09-10): header status mirrors the Kimi contract —
+        # a presentation-safe model label plus a bounded context percent;
+        # session ids, paths, and provider diagnostics never leave.
+        acp = self.state.kiro_acp
+        current_model_id = getattr(acp, "current_model_id", None)
+        current_model = str(current_model_id() if callable(current_model_id) else "") or model
+        context_percent_raw = getattr(acp, "context_usage_percent", None)
+        context_percent = self._pwa_bounded_percent(
+            context_percent_raw() if callable(context_percent_raw) else None
+        )
+        header_model = next(
+            (str(entry.get("name") or "") for entry in entries if entry.get("id") == current_model),
+            "",
+        ) or current_model
+        header_text = (
+            f"{header_model} · {context_percent:.0f}%"
+            if header_model and context_percent is not None
+            else (header_model or "Kiro 状态加载中")
+        )
+        header_display = self._header_status_display(
+            text=header_text,
+            loading_text="Kiro 状态加载中",
+            unavailable_text="Kiro 状态暂不可用",
+            model=header_model,
+            context_percent=context_percent,
+        )
+        # kiro 推理强度 (2026-09-10): current_effort 是 wire 读回（metadata
+        # 通知），当前模型不支持或进程未起时为空串，不伪造。
+        current_effort_raw = getattr(acp, "current_effort", None)
+        current_effort = str(current_effort_raw() if callable(current_effort_raw) else "")
+        if current_effort not in KIRO_APP_EFFORTS:
+            current_effort = ""
         return {
             "ok": True,
             "provider": "Kiro",
             "models": entries,
             "available_models": [str(entry.get("id") or "") for entry in entries if entry.get("id")],
-            "selection": {"model": model},
+            "available_efforts": list(KIRO_APP_EFFORTS),
+            "selection": {"model": model, "effort": effort},
             "model": model,
+            "effort": effort,
+            "current_effort": current_effort,
             "busy": self._kiro_busy(),
             "catalog_source": source,
             "applies_from": "next_turn",
+            "current_model": current_model,
+            "context_usage_percent": context_percent,
+            "header_display": header_display,
         }
 
     def _handle_kiro_preferences_get(self) -> None:
         self._send_json(200, self._kiro_preferences_payload())
 
     def _handle_kiro_preferences_post(self, body: dict[str, Any]) -> None:
-        previous_model = self._kiro_model_selection()
-        store = self.state.kiro_preferences
-        catalog = getattr(store, "catalog", None)
-        if not callable(catalog) or not catalog():
-            self._send_json(503, {
+        # kiro 推理强度 (2026-09-10)：model 与 effort 可分别或一起提交；字段
+        # 缺席表示保持现状，两者都缺席才是 400。显式 JSON null 不是"缺席"——
+        # 它恢复旧行为的 400（此前 str(None or "") 走到校验必然失败）。
+        # model 仍要求动态目录在场（失败即 503），effort 只查封闭五档，不看目录。
+        has_model = "model" in body
+        has_effort = "effort" in body
+        if (has_model and body.get("model") is None) or (has_effort and body.get("effort") is None):
+            self._send_json(400, {
                 "ok": False,
-                "error": "kiro_model_catalog_unavailable",
-                "message": "Kiro 还没有上报可用模型列表；先给 Kiro 发一条消息完成一次会话握手后再试。",
+                "error": "invalid_kiro_selection",
+                "message": "model 必须来自 Kiro 当前上报的可用模型列表，effort 仅支持 low/medium/high/xhigh/max。",
             })
             return
+        if not has_model and not has_effort:
+            self._send_json(400, {
+                "ok": False,
+                "error": "invalid_kiro_selection",
+                "message": "model 必须来自 Kiro 当前上报的可用模型列表，effort 仅支持 low/medium/high/xhigh/max。",
+            })
+            return
+        store = self.state.kiro_preferences
+        if has_model:
+            catalog = getattr(store, "catalog", None)
+            if not callable(catalog) or not catalog():
+                self._send_json(503, {
+                    "ok": False,
+                    "error": "kiro_model_catalog_unavailable",
+                    "message": "Kiro 还没有上报可用模型列表；先给 Kiro 发一条消息完成一次会话握手后再试。",
+                })
+                return
+        previous_model = self._kiro_model_selection()
+        previous_effort = self._kiro_effort_selection()
         try:
-            model = store.save_validated(str(body.get("model") or ""))
+            model, effort = store.save_validated(
+                body.get("model") if has_model else None,
+                body.get("effort") if has_effort else None,
+            )
         except KiroPreferenceError:
             self._send_json(400, {
                 "ok": False,
                 "error": "invalid_kiro_selection",
-                "message": "model 必须来自 Kiro 当前上报的可用模型列表。",
+                "message": "model 必须来自 Kiro 当前上报的可用模型列表，effort 仅支持 low/medium/high/xhigh/max。",
             })
             return
         except KiroPreferencePersistenceError:
@@ -13340,22 +13430,41 @@ class PushHandler(BaseHTTPRequestHandler):
                 "error": "kiro_preferences_persistence_failed",
             })
             return
-        # 轮次进行中不在会话上插队 set_model；钉住即可，下一轮 prepare 生效。
-        applied_now = False
-        if self._kiro_busy():
-            try:
-                self.state.kiro_acp.pin_model(model)
-            except KiroACPError:
-                logger.warning("Kiro pin_model failed", exc_info=True)
+        # 轮次进行中不在会话上插队；钉住即可，下一轮 prepare 生效。effort 的
+        # 应用走 commands/execute，当前模型不支持时 Kiro 回 success:false，
+        # 选择已持久化，换支持的模型后 prepare 重放自愈。
+        busy = self._kiro_busy()
+        applied_model = applied_effort = False
+        if busy:
+            if has_model:
+                try:
+                    self.state.kiro_acp.pin_model(model)
+                except KiroACPError:
+                    logger.warning("Kiro pin_model failed", exc_info=True)
+            if has_effort:
+                try:
+                    self.state.kiro_acp.pin_effort(effort)
+                except KiroACPError:
+                    logger.warning("Kiro pin_effort failed", exc_info=True)
         else:
-            try:
-                self.state.kiro_acp.set_model(model)
-                applied_now = True
-            except KiroACPError:
-                # 进程未起/会话未备好：选择已持久化，下次 prepare 会应用。
-                logger.warning("Kiro set_model deferred to next prepare", exc_info=True)
-        if model != previous_model:
-            self._notify_kiro_model_switched(previous_model, model, applied_now=applied_now)
+            if has_model:
+                try:
+                    self.state.kiro_acp.set_model(model)
+                    applied_model = True
+                except KiroACPError:
+                    # 进程未起/会话未备好：选择已持久化，下次 prepare 会应用。
+                    logger.warning("Kiro set_model deferred to next prepare", exc_info=True)
+            if has_effort:
+                try:
+                    self.state.kiro_acp.set_effort(effort)
+                    applied_effort = True
+                except KiroACPError:
+                    logger.warning("Kiro set_effort deferred to next prepare", exc_info=True)
+        applied_now = (not busy) and (not has_model or applied_model) and (not has_effort or applied_effort)
+        if has_model and model != previous_model:
+            self._notify_kiro_model_switched(previous_model, model, applied_now=applied_model)
+        if has_effort and effort != previous_effort:
+            self._notify_kiro_effort_switched(previous_effort, effort, applied_now=applied_effort)
         payload = self._kiro_preferences_payload()
         payload["applied_immediately"] = applied_now
         self._send_json(200, payload)
@@ -13384,6 +13493,34 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_chat_notification("Kiro 已切换模型", text[:80])
         except Exception:
             logger.warning("Kiro model switch notification failed", exc_info=True)
+
+    def _notify_kiro_effort_switched(self, previous_effort: str, effort: str, *, applied_now: bool) -> None:
+        """Append + push a notice when the App picker changes Kiro's effort.
+
+        kiro 推理强度 (2026-09-10): 与 _notify_kiro_model_switched 同形。
+        effort 支持是模型条件化的——当前模型不支持时 Kiro 拒绝应用，选择
+        已持久化并会在切到支持的模型后由 prepare 重放，所以文案区分这两种
+        情况，让降级在聊天里可见。
+        """
+        if applied_now:
+            text = f"已把 Kiro 推理强度设为 {effort}，当前会话立即生效。"
+        else:
+            text = (
+                f"已把 Kiro 推理强度设为 {effort}。当前模型不支持或会话未就绪时暂不生效，"
+                "选择已保存，切到支持的模型后自动应用。"
+            )
+        try:
+            self._chat_for_contact("kiro").append(
+                role="assistant",
+                text=text,
+                source="system:kiro-effort-switch",
+            )
+        except Exception:
+            logger.exception("Kiro effort switch notice history append failed")
+        try:
+            self._send_chat_notification("Kiro 已切换推理强度", text[:80])
+        except Exception:
+            logger.warning("Kiro effort switch notification failed", exc_info=True)
 
     # ---------- kiro 桥接 (2026-09-09) 结束 ----------
 

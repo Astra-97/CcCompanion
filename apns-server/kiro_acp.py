@@ -17,6 +17,21 @@ pointer, and pins one allowlisted model via ``session/set_model``.  Kiro
 ids and ``session/load`` resets to the persisted default, so the pin is
 re-applied after every new/load and catalog membership is the only
 validation available on this side of the wire.
+
+kiro 推理强度 (2026-09-10): reasoning effort has no ``session/set_effort``
+RPC.  Wire probe against kiro-cli 2.21.2 (no prompts, no credits) showed the
+only path is the TuiCommand bridge ``_kiro.dev/commands/execute`` with
+``command={"command": "effort", "args": {"value": level}}``; the result is
+``{"success": bool, "message": str}`` where ``success: false`` is the normal
+answer on models without effort support (the whole current catalog: auto,
+sonnet, haiku, deepseek, minimax, glm, qwen — the error text itself suggests
+claude-opus-4.7, which this account is not offered).  The provider ``message``
+never leaves this module.  Read-back is passive: ``_kiro.dev/metadata``
+notifications carry an ``effort`` field on thinking-capable models.  Whether
+Kiro itself persists effort across session/new|load is unproven (no
+thinking-capable model on this account to observe it), so the client fails
+closed: the read-back cache is cleared on every session transition and the
+pin is re-applied after every new/load, exactly like the model pin.
 """
 from __future__ import annotations
 
@@ -139,6 +154,50 @@ def _clean_catalog_text(value: Any, maximum: int) -> str:
     return re.sub(r"\s+", " ", text).strip()[:maximum]
 
 
+# kiro 状态栏 (2026-09-10): Kiro pushes ``_kiro.dev/metadata`` notifications
+# carrying ``contextUsagePercentage``; the chat header shows the latest value.
+_METADATA_METHODS = frozenset({"_kiro.dev/metadata", "kiro.dev/metadata"})
+
+# kiro 推理强度 (2026-09-10): closed five-level set.  The wire options list
+# (``_kiro.dev/commands/options`` command="effort") is model-conditional and
+# empty on every model this account is offered, so it cannot serve as the
+# allowlist; these are the only values the App may ever send.
+KIRO_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _valid_effort(value: Any) -> str:
+    effort = str(value or "").strip().lower()
+    return effort if effort in KIRO_EFFORT_LEVELS else ""
+
+
+def _metadata_effort(params: Any) -> str:
+    """Extract a validated effort level from a metadata notification."""
+    if not isinstance(params, dict):
+        return ""
+    return _valid_effort(params.get("effort"))
+
+
+def _metadata_context_percent(params: Any) -> float | None:
+    """Extract a bounded contextUsagePercentage from a metadata notification."""
+    if not isinstance(params, dict):
+        return None
+    candidates: list[Any] = [params.get("contextUsagePercentage")]
+    for key in ("metadata", "data"):
+        nested = params.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested.get("contextUsagePercentage"))
+    for candidate in candidates:
+        if isinstance(candidate, bool):
+            continue
+        try:
+            percent = float(candidate)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if 0.0 <= percent <= 100.0:
+            return percent
+    return None
+
+
 def _classified_rpc_error(method: str, error: Any) -> KiroACPError:
     """Map one JSON-RPC error object to a typed, payload-free failure."""
     code = error.get("code") if isinstance(error, dict) else None
@@ -179,6 +238,16 @@ class KiroACPClient:
         self._available_models: list[dict[str, str]] = []
         self._current_model_id = ""
         self._pinned_model_id = ""
+        # kiro 状态栏 (2026-09-10): latest contextUsagePercentage from the
+        # wire; guarded by _catalog_lock like the rest of the header state.
+        self._context_usage_percent: float | None = None
+        # kiro 推理强度 (2026-09-10): pin + last wire-confirmed level, guarded
+        # by _catalog_lock.  _effort_deferred remembers the last
+        # (session, model, effort) combo whose re-apply was refused so a
+        # non-thinking model does not produce one warning per prepare.
+        self._pinned_effort = ""
+        self._current_effort = ""
+        self._effort_deferred: tuple[str, str, str] | None = None
         self.logger = logger or logging.getLogger(__name__)
         self.request_timeout = max(1.0, float(request_timeout))
         self.prompt_timeout = max(self.request_timeout, float(prompt_timeout))
@@ -336,6 +405,76 @@ class KiroACPClient:
         with self._catalog_lock:
             return self._current_model_id
 
+    def context_usage_percent(self) -> float | None:
+        """Latest contextUsagePercentage seen on the wire, None if never."""
+        with self._catalog_lock:
+            return self._context_usage_percent
+
+    # ---------- kiro 推理强度 (2026-09-10): effort pinning via TuiCommand ----
+
+    def current_effort(self) -> str:
+        """Last effort level confirmed on the wire ("" if never/unsupported)."""
+        with self._catalog_lock:
+            return self._current_effort
+
+    def pin_effort(self, effort: str) -> str:
+        """Pin one closed-set effort level for the next and current sessions."""
+        clean = _valid_effort(effort)
+        if not clean:
+            raise KiroACPError("invalid Kiro effort level")
+        # Re-pinning the same level must not clear the deferred marker, or a
+        # refused level would be re-attempted on every prepare.
+        if clean != self._pinned_effort:
+            self._pinned_effort = clean
+            self._effort_deferred = None
+        return clean
+
+    def set_effort(self, effort: str) -> str:
+        """Pin ``effort`` and apply it to the loaded session right now."""
+        clean = self.pin_effort(effort)
+        session_id = self._loaded_session_id
+        if not session_id or not self._process_alive():
+            raise KiroACPError("Kiro ACP session was not prepared")
+        result = self._request(
+            "_kiro.dev/commands/execute",
+            {
+                "sessionId": session_id,
+                "command": {"command": "effort", "args": {"value": clean}},
+            },
+            timeout=self.request_timeout,
+        )
+        if result.get("success") is not True:
+            # success:false 是模型不支持 effort 的常规应答（2.21.2 实测当前
+            # 目录所有模型如此）；provider 的 message 字段不出模块。
+            raise KiroACPError("Kiro effort is not available on the current model")
+        with self._catalog_lock:
+            self._current_effort = clean
+        self._effort_deferred = None
+        return clean
+
+    def _apply_pinned_effort(self) -> None:
+        """Re-apply the effort pin after new/load, after the model pin.
+
+        Effort support is model-conditional, so the model pin must land first.
+        A refusal is remembered per (session, model, effort) combo: the next
+        prepare retries only when one of the three changed, which keeps a
+        non-thinking model from logging one warning per user message while
+        still self-healing after a model switch or process restart.
+        """
+        pinned = self._pinned_effort
+        if not pinned:
+            return
+        combo = (self._loaded_session_id, self.current_model_id(), pinned)
+        if pinned == self.current_effort() or combo == self._effort_deferred:
+            return
+        try:
+            self.set_effort(pinned)
+        except KiroACPError:
+            # 钉选已持久化，模型切换或下次 prepare 自愈；一次重放失败不该
+            # 打死用户消息。
+            self._effort_deferred = combo
+            self.logger.warning("Kiro pinned effort re-apply failed; will retry when model or session changes", exc_info=True)
+
     def pin_model(self, model_id: str) -> str:
         """Pin one catalog model for the next and current sessions (no RPC)."""
         clean = _valid_model_id(model_id)
@@ -417,6 +556,11 @@ class KiroACPClient:
             generation = self._process_generation
             self._initialized = False
             self._loaded_session_id = ""
+            # kiro 推理强度 (2026-09-10): 新进程没有任何 effort 应用记录，
+            # 读回缓存必须清零，否则钉选会因"已是当前值"而不重放。
+            with self._catalog_lock:
+                self._current_effort = ""
+            self._effort_deferred = None
             self._stderr_done = threading.Event()
             self._stderr_auth_hint = False
             self._reader = threading.Thread(
@@ -511,6 +655,28 @@ class KiroACPClient:
                             activity_callback(activity)
                         except Exception:
                             self.logger.warning("Kiro ACP activity callback failed", exc_info=True)
+                    continue
+                # kiro 状态栏 (2026-09-10): cache the latest context usage
+                # percentage for the chat header; malformed values are dropped.
+                # Wire probe (2026-09-10): params carry sessionId plus a
+                # top-level contextUsagePercentage float; foreign sessions
+                # must never overwrite this client's own session state.
+                if message.get("method") in _METADATA_METHODS:
+                    params = message.get("params")
+                    metadata_session = (
+                        str(params.get("sessionId") or "") if isinstance(params, dict) else ""
+                    )
+                    if not metadata_session or metadata_session == self._loaded_session_id:
+                        percent = _metadata_context_percent(params)
+                        # kiro 推理强度 (2026-09-10): thinking-capable models
+                        # also carry the active effort level here (2.21.2 wire
+                        # probe + protocol doc); only closed-set values stick.
+                        effort = _metadata_effort(params)
+                        with self._catalog_lock:
+                            if percent is not None:
+                                self._context_usage_percent = percent
+                            if effort:
+                                self._current_effort = effort
                     continue
                 # Kiro can ask its ACP client for permission. Select a bounded
                 # one-turn approval; all other client-side requests fail closed.
@@ -616,6 +782,19 @@ class KiroACPClient:
             with self._pending_lock:
                 self._pending.pop(request_id, None)
 
+    def _reset_effort_readback(self) -> None:
+        """Drop the wire effort read-back cache on any session transition.
+
+        kiro 推理强度 (2026-09-10): whether Kiro persists effort across
+        session/new|load is unproven — this account is offered no
+        thinking-capable model, so it cannot be observed on the wire.  The
+        client therefore fails closed: every session switch clears the cache,
+        forcing ``_apply_pinned_effort`` to re-apply instead of trusting a
+        stale "already current" shortcut from the previous session.
+        """
+        with self._catalog_lock:
+            self._current_effort = ""
+
     def _load_existing_session(self, session_id: str) -> str:
         """Load one known session without changing the durable session pointer."""
         clean = self._valid_session_id(session_id)
@@ -632,6 +811,7 @@ class KiroACPClient:
             raise KiroACPError("Kiro ACP loaded an unexpected session")
         self._capture_model_catalog(result)
         self._loaded_session_id = loaded
+        self._reset_effort_readback()
         return loaded
 
     def _new_session_id(self) -> str:
@@ -645,6 +825,7 @@ class KiroACPClient:
             raise KiroACPError("Kiro ACP did not return a session id")
         self._capture_model_catalog(result)
         self._loaded_session_id = session_id
+        self._reset_effort_readback()
         return session_id
 
     def _new_or_load_session(self) -> str:
@@ -662,30 +843,40 @@ class KiroACPClient:
         self._save_session_id(session_id)
         return session_id
 
-    def prepare_session(self, *, model: str | None = None) -> str:
+    def prepare_session(self, *, model: str | None = None, effort: str | None = None) -> str:
         """Start the ACP process if needed and return the current session id.
 
         kiro 切模型 (2026-09-10): ``model`` pins the App-owned selection; the
         pin is re-applied after every new/load because Kiro persists neither
         set_model nor a read-back across session/load.
+
+        kiro 推理强度 (2026-09-10): ``effort`` pins the App-owned level the
+        same way; it is applied after the model pin because effort support is
+        model-conditional, and a refusal never blocks the turn.
         """
         with self._prepare_lock:
             if model is not None:
                 self.pin_model(model)
+            if effort is not None:
+                self.pin_effort(effort)
             self._start()
             session_id = self._new_or_load_session()
             self._apply_pinned_model()
+            self._apply_pinned_effort()
             return session_id
 
-    def new_session(self, *, model: str | None = None) -> str:
+    def new_session(self, *, model: str | None = None, effort: str | None = None) -> str:
         """Explicitly abandon the persisted pointer and start a fresh session."""
         with self._prepare_lock:
             if model is not None:
                 self.pin_model(model)
+            if effort is not None:
+                self.pin_effort(effort)
             self._start()
             session_id = self._new_session_id()
             self._save_session_id(session_id)
             self._apply_pinned_model()
+            self._apply_pinned_effort()
             return session_id
 
     def prompt_existing(
