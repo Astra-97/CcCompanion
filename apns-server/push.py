@@ -178,6 +178,13 @@ from kiro_acp import (
     KiroACPError,
     KiroACPQuotaExceeded,
 )
+# kiro 切模型 (2026-09-10): App 模型选择持久化，allowlist 来自 ACP 动态目录。
+from kiro_preferences import (
+    KIRO_APP_DEFAULT_MODEL,
+    KiroPreferenceError,
+    KiroPreferencePersistenceError,
+    KiroPreferenceStore,
+)
 from reader_themes import load_reader_themes, reader_themes_config_path
 from kimi_web_client import KimiWebClient, KimiWebError, KimiWebRecoveryConflict, KimiWebSessionBusy
 from contacts import (
@@ -4300,6 +4307,12 @@ class ServerState:
             request_timeout=float(server_cfg.get("kiro_acp_request_timeout_seconds", 30)),
             prompt_timeout=float(server_cfg.get("kiro_acp_prompt_timeout_seconds", 900)),
         )
+        # kiro 切模型 (2026-09-10)：选择持久化在 kiro_preferences.json，allowlist
+        # 动态取自 kiro_acp 的模型目录（session/new|load 捕获 + 磁盘缓存）。
+        self.kiro_preferences = KiroPreferenceStore(
+            contact_history_dir / "kiro_preferences.json",
+            catalog_loader=self.kiro_acp.available_model_ids,
+        )
         self.kimi_web = KimiWebClient(
             command=server_cfg.get("kimi_bin", "/root/.kimi-code/bin/kimi"),
             port=int(server_cfg.get("kimi_web_port", 58627)),
@@ -6754,7 +6767,8 @@ class PushHandler(BaseHTTPRequestHandler):
         # Kimi control is native-App control, not a PWA capability.  Keep it
         # behind the shared secret even when legacy strict_auth is disabled;
         # importantly, this happens before the generic cookie-aware auth.
-        if request_path.startswith("/kimi/") and not self._native_pairing_auth_matches():
+        # kiro 切模型 (2026-09-10): /kiro/ 控制台走同一道 native pairing 闸门。
+        if request_path.startswith(("/kimi/", "/kiro/")) and not self._native_pairing_auth_matches():
             self._send_json(401, {"ok": False, "error": "unauthorized"})
             return
         # The Kimi interactive terminal is privileged even on a legacy
@@ -7392,7 +7406,8 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         if not self._check_ip_allowed():
             return
-        if request_path.startswith("/kimi/") and not self._native_pairing_auth_matches():
+        # kiro 切模型 (2026-09-10): /kiro/ 与 /kimi/ 同一道 native pairing 闸门。
+        if request_path.startswith(("/kimi/", "/kiro/")) and not self._native_pairing_auth_matches():
             self._send_json(401, {"ok": False, "error": "unauthorized"})
             return
         # session/target lives in the JSON body for these routes. Fail closed
@@ -12982,7 +12997,9 @@ class PushHandler(BaseHTTPRequestHandler):
             self.state.kiro_prepare_token = prepare_token
 
         try:
-            session_id = self.state.kiro_acp.prepare_session()
+            # kiro 切模型 (2026-09-10)：每轮 prepare 重新钉住 App 选择的模型
+            # （Kiro 不持久化 set_model，session/load 会回到默认）。
+            session_id = self.state.kiro_acp.prepare_session(model=self._kiro_model_selection())
         except KiroACPAuthRequired:
             self._release_kiro_prepare(prepare_token)
             self.state.kiro_acp.close()
@@ -13236,7 +13253,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 })
                 return
         try:
-            session_id = self.state.kiro_acp.new_session()
+            session_id = self.state.kiro_acp.new_session(model=self._kiro_model_selection())
         except KiroACPAuthRequired:
             self.state.kiro_acp.close()
             self._send_json(503, {"ok": False, "error": "kiro_auth_required"})
@@ -13256,6 +13273,117 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception:
             logger.exception("Kiro new-session notice append failed")
         self._send_json(200, {"ok": True, "session_id": session_id})
+
+    # ---------- kiro 切模型 (2026-09-10) — /kiro/preferences ----------
+    # 契约对照 /kimi/preferences（_kimi_preferences_payload），刻意更窄：Kiro
+    # 没有 effort 概念（ACP set_model 只收 modelId），模型目录来自 ACP
+    # session/new|load 的 availableModels，落盘缓存保证进程挂了也能回答 GET。
+
+    def _kiro_model_selection(self) -> str:
+        store = getattr(self.state, "kiro_preferences", None)
+        snapshot = getattr(store, "snapshot", None)
+        if callable(snapshot):
+            return str(snapshot() or KIRO_APP_DEFAULT_MODEL)
+        # Compatibility for minimal in-process test doubles only. The real
+        # ServerState always constructs KiroPreferenceStore above.
+        return KIRO_APP_DEFAULT_MODEL
+
+    def _kiro_busy(self) -> bool:
+        acp = getattr(self.state, "kiro_acp", None)
+        if acp is not None and getattr(acp, "busy", False):
+            return True
+        with self.state.kiro_turn_lock:
+            return bool(self.state.kiro_active_turn or self.state.kiro_prepare_token)
+
+    def _kiro_preferences_payload(self) -> dict[str, Any]:
+        model = self._kiro_model_selection()
+        entries, source = self.state.kiro_acp.available_models()
+        return {
+            "ok": True,
+            "provider": "Kiro",
+            "models": entries,
+            "available_models": [str(entry.get("id") or "") for entry in entries if entry.get("id")],
+            "selection": {"model": model},
+            "model": model,
+            "busy": self._kiro_busy(),
+            "catalog_source": source,
+            "applies_from": "next_turn",
+        }
+
+    def _handle_kiro_preferences_get(self) -> None:
+        self._send_json(200, self._kiro_preferences_payload())
+
+    def _handle_kiro_preferences_post(self, body: dict[str, Any]) -> None:
+        previous_model = self._kiro_model_selection()
+        store = self.state.kiro_preferences
+        catalog = getattr(store, "catalog", None)
+        if not callable(catalog) or not catalog():
+            self._send_json(503, {
+                "ok": False,
+                "error": "kiro_model_catalog_unavailable",
+                "message": "Kiro 还没有上报可用模型列表；先给 Kiro 发一条消息完成一次会话握手后再试。",
+            })
+            return
+        try:
+            model = store.save_validated(str(body.get("model") or ""))
+        except KiroPreferenceError:
+            self._send_json(400, {
+                "ok": False,
+                "error": "invalid_kiro_selection",
+                "message": "model 必须来自 Kiro 当前上报的可用模型列表。",
+            })
+            return
+        except KiroPreferencePersistenceError:
+            logger.exception("persist Kiro preferences failed")
+            self._send_json(500, {
+                "ok": False,
+                "error": "kiro_preferences_persistence_failed",
+            })
+            return
+        # 轮次进行中不在会话上插队 set_model；钉住即可，下一轮 prepare 生效。
+        applied_now = False
+        if self._kiro_busy():
+            try:
+                self.state.kiro_acp.pin_model(model)
+            except KiroACPError:
+                logger.warning("Kiro pin_model failed", exc_info=True)
+        else:
+            try:
+                self.state.kiro_acp.set_model(model)
+                applied_now = True
+            except KiroACPError:
+                # 进程未起/会话未备好：选择已持久化，下次 prepare 会应用。
+                logger.warning("Kiro set_model deferred to next prepare", exc_info=True)
+        if model != previous_model:
+            self._notify_kiro_model_switched(previous_model, model, applied_now=applied_now)
+        payload = self._kiro_preferences_payload()
+        payload["applied_immediately"] = applied_now
+        self._send_json(200, payload)
+
+    def _notify_kiro_model_switched(self, previous_model: str, model: str, *, applied_now: bool) -> None:
+        """Append + push a notice when the App picker moves Kiro to a new model.
+
+        Same shape as ``_notify_kimi_model_switched``: role=assistant is
+        required because Android's RealtimeNotificationService only notifies
+        on assistant rows.  set_model 不跨 session/load 持久，所以无论如何都
+        会在下一次 prepare 重新钉选；applied_now 只决定文案。
+        """
+        if applied_now:
+            text = f"已切到 {model} 模型，当前会话立即生效。"
+        else:
+            text = f"已切到 {model} 模型。从下一条回复开始生效，当前会话与上下文保持不变。"
+        try:
+            self._chat_for_contact("kiro").append(
+                role="assistant",
+                text=text,
+                source="system:kiro-model-switch",
+            )
+        except Exception:
+            logger.exception("Kiro model switch notice history append failed")
+        try:
+            self._send_chat_notification("Kiro 已切换模型", text[:80])
+        except Exception:
+            logger.warning("Kiro model switch notification failed", exc_info=True)
 
     # ---------- kiro 桥接 (2026-09-09) 结束 ----------
 

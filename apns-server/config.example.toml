@@ -168,6 +168,9 @@ allowed_ips = []
 # kiro_cwd = "/root/Karami-Workspace"
 # kiro_acp_request_timeout_seconds = 30
 # kiro_acp_prompt_timeout_seconds = 900
+# kiro 切模型 (2026-09-10)：模型选择由 App 端 /kiro/preferences 管理，持久化在
+# tokens/kiro_preferences.json；可选目录来自 ACP 动态上报，缓存在
+# tokens/kiro_models_cache.json。无配置项，默认 auto（Kiro 自动路由）。
 # Kairos App turns auto-forge after the completed reply has been persisted.
 # The old session is claimed at most once across service restarts.
 # codex_auto_forge_enabled = true

@@ -25,10 +25,17 @@ from kiro_acp import (
     _classified_rpc_error,
     _text_from_update,
 )
+# kiro 切模型 (2026-09-10)
+from kiro_preferences import (
+    KIRO_APP_DEFAULT_MODEL,
+    KiroPreferenceError,
+    KiroPreferenceStore,
+)
 from chat_history import ChatStreamBus
 from contacts import (
     chat_contact_directory,
     default_contact_routes,
+    dispatch_contact_get,
     dispatch_contact_post,
     dispatch_contact_send,
 )
@@ -499,11 +506,11 @@ class KiroChatHandlerTest(unittest.TestCase):
                 raise failure
 
         return types.SimpleNamespace(
-            prepare_session=lambda: "kiro-session-1",
+            prepare_session=lambda **_kw: "kiro-session-1",
             prompt_existing=prompt_existing,
             cancel=lambda _turn, _session: True,
             close=lambda: None,
-            new_session=lambda: "kiro-session-2",
+            new_session=lambda **_kw: "kiro-session-2",
         )
 
     def test_send_happy_path_appends_user_and_assistant(self):
@@ -575,7 +582,7 @@ class KiroChatHandlerTest(unittest.TestCase):
         self.assertEqual([], kiro.records)
 
     def test_auth_required_at_prepare_is_clean_503_without_history(self):
-        def prepare():
+        def prepare(**_kwargs):
             raise KiroACPAuthRequired("Kiro login is required")
 
         acp = self._acp()
@@ -592,7 +599,7 @@ class KiroChatHandlerTest(unittest.TestCase):
         self.assertEqual("", handler.state.kiro_prepare_token)
 
     def test_quota_exceeded_at_prepare_is_clean_503(self):
-        def prepare():
+        def prepare(**_kwargs):
             raise KiroACPQuotaExceeded("Kiro credits or quota are exhausted")
 
         acp = self._acp()
@@ -604,7 +611,7 @@ class KiroChatHandlerTest(unittest.TestCase):
         self.assertEqual([], kiro.records)
 
     def test_generic_prepare_failure_never_leaks_internal_detail(self):
-        def prepare():
+        def prepare(**_kwargs):
             raise KiroACPError("Kiro ACP /private/path failed")
 
         acp = self._acp()
@@ -680,7 +687,7 @@ class KiroChatHandlerTest(unittest.TestCase):
     def test_new_session_rejected_while_turn_active(self):
         acp = self._acp()
         called = []
-        acp.new_session = lambda: called.append(True) or "x"
+        acp.new_session = lambda **_kw: called.append(True) or "x"
         handler, kiro, _xiaoke = self._handler(acp)
         handler.state.kiro_active_turn = {"user_ts": "t", "cancel_event": threading.Event(), "session_id": "s"}
         handler._handle_kiro_new_session({})
@@ -692,6 +699,400 @@ class KiroChatHandlerTest(unittest.TestCase):
         handler._handle_kiro_new_session = lambda body: handler.calls.append(body)
         self.assertTrue(dispatch_contact_post(handler, "/kiro/new_session", {}))
         self.assertEqual([{}], handler.calls)
+
+
+# ---------------------------------------------------------------------------
+# kiro 切模型 (2026-09-10): catalog capture, pinning, preference store, routes
+# ---------------------------------------------------------------------------
+
+_KIRO_MODELS_BLOCK = {
+    "currentModelId": "auto",
+    "availableModels": [
+        {"modelId": "auto", "name": "auto", "description": "Models chosen by task"},
+        {"modelId": "claude-sonnet-4.5", "name": "claude-sonnet-4.5", "description": "Sonnet"},
+        {"modelId": "claude-haiku-4.5", "name": "claude-haiku-4.5", "description": "Haiku"},
+        # Wire junk is dropped: bad ids, duplicates, control characters.
+        {"modelId": "bad id with spaces", "name": "x", "description": "y"},
+        {"modelId": "auto", "name": "dupe", "description": "dupe"},
+        {"modelId": "glm-5", "name": "gl\x00m\n5", "description": "GLM\x1f"},
+    ],
+}
+
+
+def _catalog_handler(session_id="kiro-session-1"):
+    base = _basic_handler(session_id)
+
+    def handle(process, message):
+        method = message.get("method")
+        if method == "session/new":
+            return [{"jsonrpc": "2.0", "id": message["id"], "result": {
+                "sessionId": session_id, "models": _KIRO_MODELS_BLOCK,
+            }}]
+        if method == "session/load":
+            return [{"jsonrpc": "2.0", "id": message["id"], "result": {
+                "sessionId": message["params"]["sessionId"], "models": _KIRO_MODELS_BLOCK,
+            }}]
+        if method == "session/set_model":
+            return [{"jsonrpc": "2.0", "id": message["id"], "result": {}}]
+        return base(process, message)
+
+    return handle
+
+
+class KiroModelCatalogTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state_path = str(Path(self.tmp.name) / "kiro_acp_session.json")
+
+    def _client(self, factory):
+        return KiroACPClient(
+            command="/fake/kiro-cli",
+            cwd=self.tmp.name,
+            state_path=self.state_path,
+            request_timeout=5,
+            prompt_timeout=10,
+            popen_factory=factory,
+        )
+
+    def test_catalog_captured_sanitized_and_cached(self):
+        process = FakeKiroACPProcess(_catalog_handler())
+        client = self._client(_scripted_factory([process]))
+
+        client.prepare_session()
+
+        entries, source = client.available_models()
+        self.assertEqual("live", source)
+        self.assertEqual(
+            ["auto", "claude-sonnet-4.5", "claude-haiku-4.5", "glm-5"],
+            [entry["id"] for entry in entries],
+        )
+        self.assertEqual("gl m 5", entries[-1]["name"])
+        self.assertEqual("auto", client.current_model_id())
+        # Cache file landed next to the session pointer with 0600.
+        cache_path = Path(self.tmp.name) / "kiro_models_cache.json"
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        self.assertEqual(1, payload["version"])
+        self.assertEqual(4, len(payload["models"]))
+        self.assertEqual(0o600, cache_path.stat().st_mode & 0o777)
+
+    def test_fresh_client_reads_catalog_from_cache(self):
+        process = FakeKiroACPProcess(_catalog_handler())
+        first = self._client(_scripted_factory([process]))
+        first.prepare_session()
+
+        second = self._client(_scripted_factory([]))
+        entries, source = second.available_models()
+        self.assertEqual("cache", source)
+        self.assertEqual(("auto", "claude-sonnet-4.5", "claude-haiku-4.5", "glm-5"),
+                         second.available_model_ids())
+
+        empty = KiroACPClient(
+            command="/fake/kiro-cli",
+            cwd=self.tmp.name,
+            state_path=str(Path(self.tmp.name) / "other_session.json"),
+            request_timeout=5,
+            prompt_timeout=10,
+            popen_factory=_scripted_factory([]),
+            catalog_path=str(Path(self.tmp.name) / "absent_cache.json"),
+        )
+        self.assertEqual(([], "none"), empty.available_models())
+
+    def test_prepare_with_model_pins_and_sets_model_once(self):
+        process = FakeKiroACPProcess(_catalog_handler())
+        client = self._client(_scripted_factory([process]))
+
+        session_id = client.prepare_session(model="claude-haiku-4.5")
+
+        self.assertEqual("kiro-session-1", session_id)
+        set_calls = [r for r in process.requests if r.get("method") == "session/set_model"]
+        self.assertEqual(1, len(set_calls))
+        self.assertEqual({"sessionId": "kiro-session-1", "modelId": "claude-haiku-4.5"},
+                         set_calls[0]["params"])
+        self.assertEqual("claude-haiku-4.5", client.current_model_id())
+        # A second prepare sees the pin already current and stays quiet.
+        client.prepare_session(model="claude-haiku-4.5")
+        set_calls = [r for r in process.requests if r.get("method") == "session/set_model"]
+        self.assertEqual(1, len(set_calls))
+
+    def test_pinned_model_reapply_failure_does_not_break_prepare(self):
+        # set_model RPC 失败只告警不抛出——钉选已持久化，下次 prepare 自愈。
+        base = _catalog_handler()
+
+        def handle(process, message):
+            if message.get("method") == "session/set_model":
+                return [{"jsonrpc": "2.0", "id": message["id"],
+                         "error": {"code": -32000, "message": "boom"}}]
+            return base(process, message)
+
+        process = FakeKiroACPProcess(handle)
+        client = self._client(_scripted_factory([process]))
+        client.pin_model("claude-haiku-4.5")
+
+        session_id = client.prepare_session()
+
+        self.assertEqual("kiro-session-1", session_id)
+
+    def test_pin_survives_restart_and_reapplies_after_load(self):
+        Path(self.state_path).write_text(
+            json.dumps({"version": 2, "session_id": "durable", "cwd": str(Path(self.tmp.name).resolve())}),
+            encoding="utf-8",
+        )
+        first = FakeKiroACPProcess(_catalog_handler(session_id="durable"))
+        client = self._client(_scripted_factory([first]))
+        client.prepare_session(model="claude-sonnet-4.5")
+        client.close()
+
+        # After a process restart the session reloads with currentModelId
+        # reset to auto, so the pin must be re-applied on the fresh process.
+        second = FakeKiroACPProcess(_catalog_handler(session_id="durable"))
+        client._popen_factory = _scripted_factory([second])
+        self.assertEqual("durable", client.prepare_session())
+        set_calls = [r for r in second.requests if r.get("method") == "session/set_model"]
+        self.assertEqual(1, len(set_calls))
+        self.assertEqual("claude-sonnet-4.5", set_calls[0]["params"]["modelId"])
+
+    def test_pin_not_in_catalog_is_skipped_on_prepare(self):
+        def handler_no_haiku(process, message):
+            if message.get("method") == "session/new":
+                return [{"jsonrpc": "2.0", "id": message["id"], "result": {
+                    "sessionId": "s1",
+                    "models": {"currentModelId": "auto", "availableModels": [
+                        {"modelId": "auto", "name": "auto", "description": ""},
+                    ]},
+                }}]
+            return _basic_handler(session_id="s1")(process, message)
+
+        # The pin predates the catalog (e.g. saved while the plan offered it).
+        process = FakeKiroACPProcess(_catalog_handler(session_id="s1"))
+        client = self._client(_scripted_factory([process]))
+        client.prepare_session(model="claude-haiku-4.5")
+        client.close()
+        shrunk = FakeKiroACPProcess(handler_no_haiku)
+        client._popen_factory = _scripted_factory([shrunk])
+        client._loaded_session_id = ""
+        client._save_session_id("s1")
+        # Fresh pointer state: force a re-new by removing the pointer.
+        Path(self.state_path).unlink()
+
+        self.assertEqual("s1", client.prepare_session())
+        set_calls = [r for r in shrunk.requests if r.get("method") == "session/set_model"]
+        self.assertEqual([], set_calls)
+
+    def test_set_model_validates_against_catalog_and_charset(self):
+        process = FakeKiroACPProcess(_catalog_handler())
+        client = self._client(_scripted_factory([process]))
+        client.prepare_session()
+        with self.assertRaisesRegex(KiroACPError, "not in the available catalog"):
+            client.set_model("gpt-99")
+        with self.assertRaisesRegex(KiroACPError, "invalid Kiro model id"):
+            client.set_model("bad id")
+        with self.assertRaisesRegex(KiroACPError, "not prepared"):
+            self._client(_scripted_factory([])).set_model("auto")
+
+    def test_new_session_applies_model(self):
+        process = FakeKiroACPProcess(_catalog_handler(session_id="fresh"))
+        client = self._client(_scripted_factory([process]))
+        self.assertEqual("fresh", client.new_session(model="glm-5"))
+        set_calls = [r for r in process.requests if r.get("method") == "session/set_model"]
+        self.assertEqual("glm-5", set_calls[0]["params"]["modelId"])
+        self.assertEqual("fresh", client.load_session_id())
+
+
+class KiroPreferenceStoreTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "kiro_preferences.json"
+
+    def _store(self, catalog=("auto", "claude-haiku-4.5")):
+        return KiroPreferenceStore(self.path, catalog_loader=lambda: catalog)
+
+    def test_default_is_auto_and_persists_across_instances(self):
+        store = self._store()
+        self.assertEqual(KIRO_APP_DEFAULT_MODEL, store.snapshot())
+        self.assertEqual("claude-haiku-4.5", store.save_validated("claude-haiku-4.5"))
+        self.assertEqual(0o600, self.path.stat().st_mode & 0o777)
+        self.assertEqual("claude-haiku-4.5", self._store().snapshot())
+
+    def test_empty_catalog_fails_closed(self):
+        store = self._store(catalog=())
+        self.assertEqual("auto", store.snapshot())
+        with self.assertRaises(KiroPreferenceError):
+            store.save_validated("auto")
+        self.assertFalse(self.path.exists())
+
+    def test_unknown_or_malformed_model_rejected(self):
+        store = self._store()
+        for bad in ("gpt-99", "", "../escape", "a" * 300):
+            with self.assertRaises(KiroPreferenceError, msg=bad):
+                store.save_validated(bad)
+        self.assertEqual("auto", store.snapshot())
+
+    def test_catalog_contradiction_drops_persisted_model(self):
+        store = self._store()
+        store.save_validated("claude-haiku-4.5")
+        shrunk = KiroPreferenceStore(self.path, catalog_loader=lambda: ("auto",))
+        self.assertEqual("auto", shrunk.snapshot())
+        # An unavailable catalog cannot disprove a persisted selection.
+        offline = KiroPreferenceStore(self.path, catalog_loader=lambda: ())
+        self.assertEqual("claude-haiku-4.5", offline.snapshot())
+
+
+class KiroPreferencesHandlerTest(unittest.TestCase):
+    def _handler(self, acp, store):
+        kiro = FakeChat()
+        state = types.SimpleNamespace(
+            contact_chats={"kiro": kiro},
+            kiro_turn_lock=threading.RLock(),
+            kiro_active_turn={},
+            kiro_prepare_token="",
+            kiro_acp=acp,
+            kiro_preferences=store,
+        )
+        handler = object.__new__(PushHandler)
+        handler.state = state
+        handler.responses = []
+        handler._send_json = lambda status, payload: handler.responses.append((status, payload))
+        handler._chat_for_contact = lambda contact_id: state.contact_chats[contact_id]
+        handler._send_chat_notification = lambda *a, **k: None
+        return handler, kiro
+
+    def _acp(self, calls, models=("auto", "claude-haiku-4.5", "claude-sonnet-4.5")):
+        entries = [{"id": m, "name": m, "description": f"{m} desc"} for m in models]
+        return types.SimpleNamespace(
+            available_models=lambda: (entries, "live"),
+            available_model_ids=lambda: models,
+            set_model=lambda m: calls.append(("set_model", m)) or m,
+            pin_model=lambda m: calls.append(("pin_model", m)) or m,
+            busy=False,
+        )
+
+    def _store(self, tmp, catalog=("auto", "claude-haiku-4.5", "claude-sonnet-4.5")):
+        return KiroPreferenceStore(Path(tmp) / "kiro_preferences.json", catalog_loader=lambda: catalog)
+
+    def test_get_payload_mirrors_kimi_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            handler, _kiro = self._handler(self._acp(calls), self._store(tmp))
+            handler._handle_kiro_preferences_get()
+        status, payload = handler.responses[-1]
+        self.assertEqual(200, status)
+        self.assertEqual("Kiro", payload["provider"])
+        self.assertEqual("auto", payload["model"])
+        self.assertEqual("auto", payload["selection"]["model"])
+        self.assertEqual(["auto", "claude-haiku-4.5", "claude-sonnet-4.5"], payload["available_models"])
+        self.assertEqual("claude-haiku-4.5 desc", payload["models"][1]["description"])
+        self.assertEqual("live", payload["catalog_source"])
+        self.assertFalse(payload["busy"])
+        self.assertEqual("next_turn", payload["applies_from"])
+
+    def test_post_valid_model_persists_applies_and_notifies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            handler, kiro = self._handler(self._acp(calls), self._store(tmp))
+            handler._handle_kiro_preferences_post({"model": "claude-haiku-4.5"})
+            status, payload = handler.responses[-1]
+            self.assertEqual(200, status)
+            self.assertTrue(payload["applied_immediately"])
+            self.assertEqual("claude-haiku-4.5", payload["model"])
+            self.assertEqual([("set_model", "claude-haiku-4.5")], calls)
+            persisted = json.loads((Path(tmp) / "kiro_preferences.json").read_text(encoding="utf-8"))
+            self.assertEqual("claude-haiku-4.5", persisted["model"])
+            self.assertIn("已切到 claude-haiku-4.5 模型", kiro.records[-1]["text"])
+            self.assertEqual("system:kiro-model-switch", kiro.records[-1]["source"])
+            # 选择跨重启保留。
+            self.assertEqual("claude-haiku-4.5", self._store(tmp).snapshot())
+
+    def test_post_same_model_does_not_notify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            handler, kiro = self._handler(self._acp(calls), self._store(tmp))
+            handler._handle_kiro_preferences_post({"model": "auto"})
+            self.assertEqual(200, handler.responses[-1][0])
+            self.assertEqual([], kiro.records)
+
+    def test_post_invalid_model_is_400_and_unknown_catalog_is_503(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            handler, kiro = self._handler(self._acp(calls), self._store(tmp))
+            handler._handle_kiro_preferences_post({"model": "gpt-99"})
+            self.assertEqual(400, handler.responses[-1][0])
+            self.assertEqual("invalid_kiro_selection", handler.responses[-1][1]["error"])
+            self.assertEqual([], calls)
+            self.assertEqual([], kiro.records)
+
+            empty_store = KiroPreferenceStore(Path(tmp) / "other.json", catalog_loader=lambda: ())
+            handler2, _ = self._handler(self._acp([]), empty_store)
+            handler2._handle_kiro_preferences_post({"model": "auto"})
+            self.assertEqual(503, handler2.responses[-1][0])
+            self.assertEqual("kiro_model_catalog_unavailable", handler2.responses[-1][1]["error"])
+
+    def test_post_while_busy_pins_without_set_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            acp = self._acp(calls)
+            acp.busy = True
+            handler, kiro = self._handler(acp, self._store(tmp))
+            handler.state.kiro_active_turn = {"user_ts": "t", "cancel_event": threading.Event(), "session_id": "s"}
+            handler._handle_kiro_preferences_post({"model": "claude-sonnet-4.5"})
+            status, payload = handler.responses[-1]
+            self.assertEqual(200, status)
+            self.assertFalse(payload["applied_immediately"])
+            self.assertEqual([("pin_model", "claude-sonnet-4.5")], calls)
+            self.assertIn("下一条回复", kiro.records[-1]["text"])
+            self.assertTrue(payload["busy"])
+
+    def test_post_set_model_failure_still_saves_for_next_prepare(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            acp = self._acp(calls)
+
+            def failing_set(model):
+                calls.append(("set_model", model))
+                raise KiroACPError("Kiro ACP session was not prepared")
+
+            acp.set_model = failing_set
+            handler, kiro = self._handler(acp, self._store(tmp))
+            handler._handle_kiro_preferences_post({"model": "claude-haiku-4.5"})
+            status, payload = handler.responses[-1]
+            self.assertEqual(200, status)
+            self.assertFalse(payload["applied_immediately"])
+            self.assertIn("下一条回复", kiro.records[-1]["text"])
+            self.assertNotIn("not prepared", kiro.records[-1]["text"])
+
+    def test_preferences_routes_dispatch_through_registry(self):
+        handler = types.SimpleNamespace(calls=[])
+        handler._handle_kiro_preferences_get = lambda: handler.calls.append(("get",))
+        handler._handle_kiro_preferences_post = lambda body: handler.calls.append(("post", body))
+        self.assertTrue(dispatch_contact_get(handler, "/kiro/preferences"))
+        self.assertTrue(dispatch_contact_post(handler, "/kiro/preferences", {"model": "auto"}))
+        self.assertEqual([("get",), ("post", {"model": "auto"})], handler.calls)
+
+    def test_chat_prepare_forwards_persisted_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            acp = self._acp(calls)
+            acp.prepare_session = lambda **kw: calls.append(("prepare", kw.get("model"))) or "s1"
+            acp.prompt_existing = lambda text, *, on_update=None, **_kw: on_update and on_update("好")
+            acp.cancel = lambda *_a: True
+            acp.close = lambda: None
+            store = self._store(tmp)
+            store.save_validated("claude-haiku-4.5")
+            handler, kiro = self._handler(acp, store)
+            state = handler.state
+            # chat send 需要的状态件补齐。
+            state.contact_typing_states = {"kiro": {"is_typing": False, "since": None}}
+            state.chat_draft_lock = threading.Lock()
+            state.chat_drafts = {}
+            state.chat_reply_states = {}
+            state.chat_stream_revisions = {}
+            state.chat_stream_bus = ChatStreamBus()
+            handler._source_for_request = lambda suffix="": f"android-app:{suffix}"
+            with patch("push.threading.Thread", _immediate_thread):
+                handler._handle_kiro_chat_send({"text": "你好"}, "kiro")
+            self.assertEqual(200, handler.responses[-1][0])
+            self.assertEqual(("prepare", "claude-haiku-4.5"), calls[0])
 
 
 if __name__ == "__main__":

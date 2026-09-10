@@ -1,8 +1,11 @@
 """Kiro-specific registration and ingress policy (kiro 桥接 2026-09-09).
 
 Phase 1: text chat + durable ACP session continuity only.  Attachments,
-voice, cards, model switching, stop and forge are later phases and are
-rejected at the ingress boundary instead of being silently dropped.
+voice, cards, stop and forge are later phases and are rejected at the
+ingress boundary instead of being silently dropped.
+
+kiro 切模型 (2026-09-10): /kiro/preferences GET/POST — 模型目录查询与切换，
+契约对照 /kimi/preferences（无 effort 维度）。
 """
 from __future__ import annotations
 
@@ -14,7 +17,7 @@ CONTACT = {
     "display_name": "Kiro",
     "provider": "kiro-acp",
     "terminal_target": "",
-    "capabilities": ["chat", "history", "draft", "busy", "realtime"],
+    "capabilities": ["chat", "history", "draft", "busy", "realtime", "kiro_model_preferences"],
     "stop_fields": [],
 }
 
@@ -46,6 +49,11 @@ def send(handler: Any, body: dict[str, Any]) -> None:
     handler._handle_kiro_chat_send(body, "kiro")
 
 
+GET_ROUTES = {
+    "/kiro/preferences": "_handle_kiro_preferences_get",
+}
+
 POST_ROUTES = {
     "/kiro/new_session": "_handle_kiro_new_session",
+    "/kiro/preferences": "_handle_kiro_preferences_post",
 }

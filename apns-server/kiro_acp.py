@@ -6,9 +6,17 @@ protocol away from the HTTP handler so Kiro has an independent session,
 lifecycle and cancellation boundary.
 
 Phase 1 scope: text chat + durable session continuity (session/new,
-session/load, session/prompt, session/cancel).  Model/effort pinning
-(``session/set_model``), image blocks, forge and quota bridges are Phase 2
-and intentionally absent here.
+session/load, session/prompt, session/cancel).  Image blocks, forge and
+quota bridges are later phases and intentionally absent here.
+
+kiro 切模型 (2026-09-10): the client captures the ``models`` block from
+session/new and session/load responses (``availableModels`` /
+``currentModelId``), persists a sanitized catalog cache next to the session
+pointer, and pins one allowlisted model via ``session/set_model``.  Kiro
+2.21.2 answers ``session/set_model`` with an empty result even for unknown
+ids and ``session/load`` resets to the persisted default, so the pin is
+re-applied after every new/load and catalog membership is the only
+validation available on this side of the wire.
 """
 from __future__ import annotations
 
@@ -114,6 +122,22 @@ _QUOTA_MESSAGE_RE = re.compile(
 # content itself is never logged or surfaced.
 _STDERR_AUTH_RE = re.compile(r"not logged in|please log in|login required", re.IGNORECASE)
 
+# kiro 切模型 (2026-09-10): model ids ride the wire into session/set_model,
+# so only this closed charset may ever leave the process.
+_MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,119}\Z")
+_MODEL_CATALOG_MAX_ENTRIES = 64
+_MODEL_CATALOG_MAX_BYTES = 64 * 1024
+
+
+def _valid_model_id(value: Any) -> str:
+    model_id = str(value or "").strip()
+    return model_id if _MODEL_ID_RE.fullmatch(model_id) else ""
+
+
+def _clean_catalog_text(value: Any, maximum: int) -> str:
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", str(value or ""))
+    return re.sub(r"\s+", " ", text).strip()[:maximum]
+
 
 def _classified_rpc_error(method: str, error: Any) -> KiroACPError:
     """Map one JSON-RPC error object to a typed, payload-free failure."""
@@ -138,10 +162,23 @@ class KiroACPClient:
         request_timeout: float = 30.0,
         prompt_timeout: float = 900.0,
         popen_factory: Callable[..., subprocess.Popen[str]] = subprocess.Popen,
+        catalog_path: str | Path | None = None,
     ):
         self.command = str(Path(command).expanduser())
         self.cwd = Path(cwd).expanduser().resolve()
         self.state_path = Path(state_path).expanduser()
+        # kiro 切模型 (2026-09-10): sanitized copy of the last models block
+        # seen on the wire; the cache lets /kiro/preferences answer while the
+        # ACP process is down.
+        self.catalog_path = (
+            Path(catalog_path).expanduser()
+            if catalog_path is not None
+            else self.state_path.with_name("kiro_models_cache.json")
+        )
+        self._catalog_lock = threading.Lock()
+        self._available_models: list[dict[str, str]] = []
+        self._current_model_id = ""
+        self._pinned_model_id = ""
         self.logger = logger or logging.getLogger(__name__)
         self.request_timeout = max(1.0, float(request_timeout))
         self.prompt_timeout = max(self.request_timeout, float(prompt_timeout))
@@ -209,6 +246,137 @@ class KiroACPClient:
         )
         os.chmod(tmp, 0o600)
         os.replace(tmp, self.state_path)
+
+    # ---------- kiro 切模型 (2026-09-10): model catalog + pinning ----------
+
+    def _capture_model_catalog(self, result: dict[str, Any]) -> None:
+        """Snapshot the sanitized ``models`` block of a session/new|load result."""
+        models = result.get("models") if isinstance(result, dict) else None
+        if not isinstance(models, dict):
+            return
+        entries: list[dict[str, str]] = []
+        seen: set[str] = set()
+        raw_entries = models.get("availableModels")
+        for item in raw_entries if isinstance(raw_entries, list) else []:
+            if not isinstance(item, dict):
+                continue
+            model_id = _valid_model_id(item.get("modelId"))
+            if not model_id or model_id in seen:
+                continue
+            seen.add(model_id)
+            entries.append({
+                "id": model_id,
+                "name": _clean_catalog_text(item.get("name"), 120) or model_id,
+                "description": _clean_catalog_text(item.get("description"), 240),
+            })
+            if len(entries) >= _MODEL_CATALOG_MAX_ENTRIES:
+                break
+        if not entries:
+            return
+        current = _valid_model_id(models.get("currentModelId"))
+        with self._catalog_lock:
+            self._available_models = entries
+            if current:
+                self._current_model_id = current
+        try:
+            self.catalog_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.catalog_path.with_name(f".{self.catalog_path.name}.tmp.{os.getpid()}")
+            tmp.write_text(
+                json.dumps({"version": 1, "captured_at": int(time.time()), "models": entries},
+                           ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.catalog_path)
+        except OSError:
+            self.logger.warning("Kiro model catalog cache write failed", exc_info=True)
+
+    def _load_model_catalog_cache(self) -> list[dict[str, str]]:
+        try:
+            info = self.catalog_path.stat()
+            if not info.st_mode or info.st_size > _MODEL_CATALOG_MAX_BYTES:
+                return []
+            raw = json.loads(self.catalog_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict) or raw.get("version") != 1:
+                return []
+            entries: list[dict[str, str]] = []
+            seen: set[str] = set()
+            raw_entries = raw.get("models")
+            for item in raw_entries if isinstance(raw_entries, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                model_id = _valid_model_id(item.get("id"))
+                if not model_id or model_id in seen:
+                    continue
+                seen.add(model_id)
+                entries.append({
+                    "id": model_id,
+                    "name": _clean_catalog_text(item.get("name"), 120) or model_id,
+                    "description": _clean_catalog_text(item.get("description"), 240),
+                })
+                if len(entries) >= _MODEL_CATALOG_MAX_ENTRIES:
+                    break
+            return entries
+        except (OSError, ValueError):
+            return []
+
+    def available_models(self) -> tuple[list[dict[str, str]], str]:
+        """Return (catalog entries, source) where source is live|cache|none."""
+        with self._catalog_lock:
+            if self._available_models:
+                return [dict(entry) for entry in self._available_models], "live"
+        cached = self._load_model_catalog_cache()
+        return cached, ("cache" if cached else "none")
+
+    def available_model_ids(self) -> tuple[str, ...]:
+        entries, _source = self.available_models()
+        return tuple(entry["id"] for entry in entries)
+
+    def current_model_id(self) -> str:
+        with self._catalog_lock:
+            return self._current_model_id
+
+    def pin_model(self, model_id: str) -> str:
+        """Pin one catalog model for the next and current sessions (no RPC)."""
+        clean = _valid_model_id(model_id)
+        if not clean:
+            raise KiroACPError("invalid Kiro model id")
+        ids = self.available_model_ids()
+        if ids and clean not in ids:
+            raise KiroACPError("Kiro model is not in the available catalog")
+        self._pinned_model_id = clean
+        return clean
+
+    def set_model(self, model_id: str) -> str:
+        """Pin ``model_id`` and apply it to the loaded session right now."""
+        clean = self.pin_model(model_id)
+        session_id = self._loaded_session_id
+        if not session_id or not self._process_alive():
+            raise KiroACPError("Kiro ACP session was not prepared")
+        self._request(
+            "session/set_model",
+            {"sessionId": session_id, "modelId": clean},
+            timeout=self.request_timeout,
+        )
+        self._current_model_id = clean
+        return clean
+
+    def _apply_pinned_model(self) -> None:
+        """Re-apply the pin after new/load; the wire does not persist it."""
+        pinned = self._pinned_model_id
+        if not pinned:
+            return
+        ids = self.available_model_ids()
+        if ids and pinned not in ids:
+            self.logger.warning("Kiro pinned model is no longer offered; keeping Kiro default")
+            return
+        if pinned == self.current_model_id():
+            return
+        try:
+            self.set_model(pinned)
+        except KiroACPError:
+            # 钉选已持久化，下次 prepare 自愈；一次重放失败不该打死用户消息。
+            self.logger.warning("Kiro pinned model re-apply failed; will retry on next prepare", exc_info=True)
 
     @staticmethod
     def _valid_session_id(value: Any) -> str:
@@ -462,6 +630,7 @@ class KiroACPClient:
         loaded = self._valid_session_id(result.get("sessionId") or clean)
         if not loaded or loaded != clean:
             raise KiroACPError("Kiro ACP loaded an unexpected session")
+        self._capture_model_catalog(result)
         self._loaded_session_id = loaded
         return loaded
 
@@ -474,6 +643,7 @@ class KiroACPClient:
         session_id = self._valid_session_id(result.get("sessionId"))
         if not session_id:
             raise KiroACPError("Kiro ACP did not return a session id")
+        self._capture_model_catalog(result)
         self._loaded_session_id = session_id
         return session_id
 
@@ -492,18 +662,30 @@ class KiroACPClient:
         self._save_session_id(session_id)
         return session_id
 
-    def prepare_session(self) -> str:
-        """Start the ACP process if needed and return the current session id."""
-        with self._prepare_lock:
-            self._start()
-            return self._new_or_load_session()
+    def prepare_session(self, *, model: str | None = None) -> str:
+        """Start the ACP process if needed and return the current session id.
 
-    def new_session(self) -> str:
+        kiro 切模型 (2026-09-10): ``model`` pins the App-owned selection; the
+        pin is re-applied after every new/load because Kiro persists neither
+        set_model nor a read-back across session/load.
+        """
+        with self._prepare_lock:
+            if model is not None:
+                self.pin_model(model)
+            self._start()
+            session_id = self._new_or_load_session()
+            self._apply_pinned_model()
+            return session_id
+
+    def new_session(self, *, model: str | None = None) -> str:
         """Explicitly abandon the persisted pointer and start a fresh session."""
         with self._prepare_lock:
+            if model is not None:
+                self.pin_model(model)
             self._start()
             session_id = self._new_session_id()
             self._save_session_id(session_id)
+            self._apply_pinned_model()
             return session_id
 
     def prompt_existing(
