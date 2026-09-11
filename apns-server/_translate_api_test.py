@@ -107,6 +107,45 @@ class TranslateTextTest(unittest.TestCase):
         self.assertFalse(result["cached"])
         self.assertEqual(result["translated"], "让我先看一下配置文件。")
 
+    def test_prompt_version_derived_from_prompt_content(self) -> None:
+        # 独立审核建议：版本从 prompt 内容派生，改 prompt 自动换缓存版本，
+        # 不存在"改了 prompt 忘 bump 版本"导致陈旧缓存命中。
+        expected = hashlib.sha256(
+            translate_api.TRANSLATE_SYSTEM_PROMPT.encode("utf-8")
+        ).hexdigest()[:12]
+        self.assertEqual(translate_api.PROMPT_VERSION, expected)
+        # prompt 内容一旦变化，派生版本必然不同
+        other = hashlib.sha256(b"some other prompt").hexdigest()[:12]
+        self.assertNotEqual(translate_api.PROMPT_VERSION, other)
+
+    def test_chinese_input_short_circuits_no_api(self) -> None:
+        # 独立审核建议：短路下沉到 translate_text，/chat/translate 手动入口
+        # （push.py 直调本函数）同样覆盖——中文为主不发模型、不需要 API key。
+        zh = "她又在玩梗试探我了,问屁股臭不臭这种整活问题。"
+        with patch.object(translate_api.httpx, "post") as post, \
+             patch.object(translate_api, "openrouter_api_key", side_effect=AssertionError("不应解析 key")):
+            result = self._call(zh, api_key=None)
+        post.assert_not_called()
+        self.assertEqual(result["translated"], zh)
+        self.assertFalse(result["cached"])
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["usage"], {})
+
+    def test_chinese_mixed_with_code_short_circuits_no_api(self) -> None:
+        zh_mixed = "先看配置：\n\n```bash\ncat config.toml\n```\n\n超时改成三十秒就行。"
+        with patch.object(translate_api.httpx, "post") as post:
+            result = self._call(zh_mixed)
+        post.assert_not_called()
+        self.assertEqual(result["translated"], zh_mixed)
+
+    def test_chinese_short_circuit_does_not_touch_cache(self) -> None:
+        # 恒等结果不进缓存（无意义），也不读缓存
+        zh = "这段思维链本来就是中文。"
+        with patch.object(translate_api, "_cache_read", side_effect=AssertionError("不应读缓存")), \
+             patch.object(translate_api, "_cache_write", side_effect=AssertionError("不应写缓存")):
+            result = self._call(zh)
+        self.assertEqual(result["translated"], zh)
+
     def test_cache_hit_skips_api(self) -> None:
         with patch.object(translate_api.httpx, "post", return_value=_ok_response()) as post:
             first = self._call()

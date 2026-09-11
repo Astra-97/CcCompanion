@@ -49,11 +49,6 @@ REQUEST_USER_AGENT = "curl/7.81.0"
 SERVICE_ENV_FILE = Path("/etc/systemd/system/cc-companion.service.d/openrouter.conf")
 DEFAULT_CACHE_DIR = Path(__file__).resolve().parent / "tokens" / "translate_cache"
 
-# prompt 版本纳入缓存键（2026-09-11）：prompt 一旦改动，旧 prompt 产出的译文
-# 不得再被同文命中——2026-09-11 的事故就是旧 prompt 把中文思维链反向翻成英文，
-# 若缓存键不含 prompt 版本，同一条文本会永久命中那条错误译文。
-PROMPT_VERSION = "2026-09-11-v2"
-
 TRANSLATE_SYSTEM_PROMPT = (
     "你是一名专业翻译。把用户给出的内容忠实直译为简体中文。"
     "若输入已经是简体中文（或以中文为主），逐字原样返回输入内容，"
@@ -62,6 +57,13 @@ TRANSLATE_SYSTEM_PROMPT = (
     "完整保留 markdown 结构（标题、列表、代码块、加粗等）。"
     "不要解释、不要评注、不要输出原文，只输出译文。"
 )
+
+# 缓存键纳入 prompt 版本（2026-09-11）：prompt 一旦改动，旧 prompt 产出的译文
+# 不得再被同文命中——2026-09-11 的事故就是旧 prompt 把中文思维链反向翻成英文，
+# 若缓存键不含 prompt 版本，同一条文本会永久命中那条错误译文。
+# 版本直接从 prompt 内容派生（独立审核建议）：改 prompt 自动换版本，
+# 不存在"改了 prompt 忘 bump 版本"导致陈旧缓存命中的可能。
+PROMPT_VERSION = hashlib.sha256(TRANSLATE_SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:12]
 
 
 class TranslateError(RuntimeError):
@@ -141,6 +143,7 @@ def translate_text(
     Returns ``{"translated": str, "cached": bool, "truncated": bool,
     "usage": dict}``. Overlong input is truncated to ``max_chars`` before
     sending (the cache key is taken over the text actually sent).
+    中文为主的输入恒等短路、直接原样返回（见 :func:`_is_chinese_dominant`）。
     """
 
     source = str(text or "")
@@ -149,6 +152,13 @@ def translate_text(
     truncated = len(source) > max_chars
     if truncated:
         source = source[:max_chars]
+
+    # 中文为主恒等短路（2026-09-11，独立审核建议下沉到本函数）：中译中恒等于
+    # 原文，走模型只有被改动/反向翻成英文的风险，零收益。/chat/translate 手动
+    # 入口（push.py 直调本函数）与 translate_thinking_auto 两个调用点一并覆盖；
+    # 不查缓存、不需要 API key、不写缓存，零成本。
+    if _is_chinese_dominant(source):
+        return {"translated": source, "cached": False, "truncated": truncated, "usage": {}}
 
     key = _cache_key(source)
     cache_path = Path(cache_dir) if cache_dir is not None else DEFAULT_CACHE_DIR
@@ -261,6 +271,8 @@ def translate_thinking_auto(
 
     中文为主的输入直接原样返回（见 :func:`_is_chinese_dominant`）；其余输入
     不设语言预判门控、全部走模型翻译（Astra 2026-09-08 拍板）。
+    这里的短路让调用方能断言"中文不发模型"；:func:`translate_text` 入口也
+    内置同一短路，覆盖 /chat/translate 手动入口，两处重复无害、行为一致。
     """
 
     source = str(text or "")
