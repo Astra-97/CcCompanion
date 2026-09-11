@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import tempfile
@@ -68,6 +69,43 @@ class TranslateTextTest(unittest.TestCase):
         self.assertEqual(kwargs["json"]["model"], translate_api.TRANSLATE_MODEL)
         self.assertEqual(kwargs["json"]["messages"][0]["role"], "system")
         self.assertEqual(kwargs["json"]["messages"][1]["content"], SAMPLE_THINKING)
+
+    def test_system_prompt_guards_chinese_passthrough(self) -> None:
+        # 2026-09-11 修复：prompt 必须明确——输入已是中文则原样返回、不得翻成
+        # 任何语言（旧 prompt 写死"把英文直译为中文"，曾把中文思维链反向翻成英文）
+        prompt = translate_api.TRANSLATE_SYSTEM_PROMPT
+        self.assertIn("原样返回", prompt)
+        self.assertIn("不得", prompt)
+        self.assertNotIn("把用户给出的英文内容", prompt)
+        captured: dict = {}
+        response = _ok_response()
+
+        def _post(url, **kwargs):
+            captured.update(kwargs)
+            return response
+
+        with patch.object(translate_api.httpx, "post", side_effect=_post):
+            self._call()
+        sent_prompt = captured["json"]["messages"][0]["content"]
+        self.assertEqual(sent_prompt, prompt)
+
+    def test_cache_key_includes_prompt_version(self) -> None:
+        # 缓存键 = sha256(PROMPT_VERSION + text)：prompt 改动后旧译文不得再命中，
+        # 否则会复用旧 prompt 产出的"中文被翻成英文"错误译文（2026-09-11 事故）。
+        key = translate_api._cache_key(SAMPLE_THINKING)
+        legacy_key = hashlib.sha256(SAMPLE_THINKING.encode("utf-8")).hexdigest()
+        self.assertNotEqual(key, legacy_key)
+        # 旧格式缓存条目（sha256(text)）即使存在也不得命中
+        self.cache_dir.mkdir(parents=True)
+        (self.cache_dir / f"{legacy_key}.json").write_text(
+            json.dumps({"model": translate_api.TRANSLATE_MODEL, "translated": "旧污染译文"}),
+            encoding="utf-8",
+        )
+        with patch.object(translate_api.httpx, "post", return_value=_ok_response()) as post:
+            result = self._call()
+        self.assertEqual(post.call_count, 1)
+        self.assertFalse(result["cached"])
+        self.assertEqual(result["translated"], "让我先看一下配置文件。")
 
     def test_cache_hit_skips_api(self) -> None:
         with patch.object(translate_api.httpx, "post", return_value=_ok_response()) as post:

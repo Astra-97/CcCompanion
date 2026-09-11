@@ -45,16 +45,36 @@ class TranslateThinkingAutoTest(unittest.TestCase):
         # 自动预翻译必须带 30s 上限，不拖累聊天入库
         self.assertEqual(mock_translate.call_args.kwargs["timeout"], translate_api.AUTO_TIMEOUT_SEC)
 
-    def test_chinese_also_translated(self) -> None:
-        # Astra 2026-09-08 拍板：不设语言门控，全部翻译；中文输入经 qwen 近似恒等
+    def test_chinese_short_circuits_identity(self) -> None:
+        # 2026-09-11 防线：中文为主的输入恒等短路，不发模型——qwen 曾把中文
+        # 思维链反向翻成英文，新 prompt 下仍会改动标点，中译中零收益只有风险。
+        with patch.object(translate_api, "translate_text") as mock_translate:
+            display, original = translate_api.translate_thinking_auto(ZH_THINKING)
+        mock_translate.assert_not_called()
+        self.assertEqual(display, ZH_THINKING)
+        self.assertIsNone(original)
+
+    def test_chinese_mixed_with_code_short_circuits(self) -> None:
+        mixed = "先看配置：\n\n```bash\ncat config.toml\n```\n\n超时改成三十秒就行。"
+        self.assertTrue(translate_api._is_chinese_dominant(mixed))
+        with patch.object(translate_api, "translate_text") as mock_translate:
+            display, original = translate_api.translate_thinking_auto(mixed)
+        mock_translate.assert_not_called()
+        self.assertEqual(display, mixed)
+        self.assertIsNone(original)
+
+    def test_english_with_one_chinese_word_still_translates(self) -> None:
+        # 非中文为主的输入不设门控、全部走模型（Astra 2026-09-08 拍板不变）
+        text = EN_THINKING + "\n\n顺便记一下这个词：配置。"
+        self.assertFalse(translate_api._is_chinese_dominant(text))
         with patch.object(
             translate_api, "translate_text",
-            return_value={"translated": ZH_THINKING + "（译）", "cached": False},
+            return_value={"translated": ZH_TRANSLATION, "cached": False},
         ) as mock_translate:
-            display, original = translate_api.translate_thinking_auto(ZH_THINKING)
+            display, original = translate_api.translate_thinking_auto(text)
         mock_translate.assert_called_once()
-        self.assertEqual(display, ZH_THINKING + "（译）")
-        self.assertEqual(original, ZH_THINKING)
+        self.assertEqual(display, ZH_TRANSLATION)
+        self.assertEqual(original, text)
 
     def test_failure_falls_back_to_original(self) -> None:
         with patch.object(
@@ -136,23 +156,23 @@ class ChatAppendAutoTranslateTest(unittest.TestCase):
         self.assertEqual(stored[0]["thinking"], ZH_TRANSLATION)
         self.assertEqual(stored[0]["metadata"]["thinking_original"], EN_THINKING)
 
-    def test_chinese_thinking_also_goes_through_translation(self) -> None:
-        # 无门控：中文思考链同样过翻译管线（qwen 对中文近似恒等，原文仍留底）
+    def test_chinese_thinking_short_circuits_and_stored_as_is(self) -> None:
+        # 中文思考链恒等短路：不发模型、原文直接入库、metadata 不留 thinking_original
         handler = self.append_handler()
-        with patch.object(translate_api, "translate_text", side_effect=self._translated) as mock_translate:
+        with patch.object(translate_api, "translate_text") as mock_translate:
             handler._handle_chat_append({
                 "contact_id": "xiaoke",
                 "role": "assistant",
                 "source": "claude-code",
-                "text": "中文思考链也走翻译。",
+                "text": "中文思考链原样入库。",
                 "thinking": ZH_THINKING,
             })
-        mock_translate.assert_called_once()
+        mock_translate.assert_not_called()
         status, payload = handler.responses[-1]
         self.assertEqual(status, 200, payload)
         rec = payload["record"]
-        self.assertEqual(rec["thinking"], ZH_TRANSLATION)
-        self.assertEqual(rec["metadata"]["thinking_original"], ZH_THINKING)
+        self.assertEqual(rec["thinking"], ZH_THINKING)
+        self.assertNotIn("thinking_original", rec.get("metadata") or {})
 
     def test_translation_failure_keeps_english_and_still_appends(self) -> None:
         handler = self.append_handler()

@@ -5,8 +5,9 @@
   之前同步翻成中文（push.py /chat/append 接入），记录里直接存中文，
   英文原文留 metadata.thinking_original，app 零改动直接显示。
 - ``POST /chat/translate`` 手动翻译接口（保留，供旧记录按需补译）。
-本模块把原文发给千问做忠实直译并返回简体中文。结果按 sha256(text) 落盘
-缓存（``tokens/translate_cache/``），同一思考链重复翻译不再烧钱。
+本模块把原文发给千问做忠实直译并返回简体中文。结果按
+sha256(PROMPT_VERSION + text) 落盘缓存（``tokens/translate_cache/``），
+同一思考链重复翻译不再烧钱；prompt 版本变化即自动失效旧缓存。
 
 模型选型 (2026-09-08 实测 OpenRouter /models 在售价格)：
 ``qwen/qwen3-30b-a3b-instruct-2507`` —— $0.048/M 输入 + $0.193/M 输出，
@@ -24,6 +25,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -47,8 +49,15 @@ REQUEST_USER_AGENT = "curl/7.81.0"
 SERVICE_ENV_FILE = Path("/etc/systemd/system/cc-companion.service.d/openrouter.conf")
 DEFAULT_CACHE_DIR = Path(__file__).resolve().parent / "tokens" / "translate_cache"
 
+# prompt 版本纳入缓存键（2026-09-11）：prompt 一旦改动，旧 prompt 产出的译文
+# 不得再被同文命中——2026-09-11 的事故就是旧 prompt 把中文思维链反向翻成英文，
+# 若缓存键不含 prompt 版本，同一条文本会永久命中那条错误译文。
+PROMPT_VERSION = "2026-09-11-v2"
+
 TRANSLATE_SYSTEM_PROMPT = (
-    "你是一名专业翻译。把用户给出的英文内容忠实直译为简体中文。"
+    "你是一名专业翻译。把用户给出的内容忠实直译为简体中文。"
+    "若输入已经是简体中文（或以中文为主），逐字原样返回输入内容，"
+    "不得做任何改动，尤其不得把中文翻译成英文或其他任何语言。"
     "代码、shell 命令、文件路径、API 名等专有名词保持原文不译；"
     "完整保留 markdown 结构（标题、列表、代码块、加粗等）。"
     "不要解释、不要评注、不要输出原文，只输出译文。"
@@ -60,6 +69,8 @@ class TranslateError(RuntimeError):
 
 
 _cache_lock = threading.Lock()
+
+_CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 
 
 def openrouter_api_key() -> str:
@@ -82,7 +93,7 @@ def openrouter_api_key() -> str:
 
 
 def _cache_key(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{PROMPT_VERSION}\n{text}".encode("utf-8")).hexdigest()
 
 
 def _cache_read(cache_dir: Path, key: str, model: str) -> str:
@@ -208,6 +219,34 @@ def translate_text(
 # ---------------------------------------------------------------------------
 
 
+def _is_chinese_dominant(text: str) -> bool:
+    """中文为主判定：剔除 ``` 代码围栏后，CJK 表意字符数 >= 其他字母数。
+
+    代码/shell 是语言中立的，不计入"正文语言"——否则一段中文 prose 带一个
+    英文代码块就会被误判成英文重新过模型。
+
+    这是恒等短路，不是语言预判跳翻：Astra 2026-09-08 拍板"全部翻译、别有预置
+    语言门控"针对的是需要翻译的输入；中文为主的输入"中译中"恒等于原文，走模型
+    只有风险零收益——2026-09-11 实测旧 prompt 下 qwen 把整条中文思维链反向翻成
+    英文，新 prompt 下仍会把半角逗号改成全角。故中文为主直接原样返回，与拍板
+    意图一致（该翻的全翻，不该动的绝不动）。
+    """
+
+    prose = _CODE_FENCE_RE.sub(" ", text)
+    cjk = 0
+    other_letters = 0
+    for ch in prose:
+        if (
+            ("一" <= ch <= "鿿")  # CJK 统一表意文字 U+4E00-U+9FFF
+            or ("㐀" <= ch <= "䶿")  # 扩展 A U+3400-U+4DBF
+            or ("豈" <= ch <= "﫿")  # 兼容表意文字 U+F900-U+FAFF
+        ):
+            cjk += 1
+        elif ch.isalpha():
+            other_letters += 1
+    return cjk > 0 and cjk >= other_letters
+
+
 def translate_thinking_auto(
     text: str,
     *,
@@ -220,12 +259,14 @@ def translate_thinking_auto(
     存进 metadata.thinking_original；失败 / 超时一律静默返回 ``(原文, None)``，
     消息绝不因翻译丢失或久等。重复内容走磁盘缓存零成本。
 
-    不设语言预判门控（Astra 2026-09-08 拍板：全部翻译，别有预置）——
-    已经是中文的输入经 qwen 直译为近似恒等，成本可忽略。
+    中文为主的输入直接原样返回（见 :func:`_is_chinese_dominant`）；其余输入
+    不设语言预判门控、全部走模型翻译（Astra 2026-09-08 拍板）。
     """
 
     source = str(text or "")
     if not source.strip():
+        return text, None
+    if _is_chinese_dominant(source):
         return text, None
     try:
         result = translate_text(source, timeout=timeout, **kwargs)
