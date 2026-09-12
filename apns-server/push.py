@@ -158,6 +158,7 @@ from kimi_acp import (
     KimiACPCancelled,
     KimiACPClient,
     KimiACPError,
+    KimiMemoryWriteTracker,
 )
 from kimi_preferences import (
     KIMI_APP_DEFAULT_EFFORT,
@@ -11933,6 +11934,14 @@ class PushHandler(BaseHTTPRequestHandler):
             activity_count = 0
             activity_items: list[str] = []
             current_activity_label = ""
+            # Web-transport memory writes: tool.call.started carries name+args,
+            # tool.result the terminal output.  The tracker correlates both by
+            # toolCallId and yields the same bounded event shape the ACP path
+            # collects; items flush into one exact-turn card before the
+            # terminal answer row.
+            memory_write_tracker = KimiMemoryWriteTracker()
+            memory_write_items: list[dict[str, Any]] = []
+            memory_write_call_ids: set[str] = set()
 
             def observer_record(event_type: str) -> None:
                 record = getattr(kimi_observer, "record", None)
@@ -12237,6 +12246,32 @@ class PushHandler(BaseHTTPRequestHandler):
                             pass
                 elif event_type.startswith("tool."):
                     observer_record("tool")
+                    memory_event = None
+                    if event_type == "tool.call.started":
+                        memory_write_tracker.note_call_started(
+                            payload.get("toolCallId") or payload.get("tool_call_id"),
+                            payload.get("name"),
+                            payload.get("args"),
+                        )
+                    elif event_type == "tool.result":
+                        memory_event = memory_write_tracker.note_call_result(
+                            payload.get("toolCallId") or payload.get("tool_call_id"),
+                            payload.get("output"),
+                            is_error=bool(payload.get("isError") or payload.get("is_error")),
+                        )
+                    if memory_event is not None:
+                        memory_call_id = str(memory_event.get("tool_call_id") or "")
+                        if not memory_call_id or memory_call_id not in memory_write_call_ids:
+                            if memory_call_id:
+                                memory_write_call_ids.add(memory_call_id)
+                            memory_write_items.append({
+                                "action": memory_event.get("action"),
+                                "memory_id": memory_event.get("memory_id"),
+                                "title": memory_event.get("title"),
+                                "category": memory_event.get("category"),
+                                "subcategory": memory_event.get("subcategory"),
+                                "snippet": memory_event.get("snippet"),
+                            })
                 elif event_type == "prompt.completed":
                     lease_terminal_confirmed = True
                     incoming_reason = str(payload.get("reason") or "completed")
@@ -12343,6 +12378,15 @@ class PushHandler(BaseHTTPRequestHandler):
                 outcome=activity_outcome,
                 source="kimi-web:activity",
             )
+            try:
+                self._append_kimi_memory_write_card(
+                    chat,
+                    memory_write_items,
+                    user_ts=str(rec.get("ts") or ""),
+                    session_id=session_id,
+                )
+            except Exception:
+                logger.debug("Kimi Web memory write card append failed", exc_info=True)
             try:
                 visible, xhs_card = self._kimi_extract_xhs_login_card(answer, allowed=xhs_login_card_allowed)
                 visible, netease_card = self._kimi_extract_netease_login_card(visible, allowed=netease_login_card_allowed)

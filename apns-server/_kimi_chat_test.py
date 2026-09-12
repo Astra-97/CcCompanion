@@ -679,6 +679,99 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.assertTrue(chat.records[-1]["metadata"]["turn_terminal"])
         self.assertEqual("terminal_answer", chat.records[-1]["metadata"]["turn_message_kind"])
 
+    @staticmethod
+    def memory_frames_web(started_payload, result_payload):
+        """FakeWebChat emitting one tool call + result before the reply."""
+
+        class MemoryWeb(FakeWebChat):
+            def stream_session(self, session_id, *, on_event, on_ready, stop_event, **_kwargs):
+                on_ready()
+                on_event({"type": "tool.call.started", "session_id": session_id, "payload": started_payload})
+                on_event({"type": "tool.result", "session_id": session_id, "payload": result_payload})
+                on_event({"type": "assistant.delta", "session_id": session_id, "payload": {"turnId": "turn-1", "delta": self.text}})
+                on_event({"type": "turn.ended", "session_id": session_id, "payload": {"turnId": "turn-1", "reason": "completed"}})
+
+        return MemoryWeb()
+
+    def test_web_turn_projects_memory_write_card_before_terminal_answer(self):
+        web = self.memory_frames_web(
+            {
+                "turnId": "turn-1", "toolCallId": "tool_m1",
+                "name": "mcp__memory__write_memory",
+                "args": {"content": "探针记忆标题\n\n正文", "category": "daily", "subcategory": "daily.note"},
+            },
+            {
+                "turnId": "turn-1", "toolCallId": "tool_m1",
+                "output": '{"id": "bee5817d", "createdAt": "2026-09-12T09:00:00Z"}',
+            },
+        )
+        handler, chat, _web = self.make_handler(web=web)
+        handler.state.kimi_memory_write_card_lock = threading.Lock()
+        handler._handle_kimi_chat_send({"text": "hello"}, "kimi")
+        self.wait_idle(handler)
+        cards = [row for row in chat.records if (row.get("metadata") or {}).get("memory_write_card")]
+        self.assertEqual(1, len(cards))
+        card = cards[0]
+        self.assertEqual("✅ 已写入记忆（摘要见卡片）", card["text"])
+        self.assertEqual("memory-write:kimi", card["source"])
+        self.assertFalse(card["metadata"]["turn_terminal"])
+        item = card["metadata"]["items"][0]
+        self.assertEqual("write", item["action"])
+        self.assertEqual("bee5817d", item["memory_id"])
+        self.assertEqual("探针记忆标题", item["title"])
+        self.assertEqual("daily", item["category"])
+        self.assertEqual("daily.note", item["subcategory"])
+        self.assertEqual(chat.records[0]["ts"], card["metadata"]["kimi_user_ts"])
+        # 卡片在终态回答之前，终态行仍是最后一条。
+        self.assertLess(chat.records.index(card), len(chat.records) - 1)
+        self.assertTrue(chat.records[-1]["metadata"]["turn_terminal"])
+
+    def test_web_turn_is_error_tool_result_never_projects_memory_card(self):
+        web = self.memory_frames_web(
+            {
+                "turnId": "turn-1", "toolCallId": "tool_m2",
+                "name": "mcp__memory__write_memory",
+                "args": {"content": "x", "category": "core"},
+            },
+            {
+                "turnId": "turn-1", "toolCallId": "tool_m2",
+                "output": "core 记忆必须选择一个子分类（请提供 subcategory）。",
+                "isError": True,
+            },
+        )
+        handler, chat, _web = self.make_handler(web=web)
+        handler.state.kimi_memory_write_card_lock = threading.Lock()
+        handler._handle_kimi_chat_send({"text": "hello"}, "kimi")
+        self.wait_idle(handler)
+        self.assertFalse(any((row.get("metadata") or {}).get("memory_write_card") for row in chat.records))
+
+    def test_web_turn_memory_card_is_exact_turn_idempotent(self):
+        web = self.memory_frames_web(
+            {
+                "turnId": "turn-1", "toolCallId": "tool_m3",
+                "name": "mcp__memory__write_memory",
+                "args": {"content": "重复防护", "category": "daily"},
+            },
+            {
+                "turnId": "turn-1", "toolCallId": "tool_m3",
+                "output": '{"id": "cafe0123"}',
+            },
+        )
+        handler, chat, _web = self.make_handler(web=web)
+        handler.state.kimi_memory_write_card_lock = threading.Lock()
+        handler._handle_kimi_chat_send({"text": "hello"}, "kimi")
+        self.wait_idle(handler)
+        # 模拟重复 flush：同一 user_ts 的卡片只允许一张。
+        handler._append_kimi_memory_write_card(
+            chat,
+            [{"action": "write", "memory_id": "cafe0123", "title": "重复防护",
+              "category": "daily", "subcategory": "", "snippet": "重复防护"}],
+            user_ts=chat.records[0]["ts"],
+            session_id="web-session-1",
+        )
+        cards = [row for row in chat.records if (row.get("metadata") or {}).get("memory_write_card")]
+        self.assertEqual(1, len(cards))
+
     def test_private_web_turn_passes_consumed_attachment_records_once(self):
         with tempfile.TemporaryDirectory() as directory:
             image_path = os.path.join(directory, "stored.png")

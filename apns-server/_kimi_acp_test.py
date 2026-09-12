@@ -13,6 +13,7 @@ from kimi_acp import (
     KimiACPClient,
     KimiACPCancelled,
     KimiACPError,
+    KimiMemoryWriteTracker,
     _text_from_update,
 )
 
@@ -1493,6 +1494,136 @@ class KimiACPBashMemoryWriteTest(unittest.TestCase):
         with client._active_lock:
             client._bash_tool_commands.clear()
         self.assertEqual({}, client._bash_tool_commands)
+
+
+class KimiMemoryWriteTrackerTest(unittest.TestCase):
+    """Web 事件流两帧式（tool.call.started + tool.result）记忆写入投影。
+
+    真实 WS 抓包（2026-09-12，kimi-code v0.42.0 /api/v1/ws）：started 帧
+    payload 携带 name+args，result 帧携带 output（失败时另带 isError:
+    true，成功时省略该键）。投影与 ACP 三段式共享同一份白名单字段。
+    """
+
+    def test_write_memory_started_then_result_projects_card_event(self):
+        tracker = KimiMemoryWriteTracker()
+        tracker.note_call_started("tool_w1", "mcp__memory__write_memory", {
+            "content": "小克修复了 Web 记忆卡片\n\n两帧式关联",
+            "category": "daily",
+            "subcategory": "daily.note",
+        })
+        event = tracker.note_call_result(
+            "tool_w1", '{"id": "bee5817d", "createdAt": "2026-09-12T09:00:00Z"}'
+        )
+        self.assertIsNotNone(event)
+        self.assertEqual("memory_write", event["kind"])
+        self.assertEqual("write", event["action"])
+        self.assertEqual("tool_w1", event["tool_call_id"])
+        self.assertEqual("bee5817d", event["memory_id"])
+        self.assertEqual("daily", event["category"])
+        self.assertEqual("daily.note", event["subcategory"])
+        self.assertEqual("小克修复了 Web 记忆卡片", event["title"])
+        self.assertLessEqual(len(event["snippet"]), 80)
+
+    def test_update_memory_takes_memory_id_from_args(self):
+        tracker = KimiMemoryWriteTracker()
+        tracker.note_call_started("tool_u1", "mcp__memory__update_memory", {
+            "id": "7b64ed1e",
+            "append": "追加一行",
+        })
+        event = tracker.note_call_result("tool_u1", '{"success": true}')
+        self.assertIsNotNone(event)
+        self.assertEqual("update", event["action"])
+        self.assertEqual("7b64ed1e", event["memory_id"])
+        self.assertEqual("追加一行", event["title"])
+
+    def test_bare_tool_name_without_mcp_prefix_still_projects(self):
+        tracker = KimiMemoryWriteTracker()
+        tracker.note_call_started("tool_bare", "write_memory", {
+            "content": "裸名兼容", "category": "daily",
+        })
+        event = tracker.note_call_result("tool_bare", '{"id": "abc123"}')
+        self.assertIsNotNone(event)
+        self.assertEqual("write", event["action"])
+
+    def test_is_error_result_never_projects(self):
+        tracker = KimiMemoryWriteTracker()
+        tracker.note_call_started("tool_e1", "mcp__memory__write_memory", {
+            "content": "x", "category": "core",
+        })
+        self.assertIsNone(tracker.note_call_result(
+            "tool_e1", "core 记忆必须选择一个子分类……", is_error=True
+        ))
+        # 缓存已弹出：同 toolCallId 的迟到成功结果也不能凭空产卡片。
+        self.assertIsNone(tracker.note_call_result("tool_e1", '{"id": "bee5817d"}'))
+
+    def test_result_without_remembered_call_never_projects(self):
+        tracker = KimiMemoryWriteTracker()
+        self.assertIsNone(tracker.note_call_result("tool_unknown", '{"id": "bee5817d"}'))
+
+    def test_non_memory_tool_result_never_projects(self):
+        tracker = KimiMemoryWriteTracker()
+        tracker.note_call_started("tool_r1", "mcp__memory__read_memories", {"limit": 1})
+        self.assertIsNone(tracker.note_call_result("tool_r1", '[{"id": "x"}]'))
+
+    def test_json_string_args_are_parsed_like_acp_raw_input(self):
+        tracker = KimiMemoryWriteTracker()
+        tracker.note_call_started(
+            "tool_js1",
+            "mcp__memory__write_memory",
+            '{"content": "JSON 字符串 args", "category": "daily"}',
+        )
+        event = tracker.note_call_result("tool_js1", '{"id": "bee5817d"}')
+        self.assertIsNotNone(event)
+        self.assertEqual("JSON 字符串 args", event["title"])
+        self.assertEqual("daily", event["category"])
+
+    def test_pending_memory_calls_are_bounded(self):
+        tracker = KimiMemoryWriteTracker()
+        for index in range(80):
+            tracker.note_call_started("tool-flood-%d" % index, "write_memory", {"content": "x"})
+        self.assertLessEqual(len(tracker._memory_calls), 64)
+
+    def test_empty_tool_call_id_is_ignored(self):
+        tracker = KimiMemoryWriteTracker()
+        tracker.note_call_started("", "write_memory", {"content": "x"})
+        tracker.note_call_started(None, "write_memory", {"content": "x"})
+        self.assertEqual({}, tracker._memory_calls)
+
+    def test_bash_curl_post_memory_api_projects_card_event(self):
+        tracker = KimiMemoryWriteTracker()
+        command = (
+            "curl -sS -X POST https://memory.xiaonancaleb.xyz/api/memories "
+            "-H 'Authorization: Bearer ***' "
+            "-d '{\"content\": \"Web 路径 Bash 直连\", \"category\": \"daily\"}'"
+        )
+        tracker.note_call_started("tool_bash1", "Bash", {"command": command})
+        event = tracker.note_call_result(
+            "tool_bash1",
+            '{"id": "cafe0123", "content": "Web 路径 Bash 直连", '
+            '"createdAt": "2026-09-12T09:00:00Z"}',
+        )
+        self.assertIsNotNone(event)
+        self.assertEqual("write", event["action"])
+        self.assertEqual("cafe0123", event["memory_id"])
+        self.assertEqual("Web 路径 Bash 直连", event["title"])
+        # 命令行里的 Authorization 头绝不进入事件。
+        self.assertNotIn("Bearer", repr(event))
+
+    def test_bash_error_result_never_projects(self):
+        tracker = KimiMemoryWriteTracker()
+        command = (
+            "curl -sS -X POST https://memory.xiaonancaleb.xyz/api/memories "
+            "-d '{\"content\": \"x\"}'"
+        )
+        tracker.note_call_started("tool_bash2", "Bash", {"command": command})
+        self.assertIsNone(tracker.note_call_result(
+            "tool_bash2", "HTTP 422\n{\"error\": \"bad\"}", is_error=True
+        ))
+
+    def test_bash_non_memory_command_never_projects(self):
+        tracker = KimiMemoryWriteTracker()
+        tracker.note_call_started("tool_bash3", "Bash", {"command": "ls /tmp"})
+        self.assertIsNone(tracker.note_call_result("tool_bash3", "a\nb"))
 
 
 if __name__ == "__main__":

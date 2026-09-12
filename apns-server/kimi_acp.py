@@ -395,6 +395,89 @@ def _bash_memory_write_event(
     }
 
 
+class KimiMemoryWriteTracker:
+    """Per-turn memory-write projector for Kimi's Web event stream.
+
+    The Web transport delivers a tool call's name and args in one
+    ``tool.call.started`` frame and its terminal output in ``tool.result`` —
+    one cross-frame correlation instead of ACP's three status phases.  Both
+    projections share this module's whitelist helpers, so a card built from
+    either transport exposes the same bounded fields.  A result flagged
+    ``isError`` never projects, mirroring ACP's failed/cancelled drop (and
+    catching MCP-level failures that ACP's status vocabulary never saw).
+    """
+
+    def __init__(self) -> None:
+        self._memory_calls: dict[str, dict[str, Any]] = {}
+        self._bash_commands: dict[str, str] = {}
+
+    def note_call_started(self, tool_call_id: Any, name: Any, args: Any) -> None:
+        """Remember a memory-MCP or Bash call's action and args by call id."""
+        tool_call_id = str(tool_call_id or "").strip()
+        if not tool_call_id:
+            return
+        parsed_args = _memory_write_raw_input_dict(args)
+        action = _memory_write_action_for_title(str(name or "").strip().lower())
+        if action is not None:
+            self._memory_calls[tool_call_id] = {
+                "action": action,
+                "raw_input": parsed_args,
+            }
+            while len(self._memory_calls) > _MEMORY_WRITE_MAX_PENDING:
+                self._memory_calls.pop(next(iter(self._memory_calls)))
+            return
+        command = str(parsed_args.get("command") or "")
+        if command:
+            self._bash_commands[tool_call_id] = command[:_BASH_MEMORY_MAX_COMMAND]
+            while len(self._bash_commands) > _BASH_MEMORY_MAX_PENDING:
+                self._bash_commands.pop(next(iter(self._bash_commands)))
+
+    def note_call_result(
+        self, tool_call_id: Any, output: Any, *, is_error: bool = False
+    ) -> dict[str, Any] | None:
+        """Project a terminal tool result to a card event, or ``None``.
+
+        Only a remembered memory-MCP/Bash write with a non-error result
+        projects; unknown calls and failures leave no trace.
+        """
+        tool_call_id = str(tool_call_id or "").strip()
+        cached = self._memory_calls.pop(tool_call_id, None)
+        command = self._bash_commands.pop(tool_call_id, "")
+        if is_error:
+            return None
+        if cached is not None:
+            action = str(cached.get("action") or "")
+            raw_input = cached.get("raw_input")
+            if not isinstance(raw_input, dict):
+                raw_input = {}
+            title, snippet = _memory_write_title_snippet(
+                str(raw_input.get("content") or raw_input.get("append") or "")
+            )
+            memory_id = str(raw_input.get("id") or raw_input.get("memory_id") or "").strip()
+            if not memory_id and isinstance(output, str):
+                match = _MEMORY_WRITE_OUTPUT_ID_RE.search(output)
+                if match:
+                    memory_id = match.group(1)
+            if not _MEMORY_WRITE_ID_RE.fullmatch(memory_id):
+                memory_id = ""
+            return {
+                "kind": "memory_write",
+                "action": action,
+                "tool_call_id": tool_call_id[:80],
+                "memory_id": memory_id,
+                "title": title,
+                "category": str(raw_input.get("category") or "").strip()[:20],
+                "subcategory": str(raw_input.get("subcategory") or "").strip()[:20],
+                "snippet": snippet,
+            }
+        if command:
+            return _bash_memory_write_event(
+                {"toolCallId": tool_call_id, "output": output if isinstance(output, str) else ""},
+                command,
+            )
+        return None
+
+
 class KimiACPClient:
     def __init__(
         self,
