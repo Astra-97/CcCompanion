@@ -13,7 +13,6 @@ from kimi_acp import (
     KimiACPClient,
     KimiACPCancelled,
     KimiACPError,
-    _memory_write_from_update,
     _text_from_update,
 )
 
@@ -909,8 +908,11 @@ class KimiACPProtocolTest(unittest.TestCase):
 
 
 class KimiACPMemoryWriteProjectionTest(unittest.TestCase):
+    def _client(self) -> KimiACPClient:
+        return KimiACPClient(state_path="/tmp/unused-kimi-memory-write-test")
+
     def test_completed_write_memory_projects_bounded_card_event(self):
-        event = _memory_write_from_update({
+        event = self._client()._memory_write_from_update({
             "sessionId": "s1",
             "update": {
                 "sessionUpdate": "tool_call_update",
@@ -936,7 +938,7 @@ class KimiACPMemoryWriteProjectionTest(unittest.TestCase):
         self.assertLessEqual(len(event["snippet"]), 80)
 
     def test_update_memory_takes_id_from_raw_input_and_json_title(self):
-        event = _memory_write_from_update({
+        event = self._client()._memory_write_from_update({
             "update": {
                 "sessionUpdate": "tool_call",
                 "toolCallId": "call-2",
@@ -954,9 +956,10 @@ class KimiACPMemoryWriteProjectionTest(unittest.TestCase):
         self.assertEqual("更新摘要", event["snippet"])
 
     def test_non_terminal_or_failed_calls_never_project(self):
+        client = self._client()
         for status in ("", "pending", "in_progress", "failed"):
             with self.subTest(status=status):
-                self.assertIsNone(_memory_write_from_update({
+                self.assertIsNone(client._memory_write_from_update({
                     "update": {
                         "sessionUpdate": "tool_call_update",
                         "title": "mcp__memory__write_memory",
@@ -966,24 +969,26 @@ class KimiACPMemoryWriteProjectionTest(unittest.TestCase):
                 }))
 
     def test_unrelated_tools_and_malformed_updates_never_project(self):
-        self.assertIsNone(_memory_write_from_update({
+        client = self._client()
+        self.assertIsNone(client._memory_write_from_update({
             "update": {
                 "sessionUpdate": "tool_call_update",
                 "title": "mcp__memory__read_memory",
                 "status": "completed",
             },
         }))
-        self.assertIsNone(_memory_write_from_update({
+        self.assertIsNone(client._memory_write_from_update({
             "update": {
                 "sessionUpdate": "agent_message_chunk",
                 "content": {"type": "text", "text": "x"},
             },
         }))
-        self.assertIsNone(_memory_write_from_update(None))
-        self.assertIsNone(_memory_write_from_update({"update": "not-a-dict"}))
+        self.assertIsNone(client._memory_write_from_update(None))
+        self.assertIsNone(client._memory_write_from_update({"update": "not-a-dict"}))
 
     def test_bare_tool_name_and_title_suffix_variants_project(self):
-        bare = _memory_write_from_update({
+        client = self._client()
+        bare = client._memory_write_from_update({
             "update": {
                 "sessionUpdate": "tool_call_update",
                 "title": "write_memory",
@@ -994,7 +999,7 @@ class KimiACPMemoryWriteProjectionTest(unittest.TestCase):
         })
         self.assertEqual("write", bare["action"])
         self.assertEqual("", bare["memory_id"])
-        suffixed = _memory_write_from_update({
+        suffixed = client._memory_write_from_update({
             "update": {
                 "sessionUpdate": "tool_call_update",
                 "title": "mcp__memory__update_memory · 7b64ed1e",
@@ -1006,7 +1011,7 @@ class KimiACPMemoryWriteProjectionTest(unittest.TestCase):
         self.assertEqual("7b64ed1e", suffixed["memory_id"])
 
     def test_unsafe_memory_id_is_dropped(self):
-        event = _memory_write_from_update({
+        event = self._client()._memory_write_from_update({
             "update": {
                 "sessionUpdate": "tool_call_update",
                 "title": "mcp__memory__write_memory",
@@ -1016,6 +1021,220 @@ class KimiACPMemoryWriteProjectionTest(unittest.TestCase):
             },
         })
         self.assertEqual("", event["memory_id"])
+
+
+class KimiACPMcpMemoryWriteCacheTest(unittest.TestCase):
+    """kimi-code MCP 记忆写入的三段式 ACP 序列也要投 memory_write 事件。
+
+    真实 ACP 抓包（2026-09-12，/tmp/acp_dump.jsonl 同形状）：pending 的
+    tool_call 带 title 无 rawInput → in_progress 的 tool_call_update 带
+    title + rawInput（dict 或 JSON 字符串，两种都兼容）→ 终态 completed
+    只剩 toolCallId / status / content / rawOutput，无 title 无 rawInput，
+    必须按 toolCallId 跨 update 关联（与 Bash 路径同一范式）。
+    """
+
+    def _client(self) -> KimiACPClient:
+        return KimiACPClient(state_path="/tmp/unused-kimi-mcp-memory-test")
+
+    @staticmethod
+    def _pending(tool_call_id: str, title: str) -> dict:
+        return {
+            "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": tool_call_id,
+                "title": title,
+                "kind": "other",
+                "status": "pending",
+                "content": [{"type": "content", "content": {"type": "text", "text": ""}}],
+            },
+        }
+
+    @staticmethod
+    def _in_progress(tool_call_id: str, title: str, raw_input) -> dict:
+        return {
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": tool_call_id,
+                "title": title,
+                "kind": "other",
+                "status": "in_progress",
+                "rawInput": raw_input,
+            },
+        }
+
+    @staticmethod
+    def _terminal(tool_call_id: str, status: str, output: str = "") -> dict:
+        update = {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": tool_call_id,
+            "status": status,
+            "content": [
+                {"type": "content", "content": {"type": "text", "text": output}},
+            ],
+        }
+        if output:
+            update["rawOutput"] = output
+        return {"update": update}
+
+    def test_kimi_three_phase_write_memory_projects_card_event(self):
+        client = self._client()
+        tool_call_id = "0:tool_1VXgaVOjiIh7xzfeikxYITfK"
+        title = "mcp__memory__write_memory"
+        self.assertIsNone(client._memory_write_from_update(
+            self._pending(tool_call_id, title)
+        ))
+        self.assertIsNone(client._memory_write_from_update(
+            self._in_progress(
+                tool_call_id,
+                title,
+                '{"content": "小克修复了 MCP 记忆卡片\\n\\n三段式关联", '
+                '"category": "daily", "subcategory": "daily.note"}',
+            )
+        ))
+        event = client._memory_write_from_update(self._terminal(
+            tool_call_id,
+            "completed",
+            '{"id": "bee5817d", "createdAt": "2026-09-12T05:00:00Z"}',
+        ))
+        self.assertIsNotNone(event)
+        self.assertEqual("memory_write", event["kind"])
+        self.assertEqual("write", event["action"])
+        self.assertEqual(tool_call_id, event["tool_call_id"])
+        self.assertEqual("bee5817d", event["memory_id"])
+        self.assertEqual("daily", event["category"])
+        self.assertEqual("daily.note", event["subcategory"])
+        self.assertEqual("小克修复了 MCP 记忆卡片", event["title"])
+        self.assertLessEqual(len(event["snippet"]), 80)
+
+    def test_update_memory_takes_memory_id_from_cached_raw_input(self):
+        client = self._client()
+        tool_call_id = "0:tool_update1"
+        title = "mcp__memory__update_memory"
+        client._memory_write_from_update(self._pending(tool_call_id, title))
+        client._memory_write_from_update(self._in_progress(
+            tool_call_id,
+            title,
+            '{"id": "7b64ed1e", "content": "追加一行"}',
+        ))
+        event = client._memory_write_from_update(self._terminal(
+            tool_call_id, "completed", '{"ok": true}'
+        ))
+        self.assertIsNotNone(event)
+        self.assertEqual("update", event["action"])
+        self.assertEqual("7b64ed1e", event["memory_id"])
+        self.assertEqual("追加一行", event["title"])
+
+    def test_failed_terminal_never_projects_and_pops_cache(self):
+        client = self._client()
+        tool_call_id = "0:tool_failed1"
+        title = "mcp__memory__write_memory"
+        client._memory_write_from_update(self._pending(tool_call_id, title))
+        client._memory_write_from_update(self._in_progress(
+            tool_call_id, title, '{"content": "x", "category": "daily"}'
+        ))
+        self.assertIsNone(client._memory_write_from_update(
+            self._terminal(tool_call_id, "failed")
+        ))
+        self.assertNotIn(tool_call_id, client._memory_write_tool_calls)
+        # 缓存已弹出：同 toolCallId 的迟到 completed 也不能凭空产卡片。
+        self.assertIsNone(client._memory_write_from_update(
+            self._terminal(tool_call_id, "completed", '{"id": "bee5817d"}')
+        ))
+
+    def test_terminal_update_with_own_title_still_projects(self):
+        client = self._client()
+        event = client._memory_write_from_update({
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-legacy",
+                "title": "mcp__memory__write_memory",
+                "status": "completed",
+                "rawInput": {"content": "旧形状", "category": "daily"},
+                "output": '{"id": "bee5817d"}',
+            },
+        })
+        self.assertIsNotNone(event)
+        self.assertEqual("write", event["action"])
+        self.assertEqual("bee5817d", event["memory_id"])
+
+    def test_string_raw_input_json_parsing_and_fallback(self):
+        client = self._client()
+        # 非法 JSON 字符串按空 dict 处理，不炸、不产字段，但终态仍可凭
+        # 缓存的 action + 输出里的 memory_id 产卡片。
+        client._memory_write_from_update(self._pending("0:tool_badjson", "mcp__memory__write_memory"))
+        client._memory_write_from_update(self._in_progress(
+            "0:tool_badjson", "mcp__memory__write_memory", "not-json{"
+        ))
+        event = client._memory_write_from_update(self._terminal(
+            "0:tool_badjson", "completed", '{"id": "bee5817d"}'
+        ))
+        self.assertIsNotNone(event)
+        self.assertEqual("write", event["action"])
+        self.assertEqual("bee5817d", event["memory_id"])
+        self.assertEqual("", event["category"])
+        self.assertEqual("", event["title"])
+        # dict 形式的 rawInput（其他 ACP 实现）同样被缓存。
+        client._memory_write_from_update(self._in_progress(
+            "0:tool_dictinput",
+            "mcp__memory__update_memory",
+            {"id": "7b64ed1e", "content": "dict 输入"},
+        ))
+        event = client._memory_write_from_update(self._terminal(
+            "0:tool_dictinput", "completed", '{"ok": true}'
+        ))
+        self.assertIsNotNone(event)
+        self.assertEqual("update", event["action"])
+        self.assertEqual("7b64ed1e", event["memory_id"])
+
+    def test_pending_cache_is_fifo_bounded(self):
+        client = self._client()
+        for index in range(70):
+            client._memory_write_from_update(self._pending(
+                f"0:tool_fifo{index}", "mcp__memory__write_memory"
+            ))
+        self.assertEqual(64, len(client._memory_write_tool_calls))
+        self.assertNotIn("0:tool_fifo0", client._memory_write_tool_calls)
+        self.assertIn("0:tool_fifo69", client._memory_write_tool_calls)
+
+    def test_interleaved_calls_project_independent_cards(self):
+        client = self._client()
+        # A pending → B pending → B completed → A completed：两个写调用交错
+        # 完成，卡片必须按各自 toolCallId 的缓存取字段，互不串号。
+        client._memory_write_from_update(self._pending(
+            "0:tool_interA", "mcp__memory__write_memory"
+        ))
+        client._memory_write_from_update(self._in_progress(
+            "0:tool_interA",
+            "mcp__memory__write_memory",
+            '{"content": "A 的记忆\\n\\n甲", "category": "daily"}',
+        ))
+        client._memory_write_from_update(self._pending(
+            "0:tool_interB", "mcp__memory__update_memory"
+        ))
+        client._memory_write_from_update(self._in_progress(
+            "0:tool_interB",
+            "mcp__memory__update_memory",
+            '{"id": "7b64ed1e", "content": "B 的更新"}',
+        ))
+        event_b = client._memory_write_from_update(self._terminal(
+            "0:tool_interB", "completed", '{"ok": true}'
+        ))
+        event_a = client._memory_write_from_update(self._terminal(
+            "0:tool_interA", "completed", '{"id": "bee5817d"}'
+        ))
+        self.assertIsNotNone(event_b)
+        self.assertEqual("update", event_b["action"])
+        self.assertEqual("0:tool_interB", event_b["tool_call_id"])
+        self.assertEqual("7b64ed1e", event_b["memory_id"])
+        self.assertEqual("B 的更新", event_b["title"])
+        self.assertEqual("", event_b["category"])
+        self.assertIsNotNone(event_a)
+        self.assertEqual("write", event_a["action"])
+        self.assertEqual("0:tool_interA", event_a["tool_call_id"])
+        self.assertEqual("bee5817d", event_a["memory_id"])
+        self.assertEqual("A 的记忆", event_a["title"])
+        self.assertEqual("daily", event_a["category"])
+        self.assertEqual({}, client._memory_write_tool_calls)
 
 
 class KimiACPBashMemoryWriteTest(unittest.TestCase):

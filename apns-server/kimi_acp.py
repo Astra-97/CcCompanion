@@ -192,55 +192,34 @@ def _memory_write_output_memory_id(update: dict[str, Any]) -> str:
     return ""
 
 
-def _memory_write_from_update(params: Any) -> dict[str, Any] | None:
-    """Project a completed memory-MCP write/update tool call to a card event.
-
-    Unlike the activity projection (which targets the lock-screen observer and
-    therefore copies nothing), this event feeds a chat-history card — the same
-    trust level as the recall card — so a small whitelist survives: action,
-    memory id, category, and a truncated title/snippet derived from the written
-    content.  Raw tool payloads never leave this function unbounded.
-    """
-    if not isinstance(params, dict):
-        return None
-    update = params.get("update")
-    if not isinstance(update, dict):
-        return None
-    kind = str(update.get("sessionUpdate") or "").strip().lower()
-    if kind not in {"tool_call", "tool_call_update"}:
-        return None
-    # Only a terminal success is a write; pending/in-progress/failed calls
-    # must not produce a card.
-    status = str(update.get("status") or "").strip().lower()
-    if status not in {"completed", "success", "succeeded"}:
-        return None
-    title_field = str(update.get("title") or "").strip().lower()
+def _memory_write_action_for_title(title_field: str) -> str | None:
     action = _MEMORY_WRITE_TOOL_ACTIONS.get(title_field)
     if action is None:
         for tool_name, tool_action in _MEMORY_WRITE_TOOL_ACTIONS.items():
             if tool_name.startswith("mcp__") and tool_name in title_field:
                 action = tool_action
                 break
-    if action is None:
-        return None
-    raw_input = update.get("rawInput")
-    raw_input = raw_input if isinstance(raw_input, dict) else {}
-    title, snippet = _memory_write_title_snippet(str(raw_input.get("content") or ""))
-    memory_id = str(raw_input.get("id") or raw_input.get("memory_id") or "").strip()
-    if not memory_id:
-        memory_id = _memory_write_output_memory_id(update)
-    if not _MEMORY_WRITE_ID_RE.fullmatch(memory_id):
-        memory_id = ""
-    return {
-        "kind": "memory_write",
-        "action": action,
-        "tool_call_id": str(update.get("toolCallId") or "").strip()[:80],
-        "memory_id": memory_id,
-        "title": title,
-        "category": str(raw_input.get("category") or "").strip()[:20],
-        "subcategory": str(raw_input.get("subcategory") or "").strip()[:20],
-        "snippet": snippet,
-    }
+    return action
+
+
+def _memory_write_raw_input_dict(raw_input: Any) -> dict[str, Any]:
+    # rawInput may arrive either as a dict or as a JSON string (e.g.
+    # ``"{}"``) depending on the ACP implementation and call phase; both
+    # are accepted.  Anything unparsable degrades to an empty dict — the
+    # card whitelists fields, so a missing field is a blank card line,
+    # never an error.
+    if isinstance(raw_input, dict):
+        return raw_input
+    if isinstance(raw_input, str):
+        try:
+            parsed = json.loads(raw_input)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+_MEMORY_WRITE_MAX_PENDING = 64
 
 
 # Bash calls that write the memory REST API directly (curl / python urllib)
@@ -456,6 +435,11 @@ class KimiACPClient:
         # toolCallId; the terminal Bash update carries no rawInput, so the
         # command must be remembered here and evaluated on completion.
         self._bash_tool_commands: dict[str, str] = {}
+        # Memory-MCP write/update calls carry their title only in the pending
+        # and in-progress updates; the terminal completed update is bare, so
+        # the action and rawInput are remembered here per toolCallId and
+        # evaluated on completion (same cross-update pattern as Bash above).
+        self._memory_write_tool_calls: dict[str, dict[str, Any]] = {}
         self._reader: threading.Thread | None = None
         self._stderr_reader: threading.Thread | None = None
         self._initialized = False
@@ -677,6 +661,8 @@ class KimiACPClient:
             self._app_model_session_id = ""
             self._app_effort_session_id = ""
             self._prepared_selection = {}
+            with self._active_lock:
+                self._memory_write_tool_calls.clear()
             self._reader = threading.Thread(
                 target=self._read_stdout,
                 args=(process, generation),
@@ -766,7 +752,7 @@ class KimiACPClient:
                             activity_callback(activity)
                         except Exception:
                             self.logger.warning("Kimi ACP activity callback failed", exc_info=True)
-                    memory_write = _memory_write_from_update(params)
+                    memory_write = self._memory_write_from_update(params)
                     if memory_write is None:
                         memory_write = self._bash_memory_write_from_update(params)
                     if memory_write_callback is not None and memory_write is not None:
@@ -788,6 +774,88 @@ class KimiACPClient:
             for event, bucket, _pending_generation in pending:
                 bucket.setdefault("failure", "Kimi ACP exited")
                 event.set()
+
+    def _memory_write_from_update(self, params: Any) -> dict[str, Any] | None:
+        """Project a completed memory-MCP write/update tool call to a card event.
+
+        Unlike the activity projection (which targets the lock-screen observer and
+        therefore copies nothing), this event feeds a chat-history card — the same
+        trust level as the recall card — so a small whitelist survives: action,
+        memory id, category, and a truncated title/snippet derived from the written
+        content.  Raw tool payloads never leave this function unbounded.
+
+        kimi-code sends the tool title only in the pending tool_call and the
+        in-progress tool_call_update (where rawInput may be a dict or a JSON
+        string; both are accepted); the terminal completed update carries
+        neither, so the action/rawInput are remembered per toolCallId in
+        ``_memory_write_tool_calls`` and the card is evaluated only once the
+        call completes.  A terminal update that still carries its own title
+        (other ACP implementations) projects directly without consulting the
+        cache.
+        """
+        if not isinstance(params, dict):
+            return None
+        update = params.get("update")
+        if not isinstance(update, dict):
+            return None
+        kind = str(update.get("sessionUpdate") or "").strip().lower()
+        if kind not in {"tool_call", "tool_call_update"}:
+            return None
+        tool_call_id = str(update.get("toolCallId") or "").strip()
+        title_field = str(update.get("title") or "").strip().lower()
+        action = _memory_write_action_for_title(title_field)
+        raw_input = _memory_write_raw_input_dict(update.get("rawInput"))
+        with self._active_lock:
+            if action is not None and tool_call_id:
+                cached = self._memory_write_tool_calls.get(tool_call_id) or {}
+                self._memory_write_tool_calls[tool_call_id] = {
+                    "action": action,
+                    "raw_input": raw_input or cached.get("raw_input") or {},
+                }
+                while len(self._memory_write_tool_calls) > _MEMORY_WRITE_MAX_PENDING:
+                    self._memory_write_tool_calls.pop(
+                        next(iter(self._memory_write_tool_calls))
+                    )
+            # Only a terminal success is a write; pending/in-progress/failed
+            # calls must not produce a card.
+            status = str(update.get("status") or "").strip().lower()
+            if status not in {"completed", "success", "succeeded"}:
+                # Failed/cancelled calls never project; their remembered
+                # entry is dead weight — pop it instead of waiting for the
+                # turn-end clear or the FIFO eviction.
+                if status in {"failed", "cancelled", "canceled", "error"}:
+                    self._memory_write_tool_calls.pop(tool_call_id, None)
+                return None
+            cached = (
+                self._memory_write_tool_calls.pop(tool_call_id, None)
+                if tool_call_id
+                else None
+            )
+        if action is None and isinstance(cached, dict):
+            cached_action = cached.get("action")
+            action = cached_action if isinstance(cached_action, str) else None
+        if action is None:
+            return None
+        if not raw_input and isinstance(cached, dict):
+            cached_raw_input = cached.get("raw_input")
+            if isinstance(cached_raw_input, dict):
+                raw_input = cached_raw_input
+        title, snippet = _memory_write_title_snippet(str(raw_input.get("content") or ""))
+        memory_id = str(raw_input.get("id") or raw_input.get("memory_id") or "").strip()
+        if not memory_id:
+            memory_id = _memory_write_output_memory_id(update)
+        if not _MEMORY_WRITE_ID_RE.fullmatch(memory_id):
+            memory_id = ""
+        return {
+            "kind": "memory_write",
+            "action": action,
+            "tool_call_id": tool_call_id[:80],
+            "memory_id": memory_id,
+            "title": title,
+            "category": str(raw_input.get("category") or "").strip()[:20],
+            "subcategory": str(raw_input.get("subcategory") or "").strip()[:20],
+            "snippet": snippet,
+        }
 
     def _bash_memory_write_from_update(self, params: Any) -> dict[str, Any] | None:
         """Project a completed Bash memory-API write, tracking commands by call.
@@ -1250,6 +1318,7 @@ class KimiACPClient:
                 self._active_activity = on_activity
                 self._active_memory_write = on_memory_write
                 self._bash_tool_commands.clear()
+                self._memory_write_tool_calls.clear()
             if cancel_event is not None and cancel_event.is_set():
                 raise KimiACPCancelled("Kimi generation cancelled before prompt")
             finished = threading.Event()
@@ -1302,6 +1371,7 @@ class KimiACPClient:
                 self._active_activity = None
                 self._active_memory_write = None
                 self._bash_tool_commands.clear()
+                self._memory_write_tool_calls.clear()
             self._turn_lock.release()
 
     def _prompt_and_collect_text(
