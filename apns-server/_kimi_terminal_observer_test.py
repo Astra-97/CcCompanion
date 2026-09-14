@@ -15,7 +15,13 @@ from kimi_terminal_observer import (
     KIMI_TERMINAL_MAX_EVENTS,
     KimiTerminalObserver,
 )
-from push import KIMI_TERMINAL_OWNER_VALUE, KimiTerminalBridge, KimiTerminalBusy, PushHandler
+from push import (
+    KIMI_TERMINAL_OWNER_VALUE,
+    KimiTerminalBridge,
+    KimiTerminalBusy,
+    KimiTerminalNoActiveSession,
+    PushHandler,
+)
 
 
 class KimiTerminalObserverTest(unittest.TestCase):
@@ -795,7 +801,7 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         bridge.ensure.assert_called_once_with("session-current")
         self.assertEqual("", handler.state.kimi_terminal_acquire_token)
 
-    def test_busy_web_session_with_an_unrelated_active_turn_fails_closed(self):
+    def test_busy_background_session_attaches_after_local_turn_bookkeeping_clears(self):
         web = types.SimpleNamespace(
             cwd="/workspace", start=lambda: None,
             load_active_session_id=lambda: "session-current",
@@ -803,26 +809,18 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
             list_sessions=lambda: [{"id": "session-current", "metadata": {"cwd": "/workspace"}}],
             get_session_status=lambda _session, **_kwargs: {"busy": True},
         )
-        for active_turn in (
-            # A Web turn on another session explains nothing about this one.
-            {"user_ts": "u1", "session_id": "session-other", "transport": "kimi-web"},
-            # The ACP rollback path never authorizes a Web-session attach:
-            # its session pointer lives in a separate state file.
-            {"user_ts": "u1", "session_id": "session-current"},
-        ):
-            with self.subTest(active_turn=active_turn):
-                bridge = types.SimpleNamespace(ensure=mock.Mock(return_value="%42"))
-                handler = object.__new__(PushHandler)
-                handler.state = types.SimpleNamespace(
-                    kimi_turn_lock=threading.RLock(),
-                    kimi_active_turn=active_turn,
-                    kimi_prepare_token="", kimi_recovery_token="",
-                    kimi_terminal_acquire_token="", kimi_web=web, kimi_terminal=bridge,
-                )
-                with self.assertRaises(KimiTerminalBusy):
-                    handler._acquire_kimi_terminal()
-                bridge.ensure.assert_not_called()
-                self.assertEqual("", handler.state.kimi_terminal_acquire_token)
+        bridge = types.SimpleNamespace(ensure=mock.Mock(return_value="%42"))
+        handler = object.__new__(PushHandler)
+        handler.state = types.SimpleNamespace(
+            kimi_turn_lock=threading.RLock(),
+            # The long-running job outlived this server-side chat turn.
+            kimi_active_turn={},
+            kimi_prepare_token="", kimi_recovery_token="",
+            kimi_terminal_acquire_token="", kimi_web=web, kimi_terminal=bridge,
+        )
+        self.assertEqual("%42", handler._acquire_kimi_terminal())
+        bridge.ensure.assert_called_once_with("session-current")
+        self.assertEqual("", handler.state.kimi_terminal_acquire_token)
 
     @mock.patch("push.subprocess.Popen")
     @mock.patch("push.subprocess.run")
@@ -925,7 +923,7 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         bridge.ensure.assert_called_once_with("session-current")
         self.assertEqual("", handler.state.kimi_terminal_acquire_token)
 
-    def test_busy_web_session_allows_only_the_same_live_kimi_tui_to_capture(self):
+    def test_busy_web_session_attaches_without_a_preexisting_tui_lease(self):
         web = types.SimpleNamespace(
             cwd="/workspace",
             start=lambda: None,
@@ -935,25 +933,31 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
             get_session_status=lambda _session: {"busy": True},
         )
 
-        def handler_for(owns_live):
-            bridge = types.SimpleNamespace(
-                ensure=mock.Mock(return_value="%42"),
-                owns_live_session=mock.Mock(return_value=owns_live),
-            )
-            handler = object.__new__(PushHandler)
-            handler.state = types.SimpleNamespace(
-                kimi_turn_lock=threading.RLock(), kimi_active_turn={}, kimi_prepare_token="",
-                kimi_recovery_token="", kimi_terminal_acquire_token="", kimi_web=web, kimi_terminal=bridge,
-            )
-            return handler, bridge
-
-        handler, bridge = handler_for(True)
+        bridge = types.SimpleNamespace(ensure=mock.Mock(return_value="%42"))
+        handler = object.__new__(PushHandler)
+        handler.state = types.SimpleNamespace(
+            kimi_turn_lock=threading.RLock(), kimi_active_turn={}, kimi_prepare_token="",
+            kimi_recovery_token="", kimi_terminal_acquire_token="", kimi_web=web, kimi_terminal=bridge,
+        )
         self.assertEqual("%42", handler._acquire_kimi_terminal())
-        bridge.owns_live_session.assert_called_once_with("session-current")
         bridge.ensure.assert_called_once_with("session-current")
 
-        handler, bridge = handler_for(False)
-        with self.assertRaises(KimiTerminalBusy):
+    def test_active_pointer_change_during_busy_validation_blocks_ensure(self):
+        pointers = iter(("session-current", "session-other"))
+        web = types.SimpleNamespace(
+            cwd="/workspace", start=lambda: None,
+            load_active_session_id=lambda: next(pointers),
+            _valid_session_id=lambda value: value,
+            list_sessions=lambda: [{"id": "session-current", "metadata": {"cwd": "/workspace"}}],
+            get_session_status=lambda _session, **_kwargs: {"busy": True},
+        )
+        bridge = types.SimpleNamespace(ensure=mock.Mock(return_value="%42"))
+        handler = object.__new__(PushHandler)
+        handler.state = types.SimpleNamespace(
+            kimi_turn_lock=threading.RLock(), kimi_active_turn={}, kimi_prepare_token="",
+            kimi_recovery_token="", kimi_terminal_acquire_token="", kimi_web=web, kimi_terminal=bridge,
+        )
+        with self.assertRaises(KimiTerminalNoActiveSession):
             handler._acquire_kimi_terminal()
         bridge.ensure.assert_not_called()
         self.assertEqual("", handler.state.kimi_terminal_acquire_token)

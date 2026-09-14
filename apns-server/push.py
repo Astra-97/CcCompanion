@@ -15668,33 +15668,21 @@ class PushHandler(BaseHTTPRequestHandler):
                     not second_busy
                     and str(web.load_active_session_id() or "") == session_id
                 )
-            if session_busy:
-                # A busy status is normally an existing Web writer and must
-                # fail closed. The first exception is the same process's
-                # already-leased TUI after its own Enter: capture/resize must
-                # remain able to show that real output without opening a
-                # second pane or reviving a post-restart writer.  The second
-                # is this server's own active Web turn on the exact sampled
-                # session: attaching the TUI to it is the supported
-                # full-duplex path, with input queued by the CLI itself.
-                # The ACP rollback path is deliberately excluded: its session
-                # pointer lives in a separate state file, so a busy Web status
-                # during an ACP turn is never ours to explain away.
-                owns_live = getattr(self.state.kimi_terminal, "owns_live_session", None)
-                can_adopt = getattr(self.state.kimi_terminal, "can_adopt_bound_session", None)
-                with self.state.kimi_turn_lock:
-                    active_turn = dict(self.state.kimi_active_turn or {})
-                active_turn_owns_session = (
-                    bool(active_turn)
-                    and str(active_turn.get("transport") or "") == "kimi-web"
-                    and str(active_turn.get("session_id") or "") == session_id
-                )
-                if (
-                    not active_turn_owns_session
-                    and (not callable(owns_live) or not owns_live(session_id))
-                    and (not callable(can_adopt) or not can_adopt(session_id))
-                ):
-                    raise KimiTerminalBusy("Kimi 正在回复，暂时不能接管终端")
+            # A busy Web session is the expected state for a background task.
+            # The exact active Web pointer, session record/CWD and status
+            # checks above are the authority for this attach; ``kimi_active_turn``
+            # is only local bookkeeping and can legitimately be cleared before
+            # Kimi has finished work.  Do not downgrade the real tmux terminal
+            # to an observer just because that bookkeeping is absent.
+            #
+            # Re-read the native active pointer after the status samples so a
+            # pointer switch that races validation cannot launch ``--session``
+            # against a stale conversation.  This applies to busy sessions as
+            # well as the stable-idle reconciliation path below.
+            final_raw_session_id = str(web.load_active_session_id() or "")
+            final_session_id = valid_session(final_raw_session_id) if callable(valid_session) else final_raw_session_id
+            if final_session_id != session_id:
+                raise KimiTerminalNoActiveSession("Kimi 当前没有可恢复的活跃会话")
             with self.state.kimi_turn_lock:
                 # Group replies and orphan recovery do not consult the acquire
                 # token, so a prepare/recovery reservation can still appear
