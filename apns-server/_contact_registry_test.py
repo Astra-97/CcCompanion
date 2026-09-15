@@ -73,6 +73,14 @@ class ContactRegistryTest(unittest.TestCase):
         self.assertTrue(dispatch_contact_get(handler, "/kimi/preferences"))
         self.assertTrue(dispatch_contact_post(handler, "/codex/forge", {"x": 1}))
         self.assertTrue(dispatch_contact_post(handler, "/kimi/forge", {"x": 2}))
+        # 小克控制台 (2026-09-15)：/xiaoke/ 控制台路由注册在 contacts/xiaoke.py。
+        self.assertTrue(dispatch_contact_get(handler, "/xiaoke/status"))
+        self.assertTrue(dispatch_contact_get(handler, "/xiaoke/preferences"))
+        self.assertTrue(dispatch_contact_get(handler, "/xiaoke/sessions"))
+        self.assertTrue(dispatch_contact_post(handler, "/xiaoke/preferences", {"model": "fable"}))
+        self.assertTrue(dispatch_contact_post(handler, "/xiaoke/new_session", {}))
+        self.assertTrue(dispatch_contact_post(handler, "/xiaoke/switch_session", {"session_id": "s"}))
+        self.assertTrue(dispatch_contact_post(handler, "/xiaoke/forge", {}))
         self.assertFalse(dispatch_contact_get(handler, "/settings"))
         self.assertFalse(dispatch_contact_post(handler, "/chat/send", {}))
 

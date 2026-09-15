@@ -21,6 +21,22 @@ CONTACT = {
 
 ROUTE = {"send_handler": "xiaoke", "capabilities": CONTACT["capabilities"], "group_dispatcher": "xiaoke"}
 
+# 小克控制台 (2026-09-15)：/xiaoke/ REST 路由，对齐 /kimi/ 控制台契约族。
+# 处理器本体在 push.py（复用 _run_toolbot_command 白名单命令面）；本表只做
+# 路径 → 方法名的注册，dispatch 由 contacts.registry 统一走。
+GET_ROUTES = {
+    "/xiaoke/status": "_handle_xiaoke_status",
+    "/xiaoke/preferences": "_handle_xiaoke_preferences_get",
+    "/xiaoke/sessions": "_handle_xiaoke_sessions",
+}
+
+POST_ROUTES = {
+    "/xiaoke/preferences": "_handle_xiaoke_preferences_post",
+    "/xiaoke/new_session": "_handle_xiaoke_new_session",
+    "/xiaoke/switch_session": "_handle_xiaoke_switch_session",
+    "/xiaoke/forge": "_handle_xiaoke_forge",
+}
+
 
 def send(handler: Any, body: dict[str, Any]) -> None:
     """Route a prepared private turn into the shared exact-turn pipeline."""

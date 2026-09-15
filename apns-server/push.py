@@ -6772,7 +6772,8 @@ class PushHandler(BaseHTTPRequestHandler):
         # behind the shared secret even when legacy strict_auth is disabled;
         # importantly, this happens before the generic cookie-aware auth.
         # kiro 切模型 (2026-09-10): /kiro/ 控制台走同一道 native pairing 闸门。
-        if request_path.startswith(("/kimi/", "/kiro/")) and not self._native_pairing_auth_matches():
+        # 小克控制台 (2026-09-15): /xiaoke/ 同闸。
+        if request_path.startswith(("/kimi/", "/kiro/", "/xiaoke/")) and not self._native_pairing_auth_matches():
             self._send_json(401, {"ok": False, "error": "unauthorized"})
             return
         # The Kimi interactive terminal is privileged even on a legacy
@@ -7411,7 +7412,8 @@ class PushHandler(BaseHTTPRequestHandler):
         if not self._check_ip_allowed():
             return
         # kiro 切模型 (2026-09-10): /kiro/ 与 /kimi/ 同一道 native pairing 闸门。
-        if request_path.startswith(("/kimi/", "/kiro/")) and not self._native_pairing_auth_matches():
+        # 小克控制台 (2026-09-15): /xiaoke/ 同闸。
+        if request_path.startswith(("/kimi/", "/kiro/", "/xiaoke/")) and not self._native_pairing_auth_matches():
             self._send_json(401, {"ok": False, "error": "unauthorized"})
             return
         # session/target lives in the JSON body for these routes. Fail closed
@@ -25167,6 +25169,266 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         self._send_json(200, {"ok": True, "contact_id": contact_id, "text": text})
 
+    # ---------- 小克控制台（/xiaoke/ REST，2026-09-15） ----------
+    # 对齐 /kimi/ 控制台（contacts/kimi.py）的交互面：状态 / 模型+effort 偏好 /
+    # session 列表·切换·新建 / forge。命令面全部复用 _run_toolbot_command 的
+    # 白名单分支（model/effort/sessions/session_switch/session_new/forge），
+    # 不另开任何 shell 通道。鉴权在 do_GET/do_POST 的 /xiaoke/ 前缀闸门
+    # （native pairing，与 /kimi/ /kiro/ 同一道）。
+
+    def _xiaoke_control_busy(self) -> bool:
+        """小克是否有在跑/收尾中的回合（与 _handle_xiaoke_chat_send 同一状态机）。"""
+        with self.state.xiaoke_stop_lock:
+            typing = dict(getattr(self.state, "typing_state", None) or {})
+            stopping = dict(getattr(self.state, "xiaoke_stopping_claim", None) or {})
+            reservation = dict(getattr(self.state, "xiaoke_send_reservation", None) or {})
+        return bool(stopping or reservation or typing.get("is_typing"))
+
+    def _xiaoke_control_busy_gate(self, action: str) -> bool:
+        """会话级写操作（切会话/新建/forge）都会 systemctl restart claude-tg，
+        会杀掉在跑回合；忙时一律 409，绝不静默打断。返回 True 表示已回 409。"""
+        if not self._xiaoke_control_busy():
+            return False
+        reason = "小克正在回复中；此操作会重启会话并打断当前回合，请先停止或等回合结束。"
+        self._send_json(409, {
+            "ok": False,
+            "error": "xiaoke_busy",
+            "action": action,
+            "reason": reason,
+            "message": reason,
+        })
+        return True
+
+    def _xiaoke_claude_status(self) -> dict[str, Any]:
+        """运行时状态条数据源：@claude-code-status-json（2s 硬上限读取，隔离方法便于测试替换）。"""
+        try:
+            status = self._pwa_read_claude_status_option()
+            return status if isinstance(status, dict) else {}
+        except Exception:
+            logger.debug("xiaoke control status read failed", exc_info=True)
+            return {}
+
+    def _archive_xiaoke_control(self, command: str, args: str, ok: bool, result_text: str) -> None:
+        """把控制台操作归档到工具版窗口，与 /toolbot/command 同一审计面；归档失败绝不影响响应。"""
+        archive = getattr(self.state, "toolbot_archive", None)
+        if not callable(archive):
+            return
+        try:
+            status_icon = "✅" if ok else "⚠️"
+            archive(
+                f"{status_icon} 小克控制台 `{command}`" + (f" {args}" if args else "") + f"\n{result_text}",
+                title=f"小克控制台 · {command}",
+                source="xiaoke-control",
+                metadata={"command": command, "ok": ok},
+            )
+        except Exception:
+            logger.warning("xiaoke control archive failed", exc_info=True)
+
+    def _handle_xiaoke_status(self) -> None:
+        pin = _read_ccbot_model_file()
+        status = self._xiaoke_claude_status()
+        model_data = status.get("model") if isinstance(status.get("model"), dict) else {}
+        model_id = str(model_data.get("id") or "").strip()
+        model_name = str(model_data.get("display_name") or "").strip() or model_id
+        context_data = status.get("context_window") if isinstance(status.get("context_window"), dict) else {}
+        used_percent = self._pwa_bounded_percent(context_data.get("used_percentage"))
+        limits = status.get("rate_limits") if isinstance(status.get("rate_limits"), dict) else {}
+        windows: list[dict[str, Any]] = []
+        for source_key, label in (("five_hour", "Claude 5h"), ("seven_day", "Claude 7d")):
+            limit = limits.get(source_key) if isinstance(limits.get(source_key), dict) else {}
+            used = self._pwa_bounded_percent(limit.get("used_percentage"))
+            if used is None:
+                continue
+            reset = _format_reset_beijing(limit.get("resets_at"))
+            windows.append({
+                "label": label,
+                "used_percent": used,
+                "text": f"{used:.0f}%",
+                "reset_text": f"重置 {reset}" if reset else "",
+            })
+        try:
+            active_sid = CCBOT_CURRENT_SESSION_FILE.read_text(encoding="utf-8").strip()
+        except Exception:
+            active_sid = ""
+        self._send_json(200, {
+            "ok": True,
+            "provider": "Claude Code",
+            "model": model_name or pin,
+            "model_id": model_id or pin,
+            "effort": _read_claude_settings_effort(),
+            "busy": self._xiaoke_control_busy(),
+            "active_session_id": active_sid,
+            "context": {"available": used_percent is not None, "used_percent": used_percent},
+            "quota": {"windows": windows},
+            "capabilities": {
+                "can_new_session": True,
+                "can_switch_session": True,
+                "can_forge": True,
+            },
+        })
+
+    def _xiaoke_preferences_payload(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "provider": "Claude Code",
+            # 模型钉子（~/.ccbot/current-model）：重启后 start 脚本按它拉起。
+            "model": _read_ccbot_model_file(),
+            # effort 只读自 ~/.claude/settings.json 的 effortLevel；本路由不写它。
+            "effort": _read_claude_settings_effort(),
+            "available_models": sorted(TOOLBOT_MODEL_ALLOWLIST),
+            "model_aliases": dict(TOOLBOT_MODEL_ALIASES),
+            "available_efforts": list(TOOLBOT_EFFORT_LEVELS),
+            "busy": self._xiaoke_control_busy(),
+            "applies_from": {
+                "model": "current_session_and_next_start",
+                "effort": "current_session_only",
+            },
+        }
+
+    def _handle_xiaoke_preferences_get(self) -> None:
+        self._send_json(200, self._xiaoke_preferences_payload())
+
+    def _handle_xiaoke_preferences_post(self, body: dict[str, Any]) -> None:
+        """运行时注入 /model、/effort 到 cctg 会话；模型额外写钉子持久化。
+
+        effort 无持久面（settings.json 只读不改），只对当前会话生效，响应里
+        applies_from 明说。模型先注入再写钉子：注入失败时不落钉，避免「钉子
+        与运行态不一致」。
+        """
+        raw_model = str(body.get("model") or "").strip()
+        raw_effort = str(body.get("effort") or body.get("reasoning_effort") or "").strip().lower()
+        if not raw_model and not raw_effort:
+            self._send_json(400, {"ok": False, "error": "model_or_effort_required"})
+            return
+        model_id = ""
+        if raw_model:
+            resolved = self._resolve_toolbot_model(raw_model)
+            if resolved is None:
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "invalid_model",
+                    "message": f"未知模型：{raw_model}（允许别名/全名：{', '.join(sorted(TOOLBOT_MODEL_ALIASES))}）",
+                })
+                return
+            model_id = resolved
+        if raw_effort and raw_effort not in TOOLBOT_EFFORT_LEVELS:
+            self._send_json(400, {
+                "ok": False,
+                "error": "invalid_effort",
+                "message": f"未知 effort：{raw_effort}（允许：{', '.join(TOOLBOT_EFFORT_LEVELS)}）",
+            })
+            return
+        previous_model = _read_ccbot_model_file()
+        results: dict[str, str] = {}
+        if model_id:
+            ok, text = self._run_toolbot_command("model", model_id)
+            results["model"] = text
+            if not ok:
+                self._send_json(502, {"ok": False, "error": "model_inject_failed", "message": text})
+                return
+            try:
+                _atomic_write_text(CCBOT_CURRENT_MODEL_FILE, model_id + "\n")
+            except Exception:
+                logger.exception("write current-model pin failed")
+                self._send_json(500, {"ok": False, "error": "model_pin_persistence_failed"})
+                return
+            self._archive_xiaoke_control("model", model_id, True, text)
+        if raw_effort:
+            ok, text = self._run_toolbot_command("effort", raw_effort)
+            results["effort"] = text
+            if not ok:
+                self._send_json(502, {"ok": False, "error": "effort_inject_failed", "message": text})
+                return
+            self._archive_xiaoke_control("effort", raw_effort, True, text)
+        if model_id and model_id != previous_model:
+            self._notify_xiaoke_model_switched(previous_model, model_id, raw_effort)
+        payload = self._xiaoke_preferences_payload()
+        payload["results"] = results
+        self._send_json(200, payload)
+
+    def _notify_xiaoke_model_switched(self, previous_model: str, model: str, effort: str) -> None:
+        """App 切模型后往小克聊天历史追加一条说明并推送（对照 _notify_kimi_model_switched）。"""
+        text = f"已切到 {model} 模型"
+        if effort:
+            text += f"（推理强度 {effort}）"
+        text += "。当前会话立即生效；模型已写入钉子，服务重启后保持。"
+        try:
+            self._chat_for_contact("xiaoke").append(
+                role="assistant",
+                text=text,
+                source="system:xiaoke-model-switch",
+            )
+        except Exception:
+            logger.exception("xiaoke model switch notice history append failed")
+        try:
+            self._send_chat_notification("小克已切换模型", text[:80])
+        except Exception:
+            logger.warning("xiaoke model switch notification failed", exc_info=True)
+
+    def _handle_xiaoke_sessions(self) -> None:
+        ok, result_text = self._run_toolbot_command("sessions", "")
+        if not ok:
+            self._send_json(502, {"ok": False, "error": result_text})
+            return
+        try:
+            data = json.loads(result_text)
+        except Exception:
+            self._send_json(502, {"ok": False, "error": "sessions_payload_unparseable"})
+            return
+        sessions = data.get("sessions") if isinstance(data.get("sessions"), list) else []
+        self._send_json(200, {
+            "ok": True,
+            "provider": "Claude Code",
+            "sessions": sessions,
+            "active_session_id": str(data.get("active_sid") or "") or None,
+        })
+
+    def _handle_xiaoke_new_session(self, body: dict[str, Any]) -> None:
+        model = str(body.get("model") or "").strip()
+        if model and self._resolve_toolbot_model(model) is None:
+            self._send_json(400, {"ok": False, "error": "invalid_model", "message": f"未知模型：{model}"})
+            return
+        if self._xiaoke_control_busy_gate("new_session"):
+            return
+        ok, text = self._run_toolbot_command("session_new", model)
+        self._archive_xiaoke_control("session_new", model, ok, text)
+        self._send_json(200 if ok else 502, {"ok": ok, "command": "session_new", "result": text, "message": text})
+
+    def _handle_xiaoke_switch_session(self, body: dict[str, Any]) -> None:
+        sid = str(body.get("session_id") or body.get("sessionId") or "").strip()
+        if not sid:
+            self._send_json(400, {"ok": False, "error": "session_id required"})
+            return
+        if _session_jsonl_path(sid) is None:
+            self._send_json(404, {"ok": False, "error": "unknown_xiaoke_session"})
+            return
+        if self._xiaoke_control_busy_gate("switch_session"):
+            return
+        ok, text = self._run_toolbot_command("session_switch", sid)
+        self._archive_xiaoke_control("session_switch", sid, ok, text)
+        self._send_json(200 if ok else 502, {"ok": ok, "command": "session_switch", "result": text, "message": text})
+
+    def _handle_xiaoke_forge(self, body: dict[str, Any]) -> None:
+        """POST /xiaoke/forge — body {"retain": "all"|<数字>, "model": <别名/全名>}，均可选。
+
+        两段参数在此各自校验后拼成 "retain model" 交给 forge 分支；分支内部
+        还会逐 token 再校验一次，任何自由文本都到不了 forge-reload-claude。
+        """
+        retain = str(body.get("retain") or "").strip().lower()
+        model = str(body.get("model") or "").strip()
+        if retain and retain != "all" and not retain.isdigit():
+            self._send_json(400, {"ok": False, "error": "invalid_retain", "message": "retain 只能是 all 或纯数字"})
+            return
+        if model and self._resolve_toolbot_model(model) is None:
+            self._send_json(400, {"ok": False, "error": "invalid_model", "message": f"未知模型：{model}"})
+            return
+        if self._xiaoke_control_busy_gate("forge"):
+            return
+        args = " ".join(part for part in (retain, model) if part)
+        ok, text = self._run_toolbot_command("forge", args)
+        self._archive_xiaoke_control("forge", args, ok, text)
+        self._send_json(200 if ok else 502, {"ok": ok, "command": "forge", "result": text, "message": text})
+
     def _run_toolbot_command(self, command: str, args: str) -> tuple[bool, str]:
         """Dispatch a whitelisted toolbot command. Returns (ok, result_text).
 
@@ -25866,6 +26128,25 @@ def _read_ccbot_model_file() -> str:
     try:
         if CCBOT_MODEL_FILE.exists():
             return CCBOT_MODEL_FILE.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    return ""
+
+
+# 小克控制台 (2026-09-15)：effort 的持久面在 Claude 自己的 settings.json，
+# 本服务只读不写（写 effort 只走 /effort 运行时注入，见 _handle_xiaoke_preferences_post）。
+CLAUDE_SETTINGS_FILE = Path("/root/.claude/settings.json")
+
+
+def _read_claude_settings_effort() -> str:
+    """Read effortLevel from ~/.claude/settings.json; '' when absent/invalid."""
+    try:
+        if CLAUDE_SETTINGS_FILE.exists():
+            data = json.loads(CLAUDE_SETTINGS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                effort = str(data.get("effortLevel") or "").strip().lower()
+                if effort in TOOLBOT_EFFORT_LEVELS:
+                    return effort
     except Exception:
         pass
     return ""
