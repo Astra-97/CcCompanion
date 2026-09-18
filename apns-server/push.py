@@ -150,6 +150,8 @@ from tampon_records import (
 )
 from xhs_login import XhsLoginError, XhsLoginManager
 from netease_login import NeteaseLoginError, NeteaseLoginManager
+from jd_login import JdLoginError, JdLoginManager
+from meituan_login import MeituanLoginError, MeituanLoginManager
 from mcp_services import McpServiceError, McpServiceStore
 from kimi_acp import (
     DEFAULT_KIMI_CWD,
@@ -4042,6 +4044,40 @@ class ServerState:
             allowed_contacts=netease_allowed_contacts,
         )
 
+        jd_login_cfg = config.get("jd_login", {})
+        raw_jd_import_command = jd_login_cfg.get("import_command")
+        jd_import_command = raw_jd_import_command if isinstance(raw_jd_import_command, list) else None
+        raw_jd_status_command = jd_login_cfg.get("status_command")
+        jd_status_command = raw_jd_status_command if isinstance(raw_jd_status_command, list) else None
+        jd_allowed_contacts = {
+            str(item).strip().lower()
+            for item in (jd_login_cfg.get("allowed_contacts", ["kairos", "kimi"]) or [])
+            if str(item).strip()
+        }
+        self.jd_login = JdLoginManager(
+            import_command=jd_import_command,
+            status_command=jd_status_command,
+            ttl_seconds=int(jd_login_cfg.get("ttl_seconds", 300)),
+            allowed_contacts=jd_allowed_contacts,
+        )
+
+        meituan_login_cfg = config.get("meituan_login", {})
+        raw_mt_import_command = meituan_login_cfg.get("import_command")
+        mt_import_command = raw_mt_import_command if isinstance(raw_mt_import_command, list) else None
+        raw_mt_status_command = meituan_login_cfg.get("status_command")
+        mt_status_command = raw_mt_status_command if isinstance(raw_mt_status_command, list) else None
+        mt_allowed_contacts = {
+            str(item).strip().lower()
+            for item in (meituan_login_cfg.get("allowed_contacts", ["kairos", "kimi"]) or [])
+            if str(item).strip()
+        }
+        self.meituan_login = MeituanLoginManager(
+            import_command=mt_import_command,
+            status_command=mt_status_command,
+            ttl_seconds=int(meituan_login_cfg.get("ttl_seconds", 300)),
+            allowed_contacts=mt_allowed_contacts,
+        )
+
         if self.apns_enabled:
             self.jwt = APNsJWT(
                 p8_path=self.p8_path,
@@ -7557,6 +7593,10 @@ class PushHandler(BaseHTTPRequestHandler):
             "/xhs-login/import": 32 * 1024,
             "/netease-login/start": 4 * 1024,
             "/netease-login/import": 8 * 1024,
+            "/jd-login/start": 4 * 1024,
+            "/jd-login/import": 16 * 1024,
+            "/meituan-login/start": 4 * 1024,
+            "/meituan-login/import": 24 * 1024,
         }
         if request_path == "/mcp-services":
             # Tokens are sensitive; reject oversized requests before reading
@@ -7666,6 +7706,18 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         elif self.path == "/netease-login/import":
             self._handle_netease_login_import(body)
+            return
+        elif self.path == "/jd-login/start":
+            self._handle_jd_login_start(body)
+            return
+        elif self.path == "/jd-login/import":
+            self._handle_jd_login_import(body)
+            return
+        elif self.path == "/meituan-login/start":
+            self._handle_meituan_login_start(body)
+            return
+        elif self.path == "/meituan-login/import":
+            self._handle_meituan_login_import(body)
             return
         elif self.path == "/chat/stop":
             # XiaoKe Stop emits literal tmux Ctrl-C and remains under the
@@ -7963,6 +8015,70 @@ class PushHandler(BaseHTTPRequestHandler):
                 cookie_header=body.get("cookies"),
             )
         except NeteaseLoginError as exc:
+            self._send_json(exc.status, {"ok": False, "error": exc.code})
+            return
+        self._send_json(200, result)
+
+    def _handle_jd_login_start(self, body: dict[str, Any]):
+        if self._source_for_request() != "android-app":
+            self._send_json(403, {"ok": False, "error": "android client required"})
+            return
+        try:
+            result = self.state.jd_login.start(
+                contact_id=body.get("contact_id"),
+                device_id=body.get("device_id"),
+                origin=body.get("origin"),
+            )
+        except JdLoginError as exc:
+            self._send_json(exc.status, {"ok": False, "error": exc.code})
+            return
+        self._send_json(200, result)
+
+    def _handle_jd_login_import(self, body: dict[str, Any]):
+        if self._source_for_request() != "android-app":
+            self._send_json(403, {"ok": False, "error": "android client required"})
+            return
+        try:
+            result = self.state.jd_login.import_cookies(
+                nonce=body.get("nonce"),
+                contact_id=body.get("contact_id"),
+                device_id=body.get("device_id"),
+                origin=body.get("origin"),
+                cookie_header=body.get("cookies"),
+            )
+        except JdLoginError as exc:
+            self._send_json(exc.status, {"ok": False, "error": exc.code})
+            return
+        self._send_json(200, result)
+
+    def _handle_meituan_login_start(self, body: dict[str, Any]):
+        if self._source_for_request() != "android-app":
+            self._send_json(403, {"ok": False, "error": "android client required"})
+            return
+        try:
+            result = self.state.meituan_login.start(
+                contact_id=body.get("contact_id"),
+                device_id=body.get("device_id"),
+                origin=body.get("origin"),
+            )
+        except MeituanLoginError as exc:
+            self._send_json(exc.status, {"ok": False, "error": exc.code})
+            return
+        self._send_json(200, result)
+
+    def _handle_meituan_login_import(self, body: dict[str, Any]):
+        if self._source_for_request() != "android-app":
+            self._send_json(403, {"ok": False, "error": "android client required"})
+            return
+        try:
+            result = self.state.meituan_login.import_cookies(
+                nonce=body.get("nonce"),
+                contact_id=body.get("contact_id"),
+                device_id=body.get("device_id"),
+                origin=body.get("origin"),
+                cookie_header=body.get("cookies"),
+            )
+        except MeituanLoginError as exc:
             self._send_json(exc.status, {"ok": False, "error": exc.code})
             return
         self._send_json(200, result)
@@ -10908,6 +11024,87 @@ class PushHandler(BaseHTTPRequestHandler):
         visible = "\n".join(line for line in lines if line.strip() != marker).strip()
         return visible or "网易云音乐还没登录，点下方卡片扫码登录。", True
 
+    def _kimi_jd_login_card_allowed(self) -> bool:
+        """Permit the JD login card only while memory-sg reports no JD session.
+
+        The gate reads solely the server-owned probe (jd_keeper's status file
+        on memory-sg, via the login manager); it never inspects client
+        metadata or model text, so a user cannot conjure a login card from a
+        marker or a card-shaped payload.
+        """
+        manager = getattr(self.state, "jd_login", None)
+        needs_login = getattr(manager, "needs_login", None)
+        if not callable(needs_login):
+            return False
+        try:
+            return bool(needs_login())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _kimi_extract_jd_login_card(
+        message: str,
+        *,
+        allowed: bool,
+    ) -> tuple[str, bool]:
+        """Extract exactly one standalone, server-authorized JD card marker.
+
+        Same narrow grammar as the XHS card: near matches, inline uses,
+        repeated markers, and a marker that is not the last non-empty line
+        remain ordinary assistant text.
+        """
+        raw = str(message or "")
+        if not allowed:
+            return raw, False
+        marker = "[[CCC_JD_LOGIN_CARD:v1]]"
+        lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        marker_count = sum(line.strip() == marker for line in lines)
+        nonempty = [line.strip() for line in lines if line.strip()]
+        if marker_count != 1 or not nonempty or nonempty[-1] != marker:
+            return raw, False
+        visible = "\n".join(line for line in lines if line.strip() != marker).strip()
+        return visible or "京东登录已失效，点下方卡片重新登录。", True
+
+    def _kimi_meituan_login_card_allowed(self) -> bool:
+        """Permit the Meituan login card only while memory-sg reports no session.
+
+        Same server-owned probe pattern as the JD gate (meituan_tools status
+        on memory-sg, via the login manager); client metadata and model text
+        are never consulted.
+        """
+        manager = getattr(self.state, "meituan_login", None)
+        needs_login = getattr(manager, "needs_login", None)
+        if not callable(needs_login):
+            return False
+        try:
+            return bool(needs_login())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _kimi_extract_meituan_login_card(
+        message: str,
+        *,
+        allowed: bool,
+    ) -> tuple[str, bool]:
+        """Extract exactly one standalone, server-authorized Meituan card marker.
+
+        Same narrow grammar as the XHS card: near matches, inline uses,
+        repeated markers, and a marker that is not the last non-empty line
+        remain ordinary assistant text.
+        """
+        raw = str(message or "")
+        if not allowed:
+            return raw, False
+        marker = "[[CCC_MEITUAN_LOGIN_CARD:v1]]"
+        lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        marker_count = sum(line.strip() == marker for line in lines)
+        nonempty = [line.strip() for line in lines if line.strip()]
+        if marker_count != 1 or not nonempty or nonempty[-1] != marker:
+            return raw, False
+        visible = "\n".join(line for line in lines if line.strip() != marker).strip()
+        return visible or "美团还没登录，点下方卡片登录。", True
+
     def _kimi_bqb_protocol(self) -> str:
         """Return bounded, catalog-backed token instructions with no image URLs."""
         names: list[str] = []
@@ -10941,6 +11138,8 @@ class PushHandler(BaseHTTPRequestHandler):
         recall_context: str = "",
         xhs_login_card_allowed: bool = False,
         netease_login_card_allowed: bool = False,
+        jd_login_card_allowed: bool = False,
+        meituan_login_card_allowed: bool = False,
     ) -> str:
         sections = [
             "[消息来源]",
@@ -10973,6 +11172,24 @@ class PushHandler(BaseHTTPRequestHandler):
                 "当本轮对话涉及网易云音乐功能或 Astra 提到登录网易云时，请简短提醒她；"
                 "如需展示登录卡片，只能在回复末尾单独一行、且只输出一次"
                 " [[CCC_NETEASE_LOGIN_CARD:v1]]。其他任何情况都不要输出或复述这个标记。",
+            ])
+        if jd_login_card_allowed:
+            sections.extend([
+                "",
+                "[京东登录卡片]",
+                "本轮服务端确认京东尚未登录（服务器侧登录态失效，京东购物车/订单等工具不可用）。"
+                "当本轮对话涉及京东功能或 Astra 提到登录京东时，请简短提醒她；"
+                "如需展示登录卡片，只能在回复末尾单独一行、且只输出一次"
+                " [[CCC_JD_LOGIN_CARD:v1]]。其他任何情况都不要输出或复述这个标记。",
+            ])
+        if meituan_login_card_allowed:
+            sections.extend([
+                "",
+                "[美团登录卡片]",
+                "本轮服务端确认美团尚未登录（服务器侧登录态失效，美团外卖/买药/团购等工具不可用）。"
+                "当本轮对话涉及美团功能或 Astra 提到登录美团时，请简短提醒她；"
+                "如需展示登录卡片，只能在回复末尾单独一行、且只输出一次"
+                " [[CCC_MEITUAN_LOGIN_CARD:v1]]。其他任何情况都不要输出或复述这个标记。",
             ])
         return "\n".join(sections) + self._kimi_bqb_protocol()
 
@@ -11506,6 +11723,8 @@ class PushHandler(BaseHTTPRequestHandler):
         link_bundle = self._kimi_link_bundle(text)
         xhs_login_card_allowed = self._kimi_xhs_login_card_allowed(link_bundle)
         netease_login_card_allowed = self._kimi_netease_login_card_allowed()
+        jd_login_card_allowed = self._kimi_jd_login_card_allowed()
+        meituan_login_card_allowed = self._kimi_meituan_login_card_allowed()
         metadata = merge_preview_metadata(body.get("metadata"), link_bundle)
 
         def enqueue_busy(reason: str) -> None:
@@ -11865,6 +12084,8 @@ class PushHandler(BaseHTTPRequestHandler):
             ) if value),
             xhs_login_card_allowed=xhs_login_card_allowed,
             netease_login_card_allowed=netease_login_card_allowed,
+            jd_login_card_allowed=jd_login_card_allowed,
+            meituan_login_card_allowed=meituan_login_card_allowed,
         )
         prompt_id = ""
         stream_ready = threading.Event()
@@ -12392,6 +12613,8 @@ class PushHandler(BaseHTTPRequestHandler):
             try:
                 visible, xhs_card = self._kimi_extract_xhs_login_card(answer, allowed=xhs_login_card_allowed)
                 visible, netease_card = self._kimi_extract_netease_login_card(visible, allowed=netease_login_card_allowed)
+                visible, jd_card = self._kimi_extract_jd_login_card(visible, allowed=jd_login_card_allowed)
+                visible, meituan_card = self._kimi_extract_meituan_login_card(visible, allowed=meituan_login_card_allowed)
                 final = chat.append(
                     role="assistant",
                     text=visible,
@@ -12402,6 +12625,8 @@ class PushHandler(BaseHTTPRequestHandler):
                         "turn_message_kind": "terminal_answer",
                         **({"xhs_login_card": True} if xhs_card else {}),
                         **({"netease_login_card": True} if netease_card else {}),
+                        **({"jd_login_card": True} if jd_card else {}),
+                        **({"meituan_login_card": True} if meituan_card else {}),
                     },
                 )
                 final_ts = str(final.get("ts") or "")
@@ -12520,6 +12745,8 @@ class PushHandler(BaseHTTPRequestHandler):
         link_bundle = self._kimi_link_bundle(text)
         xhs_login_card_allowed = self._kimi_xhs_login_card_allowed(link_bundle)
         netease_login_card_allowed = self._kimi_netease_login_card_allowed()
+        jd_login_card_allowed = self._kimi_jd_login_card_allowed()
+        meituan_login_card_allowed = self._kimi_meituan_login_card_allowed()
         # User-supplied metadata is deliberately discarded. Only the server's
         # bounded link preview schema is stored alongside the Kimi message.
         metadata = merge_preview_metadata(None, link_bundle)
@@ -12698,6 +12925,8 @@ class PushHandler(BaseHTTPRequestHandler):
             recall_context=recall_context,
             xhs_login_card_allowed=xhs_login_card_allowed,
             netease_login_card_allowed=netease_login_card_allowed,
+            jd_login_card_allowed=jd_login_card_allowed,
+            meituan_login_card_allowed=meituan_login_card_allowed,
         )
         kimi_observer = getattr(self.state, "kimi_terminal_observer", None)
         observer_begin = getattr(kimi_observer, "begin", None)
@@ -12770,6 +12999,8 @@ class PushHandler(BaseHTTPRequestHandler):
                 *,
                 allow_xhs_login_card: bool = False,
                 allow_netease_login_card: bool = False,
+                allow_jd_login_card: bool = False,
+                allow_meituan_login_card: bool = False,
             ) -> str:
                 try:
                     visible_message, xhs_login_card = self._kimi_extract_xhs_login_card(
@@ -12780,6 +13011,14 @@ class PushHandler(BaseHTTPRequestHandler):
                         visible_message,
                         allowed=allow_netease_login_card,
                     )
+                    visible_message, jd_login_card = self._kimi_extract_jd_login_card(
+                        visible_message,
+                        allowed=allow_jd_login_card,
+                    )
+                    visible_message, meituan_login_card = self._kimi_extract_meituan_login_card(
+                        visible_message,
+                        allowed=allow_meituan_login_card,
+                    )
                     assistant_metadata = {
                         "kimi_user_ts": str(rec.get("ts") or ""),
                         "turn_terminal": True,
@@ -12789,6 +13028,10 @@ class PushHandler(BaseHTTPRequestHandler):
                         assistant_metadata["xhs_login_card"] = True
                     if netease_login_card:
                         assistant_metadata["netease_login_card"] = True
+                    if jd_login_card:
+                        assistant_metadata["jd_login_card"] = True
+                    if meituan_login_card:
+                        assistant_metadata["meituan_login_card"] = True
                     final = chat.append(
                         role="assistant",
                         text=visible_message,
@@ -12808,6 +13051,8 @@ class PushHandler(BaseHTTPRequestHandler):
                 status: str = "completed",
                 allow_xhs_login_card: bool = False,
                 allow_netease_login_card: bool = False,
+                allow_jd_login_card: bool = False,
+                allow_meituan_login_card: bool = False,
             ) -> None:
                 nonlocal terminalized
                 finish_observer(status)
@@ -12819,6 +13064,8 @@ class PushHandler(BaseHTTPRequestHandler):
                     source,
                     allow_xhs_login_card=allow_xhs_login_card,
                     allow_netease_login_card=allow_netease_login_card,
+                    allow_jd_login_card=allow_jd_login_card,
+                    allow_meituan_login_card=allow_meituan_login_card,
                 )
                 self._set_chat_completed(
                     contact_id,
@@ -12957,6 +13204,8 @@ class PushHandler(BaseHTTPRequestHandler):
                     "kimi-acp",
                     allow_xhs_login_card=xhs_login_card_allowed,
                     allow_netease_login_card=netease_login_card_allowed,
+                    allow_jd_login_card=jd_login_card_allowed,
+                    allow_meituan_login_card=meituan_login_card_allowed,
                 )
             except KimiACPCancelled:
                 finish_observer("interrupted")
