@@ -321,6 +321,8 @@ ttl_seconds = 300
 allowed_contacts = ["kairos", "xiaoke", "kimi"]
 # 固定 argv，cookie JSON 只经 subprocess stdin 传入，不得改成 shell 字符串。
 import_command = ["ssh", "memory-sg", "/home/ubuntu/xhs-login-bridge/import_cookies.py"]
+# 挂卡闸门探针：xhs-cli status 真实调用 /user/me 验证登录态（默认即下值）。
+# status_command = ["ssh", "memory-sg", "/home/ubuntu/.local/bin/xhs", "status", "--json"]
 
 [jd_login]
 # Android 专用 WebView 登录能力；nonce 最长十分钟且只可使用一次。

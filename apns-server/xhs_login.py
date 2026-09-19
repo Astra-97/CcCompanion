@@ -3,6 +3,12 @@
 Cookie values stay in the request body and the fixed subprocess stdin.  This
 module deliberately never places them in argv, environment variables, logs,
 exceptions, or response bodies.
+
+``needs_login()`` is the server-side card gate probe: it runs ``xhs status
+--json`` on memory-sg, which performs a real authenticated ``/user/me`` call
+against the live cookie jar.  Probe failures and unknown shapes fail closed
+(no card), matching the JD/Meituan gates; the link-preview login_required
+signal remains as a redundant detection path.
 """
 
 from __future__ import annotations
@@ -29,6 +35,14 @@ DEFAULT_IMPORT_COMMAND = [
     "memory-sg",
     "/home/ubuntu/xhs-login-bridge/import_cookies.py",
 ]
+DEFAULT_STATUS_COMMAND = [
+    "ssh",
+    "memory-sg",
+    "/home/ubuntu/.local/bin/xhs",
+    "status",
+    "--json",
+]
+DEFAULT_STATUS_CACHE_SECONDS = 120
 
 # Bound to the browser cookies xhs-cli currently consumes. Unknown fields are
 # dropped rather than forwarded to the privileged remote helper.
@@ -104,8 +118,10 @@ class XhsLoginManager:
         self,
         *,
         import_command: list[str] | tuple[str, ...] | None = None,
+        status_command: list[str] | tuple[str, ...] | None = None,
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
         allowed_contacts: set[str] | None = None,
+        status_cache_seconds: int = DEFAULT_STATUS_CACHE_SECONDS,
         runner: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -113,14 +129,74 @@ class XhsLoginManager:
         if not command or len(command) > 16 or any(not isinstance(item, str) or not item for item in command):
             raise ValueError("xhs import command must be a fixed non-empty argv list")
         self.import_command = tuple(command)
+        probe = list(status_command or DEFAULT_STATUS_COMMAND)
+        if not probe or len(probe) > 16 or any(not isinstance(item, str) or not item for item in probe):
+            raise ValueError("xhs status command must be a fixed non-empty argv list")
+        self.status_command = tuple(probe)
         self.ttl_seconds = max(60, min(int(ttl_seconds), 600))
         self.allowed_contacts = set(
             DEFAULT_ALLOWED_CONTACTS if allowed_contacts is None else allowed_contacts
         )
+        self.status_cache_seconds = max(0, min(int(status_cache_seconds), 900))
         self._runner = runner
         self._clock = clock
         self._pending: dict[str, PendingLogin] = {}
         self._lock = threading.Lock()
+        self._needs_login_cache: tuple[float, bool] | None = None
+
+    def needs_login(self) -> bool:
+        """True while memory-sg reports the XHS session is not usable.
+
+        This is the server-side gate for offering the login card; it never
+        raises, never exposes cookie material, and caches the probe briefly
+        so one ssh read serves many chat turns.  Probe errors and unknown
+        status shapes fail closed (no card), matching the JD/Meituan gates.
+        """
+        now = self._clock()
+        cached = self._needs_login_cache
+        if cached is not None and cached[0] > now:
+            return cached[1]
+        value = self._probe_needs_login()
+        self._needs_login_cache = (now + self.status_cache_seconds, value)
+        return value
+
+    def _probe_needs_login(self) -> bool:
+        try:
+            result = self._runner(
+                list(self.status_command),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        try:
+            doc = json.loads((result.stdout or b"").decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(doc, dict):
+            return False
+        if doc.get("ok") is True:
+            if result.returncode != 0:
+                return False
+            data = doc.get("data")
+            if not isinstance(data, dict) or data.get("authenticated") is not True:
+                return True
+            # A guest or id-less profile is not a usable login (mirrors
+            # xhs-cli's own _is_valid_login check at cookie import time).
+            user = data.get("user")
+            if not isinstance(user, dict) or user.get("guest") is True:
+                return True
+            return not bool(str(user.get("id") or "").strip())
+        if doc.get("ok") is False:
+            error = doc.get("error")
+            code = error.get("code") if isinstance(error, dict) else None
+            # not_authenticated covers both a missing cookie jar and a
+            # risk-control-killed session; verification_required means the
+            # account must log in again before any tool works.
+            return code in ("not_authenticated", "verification_required")
+        return False
 
     @staticmethod
     def _validate_binding(contact_id: Any, device_id: Any, origin: Any) -> tuple[str, str, str]:
@@ -206,4 +282,6 @@ class XhsLoginManager:
             raise XhsLoginError(502, "sync_failed", "cookie sync failed") from None
         if not isinstance(response, dict) or response.get("ok") is not True:
             raise XhsLoginError(502, "sync_failed", "cookie sync failed")
+        # A successful import flips the card gate on the next probe.
+        self._needs_login_cache = None
         return {"ok": True, "status": "stored"}

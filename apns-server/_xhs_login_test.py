@@ -11,13 +11,34 @@ from xhs_login import XHS_LOGIN_ORIGIN, XhsLoginError, XhsLoginManager
 DEVICE = "device_1234567890abcdef"
 
 
+def status_ok_payload(*, user_id: str = "687393f9000000001e006842", guest: bool = False) -> bytes:
+    return json.dumps({
+        "ok": True,
+        "schema_version": "1",
+        "data": {
+            "authenticated": True,
+            "user": {"id": user_id, "nickname": "n", "guest": guest},
+        },
+    }).encode("utf-8")
+
+
+def status_error_payload(code: str) -> bytes:
+    return json.dumps({
+        "ok": False,
+        "schema_version": "1",
+        "error": {"code": code, "message": "redacted"},
+    }).encode("utf-8")
+
+
 class FakeRunner:
-    def __init__(self) -> None:
+    def __init__(self, stdout: bytes = b'{"ok":true}', returncode: int = 0) -> None:
         self.calls = []
+        self.stdout = stdout
+        self.returncode = returncode
 
     def __call__(self, argv, **kwargs):
         self.calls.append((argv, kwargs))
-        return subprocess.CompletedProcess(argv, 0, stdout=b'{"ok":true}', stderr=b"")
+        return subprocess.CompletedProcess(argv, self.returncode, stdout=self.stdout, stderr=b"")
 
 
 class XhsLoginManagerTests(unittest.TestCase):
@@ -26,6 +47,7 @@ class XhsLoginManagerTests(unittest.TestCase):
         self.runner = FakeRunner()
         self.manager = XhsLoginManager(
             import_command=["ssh", "memory-sg", "/fixed/import_cookies.py"],
+            status_command=["ssh", "memory-sg", "/fixed/status"],
             runner=self.runner,
             clock=lambda: self.now,
         )
@@ -179,6 +201,86 @@ class XhsLoginManagerTests(unittest.TestCase):
         ]
         self.assertNotIn("invalidate_xhs_comment_failures", start_handler)
         self.assertIn("invalidate_xhs_comment_failures", import_handler)
+
+    def test_needs_login_tracks_status_probe(self):
+        self.runner.stdout = status_ok_payload()
+        self.assertFalse(self.manager.needs_login())
+        self.runner.stdout = status_error_payload("not_authenticated")
+        # Cached probe still serves; advance the clock past the cache TTL.
+        self.assertFalse(self.manager.needs_login())
+        self.now += 121
+        self.assertTrue(self.manager.needs_login())
+
+        self.now += 121
+        self.runner.stdout = status_error_payload("verification_required")
+        self.assertTrue(self.manager.needs_login())
+
+    def test_needs_login_flags_guest_or_incomplete_profiles(self):
+        self.runner.stdout = status_ok_payload(guest=True)
+        self.assertTrue(self.manager.needs_login())
+
+        self.now += 121
+        self.runner.stdout = status_ok_payload(user_id="")
+        self.assertTrue(self.manager.needs_login())
+
+        self.now += 121
+        self.runner.stdout = json.dumps({
+            "ok": True, "data": {"authenticated": False},
+        }).encode("utf-8")
+        self.assertTrue(self.manager.needs_login())
+
+    def test_needs_login_fails_closed_on_probe_errors(self):
+        self.runner.returncode = 1
+        self.runner.stdout = b"not json"
+        self.assertFalse(self.manager.needs_login())
+
+        self.now += 121
+        # An ok:true payload with a failing exit code is not trusted either.
+        self.runner.stdout = status_ok_payload()
+        self.assertFalse(self.manager.needs_login())
+
+        self.now += 121
+        self.runner.returncode = 0
+        # ip_blocked/signature_error are not login-card states.
+        self.runner.stdout = status_error_payload("ip_blocked")
+        self.assertFalse(self.manager.needs_login())
+
+        self.now += 121
+        self.runner.stdout = b'{"ok":"maybe"}'
+        self.assertFalse(self.manager.needs_login())
+
+        self.now += 121
+        self.manager._runner = lambda *args, **kwargs: (_ for _ in ()).throw(OSError("ssh down"))
+        self.assertFalse(self.manager.needs_login())
+
+        self.now += 121
+        self.manager._runner = lambda *args, **kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(cmd="ssh", timeout=15)
+        )
+        self.assertFalse(self.manager.needs_login())
+
+    def test_needs_login_uses_fixed_status_argv_without_stdin(self):
+        self.runner.stdout = status_error_payload("not_authenticated")
+        self.assertTrue(self.manager.needs_login())
+        argv, kwargs = self.runner.calls[0]
+        self.assertEqual(argv, ["ssh", "memory-sg", "/fixed/status"])
+        self.assertNotIn("input", kwargs)
+        self.assertNotIn("shell", kwargs)
+        self.assertNotIn("env", kwargs)
+
+    def test_successful_import_clears_needs_login_cache(self):
+        self.runner.stdout = status_error_payload("not_authenticated")
+        self.assertTrue(self.manager.needs_login())
+
+        def import_then_status(argv, **kwargs):
+            if "input" in kwargs:
+                return subprocess.CompletedProcess(argv, 0, stdout=b'{"ok":true}', stderr=b"")
+            return subprocess.CompletedProcess(argv, 0, stdout=status_ok_payload(), stderr=b"")
+
+        self.manager._runner = import_then_status
+        self.import_once(self.start()["nonce"])
+        # Without cache invalidation this would still serve the stale True.
+        self.assertFalse(self.manager.needs_login())
 
 
 if __name__ == "__main__":

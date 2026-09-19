@@ -1201,6 +1201,50 @@ class XiaokeStopTest(unittest.TestCase):
         self.assertEqual(payload["text"], text)
         self.assertNotIn("xhs_login_card", payload["metadata"])
 
+    def test_repository_stop_hook_extracts_all_login_card_markers(self) -> None:
+        token = "a" * 32
+        cases = [
+            ("[[CCC_NETEASE_LOGIN_CARD:v1]]", "netease_login_card", "网易云音乐还没登录，点下方卡片扫码登录。"),
+            ("[[CCC_JD_LOGIN_CARD:v1]]", "jd_login_card", "京东登录已失效，点下方卡片重新登录。"),
+            ("[[CCC_MEITUAN_LOGIN_CARD:v1]]", "meituan_login_card", "美团还没登录，点下方卡片登录。"),
+        ]
+        for marker, key, label in cases:
+            with self.subTest(marker=marker):
+                payload = self.run_repository_stop_hook([
+                    self.user_record(f"[CCC_APP_TURN:{token}:cctg]\nlogin"),
+                    self.assistant_record(f"请登录。\n{marker}"),
+                ], f"请登录。\n{marker}")
+                self.assertEqual(payload["text"], "请登录。")
+                self.assertTrue(payload["metadata"][key])
+                self.assertNotIn("CCC_", payload["text"])
+
+                only = self.run_repository_stop_hook([
+                    self.user_record(f"[CCC_APP_TURN:{token}:cctg]\nlogin"),
+                    self.assistant_record(marker),
+                ], marker)
+                self.assertEqual(only["text"], label)
+                self.assertTrue(only["metadata"][key])
+
+                inline = f"示例：{marker}"
+                passthrough = self.run_repository_stop_hook([
+                    self.user_record(f"[CCC_APP_TURN:{token}:cctg]\nexample"),
+                    self.assistant_record(inline),
+                ], inline)
+                self.assertEqual(passthrough["text"], inline)
+                self.assertNotIn(key, passthrough["metadata"])
+
+    def test_repository_stop_hook_extracts_multiple_login_card_markers(self) -> None:
+        token = "a" * 32
+        text = "都要登录。\n[[CCC_XHS_LOGIN_CARD:v1]]\n[[CCC_JD_LOGIN_CARD:v1]]"
+        payload = self.run_repository_stop_hook([
+            self.user_record(f"[CCC_APP_TURN:{token}:cctg]\nlogin"),
+            self.assistant_record(text),
+        ], text)
+        self.assertEqual(payload["text"], "都要登录。")
+        self.assertTrue(payload["metadata"]["xhs_login_card"])
+        self.assertTrue(payload["metadata"]["jd_login_card"])
+        self.assertNotIn("meituan_login_card", payload["metadata"])
+
     def test_delayed_old_hook_never_borrows_newer_turn_marker(self) -> None:
         old_token = "a" * 32
         new_token = "b" * 32

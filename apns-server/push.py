@@ -4022,6 +4022,8 @@ class ServerState:
         xhs_login_cfg = config.get("xhs_login", {})
         raw_import_command = xhs_login_cfg.get("import_command")
         import_command = raw_import_command if isinstance(raw_import_command, list) else None
+        raw_xhs_status_command = xhs_login_cfg.get("status_command")
+        xhs_status_command = raw_xhs_status_command if isinstance(raw_xhs_status_command, list) else None
         allowed_contacts = {
             str(item).strip().lower()
             for item in (xhs_login_cfg.get("allowed_contacts", ["kairos", "kimi"]) or [])
@@ -4029,6 +4031,7 @@ class ServerState:
         }
         self.xhs_login = XhsLoginManager(
             import_command=import_command,
+            status_command=xhs_status_command,
             ttl_seconds=int(xhs_login_cfg.get("ttl_seconds", 300)),
             allowed_contacts=allowed_contacts,
         )
@@ -10944,20 +10947,64 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.warning("Kimi link preview failed", exc_info=True)
             return LinkPreviewBundle()
 
-    @staticmethod
-    def _kimi_xhs_login_card_allowed(bundle: LinkPreviewBundle) -> bool:
-        """Permit the Kimi login card only from trusted XHS enrichment state.
+    def _xhs_login_probe_needs_login(self) -> bool:
+        """Server-owned XHS login probe (xhs status on memory-sg, via the manager).
 
-        This looks solely at the server-created ``LinkPreviewBundle``.  It
-        never inspects client metadata or model text, so a user cannot create
-        a login card by sending a marker or a card-shaped request payload.
-        ``comments_status=login_required`` is emitted by the XHS enrichment
-        path only when its authenticated comment fetch needs login again.
+        Never inspects client metadata or model text; missing/broken probe
+        pieces fail closed (no card), matching the JD/Meituan/NetEase gates.
         """
-        return any(
+        manager = getattr(self.state, "xhs_login", None)
+        needs_login = getattr(manager, "needs_login", None)
+        if not callable(needs_login):
+            return False
+        try:
+            return bool(needs_login())
+        except Exception:
+            return False
+
+    def _kimi_xhs_login_card_allowed(self, bundle: LinkPreviewBundle) -> bool:
+        """Permit the XHS login card only from trusted server-side signals.
+
+        Two independent server-owned signals authorize the card: the
+        server-created ``LinkPreviewBundle`` (``comments_status=login_required``
+        from the XHS enrichment path) and the ``xhs status`` probe on
+        memory-sg.  Neither inspects client metadata or model text, so a user
+        cannot create a login card by sending a marker or a card-shaped
+        request payload.
+        """
+        link_signal = any(
             isinstance(item, dict) and item.get("comments_status") == "login_required"
             for item in bundle.previews
         )
+        return link_signal or self._xhs_login_probe_needs_login()
+
+    def _trusted_login_card_metadata(self, metadata: Any) -> Any:
+        """Strip inbound login-card flags the server probes do not back.
+
+        Login cards unlock only from server-owned signals.  Metadata arriving
+        over /chat/append (e.g. the xiaoke stop hook) is re-validated against
+        the same probes that gate the Kimi prompt path; a truthy flag with no
+        backing probe is dropped, everything else passes through verbatim.
+        """
+        if not isinstance(metadata, dict):
+            return metadata
+        gates = (
+            ("xhs_login_card", self._xhs_login_probe_needs_login),
+            ("netease_login_card", self._kimi_netease_login_card_allowed),
+            ("jd_login_card", self._kimi_jd_login_card_allowed),
+            ("meituan_login_card", self._kimi_meituan_login_card_allowed),
+        )
+        cleaned = dict(metadata)
+        for key, gate in gates:
+            if not cleaned.get(key):
+                continue
+            try:
+                allowed = bool(gate())
+            except Exception:
+                allowed = False
+            if not allowed:
+                cleaned.pop(key, None)
+        return cleaned
 
     @staticmethod
     def _kimi_extract_xhs_login_card(
@@ -11160,7 +11207,8 @@ class PushHandler(BaseHTTPRequestHandler):
             sections.extend([
                 "",
                 "[小红书登录卡片]",
-                "本轮服务端已确认小红书评论抓取需要重新登录。请简短提醒 Astra；"
+                "本轮服务端确认小红书登录态失效（评论抓取需要重新登录，或登录态探针未通过，小红书工具不可用）。"
+                "当本轮对话涉及小红书功能或 Astra 提到登录小红书时，请简短提醒她；"
                 "如需展示登录卡片，只能在回复末尾单独一行、且只输出一次"
                 " [[CCC_XHS_LOGIN_CARD:v1]]。其他任何情况都不要输出或复述这个标记。",
             ])
@@ -20350,7 +20398,11 @@ class PushHandler(BaseHTTPRequestHandler):
         if clean_append_metadata is None:
             body.pop("metadata", None)
         else:
-            body["metadata"] = clean_append_metadata
+            gated_append_metadata = self._trusted_login_card_metadata(clean_append_metadata)
+            if gated_append_metadata:
+                body["metadata"] = gated_append_metadata
+            else:
+                body.pop("metadata", None)
         contact_id = self._contact_id_from_body(body)
         if contact_id == "kimi":
             allowed_fields = {

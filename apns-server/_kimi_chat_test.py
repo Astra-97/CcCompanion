@@ -468,6 +468,68 @@ class _LegacyKimiACPFixtures:
             self.assertNotIn("xhs_login_card", assistant["metadata"])
             self.assertIn(marker, assistant["text"])
 
+    def test_kimi_xhs_probe_alone_authorizes_the_login_card(self):
+        handler, kimi, _xiaoke = self.handler()
+        handler.state.xhs_login = types.SimpleNamespace(needs_login=lambda: True)
+        marker = "[[CCC_XHS_LOGIN_CARD:v1]]"
+        prompts = self._run_kimi_reply(
+            handler,
+            user_text="帮我看看小红书",
+            assistant_text=f"小红书登录已失效。\n{marker}",
+            bundle=LinkPreviewBundle(),
+        )
+
+        assistant = [record for record in kimi.records if record["role"] == "assistant"][-1]
+        self.assertEqual("小红书登录已失效。", assistant["text"])
+        self.assertTrue(assistant["metadata"]["xhs_login_card"])
+        self.assertNotIn(marker, assistant["text"])
+        self.assertIn(marker, prompts[0])
+
+    def test_kimi_xhs_probe_denial_or_error_never_authorizes_the_card(self):
+        marker = "[[CCC_XHS_LOGIN_CARD:v1]]"
+        with self.subTest("probe-says-logged-in"):
+            handler, kimi, _xiaoke = self.handler()
+            handler.state.xhs_login = types.SimpleNamespace(needs_login=lambda: False)
+            prompts = self._run_kimi_reply(
+                handler,
+                user_text="普通问题",
+                assistant_text=marker,
+                bundle=LinkPreviewBundle(),
+            )
+            assistant = [record for record in kimi.records if record["role"] == "assistant"][-1]
+            self.assertEqual(marker, assistant["text"])
+            self.assertNotIn("xhs_login_card", assistant["metadata"])
+            self.assertNotIn(marker, prompts[0])
+
+        with self.subTest("probe-crash-fails-closed"):
+            handler, kimi, _xiaoke = self.handler()
+
+            def broken_probe():
+                raise RuntimeError("ssh down")
+
+            handler.state.xhs_login = types.SimpleNamespace(needs_login=broken_probe)
+            prompts = self._run_kimi_reply(
+                handler,
+                user_text="普通问题",
+                assistant_text=marker,
+                bundle=LinkPreviewBundle(),
+            )
+            assistant = [record for record in kimi.records if record["role"] == "assistant"][-1]
+            self.assertNotIn("xhs_login_card", assistant["metadata"])
+            self.assertNotIn(marker, prompts[0])
+
+    def test_kimi_xhs_link_signal_still_authorizes_when_probe_is_absent(self):
+        handler, kimi, _xiaoke = self.handler()
+        marker = "[[CCC_XHS_LOGIN_CARD:v1]]"
+        self._run_kimi_reply(
+            handler,
+            user_text="https://www.xiaohongshu.com/explore/example",
+            assistant_text=f"小红书需要重新登录。\n{marker}",
+            bundle=self._xhs_login_bundle(),
+        )
+        assistant = [record for record in kimi.records if record["role"] == "assistant"][-1]
+        self.assertTrue(assistant["metadata"]["xhs_login_card"])
+
     def test_assistant_history_failure_still_finishes_every_lifecycle_state(self):
         handler, kimi, _xiaoke = self.handler()
         original_append = kimi.append
@@ -1515,6 +1577,23 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.assertNotIn("xhs_login_card", chat.records[-1]["metadata"])
         self.assertEqual(marker, chat.records[-1]["text"])
 
+    def test_xhs_probe_alone_authorizes_the_web_login_card(self):
+        marker = "[[CCC_XHS_LOGIN_CARD:v1]]"
+        handler, chat, _web = self.make_handler(web=FakeWebChat(text=f"小红书登录已失效。\n{marker}"))
+        handler.state.xhs_login = types.SimpleNamespace(needs_login=lambda: True)
+        handler._handle_kimi_chat_send({"text": "小红书还能用吗"}, "kimi")
+        self.wait_idle(handler)
+        assistant = chat.records[-1]
+        self.assertTrue(assistant["metadata"]["xhs_login_card"])
+        self.assertNotIn(marker, assistant["text"])
+
+        handler, chat, _web = self.make_handler(web=FakeWebChat(text=marker))
+        handler.state.xhs_login = types.SimpleNamespace(needs_login=lambda: False)
+        handler._handle_kimi_chat_send({"text": "ordinary"}, "kimi")
+        self.wait_idle(handler)
+        self.assertNotIn("xhs_login_card", chat.records[-1]["metadata"])
+        self.assertEqual(marker, chat.records[-1]["text"])
+
     def test_stop_after_completed_turn_is_idempotent_and_never_aborts_a_new_turn(self):
         handler, _chat, web = self.make_handler()
         handler._handle_kimi_chat_send({"text": "done"}, "kimi")
@@ -1621,6 +1700,34 @@ class KimiWebChatRoutingTest(unittest.TestCase):
             self.assertEqual("/attachments/gen-img.png", rec["attachment_url"])
             self.assertEqual("image", rec["attachment_type"])
             self.assertEqual("gen-img.png", rec["attachment_filename"])
+
+    def test_append_login_card_metadata_requires_a_backing_server_probe(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            handler, chat = self._make_kimi_append_handler(tmpdir)
+            handler._handle_chat_append({
+                "contact_id": "xiaoke",
+                "role": "assistant",
+                "text": "请登录。",
+                "metadata": {"xhs_login_card": True, "jd_login_card": True, "custom": "kept"},
+            })
+            self.assertEqual(200, handler.responses[-1][0])
+            metadata = chat.records[-1].get("metadata") or {}
+            self.assertNotIn("xhs_login_card", metadata)
+            self.assertNotIn("jd_login_card", metadata)
+            self.assertEqual("kept", metadata["custom"])
+
+            handler.state.xhs_login = types.SimpleNamespace(needs_login=lambda: True)
+            handler.state.jd_login = types.SimpleNamespace(needs_login=lambda: False)
+            handler._handle_chat_append({
+                "contact_id": "xiaoke",
+                "role": "assistant",
+                "text": "请重新登录小红书。",
+                "metadata": {"xhs_login_card": True, "jd_login_card": True},
+            })
+            self.assertEqual(200, handler.responses[-1][0])
+            metadata = chat.records[-1].get("metadata") or {}
+            self.assertTrue(metadata["xhs_login_card"])
+            self.assertNotIn("jd_login_card", metadata)
 
     def test_apples_assistant_append_publishes_one_persisted_completion_event(self):
         with tempfile.TemporaryDirectory() as tmpdir:
