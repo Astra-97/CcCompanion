@@ -2431,6 +2431,45 @@ class LinkPreviewTests(unittest.TestCase):
         )
         self.assertFalse(strict_page.comments_auth_required)
 
+    def test_xhs_login_wall_redirect_marks_login_required(self):
+        wall_page = link_preview.ExtractedPage(
+            requested_url="https://xhslink.cn/o/wall",
+            final_url="https://www.xiaohongshu.com/login?redirect_url=https%3A%2F%2Fwww.xiaohongshu.com%2Fdiscovery%2Fitem%2Fabc",
+            title="小红书 - 你的生活兴趣社区",
+            description="",
+            site_name="小红书",
+            image_url="",
+            body_text="小红书 - 你的生活兴趣社区",
+            provider="http",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(td)
+            service._fetch_page = lambda url, deadline: wall_page
+            bundle = service.enrich("https://xhslink.cn/o/wall")
+            content = Path(bundle.previews[0]["content_path"]).read_text()
+        self.assertEqual(bundle.previews[0]["comments_status"], "login_required")
+        self.assertIn("登录已失效", content)
+        self.assertIn("提醒用户重新登录", bundle.prompt_context)
+
+        ordinary_page = link_preview.ExtractedPage(
+            requested_url="https://xhslink.cn/o/plain",
+            final_url="https://www.xiaohongshu.com/discovery/item/abc",
+            title="note",
+            description="",
+            site_name="小红书",
+            image_url="",
+            body_text="body",
+            provider="http",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(td)
+            service._fetch_page = lambda url, deadline: ordinary_page
+            bundle = service.enrich("https://xhslink.cn/o/plain")
+        self.assertEqual(bundle.previews[0]["comments_status"], "not_fetched")
+
+        self.assertFalse(link_preview._is_xhs_login_wall("https://example.com/login"))
+        self.assertFalse(link_preview._is_xhs_login_wall("not a url"))
+
     def test_successful_login_invalidates_only_xhs_comment_failures(self):
         with tempfile.TemporaryDirectory() as td:
             service = link_preview.LinkPreviewService(td, cache_ttl_seconds=60)

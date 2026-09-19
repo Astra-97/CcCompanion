@@ -55,6 +55,18 @@ XHS_HOSTS = {
     "xhslink.cn",
     "www.xhslink.cn",
 }
+
+
+def _is_xhs_login_wall(final_url: str) -> bool:
+    """True when an XHS fetch was redirected to the platform login page."""
+    try:
+        parts = urlsplit(final_url or "")
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower().rstrip(".")
+    if host not in XHS_HOSTS and not host.endswith(".xiaohongshu.com"):
+        return False
+    return parts.path.rstrip("/").lower() == "/login"
 WECHAT_HOSTS = {"mp.weixin.qq.com"}
 BILIBILI_HOSTS = {
     "bilibili.com",
@@ -3065,6 +3077,7 @@ class LinkPreviewService:
         text_path, meta_path = self._paths(url)
         key = self._url_key(url)
         is_xhs = self._is_xhs(url) or self._is_xhs(page.final_url)
+        xhs_login_wall = is_xhs and _is_xhs_login_wall(page.final_url)
         is_wechat = self._is_wechat(url) or self._is_wechat(page.final_url)
         is_bilibili = self._is_bilibili(url) or self._is_bilibili(page.final_url)
         is_xiachufang_recipe = self._is_xiachufang_recipe(url) or self._is_xiachufang_recipe(page.final_url)
@@ -3098,7 +3111,7 @@ class LinkPreviewService:
             sections.extend(["", "评论：", safe_comments[: self.max_text_chars]])
             if not page.comments_complete:
                 sections.append("评论抓取范围：仅抓取首批，可能有更多评论或楼中楼。")
-        elif is_xhs and page.comments_auth_required:
+        elif is_xhs and (page.comments_auth_required or xhs_login_wall):
             sections.extend([
                 "",
                 "评论抓取状态：小红书登录已失效，需要重新登录后才能抓取评论。",
@@ -3163,7 +3176,7 @@ class LinkPreviewService:
                 "included" if page.comments and page.comments_complete
                 else "included_partial" if page.comments
                 else "login_required"
-                if is_xhs and page.comments_auth_required
+                if is_xhs and (page.comments_auth_required or xhs_login_wall)
                 else "fetched_empty"
                 if (is_xhs or is_bilibili) and page.comments_fetched and page.comments_complete
                 else "fetched_empty_partial"
