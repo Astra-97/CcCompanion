@@ -1708,26 +1708,29 @@ class KimiWebChatRoutingTest(unittest.TestCase):
                 "contact_id": "xiaoke",
                 "role": "assistant",
                 "text": "请登录。",
-                "metadata": {"xhs_login_card": True, "jd_login_card": True, "custom": "kept"},
+                "metadata": {"xhs_login_card": True, "jd_login_card": True, "mt_waimai_login_card": True, "custom": "kept"},
             })
             self.assertEqual(200, handler.responses[-1][0])
             metadata = chat.records[-1].get("metadata") or {}
             self.assertNotIn("xhs_login_card", metadata)
             self.assertNotIn("jd_login_card", metadata)
+            self.assertNotIn("mt_waimai_login_card", metadata)
             self.assertEqual("kept", metadata["custom"])
 
             handler.state.xhs_login = types.SimpleNamespace(needs_login=lambda: True)
             handler.state.jd_login = types.SimpleNamespace(needs_login=lambda: False)
+            handler.state.mt_waimai_login = types.SimpleNamespace(needs_login=lambda: True)
             handler._handle_chat_append({
                 "contact_id": "xiaoke",
                 "role": "assistant",
                 "text": "请重新登录小红书。",
-                "metadata": {"xhs_login_card": True, "jd_login_card": True},
+                "metadata": {"xhs_login_card": True, "jd_login_card": True, "mt_waimai_login_card": True},
             })
             self.assertEqual(200, handler.responses[-1][0])
             metadata = chat.records[-1].get("metadata") or {}
             self.assertTrue(metadata["xhs_login_card"])
             self.assertNotIn("jd_login_card", metadata)
+            self.assertTrue(metadata["mt_waimai_login_card"])
 
     def test_apples_assistant_append_publishes_one_persisted_completion_event(self):
         with tempfile.TemporaryDirectory() as tmpdir:

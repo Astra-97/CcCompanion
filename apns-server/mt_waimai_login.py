@@ -1,4 +1,4 @@
-"""One-time Android WebView -> Meituan main-site cookie import bridge.
+"""One-time Android WebView -> Meituan Waimai cookie import bridge.
 
 Mirrors the xhs_login.py / netease_login.py discipline: cookie values stay in
 the request body and the fixed subprocess stdin.  This module deliberately
@@ -8,17 +8,15 @@ response bodies.
 The Meituan consumer is the long-lived Chrome on memory-sg (CDP 9225); the
 remote helper injects the allowlisted cookies via ``Network.setCookie``.
 
-This card covers the Meituan main site (i.meituan.com): the login URL is the
-mobile "我的" page, which redirects logged-out sessions to the passport
-mobile SMS login page (useraccount/ilogin).  The waimai card lives in
-mt_waimai_login.py; the two login states are probed independently even
-though both ride the same .meituan.com cookie jar.
+This card covers Meituan Waimai (h5.waimai.meituan.com, 外卖/买药); the
+main-site card lives in meituan_login.py.  The two login states are probed
+independently even though both ride the same .meituan.com cookie jar.
 
 ``needs_login()`` is the server-side card gate probe: it runs meituan-mcp's
-``meituan_tools.py status_main`` on memory-sg (the i.meituan.com account
-gate, verified live 2026-09-19 in both login states) and caches the result
-briefly.  Probe failures and unknown status values fail closed (no card),
-matching the NetEase gate's exception handling in push.py.
+own ``meituan_tools.py status`` on memory-sg (the same hard-gate 302 probe
+the ``login_status`` tool uses) and caches the result briefly.  Probe
+failures and unknown status values fail closed (no card), matching the
+NetEase gate's exception handling in push.py.
 """
 
 from __future__ import annotations
@@ -33,29 +31,25 @@ import time
 from typing import Any, Callable
 
 
-# 主站移动版「我的」页：未登录自动 302 到 passport ilogin 短信登录页
-# （2026-09-19 隔离 browser context 实测），登录后回到账号页。
-MEITUAN_LOGIN_URL = "https://i.meituan.com/mttouch/page/account"
-MEITUAN_LOGIN_ORIGIN = "cccompanion-android-webview-v1"
+MT_WAIMAI_LOGIN_URL = "https://h5.waimai.meituan.com/login?force=true"
+MT_WAIMAI_LOGIN_ORIGIN = "cccompanion-android-webview-v1"
 DEFAULT_TTL_SECONDS = 300
 DEFAULT_ALLOWED_CONTACTS = frozenset({"kairos", "kimi"})
 MAX_COOKIE_HEADER_BYTES = 16_000
 MAX_COOKIE_VALUE_CHARS = 8_192
 MAX_PENDING_SESSIONS = 16
-# 固定尾参 "main"：远端注入端改用主站判据（i.meituan.com）复验。
 DEFAULT_IMPORT_COMMAND = [
     "ssh",
     "memory-sg",
     "/home/ubuntu/taobao-login/.venv/bin/python",
     "/home/ubuntu/meituan-login/import_cookies.py",
-    "main",
 ]
 DEFAULT_STATUS_COMMAND = [
     "ssh",
     "memory-sg",
     "/home/ubuntu/taobao-login/.venv/bin/python",
     "/home/ubuntu/meituan-mcp/meituan_tools.py",
-    "status_main",
+    "status",
 ]
 # The status probe drives a real CDP navigation; keep it rare.
 DEFAULT_STATUS_CACHE_SECONDS = 300
@@ -83,7 +77,7 @@ COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 
 
-class MeituanLoginError(RuntimeError):
+class MtWaimaiLoginError(RuntimeError):
     def __init__(self, status: int, code: str, message: str):
         super().__init__(message)
         self.status = status
@@ -100,10 +94,10 @@ class PendingLogin:
 
 def _parse_cookie_header(raw: Any) -> dict[str, str]:
     if not isinstance(raw, str):
-        raise MeituanLoginError(400, "bad_cookie", "cookie header required")
+        raise MtWaimaiLoginError(400, "bad_cookie", "cookie header required")
     encoded = raw.encode("utf-8", errors="strict")
     if not encoded or len(encoded) > MAX_COOKIE_HEADER_BYTES:
-        raise MeituanLoginError(413, "bad_cookie", "cookie header size invalid")
+        raise MtWaimaiLoginError(413, "bad_cookie", "cookie header size invalid")
 
     cookies: dict[str, str] = {}
     for segment in raw.split(";"):
@@ -114,19 +108,19 @@ def _parse_cookie_header(raw: Any) -> dict[str, str]:
         name = name.strip()
         value = value.strip()
         if not separator or not COOKIE_NAME_RE.fullmatch(name):
-            raise MeituanLoginError(400, "bad_cookie", "cookie header malformed")
+            raise MtWaimaiLoginError(400, "bad_cookie", "cookie header malformed")
         if name not in COOKIE_ALLOWLIST:
             continue
         if not value or len(value) > MAX_COOKIE_VALUE_CHARS or any(ord(ch) < 0x20 for ch in value):
-            raise MeituanLoginError(400, "bad_cookie", "cookie value invalid")
+            raise MtWaimaiLoginError(400, "bad_cookie", "cookie value invalid")
         cookies[name] = value
 
     if any(not cookies.get(name) for name in REQUIRED_COOKIES):
-        raise MeituanLoginError(422, "login_incomplete", "required login cookies are missing")
+        raise MtWaimaiLoginError(422, "login_incomplete", "required login cookies are missing")
     return cookies
 
 
-class MeituanLoginManager:
+class MtWaimaiLoginManager:
     def __init__(
         self,
         *,
@@ -140,11 +134,11 @@ class MeituanLoginManager:
     ) -> None:
         command = list(import_command or DEFAULT_IMPORT_COMMAND)
         if not command or len(command) > 16 or any(not isinstance(item, str) or not item for item in command):
-            raise ValueError("meituan import command must be a fixed non-empty argv list")
+            raise ValueError("mt waimai import command must be a fixed non-empty argv list")
         self.import_command = tuple(command)
         probe = list(status_command or DEFAULT_STATUS_COMMAND)
         if not probe or len(probe) > 16 or any(not isinstance(item, str) or not item for item in probe):
-            raise ValueError("meituan status command must be a fixed non-empty argv list")
+            raise ValueError("mt waimai status command must be a fixed non-empty argv list")
         self.status_command = tuple(probe)
         self.ttl_seconds = max(60, min(int(ttl_seconds), 600))
         self.allowed_contacts = set(
@@ -158,7 +152,7 @@ class MeituanLoginManager:
         self._needs_login_cache: tuple[float, bool] | None = None
 
     def needs_login(self) -> bool:
-        """True while memory-sg reports the Meituan session is not logged in.
+        """True while memory-sg reports the Waimai session is not logged in.
 
         This is the server-side gate for offering the login card; it never
         raises and never exposes cookie material.  The probe drives a real
@@ -202,15 +196,15 @@ class MeituanLoginManager:
         device = str(device_id or "").strip()
         source = str(origin or "").strip()
         if not contact or not DEVICE_ID_RE.fullmatch(device):
-            raise MeituanLoginError(400, "bad_binding", "contact or device invalid")
-        if source != MEITUAN_LOGIN_ORIGIN:
-            raise MeituanLoginError(403, "bad_origin", "origin rejected")
+            raise MtWaimaiLoginError(400, "bad_binding", "contact or device invalid")
+        if source != MT_WAIMAI_LOGIN_ORIGIN:
+            raise MtWaimaiLoginError(403, "bad_origin", "origin rejected")
         return contact, device, source
 
     def start(self, *, contact_id: Any, device_id: Any, origin: Any) -> dict[str, Any]:
         contact, device, source = self._validate_binding(contact_id, device_id, origin)
         if contact not in self.allowed_contacts:
-            raise MeituanLoginError(403, "contact_rejected", "contact rejected")
+            raise MtWaimaiLoginError(403, "contact_rejected", "contact rejected")
         now = self._clock()
         nonce = secrets.token_urlsafe(32)
         with self._lock:
@@ -231,7 +225,7 @@ class MeituanLoginManager:
             "ok": True,
             "nonce": nonce,
             "expires_in": self.ttl_seconds,
-            "login_url": MEITUAN_LOGIN_URL,
+            "login_url": MT_WAIMAI_LOGIN_URL,
         }
 
     def import_cookies(
@@ -246,7 +240,7 @@ class MeituanLoginManager:
         contact, device, source = self._validate_binding(contact_id, device_id, origin)
         capability = str(nonce or "")
         if len(capability) < 32 or len(capability) > 128:
-            raise MeituanLoginError(400, "bad_nonce", "nonce invalid")
+            raise MtWaimaiLoginError(400, "bad_nonce", "nonce invalid")
         cookies = _parse_cookie_header(cookie_header)
         now = self._clock()
         # Pop before privileged I/O: the capability is one-shot even when the
@@ -254,11 +248,11 @@ class MeituanLoginManager:
         with self._lock:
             pending = self._pending.pop(capability, None)
         if pending is None:
-            raise MeituanLoginError(409, "nonce_used", "login session unavailable")
+            raise MtWaimaiLoginError(409, "nonce_used", "login session unavailable")
         if pending.expires_at <= now:
-            raise MeituanLoginError(410, "nonce_expired", "login session expired")
+            raise MtWaimaiLoginError(410, "nonce_expired", "login session expired")
         if (pending.contact_id, pending.device_id, pending.origin) != (contact, device, source):
-            raise MeituanLoginError(403, "binding_mismatch", "login session binding mismatch")
+            raise MtWaimaiLoginError(403, "binding_mismatch", "login session binding mismatch")
 
         payload = json.dumps({"cookies": cookies}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         try:
@@ -271,15 +265,15 @@ class MeituanLoginManager:
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
-            raise MeituanLoginError(502, "sync_failed", "cookie sync failed") from None
+            raise MtWaimaiLoginError(502, "sync_failed", "cookie sync failed") from None
         if result.returncode != 0:
-            raise MeituanLoginError(502, "sync_failed", "cookie sync failed")
+            raise MtWaimaiLoginError(502, "sync_failed", "cookie sync failed")
         try:
             response = json.loads((result.stdout or b"").decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            raise MeituanLoginError(502, "sync_failed", "cookie sync failed") from None
+            raise MtWaimaiLoginError(502, "sync_failed", "cookie sync failed") from None
         if not isinstance(response, dict) or response.get("ok") is not True:
-            raise MeituanLoginError(502, "sync_failed", "cookie sync failed")
+            raise MtWaimaiLoginError(502, "sync_failed", "cookie sync failed")
         # A successful import flips the card gate on the next probe.
         self._needs_login_cache = None
         return {"ok": True, "status": "stored"}

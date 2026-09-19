@@ -334,7 +334,17 @@ allowed_contacts = ["kairos", "kimi"]
 # status_command = ["ssh", "memory-sg", "cat", "/home/ubuntu/static-assets/jd/status.json"]
 
 [meituan_login]
-# Android 专用 WebView 登录能力；nonce 最长十分钟且只可使用一次。
+# 美团主站卡（i.meituan.com）：Android 专用 WebView 登录能力；nonce 最长十分钟且只可使用一次。
+ttl_seconds = 300
+allowed_contacts = ["kairos", "kimi"]
+# 固定 argv，cookie JSON 只经 subprocess stdin 传入，不得改成 shell 字符串。
+# 尾参 "main"：远端注入端用主站判据（i.meituan.com「我的」页）复验。
+# import_command = ["ssh", "memory-sg", "/home/ubuntu/taobao-login/.venv/bin/python", "/home/ubuntu/meituan-login/import_cookies.py", "main"]
+# 挂卡闸门探针：meituan-mcp status_main（主站「我的」页未登录跳 passport ilogin，默认即下值）。
+# status_command = ["ssh", "memory-sg", "/home/ubuntu/taobao-login/.venv/bin/python", "/home/ubuntu/meituan-mcp/meituan_tools.py", "status_main"]
+
+[mt_waimai_login]
+# 美团外卖卡（h5.waimai.meituan.com）：Android 专用 WebView 登录能力；nonce 最长十分钟且只可使用一次。
 ttl_seconds = 300
 allowed_contacts = ["kairos", "kimi"]
 # 固定 argv，cookie JSON 只经 subprocess stdin 传入，不得改成 shell 字符串。

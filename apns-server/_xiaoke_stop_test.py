@@ -1206,7 +1206,8 @@ class XiaokeStopTest(unittest.TestCase):
         cases = [
             ("[[CCC_NETEASE_LOGIN_CARD:v1]]", "netease_login_card", "网易云音乐还没登录，点下方卡片扫码登录。"),
             ("[[CCC_JD_LOGIN_CARD:v1]]", "jd_login_card", "京东登录已失效，点下方卡片重新登录。"),
-            ("[[CCC_MEITUAN_LOGIN_CARD:v1]]", "meituan_login_card", "美团还没登录，点下方卡片登录。"),
+            ("[[CCC_MEITUAN_LOGIN_CARD:v1]]", "meituan_login_card", "美团主站还没登录，点下方卡片登录。"),
+            ("[[CCC_MT_WAIMAI_LOGIN_CARD:v1]]", "mt_waimai_login_card", "美团外卖还没登录，点下方卡片登录。"),
         ]
         for marker, key, label in cases:
             with self.subTest(marker=marker):
