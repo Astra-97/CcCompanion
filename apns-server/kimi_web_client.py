@@ -68,6 +68,12 @@ class KimiWebClient:
     APP_PERMISSION_MODE = "auto"
     MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
     ATTACHMENT_TTL_SECONDS = 15 * 60
+    # Lease states from which the owning turn can never act again (its stream
+    # and worker are gone), so the lease is abandoned rather than owned.
+    TURN_LEASE_TERMINAL_STATES = frozenset({"stream_lost", "failed"})
+    # A non-terminal lease older than this is likewise provably abandoned:
+    # its owner process died before reaching a terminal state or cleanup.
+    TURN_LEASE_STALE_SECONDS = 30 * 60
     def __init__(
         self,
         *,
@@ -589,8 +595,43 @@ class KimiWebClient:
         with self._turn_lease_lock(exclusive=False):
             return self._load_turn_lease_unlocked()
 
-    def save_turn_lease(self, *, session_id: str, prompt_id: str, user_ts: str, state: str) -> None:
-        """Atomically persist no-content ownership metadata before stream use."""
+    def _stale_turn_lease_takeover_allowed(self, lease: dict[str, str], *, stale_after: float) -> bool:
+        """True only when a foreign lease is provably abandoned.
+
+        The durable lease is the App's only proof of owning one prompt, so
+        takeover stays narrow: a terminal state (the owning turn ended
+        without cleanup) or a ``created_at`` older than the stale TTL.
+        Live states, unparseable or future timestamps, and anything younger
+        than the TTL all remain conflicts.
+        """
+        if str(lease.get("state") or "").strip() in self.TURN_LEASE_TERMINAL_STATES:
+            return True
+        try:
+            created_at = float(lease.get("created_at") or 0)
+        except (TypeError, ValueError):
+            return False
+        return 0 < created_at <= time.time() - stale_after
+
+    def save_turn_lease(
+        self,
+        *,
+        session_id: str,
+        prompt_id: str,
+        user_ts: str,
+        state: str,
+        stale_after: float | None = None,
+    ) -> None:
+        """Atomically persist no-content ownership metadata before stream use.
+
+        A lease belonging to a different prompt is normally a hard conflict.
+        The single exception is a provably abandoned lease: one in a terminal
+        state (e.g. ``stream_lost`` left behind when its session never goes
+        idle again, so neither the idle reconcile nor the orphan recovery
+        can ever clear it) or one older than the stale TTL.  Its owner can
+        no longer act on it, yet it would otherwise block every later submit
+        permanently, so it is taken over under the same exclusive lock that
+        already serializes lease writers.  Anything else stays fail-closed.
+        """
         if self.turn_lease_path is None:
             raise KimiWebError("Kimi Web turn lease path is required")
         session_id = self._valid_session_id(session_id)
@@ -599,14 +640,34 @@ class KimiWebClient:
         state = str(state or "").strip()
         if not session_id or not prompt_id or not user_ts or not state or len(user_ts) > 200 or len(state) > 40:
             raise KimiWebError("Kimi Web turn lease is invalid")
+        ttl = self.TURN_LEASE_STALE_SECONDS if stale_after is None else max(60.0, float(stale_after))
+        abandoned: dict[str, str] = {}
         with self._turn_lease_lock(exclusive=True):
             current = self._load_turn_lease_unlocked()
             if current and (current.get("session_id") != session_id or current.get("prompt_id") != prompt_id):
-                raise KimiWebRecoveryConflict("Kimi Web turn lease belongs to another prompt")
+                if not self._stale_turn_lease_takeover_allowed(current, stale_after=ttl):
+                    raise KimiWebRecoveryConflict(
+                        "Kimi Web turn lease belongs to another prompt and is not provably abandoned "
+                        f"(held session={current.get('session_id')} prompt={current.get('prompt_id')} "
+                        f"state={current.get('state') or 'unknown'} created_at={current.get('created_at') or 'unknown'}; "
+                        f"takeover requires a terminal state {sorted(self.TURN_LEASE_TERMINAL_STATES)} "
+                        f"or an age above {ttl:.0f}s)"
+                    )
+                abandoned = current
+                self.logger.warning(
+                    "Kimi Web abandoning stale turn lease of session %s prompt %s "
+                    "(state=%s, created_at=%s) for new prompt %s",
+                    current.get("session_id"), current.get("prompt_id"),
+                    current.get("state"), current.get("created_at"), prompt_id,
+                )
             self._write_turn_lease_unlocked({
                 "version": 1, "session_id": session_id, "prompt_id": prompt_id,
                 "user_ts": user_ts, "state": state, "created_at": str(int(time.time())),
             })
+        if abandoned:
+            # The abandoned turn's lifecycle ends here too; keep the guard
+            # bookkeeping identical to an explicit clear.
+            self.note_turn_finished(abandoned["session_id"])
 
     def clear_turn_lease(self, *, session_id: str, prompt_id: str) -> bool:
         """Clear only the same exact prompt's durable ownership record."""

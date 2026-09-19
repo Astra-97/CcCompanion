@@ -570,6 +570,64 @@ class KimiWebIsolationTest(unittest.TestCase):
             self.assertTrue(client.clear_turn_lease(session_id="web_session-1", prompt_id="prompt-1"))
             self.assertEqual({}, client.load_turn_lease())
 
+    def _write_foreign_lease(self, directory, *, state, created_at, session_id="web_session-1", prompt_id="prompt-old"):
+        lease_path = os.path.join(directory, "kimi_web_turn_lease.json")
+        with open(lease_path, "w", encoding="utf-8") as handle:
+            json.dump({
+                "version": 1, "session_id": session_id, "prompt_id": prompt_id,
+                "user_ts": "1700000000.1", "state": state, "created_at": str(created_at),
+            }, handle)
+        return lease_path
+
+    def test_stale_terminal_turn_lease_is_taken_over_by_a_new_prompt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pointer = os.path.join(directory, "kimi_web_session.json")
+            client = KimiWebClient(command="/unused/kimi", state_path=pointer, cwd="/tmp/kimi-cwd", started_at=time.time() + 60)
+            # 新鲜的 stream_lost 残骸：终态本身就是被遗弃的证明，与年龄无关。
+            self._write_foreign_lease(directory, state="stream_lost", created_at=int(time.time()))
+            client.save_turn_lease(
+                session_id="web_session-1", prompt_id="prompt-2", user_ts="1700000000.2", state="submitted",
+            )
+            lease = client.load_turn_lease()
+            self.assertEqual("prompt-2", lease["prompt_id"])
+            self.assertEqual("submitted", lease["state"])
+            # 接管与显式 clear 一样，把旧 turn 的完结写进恢复护栏。
+            self.assertTrue(client.stuck_busy_predates_process("web_session-1"))
+
+    def test_aged_non_terminal_turn_lease_is_taken_over_by_a_new_prompt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pointer = os.path.join(directory, "kimi_web_session.json")
+            client = KimiWebClient(command="/unused/kimi", state_path=pointer, cwd="/tmp/kimi-cwd")
+            stale_created = int(time.time()) - KimiWebClient.TURN_LEASE_STALE_SECONDS - 5
+            self._write_foreign_lease(directory, state="submitted", created_at=stale_created)
+            client.save_turn_lease(
+                session_id="web_session-1", prompt_id="prompt-2", user_ts="1700000000.2", state="submitted",
+            )
+            self.assertEqual("prompt-2", client.load_turn_lease()["prompt_id"])
+
+    def test_live_foreign_turn_lease_still_rejects_takeover(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pointer = os.path.join(directory, "kimi_web_session.json")
+            client = KimiWebClient(command="/unused/kimi", state_path=pointer, cwd="/tmp/kimi-cwd")
+            for state, created_at in (
+                ("submitted", int(time.time())),
+                ("stopping", int(time.time())),
+                # 无法解析时间戳的非终态租约一律 fail-closed。
+                ("submitted", "garbage"),
+                # 未来时间戳同样无法证明陈旧。
+                ("submitted", int(time.time()) + 3600),
+            ):
+                self._write_foreign_lease(directory, state=state, created_at=created_at)
+                with self.assertRaises(KimiWebRecoveryConflict) as caught:
+                    client.save_turn_lease(
+                        session_id="web_session-1", prompt_id="prompt-2", user_ts="1700000000.2", state="submitted",
+                    )
+                message = str(caught.exception)
+                self.assertIn("prompt-old", message)
+                self.assertIn(state, message)
+                # 旧租约原样保留，冲突不会削弱既有占有证明。
+                self.assertEqual("prompt-old", client.load_turn_lease()["prompt_id"])
+
     def test_submit_resolves_exact_abort_prompt_id_from_active_prompt(self):
         client = KimiWebClient(command="/unused/kimi")
         calls = []
