@@ -27,7 +27,7 @@ import time
 from typing import Any, Callable
 
 
-JD_LOGIN_URL = "https://passport.jd.com/new/login.aspx"
+JD_LOGIN_URL = "https://plogin.m.jd.com/login/login"
 JD_LOGIN_ORIGIN = "cccompanion-android-webview-v1"
 DEFAULT_TTL_SECONDS = 300
 DEFAULT_ALLOWED_CONTACTS = frozenset({"kairos", "kimi"})
