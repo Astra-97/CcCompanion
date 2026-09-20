@@ -13,9 +13,28 @@ from push import (
     PushHandler,
     TmuxInjectionResult,
     _direct_tmux_injection,
+    _extract_tmux_prompt_box,
     _inject_to_tmux_session,
     _xiaoke_attachment_paste_settle_seconds,
     _should_expire_chat_typing,
+)
+
+
+EMPTY_PROMPT_BOX_CAPTURE = (
+    "✻ Churned for 36s · done 12:41 AM\n"
+    "\n"
+    "────────────────────────────────────────────────\n"
+    "❯ \n"
+    "────────────────────────────────────────────────\n"
+    "  Fable 5 | Ctx13% 131k/1.0M\n"
+)
+STUCK_PROMPT_BOX_CAPTURE = (
+    "✻ Churned for 36s · done 12:41 AM\n"
+    "\n"
+    "────────────────────────────────────────────────\n"
+    "❯ hello stuck prompt\n"
+    "────────────────────────────────────────────────\n"
+    "  Fable 5 | Ctx13% 131k/1.0M\n"
 )
 
 
@@ -770,7 +789,8 @@ class XiaokeStopTest(unittest.TestCase):
             operations.append(args[1])
             if args[1] == "send-keys":
                 sent_keys.append(args[-1])
-            return subprocess.CompletedProcess(args, 0, "", "")
+            stdout = EMPTY_PROMPT_BOX_CAPTURE if args[1] == "capture-pane" else ""
+            return subprocess.CompletedProcess(args, 0, stdout, "")
 
         with (
             patch("push.subprocess.Popen", return_value=Loader()),
@@ -781,10 +801,12 @@ class XiaokeStopTest(unittest.TestCase):
 
         self.assertTrue(ok, error)
         self.assertEqual(operations, [
-            "has-session", "load", "paste-buffer", "send-keys", "delete-buffer",
+            "has-session", "load", "paste-buffer", "send-keys", "capture-pane", "delete-buffer",
         ])
         self.assertEqual(sent_keys, ["Enter"])
-        sleep.assert_not_called()
+        # No paste settle for the scheduled path; the one sleep is the
+        # post-Enter submission-verification grace.
+        sleep.assert_called_once_with(0.6)
 
     def test_xiaoke_force_direct_settles_before_one_submit_for_text_and_attachments(self) -> None:
         cases = {
@@ -817,7 +839,8 @@ class XiaokeStopTest(unittest.TestCase):
                     operations.append(args[1])
                     if args[1] == "send-keys":
                         sent_keys.append(args[-1])
-                    return subprocess.CompletedProcess(args, 0, "", "")
+                    stdout = EMPTY_PROMPT_BOX_CAPTURE if args[1] == "capture-pane" else ""
+                    return subprocess.CompletedProcess(args, 0, stdout, "")
 
                 with (
                     patch("push.subprocess.Popen", return_value=Loader()),
@@ -840,10 +863,11 @@ class XiaokeStopTest(unittest.TestCase):
                 self.assertEqual(loaded, [text.encode("utf-8")])
                 self.assertEqual(load_timeouts, [3])
                 self.assertEqual(operations, [
-                    "has-session", "load", "paste-buffer", "settle:1.2", "send-keys", "delete-buffer",
+                    "has-session", "load", "paste-buffer", "settle:1.2",
+                    "send-keys", "settle:0.6", "capture-pane", "delete-buffer",
                 ])
                 self.assertEqual(sent_keys, ["Enter"])
-                sleep.assert_called_once_with(1.2)
+                self.assertEqual([call.args[0] for call in sleep.call_args_list], [1.2, 0.6])
 
     def test_empty_direct_tmux_injection_never_submits_enter(self) -> None:
         with (
@@ -1044,6 +1068,129 @@ class XiaokeStopTest(unittest.TestCase):
         self.assertEqual(handler.state.typing_state["injection_phase"], "enter")
         self.assertEqual(handler.state.typing_state["since"], "turn-1")
 
+    def test_extract_tmux_prompt_box_reads_only_the_bottom_input_box(self) -> None:
+        self.assertEqual(_extract_tmux_prompt_box(EMPTY_PROMPT_BOX_CAPTURE), "")
+        self.assertEqual(_extract_tmux_prompt_box(STUCK_PROMPT_BOX_CAPTURE), "hellostuckprompt")
+        # A submitted prompt echoes as "❯ ..." in the transcript *above* the
+        # box's top border; it must not be mistaken for an unsubmitted prompt.
+        echoed = (
+            "❯ hello stuck prompt\n"
+            "\n"
+            "✻ Thinking…\n"
+            "────────────────────────────────────────────────\n"
+            "❯ \n"
+            "────────────────────────────────────────────────\n"
+            "  Fable 5 | Ctx13%\n"
+        )
+        self.assertEqual(_extract_tmux_prompt_box(echoed), "")
+        self.assertIsNone(_extract_tmux_prompt_box("no borders here\n"))
+        self.assertIsNone(_extract_tmux_prompt_box(""))
+
+    def test_swallowed_enter_is_resent_and_verified(self) -> None:
+        loader = MagicMock()
+        loader.returncode = 0
+        loader.communicate.return_value = (b"", b"")
+        captures = iter([STUCK_PROMPT_BOX_CAPTURE, EMPTY_PROMPT_BOX_CAPTURE])
+        sent_keys: list[str] = []
+
+        def run_tmux(args, **_kwargs):
+            if args[1] == "capture-pane":
+                return subprocess.CompletedProcess(args, 0, next(captures), "")
+            if args[1] == "send-keys":
+                sent_keys.append(args[-1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with (
+            patch("push.subprocess.Popen", return_value=loader),
+            patch("push.subprocess.run", side_effect=run_tmux),
+            patch("push.time.sleep") as sleep,
+        ):
+            result = _direct_tmux_injection("cctg", "hello")
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.phase, "submitted")
+        self.assertEqual(sent_keys, ["Enter", "Enter"])
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [0.6, 0.6])
+
+    def test_swallowed_enter_still_completes_xiaoke_send_under_exact_turn_lock(self) -> None:
+        handler = self.send_handler()
+        loader = MagicMock()
+        loader.returncode = 0
+        loader.communicate.return_value = (b"", b"")
+        captures = iter([STUCK_PROMPT_BOX_CAPTURE, EMPTY_PROMPT_BOX_CAPTURE])
+        enters = 0
+
+        def run_tmux(args, **_kwargs):
+            nonlocal enters
+            if args[1] == "capture-pane":
+                return subprocess.CompletedProcess(args, 0, next(captures), "")
+            if args[1] == "send-keys" and args[-1] == "Enter":
+                enters += 1
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with (
+            patch("push.subprocess.Popen", return_value=loader),
+            patch("push.subprocess.run", side_effect=run_tmux),
+            patch("push.time.sleep"),
+        ):
+            handler._handle_chat_send({"contact_id": "xiaoke", "text": "hello"})
+
+        self.assertEqual(enters, 2)
+        self.assertEqual(handler.responses[-1][0], 200)
+        self.assertTrue(handler.state.typing_state["is_typing"])
+        self.assertEqual(handler.state.typing_state["since"], "turn-1")
+
+    def test_stuck_prompt_after_max_enters_gets_bounded_cleanup(self) -> None:
+        loader = MagicMock()
+        loader.returncode = 0
+        loader.communicate.return_value = (b"", b"")
+        sent_keys: list[str] = []
+
+        def run_tmux(args, **_kwargs):
+            if args[1] == "capture-pane":
+                return subprocess.CompletedProcess(args, 0, STUCK_PROMPT_BOX_CAPTURE, "")
+            if args[1] == "send-keys":
+                sent_keys.append(args[-1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with (
+            patch("push.subprocess.Popen", return_value=loader),
+            patch("push.subprocess.run", side_effect=run_tmux),
+            patch("push.time.sleep") as sleep,
+        ):
+            result = _direct_tmux_injection("cctg", "hello")
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.phase, "enter_verify")
+        self.assertFalse(result.injection_uncertain)
+        self.assertTrue(result.cleanup_confirmed)
+        self.assertEqual(sent_keys, ["Enter", "Enter", "Enter", "C-c"])
+        self.assertEqual(len(sleep.call_args_list), 3)
+
+    def test_unreadable_pane_returns_submitted_unverified_without_cleanup(self) -> None:
+        loader = MagicMock()
+        loader.returncode = 0
+        loader.communicate.return_value = (b"", b"")
+        sent_keys: list[str] = []
+
+        def run_tmux(args, **_kwargs):
+            if args[1] == "capture-pane":
+                return subprocess.CompletedProcess(args, 1, "", "pane dead")
+            if args[1] == "send-keys":
+                sent_keys.append(args[-1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with (
+            patch("push.subprocess.Popen", return_value=loader),
+            patch("push.subprocess.run", side_effect=run_tmux),
+            patch("push.time.sleep"),
+        ):
+            result = _direct_tmux_injection("cctg", "hello")
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.phase, "submitted_unverified")
+        self.assertEqual(sent_keys, ["Enter", "Enter", "Enter"])
+
     def test_concurrent_direct_injection_cannot_overwrite_named_buffer(self) -> None:
         first_loaded = threading.Event()
         release_first = threading.Event()
@@ -1082,12 +1229,14 @@ class XiaokeStopTest(unittest.TestCase):
             elif args[1] == "delete-buffer":
                 with guard:
                     buffers.pop(args[3], None)
-            return subprocess.CompletedProcess(args, 0, "", "")
+            stdout = EMPTY_PROMPT_BOX_CAPTURE if args[1] == "capture-pane" else ""
+            return subprocess.CompletedProcess(args, 0, stdout, "")
 
         results = []
         with (
             patch("push.subprocess.Popen", side_effect=fake_popen),
             patch("push.subprocess.run", side_effect=fake_run),
+            patch("push.time.sleep"),
         ):
             first = threading.Thread(
                 target=lambda: results.append(_direct_tmux_injection("cctg", "first-marker"))

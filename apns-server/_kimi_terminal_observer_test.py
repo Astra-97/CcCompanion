@@ -20,7 +20,26 @@ from push import (
     KimiTerminalBridge,
     KimiTerminalBusy,
     KimiTerminalNoActiveSession,
+    KimiTerminalUnavailable,
     PushHandler,
+)
+
+
+EMPTY_PROMPT_BOX_CAPTURE = (
+    "✻ Churned for 36s · done 12:41 AM\n"
+    "\n"
+    "────────────────────────────────────────────────\n"
+    "❯ \n"
+    "────────────────────────────────────────────────\n"
+    "  Fable 5 | Ctx13% 131k/1.0M\n"
+)
+STUCK_PROMPT_BOX_CAPTURE = (
+    "✻ Churned for 36s · done 12:41 AM\n"
+    "\n"
+    "────────────────────────────────────────────────\n"
+    "❯ 忙时输入\n"
+    "────────────────────────────────────────────────\n"
+    "  Fable 5 | Ctx13% 131k/1.0M\n"
 )
 
 
@@ -334,6 +353,8 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
                 return types.SimpleNamespace(returncode=0, stdout=KIMI_TERMINAL_OWNER_VALUE + "\n", stderr="")
             if argv[1] == "display-message":
                 return types.SimpleNamespace(returncode=0, stdout="%42|0\n", stderr="")
+            if argv[1] == "capture-pane":
+                return types.SimpleNamespace(returncode=0, stdout=EMPTY_PROMPT_BOX_CAPTURE, stderr="")
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
         bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"), runner=runner)
         bridge._lease = "a" * 43
@@ -341,17 +362,103 @@ class KimiTerminalObserverRouteTest(unittest.TestCase):
         epoch = bridge._prompt_epoch
 
         # 忙时文本直达 owned pane：私有 buffer + paste + Enter，跳过 ready 围栏。
-        self.assertTrue(bridge.send_text("忙时输入", True))
+        with mock.patch("push.time.sleep"):
+            self.assertTrue(bridge.send_text("忙时输入", True))
         set_buffer = next(argv for argv in calls if argv[1] == "set-buffer")
         self.assertEqual("忙时输入", set_buffer[-1])
         paste = next(argv for argv in calls if argv[1] == "paste-buffer")
         self.assertIn("%42", paste)
         self.assertIn("-d", paste)
         send_keys = [argv for argv in calls if argv[1] == "send-keys"]
-        self.assertEqual(["tmux", "send-keys", "-t", "%42", "Enter"], send_keys[-1])
-        # Enter 送达后按新 prompt 记账：不确定态保持，epoch 前进。
+        self.assertEqual([["tmux", "send-keys", "-t", "%42", "Enter"]], send_keys)
+        # Enter 送达且输入框验证清空后按新 prompt 记账：不确定态保持，epoch 前进。
         self.assertTrue(bridge._prompt_active_uncertain)
         self.assertEqual(epoch + 1, bridge._prompt_epoch)
+
+    def test_busy_kimi_bridge_send_text_resends_swallowed_enter(self):
+        calls = []
+        captures = iter([STUCK_PROMPT_BOX_CAPTURE, EMPTY_PROMPT_BOX_CAPTURE])
+
+        def runner(argv, **_kwargs):
+            calls.append(argv)
+            if argv[1] == "show-options":
+                return types.SimpleNamespace(returncode=0, stdout=KIMI_TERMINAL_OWNER_VALUE + "\n", stderr="")
+            if argv[1] == "display-message":
+                return types.SimpleNamespace(returncode=0, stdout="%42|0\n", stderr="")
+            if argv[1] == "capture-pane":
+                return types.SimpleNamespace(returncode=0, stdout=next(captures), stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"), runner=runner)
+        bridge._lease = "a" * 43
+        bridge._lease_pane = "%42"
+        epoch = bridge._prompt_epoch
+
+        with mock.patch("push.time.sleep"):
+            self.assertTrue(bridge.send_text("忙时输入", True))
+        enters = [
+            argv for argv in calls
+            if argv[1] == "send-keys" and argv[-1] == "Enter"
+        ]
+        self.assertEqual(2, len(enters))
+        self.assertTrue(bridge._prompt_active_uncertain)
+        self.assertEqual(epoch + 1, bridge._prompt_epoch)
+
+    def test_busy_kimi_bridge_send_text_stuck_prompt_raises_and_cleans_buffer(self):
+        calls = []
+
+        def runner(argv, **_kwargs):
+            calls.append(argv)
+            if argv[1] == "show-options":
+                return types.SimpleNamespace(returncode=0, stdout=KIMI_TERMINAL_OWNER_VALUE + "\n", stderr="")
+            if argv[1] == "display-message":
+                return types.SimpleNamespace(returncode=0, stdout="%42|0\n", stderr="")
+            if argv[1] == "capture-pane":
+                return types.SimpleNamespace(returncode=0, stdout=STUCK_PROMPT_BOX_CAPTURE, stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"), runner=runner)
+        bridge._lease = "a" * 43
+        bridge._lease_pane = "%42"
+        epoch = bridge._prompt_epoch
+
+        with mock.patch("push.time.sleep"):
+            with self.assertRaises(KimiTerminalUnavailable):
+                bridge.send_text("忙时输入", True)
+        enters = [
+            argv for argv in calls
+            if argv[1] == "send-keys" and argv[-1] == "Enter"
+        ]
+        self.assertEqual(3, len(enters))
+        self.assertEqual(1, sum(argv[1] == "delete-buffer" for argv in calls))
+        # 未确认提交绝不记账：epoch 不动，不确定态不前进。
+        self.assertFalse(bridge._prompt_active_uncertain)
+        self.assertEqual(epoch, bridge._prompt_epoch)
+
+    def test_busy_kimi_bridge_send_text_unreadable_layout_keeps_legacy_behavior(self):
+        calls = []
+
+        def runner(argv, **_kwargs):
+            calls.append(argv)
+            if argv[1] == "show-options":
+                return types.SimpleNamespace(returncode=0, stdout=KIMI_TERMINAL_OWNER_VALUE + "\n", stderr="")
+            if argv[1] == "display-message":
+                return types.SimpleNamespace(returncode=0, stdout="%42|0\n", stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        bridge = KimiTerminalBridge(command=Path("/fake/kimi"), cwd=Path("/fake/workspace"), runner=runner)
+        bridge._lease = "a" * 43
+        bridge._lease_pane = "%42"
+
+        # capture-pane 读不出输入框（布局不认）时保持旧行为：单次 Enter 即记账。
+        with mock.patch("push.time.sleep"):
+            self.assertTrue(bridge.send_text("忙时输入", True))
+        enters = [
+            argv for argv in calls
+            if argv[1] == "send-keys" and argv[-1] == "Enter"
+        ]
+        self.assertEqual(1, len(enters))
+        self.assertTrue(bridge._prompt_active_uncertain)
 
     def test_busy_kimi_bridge_send_text_fails_closed_on_dead_pane(self):
         calls = []

@@ -1113,6 +1113,64 @@ def _settle_direct_tmux_paste(seconds: float) -> None:
     time.sleep(seconds)
 
 
+DIRECT_TMUX_ENTER_VERIFY_GRACE_SECONDS = 0.6
+DIRECT_TMUX_ENTER_MAX_ATTEMPTS = 3
+
+_TMUX_PROMPT_BORDER_CHARS = frozenset("─╭╮╰╯")
+_TMUX_PROMPT_NOISE_CHARS = frozenset("❯›>│┃")
+
+
+def _is_tmux_prompt_border(line: str) -> bool:
+    stripped = line.strip()
+    return len(stripped) >= 8 and all(
+        ch in _TMUX_PROMPT_BORDER_CHARS for ch in stripped
+    )
+
+
+def _extract_tmux_prompt_box(capture: str) -> str | None:
+    """Compacted content of the TUI's bottom prompt input box.
+
+    The bottom-most pair of full-width horizontal border lines frames the
+    prompt box in the Claude Code / Codex TUI layout (verified against Claude
+    Code 2.1.278: box top border, ``❯ <text>`` content lines, box bottom
+    border, then the status bar).  ``""`` means the box is visibly empty —
+    the TUI consumed the prompt.  ``None`` means the pane is unreadable or
+    the layout is unrecognized; submission state is then unknown.  Unlike the
+    pre-submit settle above, inspecting the pane here is sound: whatever the
+    TUI condensed the paste into, an accepted Enter always leaves this box
+    empty, and a swallowed Enter always leaves it non-empty.
+    """
+
+    lines = capture.splitlines()
+    borders = [
+        i for i, line in enumerate(lines) if _is_tmux_prompt_border(line)
+    ]
+    if len(borders) < 2:
+        return None
+    top, bottom = borders[-2], borders[-1]
+    return "".join(
+        ch
+        for line in lines[top + 1:bottom]
+        for ch in line
+        if not ch.isspace() and ch not in _TMUX_PROMPT_NOISE_CHARS
+    )
+
+
+def _capture_tmux_prompt_box(session: str) -> str | None:
+    try:
+        capture = subprocess.run(
+            ["tmux", "capture-pane", "-t", session, "-p"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return None
+    if capture.returncode != 0:
+        return None
+    return _extract_tmux_prompt_box(capture.stdout)
+
+
 @contextmanager
 def _locked_json_state(path: Path, *, exclusive: bool):
     lock_path = path.with_name(f".{path.name}.lock")
@@ -1939,8 +1997,9 @@ class KimiTerminalBridge:
 
         与真实终端一致：TUI 忙时键入的字节由 tty 缓冲，轮到它时被消费。
         归属与存活校验同 send_control_key；使用请求级私有 buffer，并发
-        输入不会互相覆盖。Enter 成功送达后按新 prompt 记账（保持不确定态
-        围栏一致）。pane 不可验证返回 False，tmux 失败抛错并清理 buffer。
+        输入不会互相覆盖。Enter 送达后先做有界提交验证（吞键则补发），
+        确认输入框已清空才按新 prompt 记账（保持不确定态围栏一致）。
+        pane 不可验证返回 False，tmux 失败抛错并清理 buffer。
         """
         with self._lock:
             if not self._has_session_locked() or not self._owns_session_locked():
@@ -1964,6 +2023,7 @@ class KimiTerminalBridge:
                     submit = self._run_tmux(["tmux", "send-keys", "-t", pane_id, "Enter"])
                     if submit.returncode != 0:
                         raise KimiTerminalUnavailable("Kimi 终端按键失败")
+                    self._confirm_prompt_submission_locked(pane_id)
                     self.mark_prompt_submitted()
             except Exception:
                 if buffer_name:
@@ -1974,6 +2034,41 @@ class KimiTerminalBridge:
                 raise
             self._touch_locked()
             return True
+
+    def _capture_prompt_box_locked(self, pane_id: str) -> str | None:
+        try:
+            capture = self._run_tmux(["tmux", "capture-pane", "-t", pane_id, "-p"])
+        except Exception:
+            return None
+        if capture.returncode != 0:
+            return None
+        return _extract_tmux_prompt_box(capture.stdout)
+
+    def _confirm_prompt_submission_locked(self, pane_id: str) -> None:
+        """Enter 送达后验证提交，被吞时有界补发（判据同 _confirm_tmux_prompt_submission）。
+
+        Claude Code 2.1.278 的输入管线会间歇吞掉 bracketed-paste 后的 Enter，
+        忙时直达路径同样不能只信 tmux 退出码。底部输入框为空才算已提交；
+        明确仍有文本时补发 Enter（空框上多按无害），含首个最多
+        DIRECT_TMUX_ENTER_MAX_ATTEMPTS 次。布局读不准（None）时保持旧行为
+        直接返回——对认不出的 TUI 盲目补发没有验证收益；明确卡住且补发
+        耗尽时抛 KimiTerminalUnavailable，让调用方报错而不是静默滞留。
+        """
+
+        attempts = 1  # 调用方已发过第一个 Enter
+        while True:
+            time.sleep(DIRECT_TMUX_ENTER_VERIFY_GRACE_SECONDS)
+            box = self._capture_prompt_box_locked(pane_id)
+            if box == "":
+                return
+            if box is None:
+                return
+            if attempts >= DIRECT_TMUX_ENTER_MAX_ATTEMPTS:
+                raise KimiTerminalUnavailable("Kimi 终端输入未提交")
+            resend = self._run_tmux(["tmux", "send-keys", "-t", pane_id, "Enter"])
+            if resend.returncode != 0:
+                raise KimiTerminalUnavailable("Kimi 终端按键失败")
+            attempts += 1
 
     def _kill_exact_pane_locked(self, expected_pane: str) -> bool:
         """Kill one verified owned pane; never target the reusable session name."""
@@ -3522,6 +3617,79 @@ def _tmux_interrupt_uncertain_injection(
     )
 
 
+def _confirm_tmux_prompt_submission(session: str) -> TmuxInjectionResult:
+    """Verify the Enter after a direct injection actually submitted the prompt.
+
+    Claude Code 2.1.278's input pipeline intermittently swallows the Enter
+    that follows a bracketed paste: tmux accepts the key, the TUI never
+    submits, and the text sits in the prompt box until a human notices
+    (2026-09-20 incident chain — a swallowed ``/model`` Enter even glued the
+    next injected ``/effort`` onto it).  The old "never retry Enter" policy
+    is deliberately reversed here: after a short grace, capture the pane and
+    read the bottom prompt box.  An empty box proves the TUI consumed the
+    prompt; a box still holding text means the Enter was lost, so resend.
+    An unreadable pane fails closed towards one more Enter — pressing Enter
+    on an empty box is a no-op, while a withheld Enter strands the prompt.
+
+    Bounds: at most ``DIRECT_TMUX_ENTER_MAX_ATTEMPTS`` Enters in total (the
+    caller already sent one), ``DIRECT_TMUX_ENTER_VERIFY_GRACE_SECONDS``
+    apart, so worst-case added latency stays around two seconds.  On
+    exhaustion, a visibly stuck prompt gets the same bounded C-c cleanup as
+    other uncertain injections; an unreadable box returns success as
+    ``submitted_unverified`` (tmux did accept every Enter) rather than
+    risking a blind C-c against a possibly healthy running turn.
+    """
+
+    attempts = 1  # the caller's Enter is attempt one
+    while True:
+        time.sleep(DIRECT_TMUX_ENTER_VERIFY_GRACE_SECONDS)
+        box = _capture_tmux_prompt_box(session)
+        if box == "":
+            return TmuxInjectionResult(True, "", "submitted")
+        if attempts >= DIRECT_TMUX_ENTER_MAX_ATTEMPTS:
+            if box is None:
+                logger.warning(
+                    "tmux prompt submission unverified session=%s attempts=%d",
+                    session,
+                    attempts,
+                )
+                return TmuxInjectionResult(True, "", "submitted_unverified")
+            return _tmux_interrupt_uncertain_injection(
+                session,
+                phase="enter_verify",
+                error=f"prompt still in input box after {attempts} Enter attempts",
+            )
+        try:
+            resend = subprocess.run(
+                ["tmux", "send-keys", "-t", session, "Enter"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+        except subprocess.TimeoutExpired:
+            return _tmux_interrupt_uncertain_injection(
+                session,
+                phase="enter",
+                error="tmux send-keys Enter timed out",
+            )
+        except Exception as exc:
+            return _tmux_interrupt_uncertain_injection(
+                session,
+                phase="enter",
+                error=f"tmux send-keys Enter failed: {exc}",
+            )
+        if resend.returncode != 0:
+            return _tmux_interrupt_uncertain_injection(
+                session,
+                phase="enter",
+                error=(
+                    "tmux send-keys Enter failed: "
+                    f"{resend.stderr.strip() or f'exit {resend.returncode}'}"
+                ),
+            )
+        attempts += 1
+
+
 def _direct_tmux_injection(
     session: str,
     text: str,
@@ -3606,8 +3774,11 @@ def _direct_tmux_injection(
             # ``paste-buffer`` returns before a bracketed-paste TUI has
             # necessarily drained a long attachment payload. Scheduled and
             # other shared direct fallbacks retain their immediate submission.
-            # The caller keeps XiaoKe's exact-turn lock through this one
-            # settle and submit; never retry Enter.
+            # The caller keeps XiaoKe's exact-turn lock through the settle,
+            # this Enter, and the bounded submission verification that follows
+            # it: Claude Code 2.1.278 intermittently swallows the Enter after
+            # a bracketed paste, so the post-Enter capture-and-resend below
+            # replaced the old "never retry Enter" policy (2026-09-20).
             if paste_settle_seconds > 0:
                 _settle_direct_tmux_paste(paste_settle_seconds)
             try:
@@ -3640,7 +3811,7 @@ def _direct_tmux_injection(
                         ),
                     )
                 else:
-                    result = TmuxInjectionResult(True, "", "submitted")
+                    result = _confirm_tmux_prompt_submission(session)
     except FileNotFoundError:
         result = TmuxInjectionResult(False, "tmux not installed", "load")
     except Exception as exc:
@@ -10894,7 +11065,9 @@ class PushHandler(BaseHTTPRequestHandler):
         # 2026-05-14 build 200 — 不依赖 ~/scripts/bus_send.py (Opia 内部 file, ccc 公开版用户没有)
         # 如果 bus_send.py 存在 用它走 bus dispatcher 路由 (Opia 内部多 agent 协调用)
         # 不存在 fallback 直接 tmux paste-buffer + send-keys 注入 (ccc 公开版默认走这条)
-        # Keep the exact-turn lock through the synchronous tmux paste + Enter.
+        # Keep the exact-turn lock through the synchronous tmux paste + Enter
+        # + bounded submission verification (a swallowed Enter is resent
+        # inside _direct_tmux_injection before the lock is released).
         # Until Enter succeeds neither Stop, typing polling, nor a completion
         # hook may observe an interruptible turn.  XiaoKe App turns explicitly
         # bypass the asynchronous Opia bus because it has no consumption ACK;
