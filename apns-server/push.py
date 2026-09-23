@@ -27262,6 +27262,63 @@ def _persist_active_session(state: "ServerState") -> None:
         logger.warning("persist_active_session failed: %s", e)
 
 
+def _kimi_web_boot_orphan_reconcile(state: ServerState) -> None:
+    """Close a pre-restart orphan Kimi Web turn at boot, not on next send.
+
+    Streaming drafts live only in process memory, so a restart strands any
+    in-flight turn: no terminal event, no draft-clear signal, and the client
+    keeps a half-rendered bubble.  The lazy entries (next /chat/send idle
+    reconciliation, Busy recovery, orphan Stop) eventually clean the lease up,
+    but only when the user sends another message.  This boot-time pass moves
+    the same fenced cleanup earlier so the terminal SSE goes out immediately.
+
+    The miskill fence is the existing idle proof, unchanged: the lease is
+    cleared and returned only when ``reconcile_owned_idle_lease`` can claim
+    it uncontested and the provider session is provably not busy.  A live
+    turn — local (active/prepare/recovery reservations) or upstream (busy
+    status) — makes this a no-op; the lazy paths stay as they were.
+    """
+    web = getattr(state, "kimi_web", None)
+    reconcile_idle = getattr(web, "reconcile_owned_idle_lease", None)
+    if not callable(reconcile_idle):
+        return
+    with state.kimi_turn_lock:
+        if (
+            state.kimi_active_turn
+            or state.kimi_prepare_token
+            or getattr(state, "kimi_recovery_token", "")
+            or getattr(state, "kimi_terminal_acquire_token", "")
+        ):
+            return
+    start = getattr(web, "start", None)
+    if callable(start):
+        try:
+            start()
+        except Exception:
+            # Fail closed: without a reachable provider there is no idle
+            # proof, so the lease stays for the lazy reconciliation entries.
+            logger.warning("Kimi Web boot orphan reconcile could not start the provider")
+            return
+    try:
+        # Boot has no user waiting on the latency budget the send path keeps,
+        # so allow a cold provider a little more headroom than 0.75s.
+        idle_lease = reconcile_idle(timeout=2.0)
+    except KimiWebError:
+        return
+    except Exception:
+        logger.warning("Kimi Web boot orphan lease reconciliation failed")
+        return
+    if not (isinstance(idle_lease, dict) and idle_lease):
+        return
+    # _mark_kimi_orphan_terminal and the _set_chat_* lifecycle publishers it
+    # drives only touch handler.state; an uninitialized instance is the same
+    # seam the unit tests use.  The user_ts history scan inside keeps this
+    # idempotent against a concurrent lazy reconciliation.
+    handler = object.__new__(PushHandler)
+    handler.state = state
+    handler._mark_kimi_orphan_terminal(idle_lease, outcome="failed")
+
+
 def run_server(state: ServerState):
     # P0-1: refuse to bind to 0.0.0.0 unless allow_public_bind = true in config
     if state.host == "0.0.0.0" and not state.allow_public_bind:
@@ -27278,6 +27335,14 @@ def run_server(state: ServerState):
         target=cleanup_loop, args=(state,), daemon=True, name="cleanup"
     )
     cleanup_thread.start()
+    # 重启孤儿回合 boot 对账：不等下一条 /chat/send，provider 可证明 idle
+    # 时立刻收尾并发出 terminal SSE（后台线程，冷启动 provider 不挡 listen）。
+    threading.Thread(
+        target=_kimi_web_boot_orphan_reconcile,
+        args=(state,),
+        daemon=True,
+        name="kimi-boot-orphan-reconcile",
+    ).start()
     # 小克·工具版 dispatcher — rule-driven scheduler injecting triggers into the
     # main session at scheduled times (no AI here; the session does the thinking).
     if getattr(state, "tool_schedule_enabled", False):
