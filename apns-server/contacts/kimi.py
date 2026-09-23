@@ -13,6 +13,9 @@ CONTACT = {
         "chat", "history", "draft", "busy", "stop", "attachments", "kimi_model_preferences",
         "kimi_session_control", "kimi_memory_recall", "forward", "group_member",
         "group_reply", "realtime", "voice_message",
+        # 2026-09-23 Astra 授权：私聊可自己浏览书架、挑任意一本续读。
+        # 群聊 turn 由服务端 _reading_ai_group_turn_active 另行拒绝。
+        "ai_reading_continue", "ai_reading_browse",
     ],
     "group_mention": "@Kimi",
     "group_display_name": "Kimi",

@@ -435,6 +435,173 @@ class ReadingProxyTest(unittest.TestCase):
         self.assertTrue(duplicate_length.close_connection)
         self.assertEqual(duplicate_length.responses[0][0], 413)
 
+    # ---- 2026-09-23: private AI contacts may browse the shelf and self-select ----
+
+    def _browse_fixture(self, chat, contacts=("kairos",)):
+        handler = self.handler("/reading/ai/continue")
+        handler.state = types.SimpleNamespace(contact_routes={}, contact_chats={c: chat for c in contacts})
+        handler._chat_for_contact = lambda _contact: chat
+        calls = []
+
+        def upstream(method, path, _token, _body=None):
+            calls.append((method, path))
+            if path == "/api/books":
+                return 200, [
+                    {"bookId": "book_1", "title": "星河", "author": "甲", "chunkCount": 2,
+                     "chunksRead": 1, "lastChunkId": "ch_1", "lastReadAt": "2026-09-01T00:00:00Z"},
+                    {"bookId": "book_2", "title": "路过", "author": "乙", "chunkCount": 2},
+                    {"bookId": "../etc", "title": "bad"},
+                ]
+            if path.endswith("/chunks"):
+                return 200, [
+                    {"id": "ch_1", "title": "第一章", "charCount": 6, "path": "chunks/ch_1.txt", "sourcePath": "x.xhtml"},
+                    {"id": "ch_2", "title": "第二章", "charCount": 5, "path": "chunks/ch_2.txt"},
+                ]
+            if path.endswith("/ch_1"):
+                return 200, {"text": "一二三四五六"}
+            if path.endswith("/ch_2"):
+                return 200, {"text": "七八九十壹"}
+            return 404, {"error": "missing"}
+
+        handler._reading_request = upstream
+        return handler, calls
+
+    class _Chat:
+        def __init__(self): self.rows = []
+        def append(self, **row): self.rows.append(row); return row
+
+    def test_registered_private_contacts_get_browse_and_group_never_does(self):
+        state = types.SimpleNamespace(
+            contact_routes={
+                "kairos": {"send_handler": "kairos", "capabilities": ["chat", "ai_reading_continue", "ai_reading_browse"]},
+                "kimi": {"send_handler": "kimi", "capabilities": ["chat", "ai_reading_continue", "ai_reading_browse"]},
+                "xiaoke": {"send_handler": "xiaoke", "capabilities": ["chat", "ai_reading_continue", "ai_reading_browse"]},
+                # Even a misconfigured group registration must never pass.
+                "apples": {"send_handler": "apples", "capabilities": ["chat", "group_chat", "ai_reading_continue", "ai_reading_browse"]},
+            },
+            contact_chats={"kairos": object(), "kimi": object(), "xiaoke": object(), "apples": object()},
+        )
+        self.assertEqual(PushHandler._reading_ai_allowed_contacts(state, "ai_reading_browse"), {"xiaoke", "kairos", "kimi"})
+        self.assertEqual(PushHandler._reading_ai_allowed_contacts(state), {"xiaoke", "kairos", "kimi"})
+
+        from contacts.registry import chat_contact_directory, default_contact_routes
+        production = types.SimpleNamespace(contact_routes=default_contact_routes())
+        caps = {item["id"]: set(item["capabilities"]) for item in chat_contact_directory(production)}
+        for contact in ("xiaoke", "kairos", "kimi"):
+            self.assertIn("ai_reading_continue", caps[contact])
+            self.assertIn("ai_reading_browse", caps[contact])
+        self.assertNotIn("ai_reading_continue", caps["apples"])
+        self.assertNotIn("ai_reading_browse", caps["apples"])
+        self.assertEqual(PushHandler._reading_ai_allowed_contacts(production, "ai_reading_browse"), {"xiaoke", "kairos", "kimi"})
+
+    def test_all_ai_bridge_routes_require_the_fixed_contact_credential(self):
+        for path in ("/reading/ai/shelf", "/reading/ai/chapters", "/reading/ai/continue"):
+            with self.subTest(path=path):
+                denied = self.handler(path, body={})
+                denied.command = "POST"
+                denied._reading_ai_bridge_contact = lambda: None
+                with patch.object(PushHandler, "_handle_reading_proxy") as proxy:
+                    denied.do_POST()
+                proxy.assert_not_called()
+                self.assertEqual(denied.responses, [(401, {"error": "unauthorized"})])
+
+    def test_shelf_listing_is_metadata_only_and_needs_browse_capability(self):
+        chat = self._Chat()
+        handler, calls = self._browse_fixture(chat)
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {
+            PushHandler._READING_AI_STATE_PATH_ENV: os.path.join(root, "anchors.json"),
+        }, clear=False), patch.object(PushHandler, "_reading_token", classmethod(lambda _cls: "upstream-token")):
+            with patch.object(PushHandler, "_reading_ai_allowed_contacts", classmethod(lambda _cls, _state, capability="ai_reading_continue": {"kairos"} if capability == "ai_reading_continue" else set())):
+                self.assertEqual(handler._reading_ai_shelf_listing("kairos")[0], 403)
+            with patch.object(PushHandler, "_reading_ai_allowed_contacts", classmethod(lambda _cls, _state, capability="ai_reading_continue": {"kairos"})):
+                status, payload = handler._reading_ai_shelf_listing("kairos")
+                self.assertEqual(status, 200)
+                self.assertEqual([book["bookId"] for book in payload["books"]], ["book_1", "book_2"])
+                self.assertEqual(set(payload["books"][0]), {"bookId", "title", "author", "chapterCount", "totalChars"})
+                self.assertEqual(payload["books"][0]["totalChars"], 11)
+                status, chapters = handler._reading_ai_chapter_listing("kairos", "book_2")
+                self.assertEqual(status, 200)
+                self.assertEqual(chapters["chapters"][0], {"chunkId": "ch_1", "title": "第一章", "charCount": 6})
+                self.assertNotIn("path", json.dumps(chapters))
+                self.assertEqual(handler._reading_ai_chapter_listing("kairos", "book_9")[0], 404)
+        self.assertTrue(all(method == "GET" for method, _path in calls))
+        self.assertFalse(any("progress" in path or "mark-read" in path for _method, path in calls))
+
+    def test_self_selected_book_reads_bounded_and_keeps_per_book_bookmarks(self):
+        chat = self._Chat()
+        handler, calls = self._browse_fixture(chat)
+        allow = classmethod(lambda _cls, _state, capability="ai_reading_continue": {"kairos"})
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {
+            PushHandler._READING_AI_STATE_PATH_ENV: os.path.join(root, "anchors.json"),
+        }, clear=False), patch.object(PushHandler, "_reading_token", classmethod(lambda _cls: "upstream-token")), \
+                patch.object(PushHandler, "_reading_ai_allowed_contacts", allow):
+            # Never shared, no anchor: self-selecting a shelf book starts at chapter one.
+            status, first = handler._reading_ai_continue("kairos", 4, "pick-1", {"bookId": "book_2"})
+            self.assertEqual(status, 200)
+            self.assertEqual(first["text"], "一二三四")
+            self.assertTrue(first["selfSelected"])
+            self.assertEqual(first["to"], {"bookId": "book_2", "chunkId": "ch_1", "anchorOffset": 4, "chapterTitle": "第一章"})
+            # Plain continuation follows the new anchor across the chapter edge.
+            status, second = handler._reading_ai_continue("kairos", 4, "pick-2")
+            self.assertEqual(second["text"], "五六七八")
+            # Jump elsewhere, then come back to book_2 by bookId only: bookmark resumes.
+            status, other = handler._reading_ai_continue("kairos", 2, "pick-3", {"bookId": "book_1", "chunkId": "ch_2", "anchorOffset": 1})
+            self.assertEqual((status, other["text"]), (200, "八九"))
+            status, back = handler._reading_ai_continue("kairos", 3, "pick-4", {"bookId": "book_2"})
+            self.assertEqual((status, back["text"]), (200, "九十壹"))
+            self.assertTrue(back["completed"])
+            # Idempotent replay: same id, same result, no second system card.
+            rows = len(chat.rows)
+            self.assertEqual(handler._reading_ai_continue("kairos", 3, "pick-4", {"bookId": "book_2"}), (200, back))
+            self.assertEqual(len(chat.rows), rows)
+            self.assertTrue(all(row["role"] == "system" and row["metadata"]["no_model_context"] for row in chat.rows))
+            self.assertFalse(any("九十壹" in row["text"] for row in chat.rows))
+            # Off-shelf book, foreign chapter and out-of-range offset are refused.
+            self.assertEqual(handler._reading_ai_continue("kairos", 3, "bad-1", {"bookId": "book_9"})[0], 404)
+            self.assertEqual(handler._reading_ai_continue("kairos", 3, "bad-2", {"bookId": "book_1", "chunkId": "ch_9"})[0], 404)
+            self.assertEqual(handler._reading_ai_continue("kairos", 3, "bad-3", {"bookId": "book_1", "chunkId": "ch_1", "anchorOffset": 99})[0], 400)
+        self.assertTrue(all(method == "GET" for method, _path in calls))
+        self.assertFalse(any("progress" in path or "mark-read" in path for _method, path in calls))
+
+    def test_continue_request_schema_rejects_traversal_and_orphan_fields(self):
+        for body in (
+            {"requestedChars": 10, "requestId": "a", "bookId": "../secret"},
+            {"requestedChars": 10, "requestId": "a", "bookId": "a/b"},
+            {"requestedChars": 10, "requestId": "a", "bookId": "..", "chunkId": "ch_1"},
+            {"requestedChars": 10, "requestId": "a", "chunkId": "ch_1"},
+            {"requestedChars": 10, "requestId": "a", "bookId": "b", "anchorOffset": 3},
+            {"requestedChars": 10, "requestId": "a", "bookId": "b", "chunkId": "c", "anchorOffset": -1},
+            {"requestedChars": 10, "requestId": "a", "bookId": "b", "path": "/etc/passwd"},
+            {"requestedChars": 1001, "requestId": "a", "bookId": "b"},
+        ):
+            with self.subTest(body=body):
+                handler = self.handler("/reading/ai/continue", body=body)
+                handler._reading_ai_continue = Mock(side_effect=AssertionError("must reject before reading"))
+                handler._handle_reading_ai_continue("kairos")
+                self.assertEqual(handler.responses[0][0], 400)
+        for body in ({"bookId": "../x"}, {"bookId": "b", "extra": 1}, {}):
+            with self.subTest(body=body):
+                handler = self.handler("/reading/ai/chapters", body=body)
+                handler._reading_ai_chapter_listing = Mock(side_effect=AssertionError("must reject"))
+                handler._handle_reading_ai_chapters("kairos")
+                self.assertEqual(handler.responses[0][0], 400)
+        shelf = self.handler("/reading/ai/shelf", body={"path": "/"})
+        shelf._reading_ai_shelf_listing = Mock(side_effect=AssertionError("must reject"))
+        shelf._handle_reading_ai_shelf("kairos")
+        self.assertEqual(shelf.responses[0][0], 400)
+
+    def test_kimi_group_turn_cannot_read(self):
+        chat = self._Chat()
+        handler, calls = self._browse_fixture(chat, contacts=("kimi",))
+        handler.state.kimi_active_turn = {"user_ts": "t", "group": True}
+        allow = classmethod(lambda _cls, _state, capability="ai_reading_continue": {"kimi"})
+        with patch.object(PushHandler, "_reading_ai_allowed_contacts", allow), \
+                patch.object(PushHandler, "_reading_token", classmethod(lambda _cls: "upstream-token")):
+            self.assertEqual(handler._reading_ai_continue("kimi", 10, "g-1", {"bookId": "book_1"})[0], 409)
+            self.assertEqual(handler._reading_ai_shelf_listing("kimi")[0], 409)
+        self.assertEqual(calls, [])
+        self.assertEqual(chat.rows, [])
+
 
 if __name__ == "__main__":
     unittest.main()

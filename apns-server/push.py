@@ -7713,13 +7713,13 @@ class PushHandler(BaseHTTPRequestHandler):
         # native-App reading proxy.  It authenticates with its own credential,
         # rather than accepting the App pairing token or any caller-selected
         # contact in a JSON payload.
-        if request_path == "/reading/ai/continue":
+        if request_path in self._READING_AI_BRIDGE_ROUTES:
             contact_id = self._reading_ai_bridge_contact()
             if contact_id is None:
                 self.close_connection = True
                 self._send_json(401, {"error": "unauthorized"})
                 return
-            self._handle_reading_ai_continue(contact_id)
+            getattr(self, self._READING_AI_BRIDGE_ROUTES[request_path])(contact_id)
             return
         # Loopback music MCP card webhook.  Like the reading bridge above it
         # authenticates with its own credential file, never with App pairing
@@ -22813,6 +22813,21 @@ class PushHandler(BaseHTTPRequestHandler):
     _READING_AI_DEFAULT_STATE_PATH = Path("/var/lib/cc-xia-relay/channel-state/reading-ai-anchors.json")
     _READING_AI_DEFAULT_TOKEN_FILE = Path("/var/lib/cc-xia-relay/channel-state/reading-ai-bridge-tokens.json")
     _READING_AI_LOCK = threading.RLock()
+    # 2026-09-23: Astra authorized private AI contacts to browse the shelf and
+    # pick any book themselves.  Every AI bridge path authenticates with its
+    # own fixed-contact credential; none accepts the App pairing token.
+    _READING_AI_BRIDGE_ROUTES = {
+        "/reading/ai/continue": "_handle_reading_ai_continue",
+        "/reading/ai/shelf": "_handle_reading_ai_shelf",
+        "/reading/ai/chapters": "_handle_reading_ai_chapters",
+    }
+    _READING_AI_CONTINUE_CAPABILITY = "ai_reading_continue"
+    _READING_AI_BROWSE_CAPABILITY = "ai_reading_browse"
+    _READING_AI_BOOKMARK_LIMIT = 200
+    _READING_AI_SHELF_LIMIT = 500
+    _READING_AI_SHELF_SIZE_PROBES = 60
+    _READING_AI_CHAPTER_LIMIT = 3000
+    _READING_AI_MAX_OFFSET = 16_000_000
     # Match the currently deployed importer's public book/chunk identifiers.
     # They may contain CJK or dots, but never separators or a traversal token.
     _READING_ID_RE = re.compile(r"[A-Za-z0-9._\-\u4e00-\u9fff]{1,128}")
@@ -23139,14 +23154,25 @@ class PushHandler(BaseHTTPRequestHandler):
         return {"bookId": book_id, "chunkId": chunk_id}
 
     @classmethod
-    def _reading_ai_allowed_contacts(cls, state: Any) -> set[str]:
-        """Only a server-registered AI session may receive a fixed bridge."""
+    def _reading_ai_allowed_contacts(cls, state: Any, capability: str = "ai_reading_continue") -> set[str]:
+        """Only a server-registered AI session may receive a fixed bridge.
+
+        ``ai_reading_browse`` is a strict superset grant: it is honoured only
+        for a contact that also holds ``ai_reading_continue``.  The group room
+        (``apples``) holds neither and is therefore always refused.
+        """
         contacts = chat_contact_directory(state)
-        return {
-            str(contact.get("id") or "").strip().lower()
-            for contact in contacts
-            if "ai_reading_continue" in set(contact.get("capabilities") or [])
-        }
+        allowed: set[str] = set()
+        for contact in contacts:
+            capabilities = set(contact.get("capabilities") or [])
+            contact_id = str(contact.get("id") or "").strip().lower()
+            if "group_chat" in capabilities or contact_id == "apples":
+                continue
+            if cls._READING_AI_CONTINUE_CAPABILITY not in capabilities:
+                continue
+            if capability in capabilities:
+                allowed.add(contact_id)
+        return allowed
 
     @classmethod
     def _reading_ai_state_path(cls) -> Path:
@@ -23199,7 +23225,13 @@ class PushHandler(BaseHTTPRequestHandler):
         # migration input only long enough to move it into per-request files;
         # new writes never put an unbounded request ledger back here.
         legacy_requests = value.get("requests") if isinstance(value.get("requests"), dict) else {}
-        return {"version": 2, "anchors": anchors, "legacyRequests": legacy_requests}
+        raw_bookmarks = value.get("bookmarks") if isinstance(value.get("bookmarks"), dict) else {}
+        bookmarks = {
+            contact: {book: mark for book, mark in marks.items() if isinstance(book, str) and isinstance(mark, dict)}
+            for contact, marks in raw_bookmarks.items()
+            if isinstance(contact, str) and isinstance(marks, dict)
+        }
+        return {"version": 2, "anchors": anchors, "bookmarks": bookmarks, "legacyRequests": legacy_requests}
 
     @classmethod
     def _reading_ai_store_save(cls, value: dict[str, Any]) -> None:
@@ -23209,7 +23241,10 @@ class PushHandler(BaseHTTPRequestHandler):
         try:
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump({"version": 2, "anchors": value.get("anchors", {})}, handle, ensure_ascii=False, separators=(",", ":"))
+                json.dump(
+                    {"version": 2, "anchors": value.get("anchors", {}), "bookmarks": value.get("bookmarks", {})},
+                    handle, ensure_ascii=False, separators=(",", ":"),
+                )
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, path)
@@ -23529,6 +23564,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 "bookId": book_id, "chunkId": chunk_id, "anchorOffset": anchor,
                 "bookTitle": title.strip(), "chapterTitle": chapter.strip(),
             }
+            self._reading_ai_set_bookmark(value, contact_id, value["anchors"][contact_id])
             # A new explicit share supersedes only this AI identity's prior cursor.
             self._reading_ai_store_save(value)
 
@@ -23587,9 +23623,168 @@ class PushHandler(BaseHTTPRequestHandler):
             return False
         return False
 
-    def _reading_ai_continue(self, contact_id: str, requested_chars: int, request_id: str) -> tuple[int, dict[str, Any]]:
+    @classmethod
+    def _reading_ai_set_bookmark(cls, value: dict[str, Any], contact_id: str, anchor: dict[str, Any]) -> None:
+        """Remember this AI identity's own per-book position (never Astra's)."""
+        book_id = anchor.get("bookId")
+        if not isinstance(book_id, str) or not cls._reading_safe_id(book_id):
+            return
+        bookmarks = value.setdefault("bookmarks", {})
+        mine = bookmarks.get(contact_id)
+        mine = dict(mine) if isinstance(mine, dict) else {}
+        mine.pop(book_id, None)
+        mine[book_id] = {
+            key: anchor[key]
+            for key in ("bookId", "chunkId", "anchorOffset", "bookTitle", "chapterTitle")
+            if key in anchor
+        }
+        while len(mine) > cls._READING_AI_BOOKMARK_LIMIT:
+            mine.pop(next(iter(mine)))
+        bookmarks[contact_id] = mine
+
+    def _reading_ai_group_turn_active(self, contact_id: str) -> bool:
+        """Refuse bridge reads while a shared-process AI is answering the group.
+
+        Kimi runs private and apples-group turns in one kimi-code process, so
+        its MCP tools are visible in both.  The server knows which turn is live
+        and keeps book text out of the group room.
+        """
+        if contact_id == "kimi":
+            active = getattr(self.state, "kimi_active_turn", None)
+            return isinstance(active, dict) and bool(active.get("group"))
+        return False
+
+    def _reading_ai_shelf(self, token: str) -> list[dict[str, Any]] | None:
+        """Return only whitelisted shelf metadata from the fixed upstream list."""
+        status, payload = self._reading_request("GET", "/api/books", token)
+        books = payload.get("books", payload) if isinstance(payload, dict) else payload
+        if status != 200 or not isinstance(books, list):
+            return None
+        shelf: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in books[: self._READING_AI_SHELF_LIMIT]:
+            if not isinstance(item, dict):
+                continue
+            book_id = item.get("bookId") or item.get("id")
+            if not isinstance(book_id, str) or not self._reading_safe_id(book_id) or book_id in seen:
+                continue
+            seen.add(book_id)
+            title = re.sub(r"[\x00-\x1f\x7f]", "", str(item.get("title") or "")).strip()[:240] or book_id
+            author = item.get("author")
+            author = re.sub(r"[\x00-\x1f\x7f]", "", author).strip()[:160] if isinstance(author, str) else ""
+            count = item.get("chunkCount")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                count = None
+            shelf.append({"bookId": book_id, "title": title, "author": author, "chapterCount": count})
+        return shelf
+
+    def _reading_ai_manifest(self, book_id: str, token: str) -> list[dict[str, Any]] | None:
+        """Return ordered chapter descriptors without any path or text field."""
+        status, payload = self._reading_request(
+            "GET", f"/api/books/{self._reading_path_segment(book_id)}/chunks", token,
+        )
+        chunks = payload.get("chunks", payload) if isinstance(payload, dict) else payload
+        if status != 200 or not isinstance(chunks, list):
+            return None
+        manifest: list[dict[str, Any]] = []
+        for item in chunks:
+            if not isinstance(item, dict):
+                continue
+            chunk_id = str(item.get("id") or item.get("chunkId") or "")
+            if not self._reading_safe_id(chunk_id):
+                continue
+            chars = item.get("charCount")
+            if isinstance(chars, bool) or not isinstance(chars, int) or chars < 0:
+                chars = None
+            manifest.append({
+                "chunkId": chunk_id,
+                "title": re.sub(r"[\x00-\x1f\x7f]", "", str(item.get("title") or item.get("sectionTitle") or "")).strip()[:320],
+                "charCount": chars,
+            })
+        return manifest
+
+    def _reading_ai_public_mark(self, mark: Any) -> dict[str, Any] | None:
+        if not isinstance(mark, dict) or not isinstance(mark.get("bookId"), str):
+            return None
+        return {
+            key: mark.get(key)
+            for key in ("bookId", "bookTitle", "chunkId", "chapterTitle", "anchorOffset")
+            if mark.get(key) is not None
+        }
+
+    def _reading_ai_shelf_listing(self, contact_id: str) -> tuple[int, dict[str, Any]]:
+        if contact_id not in self._reading_ai_allowed_contacts(self.state, self._READING_AI_BROWSE_CAPABILITY):
+            return 403, {"error": "bookshelf browsing is not enabled for this contact"}
+        if self._reading_ai_group_turn_active(contact_id):
+            return 409, {"error": "reading is private-chat only"}
+        token = self._reading_token()
+        if not token:
+            return 502, {"error": "reading upstream unavailable"}
+        shelf = self._reading_ai_shelf(token)
+        if shelf is None:
+            return 502, {"error": "reading shelf unavailable"}
+        for index, book in enumerate(shelf):
+            book["totalChars"] = None
+            if index >= self._READING_AI_SHELF_SIZE_PROBES:
+                continue
+            manifest = self._reading_ai_manifest(book["bookId"], token)
+            if manifest is None:
+                continue
+            if book["chapterCount"] is None:
+                book["chapterCount"] = len(manifest)
+            sizes = [item["charCount"] for item in manifest]
+            if sizes and all(isinstance(size, int) for size in sizes):
+                book["totalChars"] = sum(sizes)
+        with self._READING_AI_LOCK:
+            value = self._reading_ai_store_load()
+        current = self._reading_ai_public_mark(value["anchors"].get(contact_id))
+        marks = value.get("bookmarks", {}).get(contact_id) or {}
+        on_shelf = {book["bookId"] for book in shelf}
+        bookmarks = [
+            public for mark in marks.values()
+            for public in [self._reading_ai_public_mark(mark)]
+            if public is not None and public["bookId"] in on_shelf
+        ]
+        return 200, {"books": shelf, "current": current, "bookmarks": bookmarks}
+
+    def _reading_ai_chapter_listing(self, contact_id: str, book_id: str) -> tuple[int, dict[str, Any]]:
+        if contact_id not in self._reading_ai_allowed_contacts(self.state, self._READING_AI_BROWSE_CAPABILITY):
+            return 403, {"error": "bookshelf browsing is not enabled for this contact"}
+        if self._reading_ai_group_turn_active(contact_id):
+            return 409, {"error": "reading is private-chat only"}
+        token = self._reading_token()
+        if not token:
+            return 502, {"error": "reading upstream unavailable"}
+        shelf = self._reading_ai_shelf(token)
+        if shelf is None:
+            return 502, {"error": "reading shelf unavailable"}
+        book = next((item for item in shelf if item["bookId"] == book_id), None)
+        if book is None:
+            return 404, {"error": "book is not on the bookshelf"}
+        manifest = self._reading_ai_manifest(book_id, token)
+        if manifest is None:
+            return 502, {"error": "reading manifest unavailable"}
+        with self._READING_AI_LOCK:
+            value = self._reading_ai_store_load()
+        mark = (value.get("bookmarks", {}).get(contact_id) or {}).get(book_id)
+        return 200, {
+            "bookId": book_id, "title": book["title"], "author": book["author"],
+            "chapterCount": len(manifest),
+            "chapters": manifest[: self._READING_AI_CHAPTER_LIMIT],
+            "truncated": len(manifest) > self._READING_AI_CHAPTER_LIMIT,
+            "bookmark": self._reading_ai_public_mark(mark),
+        }
+
+    def _reading_ai_continue(
+        self, contact_id: str, requested_chars: int, request_id: str,
+        target: dict[str, Any] | None = None,
+    ) -> tuple[int, dict[str, Any]]:
         if contact_id not in self._reading_ai_allowed_contacts(self.state):
             return 403, {"error": "reading AI is not enabled for this contact"}
+        if target is not None and contact_id not in self._reading_ai_allowed_contacts(self.state, self._READING_AI_BROWSE_CAPABILITY):
+            return 403, {"error": "bookshelf browsing is not enabled for this contact"}
+        if self._reading_ai_group_turn_active(contact_id):
+            return 409, {"error": "reading is private-chat only"}
         with self._READING_AI_LOCK:
             value = self._reading_ai_store_load()
             migrated = self._reading_ai_migrate_legacy_results(value)
@@ -23598,28 +23793,70 @@ class PushHandler(BaseHTTPRequestHandler):
                 if migrated or self._reading_ai_reconcile_cached_result(value, contact_id, cached):
                     self._reading_ai_store_save(value)
                 return 200, dict(cached)
-            anchor = value["anchors"].get(contact_id)
-            if not isinstance(anchor, dict):
-                return 409, {"error": "no user-authorized reading anchor"}
+            explicit_offset = False
+            if target is None:
+                anchor = value["anchors"].get(contact_id)
+                if not isinstance(anchor, dict):
+                    return 409, {"error": "no user-authorized reading anchor"}
+                book_id = anchor.get("bookId")
+                chunk_id = anchor.get("chunkId")
+                offset = anchor.get("anchorOffset")
+                if not isinstance(book_id, str) or not self._reading_safe_id(book_id) or not isinstance(chunk_id, str) or not self._reading_safe_id(chunk_id) or isinstance(offset, bool) or not isinstance(offset, int):
+                    return 409, {"error": "reading anchor is invalid"}
+                token = self._reading_token()
+                if not token:
+                    return 502, {"error": "reading upstream unavailable"}
+                manifest = self._reading_ai_manifest(book_id, token)
+                if manifest is None:
+                    return 502, {"error": "reading manifest unavailable"}
+            else:
+                # Self-selected book: it must be on the shelf, the chapter must
+                # be in that book's manifest, and the offset is re-checked
+                # against the fetched chapter body below.
+                book_id = target["bookId"]
+                token = self._reading_token()
+                if not token:
+                    return 502, {"error": "reading upstream unavailable"}
+                shelf = self._reading_ai_shelf(token)
+                if shelf is None:
+                    return 502, {"error": "reading shelf unavailable"}
+                book = next((item for item in shelf if item["bookId"] == book_id), None)
+                if book is None:
+                    return 404, {"error": "book is not on the bookshelf"}
+                manifest = self._reading_ai_manifest(book_id, token)
+                if manifest is None:
+                    return 502, {"error": "reading manifest unavailable"}
+                if not manifest:
+                    return 409, {"error": "book has no readable chapters"}
+                ids = [item["chunkId"] for item in manifest]
+                chunk_id = target.get("chunkId")
+                if chunk_id is None:
+                    mark = (value.get("bookmarks", {}).get(contact_id) or {}).get(book_id)
+                    current = value["anchors"].get(contact_id)
+                    if not isinstance(mark, dict) and isinstance(current, dict) and current.get("bookId") == book_id:
+                        mark = current
+                    mark_chunk = mark.get("chunkId") if isinstance(mark, dict) else None
+                    mark_offset = mark.get("anchorOffset") if isinstance(mark, dict) else None
+                    if (
+                        isinstance(mark_chunk, str) and mark_chunk in ids
+                        and not isinstance(mark_offset, bool) and isinstance(mark_offset, int)
+                        and 0 <= mark_offset <= self._READING_AI_MAX_OFFSET
+                    ):
+                        chunk_id, offset = mark_chunk, mark_offset
+                    else:
+                        chunk_id, offset = ids[0], 0
+                else:
+                    if chunk_id not in ids:
+                        return 404, {"error": "chapter is not in this book"}
+                    offset = int(target.get("anchorOffset") or 0)
+                    explicit_offset = True
+                anchor = {
+                    "bookId": book_id, "chunkId": chunk_id, "anchorOffset": offset,
+                    "bookTitle": book["title"],
+                    "chapterTitle": next((item["title"] for item in manifest if item["chunkId"] == chunk_id), ""),
+                }
             from_anchor = dict(anchor)
-            book_id = anchor.get("bookId")
-            chunk_id = anchor.get("chunkId")
-            offset = anchor.get("anchorOffset")
-            if not isinstance(book_id, str) or not self._reading_safe_id(book_id) or not isinstance(chunk_id, str) or not self._reading_safe_id(chunk_id) or isinstance(offset, bool) or not isinstance(offset, int):
-                return 409, {"error": "reading anchor is invalid"}
-            token = self._reading_token()
-            if not token:
-                return 502, {"error": "reading upstream unavailable"}
-            chunks_status, chunks_payload = self._reading_request("GET", f"/api/books/{self._reading_path_segment(book_id)}/chunks", token)
-            chunks = chunks_payload.get("chunks", chunks_payload) if isinstance(chunks_payload, dict) else chunks_payload
-            if chunks_status != 200 or not isinstance(chunks, list):
-                return 502, {"error": "reading manifest unavailable"}
-            descriptors = [
-                (chunk_id, str(item.get("title") or item.get("sectionTitle") or ""))
-                for item in chunks if isinstance(item, dict)
-                for chunk_id in [str(item.get("id") or item.get("chunkId") or "")]
-                if self._reading_safe_id(chunk_id)
-            ]
+            descriptors = [(item["chunkId"], item["title"]) for item in manifest]
             current = next((index for index, item in enumerate(descriptors) if item[0] == chunk_id), -1)
             if current < 0:
                 return 409, {"error": "authorized chapter is unavailable"}
@@ -23628,17 +23865,21 @@ class PushHandler(BaseHTTPRequestHandler):
             next_chunk, next_offset = chunk_id, max(0, offset)
             next_chapter_title = str(anchor.get("chapterTitle") or "").strip()[:320]
             completed = False
+            first_chapter = True
             while remaining > 0 and current < len(descriptors):
                 candidate_id, candidate_title = descriptors[current]
                 body_status, body_payload = self._reading_request("GET", f"/api/books/{self._reading_path_segment(book_id)}/chunks/{self._reading_path_segment(candidate_id)}", token)
                 body = body_payload.get("text", "") if isinstance(body_payload, dict) else ""
                 if body_status != 200 or not isinstance(body, str):
                     return 502, {"error": "reading chapter unavailable"}
+                chapter_units = len(body.encode("utf-16-le")) // 2
+                if first_chapter and explicit_offset and next_offset > chapter_units:
+                    return 400, {"error": "anchorOffset is outside the chapter"}
+                first_chapter = False
                 piece, used_offset = self._reading_ai_utf16_slice(body, next_offset if candidate_id == chunk_id else 0, remaining)
                 if piece:
                     pieces.append(piece)
                     remaining -= len(piece.encode("utf-16-le")) // 2
-                chapter_units = len(body.encode("utf-16-le")) // 2
                 if used_offset < chapter_units:
                     next_chunk, next_offset = candidate_id, used_offset
                     next_chapter_title = candidate_title.strip()[:320]
@@ -23669,6 +23910,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     "bookId": from_anchor.get("bookId"), "chunkId": from_anchor.get("chunkId"),
                     "anchorOffset": from_anchor.get("anchorOffset"),
                 }, "to": to_anchor, "returnedChars": returned_chars, "completed": completed,
+                "selfSelected": target is not None,
             }
             chat = self._chat_for_contact(contact_id)
             if not self._reading_ai_existing_event(chat, request_id):
@@ -23681,6 +23923,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         "bookTitle": title, "chapterTitle": chapter_title,
                         "from": result["from"], "to": to_anchor,
                         "returnedChars": returned_chars, "completed": completed,
+                        "selfSelected": target is not None,
                     }},
                 )
             # The result is the durable idempotency ledger.  It is deliberately
@@ -23688,14 +23931,42 @@ class PushHandler(BaseHTTPRequestHandler):
             # the small anchor state file and erase old request IDs.
             self._reading_ai_result_save(contact_id, request_id, result)
             value["anchors"][contact_id] = {**anchor, **to_anchor}
+            self._reading_ai_set_bookmark(value, contact_id, value["anchors"][contact_id])
             self._reading_ai_store_save(value)
             return 200, result
+
+    @classmethod
+    def _reading_ai_parse_target(cls, incoming: dict[str, Any]) -> tuple[bool, dict[str, Any] | None]:
+        """Validate the optional self-selected position; (ok, target)."""
+        if "bookId" not in incoming:
+            if "chunkId" in incoming or "anchorOffset" in incoming:
+                return False, None
+            return True, None
+        book_id = incoming.get("bookId")
+        if not isinstance(book_id, str) or not cls._reading_safe_id(book_id):
+            return False, None
+        target: dict[str, Any] = {"bookId": book_id}
+        if "chunkId" in incoming:
+            chunk_id = incoming.get("chunkId")
+            if not isinstance(chunk_id, str) or not cls._reading_safe_id(chunk_id):
+                return False, None
+            target["chunkId"] = chunk_id
+        if "anchorOffset" in incoming:
+            offset = incoming.get("anchorOffset")
+            if (
+                "chunkId" not in target or isinstance(offset, bool) or not isinstance(offset, int)
+                or not 0 <= offset <= cls._READING_AI_MAX_OFFSET
+            ):
+                return False, None
+            target["anchorOffset"] = offset
+        return True, target
 
     def _handle_reading_ai_continue(self, contact_id: str) -> None:
         incoming = self._reading_read_body(self._READING_AI_REQUEST_LIMIT)
         if incoming is None:
             return
-        if set(incoming) != {"requestedChars", "requestId"}:
+        keys = set(incoming)
+        if not {"requestedChars", "requestId"}.issubset(keys) or keys - {"requestedChars", "requestId", "bookId", "chunkId", "anchorOffset"}:
             self._send_json(400, {"error": "invalid reading AI request"})
             return
         requested = incoming.get("requestedChars")
@@ -23703,7 +23974,32 @@ class PushHandler(BaseHTTPRequestHandler):
         if isinstance(requested, bool) or not isinstance(requested, int) or not 1 <= requested <= 1000 or not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", request_id):
             self._send_json(400, {"error": "invalid reading AI request"})
             return
-        status, payload = self._reading_ai_continue(contact_id, requested, request_id)
+        ok, target = self._reading_ai_parse_target(incoming)
+        if not ok:
+            self._send_json(400, {"error": "invalid reading AI request"})
+            return
+        status, payload = self._reading_ai_continue(contact_id, requested, request_id, target)
+        self._send_json(status, payload)
+
+    def _handle_reading_ai_shelf(self, contact_id: str) -> None:
+        incoming = self._reading_read_body(self._READING_AI_REQUEST_LIMIT)
+        if incoming is None:
+            return
+        if incoming:
+            self._send_json(400, {"error": "invalid reading AI request"})
+            return
+        status, payload = self._reading_ai_shelf_listing(contact_id)
+        self._send_json(status, payload)
+
+    def _handle_reading_ai_chapters(self, contact_id: str) -> None:
+        incoming = self._reading_read_body(self._READING_AI_REQUEST_LIMIT)
+        if incoming is None:
+            return
+        book_id = incoming.get("bookId")
+        if set(incoming) != {"bookId"} or not isinstance(book_id, str) or not self._reading_safe_id(book_id):
+            self._send_json(400, {"error": "invalid reading AI request"})
+            return
+        status, payload = self._reading_ai_chapter_listing(contact_id, book_id)
         self._send_json(status, payload)
 
     def _handle_reading_proxy(self, method: str) -> None:

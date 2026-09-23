@@ -11,6 +11,8 @@ CONTACT = {
     "capabilities": [
         "chat", "history", "draft", "busy", "stop", "attachments", "terminal",
         "forward", "group_member", "group_reply", "realtime", "ai_reading_continue",
+        # 2026-09-23 Astra 授权：私聊可自己浏览书架、挑任意一本续读。
+        "ai_reading_browse",
         "voice_message",
     ],
     "group_display_name": "小克（螃蟹版）",
