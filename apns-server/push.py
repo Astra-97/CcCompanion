@@ -11209,18 +11209,41 @@ class PushHandler(BaseHTTPRequestHandler):
         )
         return link_signal or self._xhs_login_probe_needs_login()
 
-    def _trusted_login_card_metadata(self, metadata: Any) -> Any:
+    # 小克 Stop hook 的小红书登录卡直通来源（2026-09-23 方小南要求恢复 09-19 前行为）
+    _XIAOKE_XHS_CARD_TRUSTED_SOURCES = frozenset({"ccc-stop-hook", "claude-code"})
+
+    def _trusted_login_card_metadata(
+        self,
+        metadata: Any,
+        *,
+        contact_id: str = "",
+        source: Any = None,
+    ) -> Any:
         """Strip inbound login-card flags the server probes do not back.
 
         Login cards unlock only from server-owned signals.  Metadata arriving
-        over /chat/append (e.g. the xiaoke stop hook) is re-validated against
-        the same probes that gate the Kimi prompt path; a truthy flag with no
-        backing probe is dropped, everything else passes through verbatim.
+        over /chat/append is re-validated against the same probes that gate
+        the Kimi prompt path; a truthy flag with no backing probe is dropped,
+        everything else passes through verbatim.
+
+        Exception (restored pre-2026-09-19 behavior, owner request): the
+        ``xhs_login_card`` flag posted by the xiaoke Stop hook (contact
+        ``xiaoke``, source ``ccc-stop-hook``/``claude-code``) over this
+        already-authenticated endpoint is kept unconditionally, without the
+        ``xhs status`` probe.  All other flags/contacts keep their gates.
         """
         if not isinstance(metadata, dict):
             return metadata
+        xhs_unconditional = (
+            contact_id == "xiaoke"
+            and isinstance(source, str)
+            and source.strip() in self._XIAOKE_XHS_CARD_TRUSTED_SOURCES
+        )
         gates = (
-            ("xhs_login_card", self._xhs_login_probe_needs_login),
+            (
+                "xhs_login_card",
+                (lambda: True) if xhs_unconditional else self._xhs_login_probe_needs_login,
+            ),
             ("netease_login_card", self._kimi_netease_login_card_allowed),
             ("jd_login_card", self._kimi_jd_login_card_allowed),
             ("meituan_login_card", self._kimi_meituan_login_card_allowed),
@@ -20696,7 +20719,11 @@ class PushHandler(BaseHTTPRequestHandler):
         if clean_append_metadata is None:
             body.pop("metadata", None)
         else:
-            gated_append_metadata = self._trusted_login_card_metadata(clean_append_metadata)
+            gated_append_metadata = self._trusted_login_card_metadata(
+                clean_append_metadata,
+                contact_id=self._contact_id_from_body(body),
+                source=body.get("source"),
+            )
             if gated_append_metadata:
                 body["metadata"] = gated_append_metadata
             else:

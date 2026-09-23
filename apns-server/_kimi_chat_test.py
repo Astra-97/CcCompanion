@@ -1732,6 +1732,70 @@ class KimiWebChatRoutingTest(unittest.TestCase):
             self.assertNotIn("jd_login_card", metadata)
             self.assertTrue(metadata["mt_waimai_login_card"])
 
+    def test_xiaoke_stop_hook_xhs_login_card_skips_probe(self):
+        # 2026-09-23 恢复 09-19 前行为：小克 Stop hook 经鉴权 /chat/append 发来的
+        # xhs_login_card 无条件保留，不再看 xhs status 探针；其余闸门不变。
+        with tempfile.TemporaryDirectory() as tmpdir:
+            handler, chat = self._make_kimi_append_handler(tmpdir)
+            probe_calls = []
+
+            def logged_in_probe():
+                probe_calls.append(True)
+                return False
+
+            handler.state.xhs_login = types.SimpleNamespace(needs_login=logged_in_probe)
+            handler.state.jd_login = types.SimpleNamespace(needs_login=lambda: False)
+            for source in ("ccc-stop-hook", "claude-code"):
+                with self.subTest(source=source):
+                    handler._handle_chat_append({
+                        "contact_id": "xiaoke",
+                        "role": "assistant",
+                        "source": source,
+                        "text": "小红书登录卡片测试,点下方卡片登录。",
+                        "metadata": {"xhs_login_card": True, "jd_login_card": True, "custom": "kept"},
+                    })
+                    self.assertEqual(200, handler.responses[-1][0])
+                    metadata = chat.records[-1].get("metadata") or {}
+                    self.assertTrue(metadata["xhs_login_card"])
+                    self.assertNotIn("jd_login_card", metadata)
+                    self.assertEqual("kept", metadata["custom"])
+            self.assertEqual([], probe_calls)
+
+            # 默认 contact（hook 不带 contact_id）同样走小克通道
+            handler._handle_chat_append({
+                "role": "assistant",
+                "source": "ccc-stop-hook",
+                "text": "请登录小红书。",
+                "metadata": {"xhs_login_card": True},
+            })
+            self.assertEqual(200, handler.responses[-1][0])
+            self.assertTrue((chat.records[-1].get("metadata") or {})["xhs_login_card"])
+
+            # 小克但来源不是 Stop hook / claude-code：仍走探针闸门
+            handler._handle_chat_append({
+                "contact_id": "xiaoke",
+                "role": "assistant",
+                "source": "android-app",
+                "text": "伪造卡片",
+                "metadata": {"xhs_login_card": True, "custom": "kept"},
+            })
+            self.assertEqual(200, handler.responses[-1][0])
+            self.assertNotIn("xhs_login_card", chat.records[-1].get("metadata") or {})
+            self.assertEqual(1, len(probe_calls))
+
+        # 其他联系人即便来源是 claude-code 也照旧需要探针背书
+        handler, _chat, _web = self.make_handler()
+        handler.state.xhs_login = types.SimpleNamespace(needs_login=lambda: False)
+        for contact in ("kairos", "kimi", "apples"):
+            with self.subTest(contact=contact):
+                cleaned = handler._trusted_login_card_metadata(
+                    {"xhs_login_card": True, "custom": "kept"},
+                    contact_id=contact,
+                    source="claude-code",
+                )
+                self.assertNotIn("xhs_login_card", cleaned)
+                self.assertEqual("kept", cleaned["custom"])
+
     def test_apples_assistant_append_publishes_one_persisted_completion_event(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             handler, _chat = self._make_kimi_append_handler(tmpdir)
