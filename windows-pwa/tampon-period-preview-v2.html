@@ -1,0 +1,911 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CC Companion · 经期 × 棉条 预览 v2（苏菲四色 · 全周期阶段）</title>
+<style>
+  /* ── 设计 token：全部取自 app ui/theme/Color.kt ─────────────────
+     Bg #1A1A1A / Surface #222222 / Surface2 #282828 / Surface3 #2F2F2F
+     CcGlassSurface       = Surface  @ 48%  （暗色玻璃）
+     CcGlassSurfaceStrong = Surface  @ 62%  （弹层玻璃）
+     经期主色 #C97B6E · 月经期 #E05A5A · 卵泡期 #E8913A
+     排卵期 #D4AA3C · 黄体期 #9D7CB0 · HealthBrand #D4725C
+     Warning #C7944A · Danger #B9534F · Success #6B9F76
+
+     v2 新增：苏菲四色规格 token（按 Astra 实物包装，
+     取柔和低饱和版本以融入暗色玻璃主题）：
+     粉 #E08AA4 = 量少 · 蓝 #6F9FD6 = 普通
+     绿 #75B787 = 量多 · 紫 #A88CCF = 特多
+  ─────────────────────────────────────────────────────────────── */
+  :root{
+    --bg:#1A1A1A; --surface:#222222; --surface2:#282828; --surface3:#2F2F2F;
+    --border:#2C2C2C; --divider:#303030;
+    --glass:rgba(34,34,34,.48); --glass-strong:rgba(30,28,28,.62);
+    --glass-border:rgba(255,255,255,.10);
+    --rose:#C97B6E; --menstrual:#E05A5A; --follicle:#E8913A; --ovulation:#D4AA3C; --luteal:#9D7CB0;
+    --health-brand:#D4725C; --brand:#A35347; --brand-glow:#C16B5E;
+    --warning:#C7944A; --danger:#B9534F; --success:#6B9F76;
+    --text:#ECECEC; --dim:#9C9C9C; --muted:#6A6A6A; --ghost:#4A4A4A;
+    --r-lg:22px; --r-md:16px; --r-sm:12px;
+    /* 苏菲四色 */
+    --sofy-pink:#E08AA4; --sofy-blue:#6F9FD6; --sofy-green:#75B787; --sofy-purple:#A88CCF;
+    --sofy-pink-t:#F2B7C7; --sofy-blue-t:#AFCBEE; --sofy-green-t:#ABDDB7; --sofy-purple-t:#CDB9EC;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Microsoft YaHei",sans-serif;
+    background:#101010; color:var(--text); min-height:100vh;
+    display:flex; flex-direction:column; align-items:center; padding:36px 16px 64px;
+  }
+  .page-title{text-align:center; margin-bottom:8px}
+  .page-title h1{font-size:22px; font-weight:700; letter-spacing:.5px}
+  .page-title h1 em{font-style:normal; color:var(--rose)}
+  .page-sub{color:var(--muted); font-size:12.5px; margin-bottom:26px; letter-spacing:.4px}
+  .page-sub b{color:var(--dim); font-weight:500}
+
+  /* ── Phone frame ── */
+  .phone{
+    width:375px; height:780px; border-radius:44px; position:relative; overflow:hidden;
+    border:1px solid #333; box-shadow:0 40px 80px rgba(0,0,0,.6), inset 0 0 0 1px rgba(255,255,255,.04);
+    background:var(--bg);
+  }
+  /* 壁纸层：让玻璃雾面有东西可模糊（app 里玻璃卡片就是浮在壁纸上） */
+  .wallpaper{position:absolute; inset:0; z-index:0}
+  .wallpaper::before{content:""; position:absolute; inset:0;
+    background:
+      radial-gradient(140% 90% at 85% -10%, rgba(163,83,71,.55) 0%, transparent 55%),
+      radial-gradient(120% 80% at -20% 30%, rgba(201,123,110,.34) 0%, transparent 50%),
+      radial-gradient(130% 90% at 110% 75%, rgba(110,90,140,.38) 0%, transparent 55%),
+      radial-gradient(100% 70% at 30% 110%, rgba(212,114,92,.30) 0%, transparent 55%),
+      linear-gradient(180deg,#1d1917 0%, #1A1A1A 60%, #171412 100%);
+  }
+  .wallpaper::after{content:""; position:absolute; inset:0;
+    background:linear-gradient(180deg, rgba(26,26,26,.25), rgba(26,26,26,.55));}
+
+  .screen{position:absolute; inset:0; z-index:1; display:flex; flex-direction:column}
+
+  /* status bar + header */
+  .statusbar{display:flex; justify-content:space-between; padding:14px 26px 4px; font-size:12.5px; color:rgba(255,255,255,.85); font-weight:600}
+  .statusbar .icons{display:flex; gap:6px; align-items:center; font-size:11px}
+  .header{padding:10px 20px 12px}
+  .header .crumb{font-size:11px; color:var(--rose); letter-spacing:2px; font-weight:600; margin-bottom:4px}
+  .header h2{font-size:26px; font-weight:700; display:flex; align-items:baseline; gap:10px}
+  .header h2 .date{font-size:12px; color:var(--muted); font-weight:400; font-family:ui-monospace,monospace}
+
+  /* segmented tabs（预览内切换界面状态） */
+  .tabs{
+    margin:0 20px 10px; display:flex; padding:4px; border-radius:14px;
+    background:var(--glass); backdrop-filter:blur(20px) saturate(140%); -webkit-backdrop-filter:blur(20px) saturate(140%);
+    border:1px solid var(--glass-border);
+  }
+  .tabs button{
+    flex:1; border:0; background:transparent; color:var(--dim); font-size:13.5px; font-weight:600;
+    padding:9px 0; border-radius:11px; cursor:pointer; transition:all .25s; font-family:inherit;
+  }
+  .tabs button.active{background:rgba(201,123,110,.22); color:#F0B0A4; box-shadow:inset 0 0 0 1px rgba(201,123,110,.35)}
+
+  /* v2：演示状态切换（经期中 / 非经期各阶段） */
+  .demo-state{
+    margin:0 20px 14px; display:flex; align-items:center; gap:4px; padding:4px; border-radius:12px;
+    background:rgba(255,255,255,.035); border:1px dashed rgba(255,255,255,.14);
+  }
+  .demo-state .label{font-size:9.5px; color:var(--muted); padding:0 7px 0 5px; letter-spacing:1px; flex:none}
+  .demo-state button{
+    flex:1; border:0; background:transparent; color:var(--ghost); font-size:11px; font-weight:600;
+    padding:7px 0; border-radius:9px; cursor:pointer; transition:all .2s; font-family:inherit; white-space:nowrap;
+  }
+  .demo-state button.active{background:rgba(255,255,255,.09); color:var(--text)}
+  .demo-state button[data-phase="period"].active{background:rgba(224,90,90,.18); color:#F0958A}
+  .demo-state button[data-phase="follicular"].active{background:rgba(232,145,58,.16); color:#F0B884}
+  .demo-state button[data-phase="ovulation"].active{background:rgba(212,170,60,.16); color:#E5C56A}
+  .demo-state button[data-phase="luteal"].active{background:rgba(157,124,176,.18); color:#C0A3D6}
+
+  .content{flex:1; overflow-y:auto; padding:2px 20px 90px; scrollbar-width:none}
+  .content::-webkit-scrollbar{display:none}
+  .view{display:none; animation:fadeIn .3s ease}
+  .view.active{display:block}
+  @keyframes fadeIn{from{opacity:0; transform:translateY(6px)} to{opacity:1; transform:none}}
+
+  /* 通用玻璃卡片 */
+  .glass{
+    background:var(--glass); backdrop-filter:blur(24px) saturate(150%); -webkit-backdrop-filter:blur(24px) saturate(150%);
+    border:1px solid var(--glass-border); border-radius:var(--r-lg);
+    box-shadow:0 12px 32px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.07);
+  }
+
+  /* ── 视图 A：经期主页 ── */
+  .hero{padding:22px 20px 20px; display:flex; gap:18px; align-items:center; margin-bottom:14px}
+  .ring{position:relative; width:132px; height:132px; flex:none}
+  .ring svg{transform:rotate(-90deg)}
+  .ring .center{position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center}
+  .ring .center .big{font-size:30px; font-weight:800; color:#F2C0B6; line-height:1}
+  .ring .center .big small{font-size:13px; font-weight:600; color:var(--rose)}
+  .ring .center .sub{font-size:10.5px; color:var(--dim); margin-top:5px}
+  .hero-info{flex:1; min-width:0}
+  .phase-chip{display:inline-flex; align-items:center; gap:6px; font-size:12px; font-weight:700; color:#F0958A;
+    background:rgba(224,90,90,.16); border:1px solid rgba(224,90,90,.35); padding:4px 10px; border-radius:99px; margin-bottom:10px}
+  .phase-chip i{width:7px; height:7px; border-radius:50%; background:var(--menstrual); box-shadow:0 0 8px var(--menstrual)}
+  .phase-chip.follicular{color:#F0B884; background:rgba(232,145,58,.14); border-color:rgba(232,145,58,.38)}
+  .phase-chip.follicular i{background:var(--follicle); box-shadow:0 0 8px var(--follicle)}
+  .phase-chip.ovulation{color:#E5C56A; background:rgba(212,170,60,.14); border-color:rgba(212,170,60,.38)}
+  .phase-chip.ovulation i{background:var(--ovulation); box-shadow:0 0 8px var(--ovulation)}
+  .phase-chip.luteal{color:#C0A3D6; background:rgba(157,124,176,.16); border-color:rgba(157,124,176,.38)}
+  .phase-chip.luteal i{background:var(--luteal); box-shadow:0 0 8px var(--luteal)}
+  .hero-line{font-size:12.5px; color:var(--dim); line-height:1.9}
+  .hero-line b{color:var(--text); font-weight:600}
+  .hero-line .mono{font-family:ui-monospace,monospace; font-size:11px; color:var(--muted)}
+
+  /* v2：非经期的阶段信息卡 */
+  .phase-card{padding:18px; margin-bottom:14px; position:relative; overflow:hidden}
+  .pc-head{display:flex; align-items:baseline; gap:9px; margin-bottom:6px}
+  .pc-name{font-size:15px; font-weight:700}
+  .pc-en{font-size:10px; color:var(--muted); letter-spacing:1.5px; font-family:ui-monospace,monospace}
+  .pc-range{font-size:11px; color:var(--muted); margin-bottom:12px}
+  .pc-tips{list-style:none; margin-bottom:12px}
+  .pc-tips li{font-size:12px; color:var(--dim); line-height:1.7; padding-left:15px; position:relative; margin-bottom:4px}
+  .pc-tips li::before{content:""; position:absolute; left:2px; top:9px; width:5px; height:5px; border-radius:50%}
+  .pc-tips.follicular li::before{background:var(--follicle)}
+  .pc-tips.ovulation li::before{background:var(--ovulation)}
+  .pc-tips.luteal li::before{background:var(--luteal)}
+  .pc-forecast{display:flex; align-items:center; gap:8px; font-size:11.5px; padding:9px 12px; border-radius:var(--r-sm);
+    background:rgba(255,255,255,.045); border:1px solid var(--glass-border)}
+  .pc-forecast b{font-weight:600}
+
+  /* v2：非经期快捷操作卡 */
+  .quick-card{padding:16px 18px; margin-bottom:14px; display:flex; align-items:center; gap:14px}
+  .quick-card .q-body{flex:1; min-width:0}
+  .quick-card .q-title{font-size:13.5px; font-weight:700; margin-bottom:3px}
+  .quick-card .q-sub{font-size:11px; color:var(--muted); line-height:1.6}
+  .quick-card .btn{flex:none; padding:11px 16px; font-size:12.5px}
+
+  /* v2：棉条库存卡（苏菲四色） */
+  .stock-card{padding:16px 18px 14px; margin-bottom:14px}
+  .stock-head{display:flex; justify-content:space-between; align-items:center; margin-bottom:12px}
+  .stock-title{font-size:13px; font-weight:700; color:var(--rose); letter-spacing:1px}
+  .stock-sub{font-size:10px; color:var(--muted)}
+  .stock-grid{display:grid; grid-template-columns:1fr 1fr; gap:9px}
+  .stock-item{display:flex; align-items:center; gap:9px; padding:10px 12px; border-radius:var(--r-sm);
+    background:rgba(255,255,255,.04); border:1px solid var(--glass-border)}
+  .stock-item .sw{width:15px; height:15px; border-radius:6px; flex:none; box-shadow:inset 0 1px 0 rgba(255,255,255,.3)}
+  .stock-item .s-body{flex:1; min-width:0}
+  .stock-item .s-name{font-size:12px; font-weight:600; line-height:1.3}
+  .stock-item .s-jp{font-size:9.5px; color:var(--muted); font-family:ui-monospace,monospace}
+  .stock-item .s-count{font-size:14px; font-weight:800; font-family:ui-monospace,monospace; color:var(--text)}
+  .stock-item .s-count.low{color:#DEB27A}
+  .stock-item .s-unit{font-size:9.5px; color:var(--muted)}
+
+  /* 融合进来的棉条卡片 */
+  .tampon-card{padding:18px; margin-bottom:14px; position:relative; overflow:hidden}
+  .tampon-card::before{content:""; position:absolute; top:-40%; right:-20%; width:70%; height:120%;
+    background:radial-gradient(closest-side, rgba(212,114,92,.20), transparent); pointer-events:none}
+  .tc-head{display:flex; justify-content:space-between; align-items:center; margin-bottom:12px}
+  .tc-title{font-size:13px; font-weight:700; color:var(--rose); letter-spacing:1px; display:flex; align-items:center; gap:7px}
+  .tc-title .dot{width:8px; height:8px; border-radius:50%; background:var(--rose)}
+  .tc-badge{font-size:10.5px; color:var(--muted); border:1px solid var(--glass-border); padding:3px 9px; border-radius:99px; background:rgba(255,255,255,.03)}
+  .tc-elapsed{display:flex; align-items:baseline; gap:8px; margin-bottom:4px}
+  .tc-elapsed .t{font-size:32px; font-weight:800; font-family:ui-monospace,monospace; letter-spacing:-.5px; color:var(--text)}
+  .tc-elapsed .u{font-size:12px; color:var(--dim)}
+  .tc-meta{font-size:12px; color:var(--dim); margin-bottom:14px}
+  .tc-meta b{color:var(--text); font-weight:600}
+  /* 佩戴进度条（相对 8 小时上限） */
+  .wear-bar{height:7px; border-radius:99px; background:rgba(255,255,255,.07); overflow:hidden; margin-bottom:6px; position:relative}
+  .wear-bar .fill{height:100%; border-radius:99px; background:linear-gradient(90deg, var(--rose), var(--health-brand)); transition:width .5s ease}
+  .wear-bar .limit{position:absolute; top:-2px; bottom:-2px; width:1.5px; background:rgba(255,255,255,.35)}
+  .wear-hint{display:flex; justify-content:space-between; font-size:10.5px; color:var(--muted); margin-bottom:14px}
+  /* 超时状态 */
+  .tampon-card.overtime .tc-elapsed .t{color:#E88A82}
+  .tampon-card.overtime .wear-bar .fill{background:linear-gradient(90deg, var(--warning), var(--danger))}
+  .overtime-banner{display:none; align-items:flex-start; gap:9px; margin-bottom:14px; padding:11px 13px; border-radius:var(--r-sm);
+    background:rgba(185,83,79,.16); border:1px solid rgba(185,83,79,.42)}
+  .tampon-card.overtime .overtime-banner{display:flex; animation:pulseGlow 2s infinite}
+  @keyframes pulseGlow{0%,100%{box-shadow:0 0 0 0 rgba(185,83,79,.25)} 50%{box-shadow:0 0 0 5px rgba(185,83,79,0)}}
+  .overtime-banner .icon{color:#E88A82; font-size:14px; line-height:1.4}
+  .overtime-banner .txt{font-size:11.5px; color:#E8B0AA; line-height:1.6}
+  .overtime-banner .txt b{color:#F0C7C2}
+  .tc-actions{display:flex; gap:10px}
+  .btn{border:0; cursor:pointer; font-family:inherit; border-radius:14px; font-weight:700; transition:transform .12s ease, filter .2s}
+  .btn:active{transform:scale(.97)}
+  .btn-primary{
+    flex:1.4; padding:13px 0; font-size:14.5px; color:#fff;
+    background:linear-gradient(135deg, #C16B5E, #A35347);
+    box-shadow:0 8px 20px rgba(163,83,71,.4), inset 0 1px 0 rgba(255,255,255,.2);
+  }
+  .btn-primary:hover{filter:brightness(1.08)}
+  .btn-ghost{
+    flex:1; padding:13px 0; font-size:13.5px; color:var(--dim);
+    background:rgba(255,255,255,.05); border:1px solid var(--glass-border);
+  }
+  .btn-ghost:hover{color:var(--text)}
+  .demo-toggle{margin-top:12px; text-align:center}
+  .demo-toggle button{background:none; border:0; color:var(--ghost); font-size:10.5px; cursor:pointer; font-family:inherit; text-decoration:underline dotted}
+  .demo-toggle button:hover{color:var(--muted)}
+
+  /* 主页下的今日棉条摘要 */
+  .mini-section{font-size:12px; color:var(--muted); font-weight:600; letter-spacing:1px; margin:4px 2px 10px}
+  .mini-row{display:flex; align-items:center; gap:12px; padding:12px 14px; margin-bottom:9px}
+  .mini-row .time{font-family:ui-monospace,monospace; font-size:11px; color:var(--dim); width:74px; flex:none}
+  .mini-row .body{flex:1; min-width:0}
+  .mini-row .name{font-size:13.5px; font-weight:600}
+  .mini-row .detail{font-size:11px; color:var(--dim); margin-top:2px}
+  .tag{font-size:10px; padding:2px 7px; border-radius:99px; font-weight:600; flex:none}
+  .tag-night{background:rgba(157,124,176,.18); color:#C0A3D6; border:1px solid rgba(157,124,176,.35)}
+  .tag-warn{background:rgba(199,148,74,.16); color:#DEB27A; border:1px solid rgba(199,148,74,.4)}
+  .tag-open{background:rgba(201,123,110,.16); color:#E8A79C; border:1px solid rgba(201,123,110,.4)}
+  .tag-actor{background:rgba(255,255,255,.05); color:var(--muted); border:1px solid var(--glass-border)}
+
+  /* v2：苏菲规格小方块（记录条目 / 摘要行内联用） */
+  .size-dot{display:inline-block; width:9px; height:9px; border-radius:3px; margin-right:6px; vertical-align:0; box-shadow:inset 0 1px 0 rgba(255,255,255,.28)}
+  .size-jp{font-size:10px; color:var(--muted); font-family:ui-monospace,monospace; margin-left:5px}
+
+  /* ── 视图 B：使用记录 ── */
+  .stats-strip{display:flex; gap:10px; margin-bottom:16px}
+  .stat{flex:1; padding:13px 12px; text-align:center}
+  .stat .v{font-size:20px; font-weight:800; font-family:ui-monospace,monospace; color:var(--rose)}
+  .stat .v.warn{color:#DEB27A}
+  .stat .k{font-size:10.5px; color:var(--muted); margin-top:4px}
+
+  .day-group{margin-bottom:18px}
+  .day-head{display:flex; align-items:baseline; gap:10px; margin:0 2px 10px}
+  .day-head .d{font-size:15px; font-weight:700}
+  .day-head .summary{font-size:11px; color:var(--muted); font-family:ui-monospace,monospace}
+  .day-head .summary b{color:var(--dim); font-weight:600}
+
+  .rec-card{padding:14px 15px; margin-bottom:10px; position:relative}
+  .rec-top{display:flex; align-items:center; gap:10px; margin-bottom:10px}
+  .rec-top .size{font-size:15px; font-weight:700; display:flex; align-items:center}
+  .rec-top .size .size-dot{width:12px; height:12px; border-radius:4px; margin-right:8px}
+  .rec-top .spacer{flex:1}
+  .rec-times{display:flex; align-items:center; gap:8px; font-family:ui-monospace,monospace; font-size:13px; color:var(--text); margin-bottom:9px}
+  .rec-times .arrow{color:var(--ghost)}
+  .rec-times .dur{margin-left:auto; font-size:11.5px; color:var(--dim); background:rgba(255,255,255,.05); padding:3px 9px; border-radius:99px; border:1px solid var(--glass-border)}
+  .rec-bar{height:5px; border-radius:99px; background:rgba(255,255,255,.06); overflow:hidden; margin-bottom:10px}
+  .rec-bar .fill{height:100%; border-radius:99px}
+  .rec-foot{display:flex; align-items:center; gap:8px; font-size:11px; color:var(--muted)}
+  .amount-dots{display:inline-flex; gap:3px; align-items:center}
+  .amount-dots i{width:8px; height:8px; border-radius:50%; background:rgba(255,255,255,.10)}
+  .amount-dots i.on{background:var(--rose)}
+  .rec-card.overtime{border-color:rgba(199,148,74,.4)}
+  .rec-card.overtime .rec-bar .fill{background:linear-gradient(90deg,var(--warning),var(--danger)) !important}
+  .rec-card .warn-line{display:flex; gap:6px; align-items:center; margin-top:9px; font-size:11px; color:#DEB27A;
+    background:rgba(199,148,74,.10); border-radius:9px; padding:7px 10px}
+  .records-note{font-size:11px; color:var(--ghost); text-align:center; line-height:1.7; margin-top:4px}
+
+  /* ── 玻璃弹层（bottom sheet） ── */
+  .sheet-mask{
+    position:absolute; inset:0; z-index:10; background:rgba(10,8,8,.45);
+    backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px);
+    opacity:0; pointer-events:none; transition:opacity .28s;
+  }
+  .sheet-mask.show{opacity:1; pointer-events:auto}
+  .sheet{
+    position:absolute; left:0; right:0; bottom:0; z-index:11;
+    background:var(--glass-strong);
+    backdrop-filter:blur(32px) saturate(160%); -webkit-backdrop-filter:blur(32px) saturate(160%);
+    border:1px solid var(--glass-border); border-bottom:0;
+    border-radius:26px 26px 0 0; padding:12px 20px 26px;
+    transform:translateY(105%); transition:transform .34s cubic-bezier(.32,.72,.24,1);
+    box-shadow:0 -18px 50px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.09);
+  }
+  .sheet.show{transform:translateY(0)}
+  .sheet .grab{width:38px; height:4px; border-radius:99px; background:rgba(255,255,255,.18); margin:2px auto 14px}
+  .sheet h3{font-size:17px; font-weight:700; margin-bottom:3px}
+  .sheet .sheet-sub{font-size:11.5px; color:var(--muted); margin-bottom:16px}
+  .field-label{font-size:11.5px; color:var(--dim); font-weight:600; margin:0 2px 8px; letter-spacing:.5px}
+  .time-pill{display:flex; align-items:center; justify-content:space-between; padding:12px 15px; border-radius:var(--r-sm);
+    background:rgba(255,255,255,.05); border:1px solid var(--glass-border); margin-bottom:16px}
+  .time-pill .val{font-family:ui-monospace,monospace; font-size:15px; font-weight:700}
+  .time-pill .edit{font-size:11px; color:var(--rose); font-weight:600}
+  .chips{display:flex; gap:8px; flex-wrap:wrap; margin-bottom:18px}
+  .chip{
+    flex:1; min-width:64px; text-align:center; padding:11px 4px; border-radius:13px; cursor:pointer;
+    background:rgba(255,255,255,.05); border:1px solid var(--glass-border);
+    font-size:13px; font-weight:600; color:var(--dim); transition:all .18s; user-select:none;
+  }
+  .chip small{display:block; font-size:9.5px; color:var(--ghost); font-weight:400; margin-top:3px}
+  .chip.sel{background:rgba(201,123,110,.20); border-color:rgba(201,123,110,.55); color:#F0B0A4}
+  .chip.sel small{color:rgba(240,176,164,.7)}
+
+  /* v2：苏菲四色规格 chips（2×2 网格，色块 + 中文名 + 日文名 + 包装数） */
+  .chips.size-chips{display:grid; grid-template-columns:1fr 1fr}
+  .chips.size-chips .chip{display:flex; align-items:center; gap:9px; padding:11px 12px; text-align:left; min-width:0}
+  .chips.size-chips .chip .sw{width:18px; height:18px; border-radius:7px; flex:none; box-shadow:inset 0 1px 0 rgba(255,255,255,.3), 0 2px 6px rgba(0,0,0,.3)}
+  .chips.size-chips .chip .nm{font-size:12.5px; line-height:1.25}
+  .chips.size-chips .chip .nm small{font-size:9px; margin-top:2px; font-family:ui-monospace,monospace}
+  /* 每色独立选中态：边框/底色/文字都用对应苏菲色 */
+  .chip[data-c="pink"]  .sw{background:var(--sofy-pink)}
+  .chip[data-c="blue"]  .sw{background:var(--sofy-blue)}
+  .chip[data-c="green"] .sw{background:var(--sofy-green)}
+  .chip[data-c="purple"] .sw{background:var(--sofy-purple)}
+  .chip[data-c="pink"].sel  {background:rgba(224,138,164,.15); border-color:rgba(224,138,164,.6);  color:var(--sofy-pink-t)}
+  .chip[data-c="pink"].sel small  {color:rgba(242,183,199,.72)}
+  .chip[data-c="blue"].sel  {background:rgba(111,159,214,.15);  border-color:rgba(111,159,214,.6);  color:var(--sofy-blue-t)}
+  .chip[data-c="blue"].sel small  {color:rgba(175,203,238,.72)}
+  .chip[data-c="green"].sel {background:rgba(117,183,135,.15);  border-color:rgba(117,183,135,.6);  color:var(--sofy-green-t)}
+  .chip[data-c="green"].sel small {color:rgba(171,221,183,.72)}
+  .chip[data-c="purple"].sel{background:rgba(168,140,207,.16);  border-color:rgba(168,140,207,.62); color:var(--sofy-purple-t)}
+  .chip[data-c="purple"].sel small{color:rgba(205,185,236,.72)}
+  .sofy-hint{font-size:10px; color:var(--ghost); margin:-10px 2px 16px; line-height:1.6}
+
+  .sheet-note{display:none; gap:8px; align-items:flex-start; font-size:11px; color:#DEB27A; line-height:1.6;
+    background:rgba(199,148,74,.10); border:1px solid rgba(199,148,74,.28); border-radius:var(--r-sm); padding:10px 12px; margin-bottom:16px}
+  .sheet-note.show{display:flex}
+  .sheet-actions{display:flex; gap:10px; margin-top:2px}
+  .sheet-actions .btn-primary,.sheet-actions .btn-ghost{padding:14px 0}
+
+  /* toast */
+  .toast{
+    position:absolute; left:50%; bottom:110px; transform:translateX(-50%) translateY(20px); z-index:20;
+    background:var(--glass-strong); backdrop-filter:blur(20px); -webkit-backdrop-filter:blur(20px);
+    border:1px solid var(--glass-border); border-radius:99px; padding:10px 20px;
+    font-size:12.5px; color:var(--text); opacity:0; transition:all .3s; pointer-events:none; white-space:nowrap;
+    box-shadow:0 10px 30px rgba(0,0,0,.4);
+  }
+  .toast.show{opacity:1; transform:translateX(-50%) translateY(0)}
+  .toast .ok{color:var(--success); font-weight:700; margin-right:6px}
+
+  .legend{display:flex; gap:14px; justify-content:center; margin-top:18px; flex-wrap:wrap; max-width:520px}
+  .legend span{font-size:11px; color:var(--muted); display:flex; align-items:center; gap:6px}
+  .legend i{width:9px; height:9px; border-radius:3px}
+  .legend .lg-title{width:100%; text-align:center; font-size:10px; color:var(--ghost); letter-spacing:2px; margin-top:6px}
+</style>
+</head>
+<body>
+
+<div class="page-title">
+  <h1>经期 <em>×</em> 棉条 · 重设计预览 <em>v2</em></h1>
+</div>
+<div class="page-sub">棉条规格对齐苏菲四色包装 · 非经期显示当前周期阶段信息<br><b>点击手机内的 Tab / 演示状态 / 按钮可交互演示</b></div>
+
+<div class="phone">
+  <div class="wallpaper"></div>
+
+  <div class="screen">
+    <div class="statusbar"><span>11:58</span><span class="icons">5G ▰▰▰▱ 89%</span></div>
+
+    <div class="header">
+      <div class="crumb">健康 · HEALTH</div>
+      <h2>经期 <span class="date">2026 / 08 / 24 · 周一</span></h2>
+    </div>
+
+    <div class="tabs">
+      <button id="tab-home" class="active" onclick="switchView('home')">经期主页</button>
+      <button id="tab-records" onclick="switchView('records')">使用记录</button>
+    </div>
+
+    <!-- v2：演示状态切换（经期中 / 卵泡期 / 排卵期 / 黄体期） -->
+    <div class="demo-state">
+      <span class="label">演示状态</span>
+      <button data-phase="period" class="active" onclick="setCycleState('period')">经期中</button>
+      <button data-phase="follicular" onclick="setCycleState('follicular')">卵泡期</button>
+      <button data-phase="ovulation" onclick="setCycleState('ovulation')">排卵期</button>
+      <button data-phase="luteal" onclick="setCycleState('luteal')">黄体期</button>
+    </div>
+
+    <div class="content">
+
+      <!-- ══ 视图 A：经期主页 ══ -->
+      <div class="view active" id="view-home">
+
+        <!-- ── A1：经期中 ── -->
+        <div id="home-period">
+          <!-- 周期环 -->
+          <div class="glass hero">
+            <div class="ring">
+              <svg width="132" height="132" viewBox="0 0 132 132">
+                <circle cx="66" cy="66" r="56" fill="none" stroke="rgba(255,255,255,.06)" stroke-width="10"/>
+                <!-- 月经期 day1-5 · 卵泡期 6-11 · 排卵期 12-16 · 黄体期 17-28 -->
+                <circle cx="66" cy="66" r="56" fill="none" stroke="#E05A5A" stroke-width="10" stroke-linecap="round"
+                  stroke-dasharray="63 351.8" stroke-dashoffset="0"/>
+                <circle cx="66" cy="66" r="56" fill="none" stroke="#E8913A" stroke-width="10"
+                  stroke-dasharray="75 351.8" stroke-dashoffset="-63"/>
+                <circle cx="66" cy="66" r="56" fill="none" stroke="#D4AA3C" stroke-width="10"
+                  stroke-dasharray="63 351.8" stroke-dashoffset="-138"/>
+                <circle cx="66" cy="66" r="56" fill="none" stroke="#9D7CB0" stroke-width="10"
+                  stroke-dasharray="151 351.8" stroke-dashoffset="-201"/>
+                <!-- 今日指针：第 3 天 -->
+                <circle cx="66" cy="10" r="4.5" fill="#F2C0B6" transform="rotate(38.6 66 66)"/>
+              </svg>
+              <div class="center">
+                <div class="big">3<small> 天</small></div>
+                <div class="sub">经期第 3 天</div>
+              </div>
+            </div>
+            <div class="hero-info">
+              <span class="phase-chip"><i></i>月经期</span>
+              <div class="hero-line">本次 <b>8月22日</b> 开始<br>预计 <b>8月26日</b> 结束</div>
+              <div class="hero-line mono">下次预计 9月19日<br>约 26 天后</div>
+            </div>
+          </div>
+
+          <!-- 融合进来的棉条卡片 -->
+          <div class="glass tampon-card" id="tamponCard">
+            <div class="tc-head">
+              <div class="tc-title"><span class="dot"></span>当前棉条</div>
+              <span class="tc-badge">Astra 记录</span>
+            </div>
+
+            <div class="overtime-banner">
+              <span class="icon">⚠</span>
+              <span class="txt"><b>已超过建议更换时间。</b>单根棉条佩戴不建议超过 8 小时，请尽快更换，降低 TSS 风险。</span>
+            </div>
+
+            <div class="tc-elapsed">
+              <span class="t" id="elapsedText">3小时38分</span>
+              <span class="u">已佩戴</span>
+            </div>
+            <div class="tc-meta">08:20 戴入 · 规格
+              <b><span class="size-dot" style="background:var(--sofy-blue)"></span>普通</b>
+              · 用量将在取出时结算
+            </div>
+
+            <div class="wear-bar">
+              <div class="fill" id="wearFill" style="width:45%"></div>
+              <div class="limit" style="left:100%"></div>
+            </div>
+            <div class="wear-hint"><span id="wearHint">建议 4–6 小时更换</span><span>上限 8h</span></div>
+
+            <div class="tc-actions">
+              <button class="btn btn-primary" onclick="openSheet('replace')">换上新的</button>
+              <button class="btn btn-ghost" onclick="openSheet('remove')">只取出</button>
+            </div>
+            <div class="demo-toggle"><button onclick="toggleOvertime()">演示：切换「超时未换」状态</button></div>
+          </div>
+
+          <!-- 今日棉条摘要（属于经期这一天的时间线） -->
+          <div class="mini-section">今日 · 8月24日</div>
+          <div class="glass mini-row">
+            <span class="time">08:20 —</span>
+            <div class="body">
+              <div class="name"><span class="size-dot" style="background:var(--sofy-blue)"></span>普通 <span style="font-size:11px;color:var(--dim)">使用中</span></div>
+              <div class="detail">已佩戴 3小时38分</div>
+            </div>
+            <span class="tag tag-open">进行中</span>
+          </div>
+          <div class="glass mini-row">
+            <span class="time">22:10→07:35</span>
+            <div class="body">
+              <div class="name"><span class="size-dot" style="background:var(--sofy-green)"></span>量多 <span style="font-size:11px;color:var(--dim)">· 用量中等</span></div>
+              <div class="detail">佩戴 9小时25分 · 跨夜</div>
+            </div>
+            <span class="tag tag-night">夜间</span>
+            <span class="tag tag-warn">超时</span>
+          </div>
+        </div>
+
+        <!-- ── A2：非经期（排卵期 / 黄体期，由演示状态驱动） ── -->
+        <div id="home-off" style="display:none">
+
+          <!-- 周期环：同一圆环，指针走到当前周期日 -->
+          <div class="glass hero">
+            <div class="ring">
+              <svg width="132" height="132" viewBox="0 0 132 132">
+                <circle cx="66" cy="66" r="56" fill="none" stroke="rgba(255,255,255,.06)" stroke-width="10"/>
+                <circle cx="66" cy="66" r="56" fill="none" stroke="#E05A5A" stroke-width="10" stroke-linecap="round"
+                  stroke-dasharray="63 351.8" stroke-dashoffset="0" opacity=".45"/>
+                <circle cx="66" cy="66" r="56" fill="none" stroke="#E8913A" stroke-width="10"
+                  stroke-dasharray="75 351.8" stroke-dashoffset="-63" opacity=".45"/>
+                <circle cx="66" cy="66" r="56" fill="none" stroke="#D4AA3C" stroke-width="10"
+                  stroke-dasharray="63 351.8" stroke-dashoffset="-138" opacity=".45"/>
+                <circle cx="66" cy="66" r="56" fill="none" stroke="#9D7CB0" stroke-width="10"
+                  stroke-dasharray="151 351.8" stroke-dashoffset="-201" opacity=".45"/>
+                <!-- 今日指针：角度由 JS 按周期日设置 -->
+                <circle id="offPointer" cx="66" cy="10" r="4.5" fill="#E5C56A" transform="rotate(180 66 66)"/>
+              </svg>
+              <div class="center">
+                <div class="big" id="offDay">14<small> 天</small></div>
+                <div class="sub" id="offDaySub">周期第 14 天</div>
+              </div>
+            </div>
+            <div class="hero-info">
+              <span class="phase-chip ovulation" id="offChip"><i></i><span id="offChipText">排卵期</span></span>
+              <div class="hero-line" id="offHeroLine">上次经期 <b>8月5日</b> 开始<br>周期长度约 <b>28 天</b></div>
+              <div class="hero-line mono" id="offHeroMono">下次月经预计 9月1日<br>约 8 天后</div>
+            </div>
+          </div>
+
+          <!-- 阶段信息卡：内容随演示状态切换 -->
+          <div class="glass phase-card">
+            <div class="pc-head">
+              <span class="pc-name" id="pcName">排卵期</span>
+              <span class="pc-en" id="pcEn">OVULATION</span>
+            </div>
+            <div class="pc-range" id="pcRange">通常位于周期第 12–16 天 · 排卵日前后</div>
+            <ul class="pc-tips ovulation" id="pcTips">
+              <li>受孕概率最高的窗口期，前后约 5 天</li>
+              <li>分泌物增多、呈透明蛋清状</li>
+              <li>排卵后基础体温上升约 0.3–0.5°C</li>
+            </ul>
+            <div class="pc-forecast" id="pcForecastWrap">
+              <span>🗓</span><span id="pcForecast">预计下次月经 <b>9月1日</b> · 约 8 天后，可提前备好棉条</span>
+            </div>
+          </div>
+
+          <!-- 经期开始快捷操作 -->
+          <div class="glass quick-card">
+            <div class="q-body">
+              <div class="q-title">经期来了？</div>
+              <div class="q-sub">一键记录经期开始，主页即刻切回经期模式，棉条记录随之回归。</div>
+            </div>
+            <button class="btn btn-primary" onclick="startPeriodDemo()">记录经期开始</button>
+          </div>
+
+          <!-- 棉条库存（苏菲四色规格一一对应实物包装） -->
+          <div class="glass stock-card">
+            <div class="stock-head">
+              <span class="stock-title">棉条库存</span>
+              <span class="stock-sub">苏菲棉条 · 四色规格</span>
+            </div>
+            <div class="stock-grid">
+              <div class="stock-item">
+                <span class="sw" style="background:var(--sofy-pink)"></span>
+                <div class="s-body"><div class="s-name">量少</div><div class="s-jp">10个装</div></div>
+                <span class="s-count">8</span><span class="s-unit">支</span>
+              </div>
+              <div class="stock-item">
+                <span class="sw" style="background:var(--sofy-blue)"></span>
+                <div class="s-body"><div class="s-name">普通</div><div class="s-jp">10个装</div></div>
+                <span class="s-count">10</span><span class="s-unit">支</span>
+              </div>
+              <div class="stock-item">
+                <span class="sw" style="background:var(--sofy-green)"></span>
+                <div class="s-body"><div class="s-name">量多</div><div class="s-jp">9个装</div></div>
+                <span class="s-count">4</span><span class="s-unit">支</span>
+              </div>
+              <div class="stock-item">
+                <span class="sw" style="background:var(--sofy-purple)"></span>
+                <div class="s-body"><div class="s-name">特多</div><div class="s-jp">7个装 · 吸收力1.3倍</div></div>
+                <span class="s-count low">2</span><span class="s-unit">支</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="records-note">非经期时主页不再空白：周期环照常运转，当前阶段的身体提示<br>与经期倒计时常驻；棉条卡片在经期开始当天自动回归</div>
+        </div>
+
+      </div>
+
+      <!-- ══ 视图 B：使用记录（按天分组 · 卡片式 · 苏菲四色规格） ══ -->
+      <div class="view" id="view-records">
+
+        <div class="stats-strip">
+          <div class="glass stat"><div class="v">9</div><div class="k">本次经期已用</div></div>
+          <div class="glass stat"><div class="v">5h12m</div><div class="k">平均佩戴</div></div>
+          <div class="glass stat"><div class="v warn">1</div><div class="k">超时记录</div></div>
+        </div>
+
+        <!-- 今天 -->
+        <div class="day-group">
+          <div class="day-head">
+            <span class="d">今天 · 8月24日</span>
+            <span class="summary">更换 <b>1 次</b> · 经期第 <b>3</b> 天</span>
+          </div>
+
+          <div class="glass rec-card" style="border-color:rgba(111,159,214,.45)">
+            <div class="rec-top">
+              <span class="size"><span class="size-dot" style="background:var(--sofy-blue)"></span>普通</span>
+              <span class="tag tag-open">进行中</span>
+              <span class="spacer"></span>
+              <span class="tag tag-actor">Astra</span>
+            </div>
+            <div class="rec-times">08:20 <span class="arrow">→</span> 现在 <span class="dur">3小时38分</span></div>
+            <div class="rec-bar"><div class="fill" style="width:45%; background:linear-gradient(90deg,var(--sofy-blue),var(--health-brand))"></div></div>
+            <div class="rec-foot"><span>用量待取出时结算</span></div>
+          </div>
+
+          <div class="glass rec-card overtime">
+            <div class="rec-top">
+              <span class="size"><span class="size-dot" style="background:var(--sofy-green)"></span>量多</span>
+              <span class="tag tag-night">夜间</span>
+              <span class="spacer"></span>
+              <span class="tag tag-actor">Astra</span>
+            </div>
+            <div class="rec-times">22:10 <span class="arrow">→</span> 07:35 <span class="dur">9小时25分</span></div>
+            <div class="rec-bar"><div class="fill" style="width:100%"></div></div>
+            <div class="rec-foot">
+              <span class="amount-dots"><i class="on"></i><i class="on"></i><i></i><i></i></span>
+              <span>用量中等</span>
+            </div>
+            <div class="warn-line">⚠ 佩戴超过 8 小时上限，下次记得早点更换</div>
+          </div>
+        </div>
+
+        <!-- 昨天 -->
+        <div class="day-group">
+          <div class="day-head">
+            <span class="d">昨天 · 8月23日</span>
+            <span class="summary">更换 <b>3 次</b> · 平均 <b>4h20m</b></span>
+          </div>
+
+          <div class="glass rec-card">
+            <div class="rec-top"><span class="size"><span class="size-dot" style="background:var(--sofy-blue)"></span>普通</span><span class="spacer"></span><span class="tag tag-actor">Astra</span></div>
+            <div class="rec-times">18:20 <span class="arrow">→</span> 22:05 <span class="dur">3小时45分</span></div>
+            <div class="rec-bar"><div class="fill" style="width:47%; background:linear-gradient(90deg,var(--sofy-blue),var(--health-brand))"></div></div>
+            <div class="rec-foot"><span class="amount-dots"><i class="on"></i><i></i><i></i><i></i></span><span>用量少量</span></div>
+          </div>
+
+          <div class="glass rec-card">
+            <div class="rec-top"><span class="size"><span class="size-dot" style="background:var(--sofy-purple)"></span>特多</span><span class="spacer"></span><span class="tag tag-actor">Astra</span></div>
+            <div class="rec-times">13:10 <span class="arrow">→</span> 17:50 <span class="dur">4小时40分</span></div>
+            <div class="rec-bar"><div class="fill" style="width:58%; background:linear-gradient(90deg,var(--sofy-purple),var(--health-brand))"></div></div>
+            <div class="rec-foot"><span class="amount-dots"><i class="on"></i><i class="on"></i><i></i><i></i></span><span>用量中等 · 吸收力 1.3×</span></div>
+          </div>
+
+          <div class="glass rec-card">
+            <div class="rec-top"><span class="size"><span class="size-dot" style="background:var(--sofy-green)"></span>量多</span><span class="spacer"></span><span class="tag tag-actor">AI</span></div>
+            <div class="rec-times">08:05 <span class="arrow">→</span> 12:40 <span class="dur">4小时35分</span></div>
+            <div class="rec-bar"><div class="fill" style="width:57%; background:linear-gradient(90deg,var(--sofy-green),var(--health-brand))"></div></div>
+            <div class="rec-foot"><span class="amount-dots"><i class="on"></i><i class="on"></i><i class="on"></i><i></i></span><span>用量较多</span></div>
+          </div>
+        </div>
+
+        <!-- 前天 -->
+        <div class="day-group">
+          <div class="day-head">
+            <span class="d">8月22日 · 经期第 1 天</span>
+            <span class="summary">更换 <b>3 次</b> · 平均 <b>4h38m</b></span>
+          </div>
+
+          <div class="glass rec-card">
+            <div class="rec-top"><span class="size"><span class="size-dot" style="background:var(--sofy-pink)"></span>量少</span><span class="spacer"></span><span class="tag tag-actor">Astra</span></div>
+            <div class="rec-times">20:10 <span class="arrow">→</span> 23:50 <span class="dur">3小时40分</span></div>
+            <div class="rec-bar"><div class="fill" style="width:46%; background:linear-gradient(90deg,var(--sofy-pink),var(--health-brand))"></div></div>
+            <div class="rec-foot"><span class="amount-dots"><i class="on"></i><i></i><i></i><i></i></span><span>用量少量</span></div>
+          </div>
+
+          <div class="glass rec-card">
+            <div class="rec-top"><span class="size"><span class="size-dot" style="background:var(--sofy-green)"></span>量多</span><span class="spacer"></span><span class="tag tag-actor">Astra</span></div>
+            <div class="rec-times">15:00 <span class="arrow">→</span> 19:40 <span class="dur">4小时40分</span></div>
+            <div class="rec-bar"><div class="fill" style="width:58%; background:linear-gradient(90deg,var(--sofy-green),var(--health-brand))"></div></div>
+            <div class="rec-foot"><span class="amount-dots"><i class="on"></i><i class="on"></i><i class="on"></i><i></i></span><span>用量较多</span></div>
+          </div>
+
+          <div class="glass rec-card">
+            <div class="rec-top"><span class="size"><span class="size-dot" style="background:var(--sofy-purple)"></span>特多</span><span class="spacer"></span><span class="tag tag-actor">Astra</span></div>
+            <div class="rec-times">09:00 <span class="arrow">→</span> 14:30 <span class="dur">5小时30分</span></div>
+            <div class="rec-bar"><div class="fill" style="width:69%; background:linear-gradient(90deg,var(--sofy-purple),var(--health-brand))"></div></div>
+            <div class="rec-foot"><span class="amount-dots"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i></span><span>用量已满</span></div>
+          </div>
+        </div>
+
+        <div class="records-note">规格色块对应苏菲包装：粉=量少 · 蓝=普通<br>绿=量多 · 紫=特多（吸收力 1.3 倍）<br>夜间标记在结算后自动识别 · 用量点：少量 / 中等 / 较多 / 已满</div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ══ 视图 C：玻璃雾面录入弹层（苏菲四色规格） ══ -->
+  <div class="sheet-mask" id="sheetMask" onclick="closeSheet()"></div>
+  <div class="sheet" id="sheet">
+    <div class="grab"></div>
+    <h3 id="sheetTitle">换上新的</h3>
+    <div class="sheet-sub" id="sheetSub">先结算当前这一根，再以同一时间开启下一根</div>
+
+    <div class="field-label" id="closeTimeLabel">取出时间</div>
+    <div class="time-pill">
+      <span class="val" id="sheetTime">11:58 · 8月24日</span>
+      <span class="edit">修改</span>
+    </div>
+
+    <div class="sheet-note show" id="sheetNote">
+      <span>⚠</span><span>当前这根已佩戴 <b>3小时38分</b>，结算后用量会记到它身上。</span>
+    </div>
+
+    <div class="field-label">这根的用量</div>
+    <div class="chips" id="amountChips">
+      <div class="chip" onclick="pick(this,'amountChips')">少量</div>
+      <div class="chip sel" onclick="pick(this,'amountChips')">中等</div>
+      <div class="chip" onclick="pick(this,'amountChips')">较多</div>
+      <div class="chip" onclick="pick(this,'amountChips')">已满</div>
+    </div>
+
+    <div id="nextSizeSection">
+      <div class="field-label">下一根规格 · 苏菲四色</div>
+      <div class="chips size-chips" id="sizeChips">
+        <div class="chip" data-c="pink" onclick="pick(this,'sizeChips')">
+          <span class="sw"></span>
+          <span class="nm">量少<small>量少的日子 · 10个装</small></span>
+        </div>
+        <div class="chip sel" data-c="blue" onclick="pick(this,'sizeChips')">
+          <span class="sw"></span>
+          <span class="nm">普通<small>普通的日子 · 10个装</small></span>
+        </div>
+        <div class="chip" data-c="green" onclick="pick(this,'sizeChips')">
+          <span class="sw"></span>
+          <span class="nm">量多<small>量多的日子 · 9个装</small></span>
+        </div>
+        <div class="chip" data-c="purple" onclick="pick(this,'sizeChips')">
+          <span class="sw"></span>
+          <span class="nm">特多<small>特别多的日子 · 7个装 · 吸收力1.3倍</small></span>
+        </div>
+      </div>
+      <div class="sofy-hint">色块与苏菲实物包装一一对应：粉 = 量少 · 蓝 = 普通 · 绿 = 量多 · 紫 = 特多（吸收力 1.3 倍）</div>
+    </div>
+
+    <div class="field-label">备注（可选）</div>
+    <div class="time-pill" style="margin-bottom:18px">
+      <span style="font-size:13px; color:var(--ghost)">例如：外出、运动后……</span>
+    </div>
+
+    <div class="sheet-actions">
+      <button class="btn btn-ghost" onclick="closeSheet()">取消</button>
+      <button class="btn btn-primary" id="sheetConfirm" onclick="confirmSheet()">确认更换</button>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"><span class="ok">✓</span><span id="toastText">已更换，新纪录已开始</span></div>
+</div>
+
+<div class="legend">
+  <span><i style="background:#E05A5A"></i>月经期</span>
+  <span><i style="background:#E8913A"></i>卵泡期</span>
+  <span><i style="background:#D4AA3C"></i>排卵期</span>
+  <span><i style="background:#9D7CB0"></i>黄体期</span>
+  <span><i style="background:#C97B6E"></i>经期主色</span>
+  <span class="lg-title">苏菲规格色</span>
+  <span><i style="background:var(--sofy-pink)"></i>粉 · 量少（10个装）</span>
+  <span><i style="background:var(--sofy-blue)"></i>蓝 · 普通（10个装）</span>
+  <span><i style="background:var(--sofy-green)"></i>绿 · 量多（9个装）</span>
+  <span><i style="background:var(--sofy-purple)"></i>紫 · 特多（7个装 · 吸收力1.3倍）</span>
+</div>
+
+<script>
+  var currentMode = 'replace';
+  var overtime = false;
+
+  /* ── v2：周期演示状态（经期中 / 非经期各阶段） ──
+     非经期阶段数据驱动主页：圆环指针、阶段 chip、阶段信息卡 */
+  var PHASES = {
+    follicular: {
+      day: 9, chip: '卵泡期', chipClass: 'follicular', pointerColor: '#F0B884',
+      heroLine: '上次经期 <b>8月5日</b> 开始<br>周期长度约 <b>28 天</b>',
+      heroMono: '预计排卵 8月18日前后<br>约 5 天后',
+      name: '卵泡期', en: 'FOLLICULAR', tipsClass: 'follicular',
+      range: '经期结束后 → 排卵前 · 通常第 6–11 天',
+      tips: ['雌激素回升，精力与皮肤状态逐渐变好',
+             '适合安排运动与高强度工作',
+             '临近排卵，分泌物开始增多'],
+      forecast: '预计 <b>8月18日前后</b> 排卵 · 之后进入易孕期'
+    },
+    ovulation: {
+      day: 14, chip: '排卵期', chipClass: 'ovulation', pointerColor: '#E5C56A',
+      heroLine: '上次经期 <b>8月5日</b> 开始<br>周期长度约 <b>28 天</b>',
+      heroMono: '下次月经预计 9月1日<br>约 8 天后',
+      name: '排卵期', en: 'OVULATION', tipsClass: 'ovulation',
+      range: '通常位于周期第 12–16 天 · 排卵日前后',
+      tips: ['受孕概率最高的窗口期，前后约 5 天',
+             '分泌物增多、呈透明蛋清状',
+             '排卵后基础体温上升约 0.3–0.5°C'],
+      forecast: '预计下次月经 <b>9月1日</b> · 约 8 天后，可提前备好棉条'
+    },
+    luteal: {
+      day: 22, chip: '黄体期', chipClass: 'luteal', pointerColor: '#C0A3D6',
+      heroLine: '上次经期 <b>8月5日</b> 开始<br>周期长度约 <b>28 天</b>',
+      heroMono: '下次月经预计 9月1日<br>约 6 天后',
+      name: '黄体期', en: 'LUTEAL PHASE', tipsClass: 'luteal',
+      range: '排卵后 → 下次月经前 · 通常第 17–28 天',
+      tips: ['基础体温维持高位，约高 0.3–0.5°C',
+             '可能出现 PMS：情绪波动、乳房胀痛、易水肿',
+             '建议适度运动、少盐少咖啡因、保证睡眠'],
+      forecast: '预计下次月经 <b>9月1日</b> · 约 6 天后，「量多」规格库存偏低'
+    }
+  };
+
+  function switchView(name){
+    document.querySelectorAll('.view').forEach(function(v){ v.classList.remove('active'); });
+    document.getElementById('view-' + name).classList.add('active');
+    document.getElementById('tab-home').classList.toggle('active', name === 'home');
+    document.getElementById('tab-records').classList.toggle('active', name === 'records');
+  }
+
+  /* 切换 经期中 / 排卵期 / 黄体期 演示状态 */
+  function setCycleState(phase){
+    document.querySelectorAll('.demo-state button').forEach(function(b){
+      b.classList.toggle('active', b.getAttribute('data-phase') === phase);
+    });
+    var isPeriod = phase === 'period';
+    document.getElementById('home-period').style.display = isPeriod ? 'block' : 'none';
+    document.getElementById('home-off').style.display = isPeriod ? 'none' : 'block';
+    if (!isPeriod){
+      var p = PHASES[phase];
+      // 圆环指针：360° / 28 天 ≈ 12.86° 每天
+      var ptr = document.getElementById('offPointer');
+      ptr.setAttribute('transform', 'rotate(' + (p.day * 360 / 28).toFixed(1) + ' 66 66)');
+      ptr.setAttribute('fill', p.pointerColor);
+      document.getElementById('offDay').innerHTML = p.day + '<small> 天</small>';
+      document.getElementById('offDaySub').textContent = '周期第 ' + p.day + ' 天';
+      var chip = document.getElementById('offChip');
+      chip.className = 'phase-chip ' + p.chipClass;
+      document.getElementById('offChipText').textContent = p.chip;
+      document.getElementById('offHeroLine').innerHTML = p.heroLine;
+      document.getElementById('offHeroMono').innerHTML = p.heroMono;
+      document.getElementById('pcName').textContent = p.name;
+      document.getElementById('pcName').style.color = p.pointerColor;
+      document.getElementById('pcEn').textContent = p.en;
+      document.getElementById('pcRange').textContent = p.range;
+      var tips = document.getElementById('pcTips');
+      tips.className = 'pc-tips ' + p.tipsClass;
+      tips.innerHTML = p.tips.map(function(t){ return '<li>' + t + '</li>'; }).join('');
+      document.getElementById('pcForecast').innerHTML = p.forecast;
+      // 回到主页 tab 看阶段内容
+      switchView('home');
+    }
+  }
+
+  /* 非经期快捷操作：记录经期开始 → 切回经期模式 */
+  function startPeriodDemo(){
+    setCycleState('period');
+    showToast('已记录经期开始 · 主页切回经期模式（演示）');
+  }
+
+  function toggleOvertime(){
+    overtime = !overtime;
+    var card = document.getElementById('tamponCard');
+    card.classList.toggle('overtime', overtime);
+    document.getElementById('elapsedText').textContent = overtime ? '9小时12分' : '3小时38分';
+    document.getElementById('wearFill').style.width = overtime ? '100%' : '45%';
+    document.getElementById('wearHint').textContent = overtime ? '已超过 8 小时上限' : '建议 4–6 小时更换';
+  }
+
+  function openSheet(mode){
+    currentMode = mode;
+    var title = document.getElementById('sheetTitle');
+    var sub = document.getElementById('sheetSub');
+    var confirmBtn = document.getElementById('sheetConfirm');
+    var nextSize = document.getElementById('nextSizeSection');
+    var note = document.getElementById('sheetNote');
+
+    if (mode === 'replace'){
+      title.textContent = '换上新的';
+      sub.textContent = '先结算当前这一根，再以同一时间开启下一根';
+      confirmBtn.textContent = '确认更换';
+      nextSize.style.display = 'block';
+      note.classList.add('show');
+    } else if (mode === 'remove'){
+      title.textContent = '只取出并结算';
+      sub.textContent = '关闭当前记录，不再开启新的';
+      confirmBtn.textContent = '确认取出';
+      nextSize.style.display = 'none';
+      note.classList.add('show');
+    } else { // start
+      title.textContent = '开始使用';
+      sub.textContent = '记录戴入时间与规格；用量在取出时结算';
+      confirmBtn.textContent = '确认开始';
+      nextSize.style.display = 'block';
+      note.classList.remove('show');
+    }
+    document.getElementById('sheetMask').classList.add('show');
+    document.getElementById('sheet').classList.add('show');
+  }
+
+  function closeSheet(){
+    document.getElementById('sheetMask').classList.remove('show');
+    document.getElementById('sheet').classList.remove('show');
+  }
+
+  function pick(el, groupId){
+    document.querySelectorAll('#' + groupId + ' .chip').forEach(function(c){ c.classList.remove('sel'); });
+    el.classList.add('sel');
+  }
+
+  function confirmSheet(){
+    closeSheet();
+    // v2：把选中的苏菲规格名带进 toast，演示色块选择生效
+    var selSize = document.querySelector('#sizeChips .chip.sel .nm');
+    var sizeName = selSize ? selSize.firstChild.textContent : '';
+    var msg = currentMode === 'replace' ? '已结算并换上新的一根'
+            : currentMode === 'remove' ? '已取出并结算'
+            : '已开始新的记录';
+    if (currentMode !== 'remove' && sizeName) msg += '（' + sizeName + '）';
+    showToast(msg + ' · 演示');
+  }
+
+  function showToast(msg){
+    document.getElementById('toastText').textContent = msg;
+    var t = document.getElementById('toast');
+    t.classList.add('show');
+    setTimeout(function(){ t.classList.remove('show'); }, 2200);
+  }
+</script>
+</body>
+</html>
