@@ -66,6 +66,58 @@ class ParseMeituanShareTextTest(unittest.TestCase):
         self.assertEqual(fields["name"], "舒心体检中心")
         self.assertEqual(fields["address"], "和平区太原街16号")
 
+    def test_names_with_road_avenue_square_words_stay_names(self):
+        # 「路/大道/广场」在分店名里极常见，不得被地址正则吞掉（审核 F2）。
+        cases = (
+            (
+                "海底捞火锅（中山路店）,¥120/人,朝阳区,朝阳区建国路88号 http://dpurl.cn/abc",
+                "海底捞火锅（中山路店）",
+            ),
+            (
+                "星光大道KTV,¥80/人,朝阳区,朝阳区建国路88号 http://dpurl.cn/abc",
+                "星光大道KTV",
+            ),
+            (
+                "万象城广场店,¥60/人,朝阳区,朝阳区建国路88号 http://dpurl.cn/abc",
+                "万象城广场店",
+            ),
+        )
+        for text, expected_name in cases:
+            with self.subTest(text=text):
+                fields = parse_meituan_share_text(text)
+                self.assertEqual(fields["name"], expected_name)
+                self.assertEqual(fields["address"], "朝阳区建国路88号")
+
+    def test_address_without_hao_accepted_only_after_region(self):
+        # 无「号」地址靠位次判定：必须出现在区域之后且带区域名前缀或数字。
+        fields = parse_meituan_share_text(
+            "某店,¥50/人,朝阳区,朝阳区建国路 http://dpurl.cn/abc"
+        )
+        self.assertEqual(fields["name"], "某店")
+        self.assertEqual(fields["address"], "朝阳区建国路")
+
+    def test_second_region_segment_does_not_take_name_slot(self):
+        fields = parse_meituan_share_text(
+            "皇姑区,铁西区,¥50/人,铁西区建设大路2号 http://dpurl.cn/abc"
+        )
+        self.assertEqual(fields["region"], "皇姑区")
+        self.assertEqual(fields["name"], "")
+        self.assertEqual(fields["address"], "铁西区建设大路2号")
+
+    def test_plain_extra_segment_does_not_take_address_slot(self):
+        fields = parse_meituan_share_text(
+            "店名A,分店描述B,¥50/人,朝阳区建国路88号 http://dpurl.cn/abc"
+        )
+        self.assertEqual(fields["name"], "店名A")
+        self.assertEqual(fields["address"], "朝阳区建国路88号")
+
+    def test_chat_question_text_is_not_a_name(self):
+        # 整条聊天文本当 share_text 时，提问句不得兜底成店名（审核 F4）。
+        fields = parse_meituan_share_text("帮我看看这家靠谱吗 http://dpurl.cn/abc")
+        self.assertEqual(fields["name"], "")
+        fields = parse_meituan_share_text("这家怎么样？ http://dpurl.cn/abc")
+        self.assertEqual(fields["name"], "")
+
     def test_missing_price(self):
         fields = parse_meituan_share_text(
             "某店名,朝阳区,朝阳区建国路88号 https://www.meituan.com/shop/12345.html"
@@ -259,6 +311,33 @@ class EnrichMeituanTest(unittest.TestCase):
             self.assertEqual(len(second.previews), 1)
             self.assertEqual(fetcher.calls, calls_after_first)
             self.assertEqual(second.previews[0]["title"], first.previews[0]["title"])
+
+    def test_same_url_different_share_text_does_not_share_cache(self):
+        # 审核 F1：缓存键必须覆盖分享文本——同一 dpurl 配不同文本不得串卡。
+        other_text = (
+            "海底捞火锅（中山路店）,¥120/人,朝阳区,朝阳区建国路88号 "
+            "http://dpurl.cn/uxoFqcyz"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            fetcher = StubFetcher(final_url=CANONICAL)
+            service = make_service(td, fetcher)
+            first = service.enrich(SHARE_TEXT)
+            second = service.enrich(other_text)
+            self.assertEqual(first.previews[0]["title"], "暖山静舍·SPA足道连锁（北站北店）")
+            self.assertEqual(second.previews[0]["title"], "海底捞火锅（中山路店）")
+            # 不同分享文本各写各的缓存文件，且第二张卡不是缓存命中。
+            self.assertNotEqual(
+                first.previews[0]["content_path"], second.previews[0]["content_path"]
+            )
+            calls_after_two_texts = fetcher.calls
+            self.assertGreaterEqual(calls_after_two_texts, 2)
+            # 相同分享文本仍命中缓存，不重复请求。
+            third = service.enrich(SHARE_TEXT)
+            self.assertEqual(fetcher.calls, calls_after_two_texts)
+            self.assertEqual(third.previews[0]["title"], first.previews[0]["title"])
+            self.assertEqual(
+                third.previews[0]["content_path"], first.previews[0]["content_path"]
+            )
 
     def test_resolution_failure_still_enriches_from_text(self):
         with tempfile.TemporaryDirectory() as td:

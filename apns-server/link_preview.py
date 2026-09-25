@@ -113,11 +113,15 @@ MEITUAN_MOBILE_UA = (
 _MEITUAN_PRICE_RE = re.compile(r"[¥￥]\s*\d+(?:\.\d+)?\s*/\s*人")
 _MEITUAN_PRICE_ALT_RE = re.compile(r"人均\s*[¥￥]?\s*(\d+(?:\.\d+)?)\s*元?")
 _MEITUAN_REGION_RE = re.compile(r"^[^\d\s，,。.;；:：、（）()]{2,15}(?:区|县|市|旗)$")
-# 「道/中心」这类单字常出现在店名里（足道、体检中心），地址只认更特异的
-# 形态；剩余的兜底归属交给 parse_meituan_share_text 的顺序逻辑。
-_MEITUAN_ADDRESS_RE = re.compile(
-    r"(?:\d+\s*号|路|街|巷|弄|大道|胡同|广场|大厦|\d+\s*[栋座楼层])"
-)
+# 地址判定分两层：严格形态要求「数字+号/栋/座/楼/层/室」，单独即可落地址位；
+# 「路/街/大道/广场/大厦」这类字在分店名里极常见（中山路店、星光大道KTV、
+# 万象城广场店），只在已定位区域之后的位次上才按宽松形态采纳（真实分享格式
+# 为「店名,¥人均,区域,地址」，地址恒在区域之后）。
+_MEITUAN_ADDRESS_RE = re.compile(r"(?:\d+\s*号|\d+\s*[栋座楼层室])")
+_MEITUAN_ADDRESS_LOOSE_RE = re.compile(r"(?:路|街|巷|弄|大道|胡同|广场|大厦)")
+# 店名兜底不收自由聊天文本：疑问/陈述语气结尾的段（「帮我看看这家靠谱吗」）
+# 不是店名。
+_MEITUAN_NAME_REJECT_RE = re.compile(r"(?:[?？!！。…]|[吗呢][?？!！。…]*)$")
 _MEITUAN_SHOP_ID_RE = re.compile(r"/(?:shop(?:share)?|poi)/(\d{4,25})(?:\.html)?(?:/|$)")
 MAX_TITLE = 300
 MAX_DESCRIPTION = 800
@@ -130,7 +134,9 @@ BILIBILI_CACHE_SCHEMA_VERSION = 1
 # Recipe extraction deliberately has its own schema: unlike generic previews,
 # its body is constructed only from a trusted Recipe JSON-LD node.
 XIACHUFANG_CACHE_SCHEMA_VERSION = 1
-MEITUAN_CACHE_SCHEMA_VERSION = 1
+# 版本 2：meituan-share 卡片的缓存键改为 URL + 分享文本哈希（卡片内容同时
+# 由两者决定），旧 URL 单键条目作废。
+MEITUAN_CACHE_SCHEMA_VERSION = 2
 DNS_WORKERS = 4
 DNS_QUEUE_SIZE = 8
 
@@ -340,15 +346,28 @@ def parse_meituan_share_text(text: Any) -> dict[str, str]:
     for segment in text_segments[:20]:
         is_region = bool(_MEITUAN_REGION_RE.fullmatch(segment))
         is_address = bool(_MEITUAN_ADDRESS_RE.search(segment))
-        if is_region and not result["region"]:
-            result["region"] = segment[:30]
-        elif is_address and not result["address"]:
-            result["address"] = segment[:150]
-        elif not result["name"] and not is_address:
-            # 地址形态的格子绝不顶进店名位（店名缺失时宁空不错）。
+        if not is_address and not is_region and result["region"]:
+            # 位次兜底：区域之后含「路/街/大道」等形态、且带数字或以区域名
+            # 开头的段按地址处理（如「朝阳区建国路」这类无「号」地址）。
+            region_core = result["region"][: len(result["region"]) - 1]
+            if _MEITUAN_ADDRESS_LOOSE_RE.search(segment) and (
+                any(char.isdigit() for char in segment)
+                or (region_core and segment.startswith(region_core))
+            ):
+                is_address = True
+        if is_region:
+            # 第二个区域形态段不再顶店名/地址位（分享里区域偶尔重复出现）。
+            if not result["region"]:
+                result["region"] = segment[:30]
+            continue
+        if is_address:
+            if not result["address"]:
+                result["address"] = segment[:150]
+            continue
+        if not result["name"] and not _MEITUAN_NAME_REJECT_RE.search(segment):
             result["name"] = segment[:80]
-        elif not result["address"] and not is_region:
-            result["address"] = segment[:150]
+        # 多余的普通文本段直接丢弃，不再兜底进地址位（分店描述等非地址文本
+        # 顶掉真地址比留空更糟）。
     return result
 
 
@@ -2091,8 +2110,19 @@ class LinkPreviewService:
             return cls._url_key("xhs\0" + url)
         return cls._url_key(url)
 
-    def _paths(self, url: str) -> tuple[Path, Path]:
-        key = self._url_key(url)
+    def _preview_cache_key(self, url: str, share_text: str = "") -> str:
+        # meituan-share 卡片内容同时由 URL 与分享文本决定：缓存键必须覆盖
+        # 两者，否则同一链接配不同分享文本会串卡片，私聊自由文本也会借
+        # name 兜底落进全局缓存跨消息外溢。分享文本只以哈希进键，不落盘。
+        if self._is_meituan_share_link(url):
+            digest = hashlib.sha256(
+                str(share_text or "").encode("utf-8", errors="surrogatepass")
+            ).hexdigest()
+            return self._url_key(f"meituan-share\0{url}\0{digest}")
+        return self._url_key(url)
+
+    def _paths(self, url: str, *, cache_key: str = "") -> tuple[Path, Path]:
+        key = cache_key or self._url_key(url)
         return self.attachments_dir / f"link_{key}.txt", self.attachments_dir / f".link_{key}.json"
 
     def _acquire_key_lock(self, key: str, deadline: float) -> _LockEntry:
@@ -2407,9 +2437,9 @@ class LinkPreviewService:
                 return False
         return True
 
-    def _load_cache(self, url: str, deadline: float) -> dict[str, Any] | None:
-        text_path, meta_path = self._paths(url)
-        key = self._url_key(url)
+    def _load_cache(self, url: str, deadline: float, *, cache_key: str = "") -> dict[str, Any] | None:
+        text_path, meta_path = self._paths(url, cache_key=cache_key)
+        key = cache_key or self._url_key(url)
         acquired = False
         try:
             self._acquire_budget_lock(deadline)
@@ -3274,9 +3304,10 @@ class LinkPreviewService:
         deadline: float,
         *,
         xhs_login_generation: int | None = None,
+        cache_key: str = "",
     ) -> dict[str, Any]:
-        text_path, meta_path = self._paths(url)
-        key = self._url_key(url)
+        text_path, meta_path = self._paths(url, cache_key=cache_key)
+        key = cache_key or self._url_key(url)
         is_xhs = self._is_xhs(url) or self._is_xhs(page.final_url)
         xhs_login_wall = is_xhs and _is_xhs_login_wall(page.final_url)
         is_wechat = self._is_wechat(url) or self._is_wechat(page.final_url)
@@ -3537,28 +3568,37 @@ class LinkPreviewService:
         return result
 
     def _preview_one(self, url: str, deadline: float, share_text: str = "") -> dict[str, Any]:
-        key = self._url_key(url)
+        is_meituan_share = self._is_meituan_share_link(url)
+        # meituan-share 的缓存读写都走 URL + 分享文本哈希的派生键（见
+        # _preview_cache_key）；其他链路保持 URL 单键。
+        cache_key = self._preview_cache_key(url, share_text) if is_meituan_share else ""
+        key = cache_key or self._url_key(url)
         lock_entry = self._acquire_key_lock(key, deadline)
         try:
-            cached = self._load_cache(url, deadline)
+            if cache_key:
+                cached = self._load_cache(url, deadline, cache_key=cache_key)
+            else:
+                cached = self._load_cache(url, deadline)
             if cached is not None:
                 return cached
             xhs_login_generation = (
                 self._xhs_login_generation_snapshot() if self._is_xhs(url) else None
             )
-            if self._is_meituan_share_link(url):
+            if is_meituan_share:
                 # 美团/点评门店分享：文本正则 + 短链 302 解析，免登录；失败只
                 # 降级不回落通用抓取（门店页反爬外壳不能入库成卡片）。
                 page = self._fetch_meituan_page(url, deadline, share_text)
             else:
                 page = self._fetch_page(url, deadline)
+            persist_kwargs = {"cache_key": cache_key} if cache_key else {}
             if xhs_login_generation is None:
-                return self._persist_page(url, page, deadline)
+                return self._persist_page(url, page, deadline, **persist_kwargs)
             return self._persist_page(
                 url,
                 page,
                 deadline,
                 xhs_login_generation=xhs_login_generation,
+                **persist_kwargs,
             )
         finally:
             self._release_key_lock(key, lock_entry)
@@ -3577,7 +3617,7 @@ class LinkPreviewService:
                 try:
                     preview = self._preview_one(url, deadline, share_text=text)
                     previews.append(preview)
-                    protected_keys.add(self._url_key(url))
+                    protected_keys.add(self._preview_cache_key(url, text))
                     cache_urls = preview.get("image_cache_urls")
                     if not isinstance(cache_urls, list):
                         cache_urls = [preview.get("image_cache_url")]

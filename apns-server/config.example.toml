@@ -244,6 +244,7 @@ max_cache_bytes = 256000000
 # 美团/点评门店分享（dpurl.cn 短链、meituan.com/shop、dianping.com/shop）走内置
 # 免登录解析：分享文本正则提取店名/人均/区域/地址 + 移动 UA 跟 302 拿 shop id，
 # 无需任何配置；短链解析失败时静默降级为只展示文本提取的信息。
+# 缓存按「链接 + 分享文本哈希」隔离：同一链接配不同分享文案各成卡片，互不串数据。
 
 # 小红书 cookie/API 抓取器与 Windows Playwright 节点都是显式可选的 JSON
 # adapter，均接收 POST {"url":"..."}。未配置或离线时聊天会安全降级，不受影响。
