@@ -226,6 +226,9 @@ class KairosRecallCardTest(unittest.TestCase):
         handler._apples_room_global_allowed = lambda *_args: True
         handler._apples_record_global = lambda *_args: None
         handler._apples_emit_drop_system_msg = lambda *_args, **_kwargs: None
+        # 未读游标注入由 _apples_cursor_test.py 专测; 本用例聚焦 recall 边界, 保持旧行为
+        handler._apples_unread_block = lambda *_args, **_kwargs: ("", "")
+        handler._apples_cursor_store = lambda: mock.MagicMock()
 
         handler._dispatch_apples_mentions(
             {"ts": "human-turn", "text": "@Kairos 还记得吗"},

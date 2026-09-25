@@ -79,6 +79,13 @@ def make_handler():
     def _group_reply_marker(self, member_id, user_ts):
         return f"[{member_id}|{user_ts}]"
 
+    def _apples_unread_block(self, member_id, chat, trigger_ts):
+        # 未读游标注入由 _apples_cursor_test.py 专测; 本文件聚焦派发守卫, 保持旧行为
+        return "", ""
+
+    def _apples_cursor_store(self):
+        return MagicMock()
+
     # Wire methods
     bound = {
         "_chat_for_contact": _chat_for_contact,
@@ -90,6 +97,8 @@ def make_handler():
         "_link_context_from_record": _link_context_from_record,
         "_remember_group_reply": _remember_group_reply,
         "_group_reply_marker": _group_reply_marker,
+        "_apples_unread_block": _apples_unread_block,
+        "_apples_cursor_store": _apples_cursor_store,
     }
     # Grab actual Handler methods we want to test
     for name in [
