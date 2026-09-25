@@ -261,7 +261,9 @@ max_cache_bytes = 256000000
 enabled = true
 sample_interval_seconds = 60
 # multiplier = 2.0
-# data_path = "~/CcCompanion/apns-server/tokens/fable_quota.json"  # 默认 tokens/ 下
+# data_path 必须写绝对路径：代码用 Path() 直接打开，不做 ~ 展开，
+# 写 "~" 会落到字面名为 ~ 的相对目录。不配置时默认 tokens/fable_quota.json。
+# data_path = "/root/CcCompanion/apns-server/tokens/fable_quota.json"
 
 [auth]
 # Android 首次登录接口 POST /login 使用。

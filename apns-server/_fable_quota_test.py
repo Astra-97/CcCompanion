@@ -6,9 +6,11 @@ Covers:
 3. accounting— 定稿口径: Fable delta ×2 计入, 非 Fable 忽略但锚点推进,
                首样本只锚定不记账, 估计值 clamp [0,100]
 4. reset     — 7d% 下降 / resets_at 变化 → 周重置清零重记, 新周存量归当前模型
-5. persist   — JSON 落盘 + 重载恢复, 损坏文件从头开始
-6. handler   — GET /fable-quota: tracker 缺失 503, 正常 200 带口径字段
-7. sampler   — tmux option 读取容错 (非零退出/坏 JSON/超大), loop 单 tick 记账
+5. pseudo    — F1 回归: fallback→实测迁移/resets_at 间歇缺失 flap 不伪重置暴冲,
+               两端均实测的 resets_at 变化仍判跨周, 旧状态文件缺 source 字段保守处理
+6. persist   — JSON 落盘 + 重载恢复, 损坏文件从头开始
+7. handler   — GET /fable-quota: tracker 缺失 503, 正常 200 带口径字段
+8. sampler   — tmux option 读取容错 (非零退出/坏 JSON/超大), loop 单 tick 记账
 """
 from __future__ import annotations
 
@@ -184,6 +186,81 @@ class WeekResetTests(unittest.TestCase):
         self.assertEqual(end - start, WEEK)
         # 当周五 20:00 北京已过 19:00 → 本周起点就是当天 19:00 北京 = 11:00 UTC
         self.assertEqual(start, friday_noon_utc - 3600)
+
+
+class PseudoResetTests(unittest.TestCase):
+    """F1 回归: resets_at 间歇缺失 / fallback→实测迁移不得触发伪周重置暴冲。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tracker = fable_quota.FableQuotaTracker(
+            Path(self._tmp.name) / "fable_quota.json"
+        )
+
+    def test_fallback_to_first_real_reset_is_silent_anchor_correction(self):
+        # 审核用例①: 兜底阶段积累估计后, 首个带 resets_at 的样本到达
+        # 不得清零暴冲 (旧实现 43%×2 → 86.0)。
+        self.tracker.ingest(_sample("Fable 5.1", 40))  # 无 resets_at → fallback 锚
+        event = self.tracker.ingest(_sample("Fable 5.1", 42))
+        self.assertEqual(event["kind"], "credit")
+        self.assertAlmostEqual(self.tracker.snapshot()["fable_estimate_pct"], 4.0)
+        # 首个实测 resets_at 样本: 只静默校正锚点, 按 delta 正常记账
+        event = self.tracker.ingest(_sample("Fable 5.1", 43, resets_at=T0 + WEEK))
+        self.assertEqual(event["kind"], "credit")
+        self.assertTrue(event["anchor_corrected"])
+        self.assertAlmostEqual(event["credited"], 2.0)
+        self.assertAlmostEqual(self.tracker.snapshot()["fable_estimate_pct"], 6.0)
+        # 锚点已切到实测来源
+        week = self.tracker.snapshot()["week"]
+        self.assertEqual(week["reset_at"], T0 + WEEK)
+        self.assertEqual(week["reset_source"], "statusline")
+
+    def test_intermittent_resets_at_flap_does_not_pseudo_reset(self):
+        # 审核用例②: resets_at 间歇缺失 → known 在真实值与兜底值间 flap,
+        # 恢复实测时不得重复伪重置 (旧实现 est 暴冲 84.0)。
+        self.tracker.ingest(_sample("Fable 5.1", 40, resets_at=T0 + WEEK))
+        self.tracker.ingest(_sample("Fable 5.1", 41, resets_at=T0 + WEEK))
+        self.assertAlmostEqual(self.tracker.snapshot()["fable_estimate_pct"], 2.0)
+        # 缺 resets_at 的样本: 锚点翻成 fallback 值, 但不算跨周
+        event = self.tracker.ingest(_sample("Fable 5.1", 41))
+        self.assertEqual(event["kind"], "noop")
+        # 恢复 resets_at: 与 known (fallback) 不等但来源是 fallback → 不伪重置
+        event = self.tracker.ingest(_sample("Fable 5.1", 42, resets_at=T0 + WEEK))
+        self.assertEqual(event["kind"], "credit")
+        self.assertTrue(event["anchor_corrected"])
+        self.assertAlmostEqual(event["credited"], 2.0)
+        self.assertAlmostEqual(self.tracker.snapshot()["fable_estimate_pct"], 4.0)
+
+    def test_fallback_anchor_never_rolls_week(self):
+        # fallback → fallback: 两端都不是实测, 永不判跨周
+        self.tracker.ingest(_sample("Fable 5.1", 40, ts=T0))
+        event = self.tracker.ingest(_sample("Fable 5.1", 45, ts=T0 + 8 * 86400))
+        self.assertNotEqual(event["kind"], "week_reset")
+        self.assertAlmostEqual(self.tracker.snapshot()["fable_estimate_pct"], 10.0)
+
+    def test_real_reset_change_still_rolls_after_correction(self):
+        # 校正到实测锚点后, 真正的 resets_at 变化 (两端均实测) 仍判跨周
+        self.tracker.ingest(_sample("Fable 5.1", 40))  # fallback 锚
+        self.tracker.ingest(_sample("Fable 5.1", 41, resets_at=T0 + WEEK))
+        event = self.tracker.ingest(_sample("Fable 5.1", 3, resets_at=T0 + 2 * WEEK))
+        self.assertEqual(event["kind"], "week_reset")
+        self.assertAlmostEqual(event["credited"], 6.0)
+
+    def test_reload_legacy_state_without_source_is_conservative(self):
+        # 升级前的旧状态文件没有 week_reset_source: 视为非实测锚点,
+        # 首个 resets_at 变化只校正不暴冲 (真实跨周由 pct 下降路径兜底)。
+        path = Path(self._tmp.name) / "fable_quota.json"
+        self.tracker.ingest(_sample("Fable 5.1", 40, resets_at=T0 + WEEK))
+        self.tracker.ingest(_sample("Fable 5.1", 45, resets_at=T0 + WEEK))
+        stored = json.loads(path.read_text())
+        del stored["week_reset_source"]
+        path.write_text(json.dumps(stored))
+        reloaded = fable_quota.FableQuotaTracker(path)
+        event = reloaded.ingest(_sample("Fable 5.1", 46, resets_at=T0 + 2 * WEEK))
+        self.assertNotEqual(event["kind"], "week_reset")
+        self.assertTrue(event["anchor_corrected"])
+        self.assertAlmostEqual(event["credited"], 2.0)
 
 
 class PersistenceTests(unittest.TestCase):

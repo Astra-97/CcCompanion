@@ -16,6 +16,11 @@
   → 肥波估计 += delta × 2; 非 Fable → 忽略 (锚点照常推进)。
 - 7d% 下降或 resets_at 变化 → 视为周重置: 肥波计数清零重记, 当前样本的
   7d% 作为新周已发生量, 按当前样本模型归属 (Fable 则 ×2 计入)。
+- 周重置判定只看 statusline 实测锚点: ``week_reset_at`` 记录来源
+  (``week_reset_source`` = statusline / fallback), 仅当新旧两端 resets_at
+  都来自 statusline 实测且不等才判跨周; fallback → 实测的首次迁移只静默
+  校正锚点, 不清零不暴冲 (resets_at 间歇缺失时 known 在真实值与兜底值间
+  flap 也不再触发伪重置)。
 - 周窗起止以 statusline 的 seven_day.resets_at 为准 ([reset-7d, reset]);
   拿不到时回落到配置的每周刷新点 (默认周五 19:00, UTC+8)。
 """
@@ -38,7 +43,7 @@ METHODOLOGY = (
     "肥波估计口径 (2026-09-25 Astra 定稿): 周期采样 Claude Code statusline 的"
     " 7d% (账号级, 经 tmux @claude-code-status-json 单源去重); 7d% 每上涨 delta"
     " 且该样本模型为 Fable 家族时, 肥波估计 += delta×2; 非 Fable 不记; 7d% 下降"
-    " 或周重置点变化时清零重记。估计值 ≠ 官方额度, 仅供参考。"
+    " 或实测周重置点变化时清零重记。估计值 ≠ 官方额度, 仅供参考。"
 )
 
 _DEFAULT_TZ = timezone(timedelta(hours=8))  # Asia/Shanghai, 配置兜底用
@@ -168,6 +173,7 @@ class FableQuotaTracker:
         self._state: dict[str, Any] = {
             "week_start_at": None,
             "week_reset_at": None,
+            "week_reset_source": None,  # statusline 实测 / fallback 推算
             "fable_estimate_pct": 0.0,
             "last_seven_day_pct": None,
             "last_sample": None,
@@ -231,15 +237,33 @@ class FableQuotaTracker:
             week_start, week_reset = self._week_window_locked(sample)
             last_pct = state.get("last_seven_day_pct")
             known_reset = state.get("week_reset_at")
-            event = {"kind": "noop", "delta": 0.0, "credited": 0.0}
+            known_source = state.get("week_reset_source")
+            sample_reset = sample.get("seven_day_resets_at")
+            has_reset = bool(sample_reset)
+            event = {
+                "kind": "noop", "delta": 0.0, "credited": 0.0,
+                "anchor_corrected": False,
+            }
 
             is_first = last_pct is None
+            # 仅当新旧两端 resets_at 都来自 statusline 实测且不等才判跨周。
+            # fallback → 实测的首次迁移 (或 resets_at 间歇缺失导致的 flap)
+            # 只静默校正锚点, 不清零、不把存量 ×2 记到当前模型头上。
             week_rolled = bool(
                 not is_first
-                and sample.get("seven_day_resets_at")
+                and has_reset
                 and known_reset
-                and float(sample["seven_day_resets_at"]) != float(known_reset)
+                and known_source == "statusline"
+                and float(sample_reset) != float(known_reset)
             )
+            anchor_corrected = bool(
+                not is_first
+                and not week_rolled
+                and has_reset
+                and known_reset
+                and float(sample_reset) != float(known_reset)
+            )
+            event["anchor_corrected"] = anchor_corrected
             pct_dropped = bool(not is_first and pct < float(last_pct) - 1e-9)
 
             if is_first:
@@ -270,6 +294,7 @@ class FableQuotaTracker:
             )
             state["week_start_at"] = week_start
             state["week_reset_at"] = week_reset
+            state["week_reset_source"] = "statusline" if has_reset else "fallback"
             state["last_seven_day_pct"] = pct
             sample_view = {
                 "ts": sample["ts"],
@@ -307,6 +332,7 @@ class FableQuotaTracker:
             "week": {
                 "start_at": state.get("week_start_at"),
                 "reset_at": state.get("week_reset_at"),
+                "reset_source": state.get("week_reset_source"),
                 "start_bj": self._fmt_bj(state.get("week_start_at")),
                 "reset_bj": self._fmt_bj(state.get("week_reset_at")),
             },

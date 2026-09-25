@@ -27696,7 +27696,11 @@ def run_server(state: ServerState):
     # 肥波额度估计采样器：周期读 statusline 的 tmux 全局 option 记账，
     # daemon 线程随服务进程退出，无需单独 stop 通道。
     fable_tracker = getattr(state, "fable_quota_tracker", None)
-    if fable_tracker is not None:
+    sampler_alive = any(
+        t.name == "fable-quota-sampler" and t.is_alive()
+        for t in threading.enumerate()
+    )
+    if fable_tracker is not None and not sampler_alive:
         threading.Thread(
             target=fable_quota.sampler_loop,
             args=(fable_tracker,),
