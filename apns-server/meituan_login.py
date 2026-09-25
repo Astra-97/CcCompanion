@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 import re
 import secrets
 import subprocess
@@ -40,6 +41,8 @@ MEITUAN_LOGIN_ORIGIN = "cccompanion-android-webview-v1"
 DEFAULT_TTL_SECONDS = 300
 DEFAULT_ALLOWED_CONTACTS = frozenset({"kairos", "kimi"})
 MAX_COOKIE_HEADER_BYTES = 16_000
+
+logger = logging.getLogger("cc-apns-server")
 MAX_COOKIE_VALUE_CHARS = 8_192
 MAX_PENDING_SESSIONS = 16
 # 固定尾参 "main"：远端注入端改用主站判据（i.meituan.com）复验。
@@ -271,14 +274,22 @@ class MeituanLoginManager:
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
+            logger.warning("meituan cookie import failed: runner error", exc_info=True)
             raise MeituanLoginError(502, "sync_failed", "cookie sync failed") from None
-        if result.returncode != 0:
-            raise MeituanLoginError(502, "sync_failed", "cookie sync failed")
+        # The remote helper only ever emits cookie *names* and status codes,
+        # so its stdout/stderr are safe to log for diagnosis (values never
+        # leave the request body / subprocess stdin).
         try:
             response = json.loads((result.stdout or b"").decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            raise MeituanLoginError(502, "sync_failed", "cookie sync failed") from None
-        if not isinstance(response, dict) or response.get("ok") is not True:
+            response = None
+        if result.returncode != 0 or not isinstance(response, dict) or response.get("ok") is not True:
+            logger.warning(
+                "meituan cookie import failed: rc=%s remote=%r stderr=%r",
+                result.returncode,
+                response,
+                (result.stderr or b"").decode("utf-8", errors="replace")[:500],
+            )
             raise MeituanLoginError(502, "sync_failed", "cookie sync failed")
         # A successful import flips the card gate on the next probe.
         self._needs_login_cache = None
