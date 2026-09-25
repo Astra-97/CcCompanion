@@ -88,6 +88,37 @@ XIACHUFANG_HOSTS = {
     "www.xiachufang.com",
     "m.xiachufang.com",
 }
+MEITUAN_SHORTLINK_HOSTS = {
+    "dpurl.cn",
+    "www.dpurl.cn",
+}
+MEITUAN_HOSTS = {
+    "meituan.com",
+    "www.meituan.com",
+    "m.meituan.com",
+    "dianping.com",
+    "www.dianping.com",
+    "m.dianping.com",
+    "h5.dianping.com",
+}
+# 美团/点评门店分享卡片：店名/人均/区域/地址主要来自分享文本正则，
+# 短链 302 仅用于补 canonical URL 与 shop id。移动 UA 即可拿到跳转，
+# 全程不依赖美团登录态；登录态增强（团购套餐等）后续在
+# LinkPreviewService._fetch_meituan_page 内扩展。
+MEITUAN_MOBILE_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 "
+    "Mobile/15E148 Safari/604.1"
+)
+_MEITUAN_PRICE_RE = re.compile(r"[¥￥]\s*\d+(?:\.\d+)?\s*/\s*人")
+_MEITUAN_PRICE_ALT_RE = re.compile(r"人均\s*[¥￥]?\s*(\d+(?:\.\d+)?)\s*元?")
+_MEITUAN_REGION_RE = re.compile(r"^[^\d\s，,。.;；:：、（）()]{2,15}(?:区|县|市|旗)$")
+# 「道/中心」这类单字常出现在店名里（足道、体检中心），地址只认更特异的
+# 形态；剩余的兜底归属交给 parse_meituan_share_text 的顺序逻辑。
+_MEITUAN_ADDRESS_RE = re.compile(
+    r"(?:\d+\s*号|路|街|巷|弄|大道|胡同|广场|大厦|\d+\s*[栋座楼层])"
+)
+_MEITUAN_SHOP_ID_RE = re.compile(r"/(?:shop(?:share)?|poi)/(\d{4,25})(?:\.html)?(?:/|$)")
 MAX_TITLE = 300
 MAX_DESCRIPTION = 800
 MAX_PAGE_IMAGES = 18
@@ -99,6 +130,7 @@ BILIBILI_CACHE_SCHEMA_VERSION = 1
 # Recipe extraction deliberately has its own schema: unlike generic previews,
 # its body is constructed only from a trusted Recipe JSON-LD node.
 XIACHUFANG_CACHE_SCHEMA_VERSION = 1
+MEITUAN_CACHE_SCHEMA_VERSION = 1
 DNS_WORKERS = 4
 DNS_QUEUE_SIZE = 8
 
@@ -265,6 +297,70 @@ def clean_shared_link_text(text: str) -> str:
     cleaned = re.sub(r"(?:\n\s*){3,}", "\n\n", "\n".join(kept)).strip()
     # 防御：万一清空了整条消息，回退原文，绝不让用户消息凭空消失。
     return cleaned or value
+
+
+def parse_meituan_share_text(text: Any) -> dict[str, str]:
+    """从美团/点评分享文本提取店名/人均/区域/地址，字段缺失时留空。
+
+    典型格式：「店名 店名,¥170/人,皇姑区,皇姑区昆山中路5号 <链接>」。分隔符
+    混用中英文逗号/换行，店名常在同一格里空格重复两遍。只在已确认消息含有
+    美团/点评链接时调用，纯聊天文本不会走到这里。
+    """
+    result = {"name": "", "avg_price": "", "region": "", "address": ""}
+    value = URL_RE.sub(" ", str(text or ""))
+    if not value.strip():
+        return result
+    segments: list[str] = []
+    for raw in re.split(r"[\r\n,，、;；]+", value):
+        segment = re.sub(r"\s+", " ", raw).strip(" ·|")
+        if not segment:
+            continue
+        # 同一格里空格隔开的重复店名（「店名 店名」）收敛成一份。
+        parts = [part for part in segment.split(" ") if part]
+        if len(parts) > 1 and len(set(parts)) == 1:
+            segment = parts[0]
+        if segments and segments[-1] == segment:
+            continue
+        segments.append(segment)
+    text_segments: list[str] = []
+    for segment in segments[:40]:
+        price = _MEITUAN_PRICE_RE.search(segment)
+        if price is not None:
+            if not result["avg_price"]:
+                result["avg_price"] = re.sub(r"\s+", "", price.group(0))
+            segment = (segment[: price.start()] + " " + segment[price.end() :]).strip(" ·|")
+        else:
+            alt = _MEITUAN_PRICE_ALT_RE.search(segment)
+            if alt is not None:
+                if not result["avg_price"]:
+                    result["avg_price"] = f"¥{alt.group(1)}/人"
+                segment = (segment[: alt.start()] + " " + segment[alt.end() :]).strip(" ·|")
+        if segment:
+            text_segments.append(segment)
+    for segment in text_segments[:20]:
+        is_region = bool(_MEITUAN_REGION_RE.fullmatch(segment))
+        is_address = bool(_MEITUAN_ADDRESS_RE.search(segment))
+        if is_region and not result["region"]:
+            result["region"] = segment[:30]
+        elif is_address and not result["address"]:
+            result["address"] = segment[:150]
+        elif not result["name"] and not is_address:
+            # 地址形态的格子绝不顶进店名位（店名缺失时宁空不错）。
+            result["name"] = segment[:80]
+        elif not result["address"] and not is_region:
+            result["address"] = segment[:150]
+    return result
+
+
+def _meituan_shop_id_from_url(value: Any) -> str:
+    if not isinstance(value, str) or len(value) > 4_096:
+        return ""
+    try:
+        path = urlsplit(value.strip()).path
+    except ValueError:
+        return ""
+    match = _MEITUAN_SHOP_ID_RE.search(path)
+    return match.group(1) if match else ""
 
 
 def _metadata_url(url: str) -> str:
@@ -2345,6 +2441,8 @@ class LinkPreviewService:
                 and meta.get("schema_version") != XIACHUFANG_CACHE_SCHEMA_VERSION
             ):
                 return None
+            if self._is_meituan(url) and meta.get("schema_version") != MEITUAN_CACHE_SCHEMA_VERSION:
+                return None
             if not self._cached_image_paths_are_valid(meta):
                 return None
             # Renew before exposing the path.  The atomic sidecar replacement is
@@ -2654,6 +2752,31 @@ class LinkPreviewService:
             return False
         return host in X_HOSTS
 
+    @staticmethod
+    def _is_meituan(url: str) -> bool:
+        try:
+            host = (urlsplit(url).hostname or "").lower().rstrip(".")
+        except ValueError:
+            return False
+        return (
+            host in MEITUAN_SHORTLINK_HOSTS
+            or host in MEITUAN_HOSTS
+            or host.endswith(".meituan.com")
+            or host.endswith(".dianping.com")
+        )
+
+    @staticmethod
+    def _is_meituan_share_link(url: str) -> bool:
+        """dpurl.cn 短链或美团/点评门店页；其他 meituan 链接仍走通用抓取。"""
+        try:
+            parts = urlsplit(url)
+            host = (parts.hostname or "").lower().rstrip(".")
+        except ValueError:
+            return False
+        if host in MEITUAN_SHORTLINK_HOSTS:
+            return True
+        return LinkPreviewService._is_meituan(url) and "/shop" in parts.path
+
     def _fetch_bilibili_page(self, url: str, deadline: float) -> ExtractedPage:
         """B站视频页走免登录公开 API：详情 view + 评论 reply。"""
         # 2026-09 实测：从服务器 IP 带浏览器 UA 必吃 412 风控页，fetcher 默认
@@ -2916,6 +3039,84 @@ class LinkPreviewService:
                 last_error = exc
         raise last_error or LinkPreviewError("WeChat article fetch failed")
 
+    def _resolve_meituan_shop(self, url: str, deadline: float) -> tuple[str, str]:
+        """跟随短链 302 拿 canonical 门店 URL 与 shop id；失败静默返回空串。
+
+        只需最终 URL，不需要正文，所以小预算截断下载。移动 UA 下 dpurl.cn
+        免登录 302 到 meituan.com/shop/<id>.html；不带任何 Cookie/凭证，最终
+        落地主机必须是美团/点评系，否则视为解析失败。
+        """
+        try:
+            payload = self.fetcher.request(
+                url,
+                deadline=deadline,
+                headers={
+                    "User-Agent": MEITUAN_MOBILE_UA,
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                },
+                max_bytes=60_000,
+                truncate_at_limit=True,
+            )
+        except LinkPreviewError:
+            return "", ""
+        final_url = _metadata_url(payload.url)
+        if not final_url or not self._is_meituan(final_url):
+            return "", ""
+        return final_url, _meituan_shop_id_from_url(final_url)
+
+    def _fetch_meituan_page(self, url: str, deadline: float, share_text: str = "") -> ExtractedPage:
+        """美团/点评门店分享卡片：文本正则为主，短链解析补 canonical URL。
+
+        免登录。短链解析失败时静默降级为只展示文本提取的信息；两者都拿不到
+        才放弃（门店页有反爬外壳，绝不回落通用抓取入库）。后续登录态增强
+        （团购套餐等）可在拿到 shop id 后在此扩展。
+        """
+        fields = parse_meituan_share_text(share_text)
+        resolved_url, shop_id = self._resolve_meituan_shop(url, deadline)
+        canonical_url = ""
+        if shop_id:
+            # 拿到 shop id 就回构干净的门店 URL（移动 UA 下 www 常再跳到
+            # i.meituan.com/poi/<id>；id 与 /shop/<id>.html 一致）。
+            try:
+                resolved_host = (urlsplit(resolved_url or url).hostname or "").lower()
+            except ValueError:
+                resolved_host = ""
+            if resolved_host.endswith("dianping.com"):
+                canonical_url = f"https://www.dianping.com/shop/{shop_id}"
+            else:
+                canonical_url = f"https://www.meituan.com/shop/{shop_id}.html"
+        if not canonical_url:
+            canonical_url = resolved_url or _metadata_url(url)
+            shop_id = shop_id or _meituan_shop_id_from_url(canonical_url)
+        if not any(fields.values()) and not shop_id:
+            raise LinkPreviewError("Meituan share had no extractable fields")
+        title = fields["name"] or "美团门店"
+        description = " · ".join(
+            item for item in (fields["avg_price"], fields["region"], fields["address"]) if item
+        )
+        body_lines: list[str] = []
+        if fields["name"]:
+            body_lines.append(f"门店：{fields['name']}")
+        if fields["avg_price"]:
+            body_lines.append(f"人均：{fields['avg_price']}")
+        if fields["region"]:
+            body_lines.append(f"区域：{fields['region']}")
+        if fields["address"]:
+            body_lines.append(f"地址：{fields['address']}")
+        if shop_id:
+            body_lines.append(f"门店 ID：{shop_id}")
+        body_lines.append(f"门店链接：{canonical_url}")
+        return ExtractedPage(
+            requested_url=url,
+            final_url=canonical_url,
+            title=_metadata_text(title, MAX_TITLE),
+            description=_metadata_text(description, MAX_DESCRIPTION),
+            site_name="美团·大众点评",
+            image_url="",
+            body_text="\n".join(body_lines)[: self.max_text_chars],
+            provider="meituan-share",
+        )
+
     def _fetch_page(self, url: str, deadline: float) -> ExtractedPage:
         try:
             xiachufang_recipe_path = (
@@ -3081,6 +3282,7 @@ class LinkPreviewService:
         is_wechat = self._is_wechat(url) or self._is_wechat(page.final_url)
         is_bilibili = self._is_bilibili(url) or self._is_bilibili(page.final_url)
         is_xiachufang_recipe = self._is_xiachufang_recipe(url) or self._is_xiachufang_recipe(page.final_url)
+        is_meituan = self._is_meituan(url) or self._is_meituan(page.final_url)
         remote_image_urls = list(page.image_urls or ((page.image_url,) if page.image_url else ()))[:MAX_PAGE_IMAGES]
         source_urls = (url, page.final_url, *remote_image_urls)
         safe_requested_url = _redact_url_echoes(_metadata_url(url), *source_urls)
@@ -3158,6 +3360,8 @@ class LinkPreviewService:
                 if is_bilibili
                 else XIACHUFANG_CACHE_SCHEMA_VERSION
                 if is_xiachufang_recipe
+                else MEITUAN_CACHE_SCHEMA_VERSION
+                if is_meituan
                 else GENERIC_CACHE_SCHEMA_VERSION
             ),
             "url": safe_requested_url,
@@ -3332,7 +3536,7 @@ class LinkPreviewService:
         result["content_url"] = f"/attachments/{text_path.name}"
         return result
 
-    def _preview_one(self, url: str, deadline: float) -> dict[str, Any]:
+    def _preview_one(self, url: str, deadline: float, share_text: str = "") -> dict[str, Any]:
         key = self._url_key(url)
         lock_entry = self._acquire_key_lock(key, deadline)
         try:
@@ -3342,7 +3546,12 @@ class LinkPreviewService:
             xhs_login_generation = (
                 self._xhs_login_generation_snapshot() if self._is_xhs(url) else None
             )
-            page = self._fetch_page(url, deadline)
+            if self._is_meituan_share_link(url):
+                # 美团/点评门店分享：文本正则 + 短链 302 解析，免登录；失败只
+                # 降级不回落通用抓取（门店页反爬外壳不能入库成卡片）。
+                page = self._fetch_meituan_page(url, deadline, share_text)
+            else:
+                page = self._fetch_page(url, deadline)
             if xhs_login_generation is None:
                 return self._persist_page(url, page, deadline)
             return self._persist_page(
@@ -3366,7 +3575,7 @@ class LinkPreviewService:
         try:
             for url in urls:
                 try:
-                    preview = self._preview_one(url, deadline)
+                    preview = self._preview_one(url, deadline, share_text=text)
                     previews.append(preview)
                     protected_keys.add(self._url_key(url))
                     cache_urls = preview.get("image_cache_urls")
