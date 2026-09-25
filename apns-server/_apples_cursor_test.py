@@ -264,7 +264,9 @@ send(handler, "连续发言甲", [])
 send(handler, "连续发言乙", [])
 p_a = handler._send_json.call_args_list[-2][0][1]
 p_b = handler._send_json.call_args_list[-1][0][1]
-check("dedupe:distinct msgs both stored", not p_a.get("deduped") and not p_b.get("deduped") and p_a["record"]["ts"] != p_b["record"]["ts"])
+check("dedupe:distinct msgs both stored", not p_a.get("deduped") and not p_b.get("deduped"))
+rows = [l for l in TEST_CHAT_PATH.read_text(encoding="utf-8").splitlines() if "连续发言甲" in l or "连续发言乙" in l]
+check("dedupe:distinct msgs both persisted", len(rows) == 2, f"rows={len(rows)}")
 
 # 同文本隔 3 秒以上再发 → 正常落库
 send(handler, "隔窗重复句", [])

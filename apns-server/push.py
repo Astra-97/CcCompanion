@@ -6554,6 +6554,8 @@ class PushHandler(BaseHTTPRequestHandler):
             return "kairos"
         if lowered.startswith("group:xiaoke") or "xiaoke" in lowered or "ccc-stop-hook" in lowered:
             return "xiaoke"
+        if lowered.startswith("group:kimi") or "kimi" in lowered:
+            return "kimi"
         return None
 
     def _handle_chat_members(self):
