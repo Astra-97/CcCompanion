@@ -67,19 +67,39 @@ DEFAULT_STATUS_CACHE_SECONDS = 300
 # Unknown fields are dropped rather than forwarded to the privileged remote
 # helper.  ``token`` is the account session cookie sms_meituan.py treats as
 # the login-success signal.
+# 2026-09-25 放宽：主站「我的」页只放行 12 个时复验不过（verify_failed），
+# 补齐登录后 mttouch/passport 现场实际存在的名字（实测自 CDP cookie 罐）。
 COOKIE_ALLOWLIST = frozenset({
     "token",
     "u",
     "uuid",
+    "iuuid",
     "openh5_uuid",
     "_lxsdk_cuid",
     "_lxsdk",
     "_lxsdk_s",
+    "_lx_utm",
     "_hc.v",
     "JSESSIONID",
+    "IJSESSIONID",
     "cityid",
+    "ci",
+    "cityname",
     "lng",
     "lat",
+    "latlng",
+    "logan_session_token",
+    "logintype",
+    "mt_c_token",
+    "isid",
+    "isIframe",
+    "WEBDFPID",
+    "au_trace_key_net",
+    "swim_line",
+    "oops",
+    "utm_source",
+    "utm_source_rg",
+    "wm_order_channel",
 })
 REQUIRED_COOKIES = ("token",)
 COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
