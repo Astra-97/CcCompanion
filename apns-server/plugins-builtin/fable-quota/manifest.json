@@ -1,0 +1,7 @@
+{
+  "id": "fable-quota",
+  "name": "肥波额度",
+  "version": "0.1.0",
+  "description": "肥波 (Fable) 周额度估计：采样 Claude Code statusline 的账号级 7d%，仅 Fable 家族模型的用量按 ×2 记账，与官方 7d% 对照展示。数据来自服务端 GET /fable-quota。",
+  "entry": "index.html"
+}

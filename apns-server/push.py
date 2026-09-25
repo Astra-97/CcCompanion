@@ -133,6 +133,7 @@ import translate_api
 import voice_acoustics
 import voice_gemini
 import voice_message
+import fable_quota
 from health_records import (
     PERIOD_RECORD_TYPES,
     format_health_context_prompt,
@@ -4747,6 +4748,26 @@ class ServerState:
             self.deliver_trigger,
             tick_seconds=float(server_cfg.get("tool_dispatcher_tick_seconds", 20)),
         )
+        # 肥波 (Fable) 周额度估计 — statusline 采样, 口径见 fable_quota.py。
+        fable_cfg = config.get("fable_quota", {})
+        if not isinstance(fable_cfg, dict):
+            fable_cfg = {}
+        self.fable_quota_enabled: bool = bool(fable_cfg.get("enabled", True))
+        self.fable_quota_interval: float = float(
+            fable_cfg.get("sample_interval_seconds", 60)
+        )
+        self.fable_quota_tracker: fable_quota.FableQuotaTracker | None = None
+        if self.fable_quota_enabled:
+            fable_data_path = fable_cfg.get("data_path") or str(
+                Path(self.token_store_path).parent / "fable_quota.json"
+            )
+            try:
+                self.fable_quota_tracker = fable_quota.FableQuotaTracker(
+                    fable_data_path,
+                    multiplier=float(fable_cfg.get("multiplier", 2.0)),
+                )
+            except Exception:
+                logger.exception("fable quota tracker init failed")
         # 服务器启动时间 (unix timestamp) — 用于 uptime 计算
         self.started_at: float = time.time()
         # 完整 config 引用 (anthropic dashboard url 等)
@@ -7497,6 +7518,10 @@ class PushHandler(BaseHTTPRequestHandler):
         # --- User Settings GET ---
         if self.path == "/user-settings":
             self._handle_user_settings_get()
+            return
+        # --- Fable (肥波) 周额度估计 GET ---
+        if self.path == "/fable-quota":
+            self._handle_fable_quota_get()
             return
         # --- Uploads static file serving ---
         if self.path.startswith("/uploads/"):
@@ -25124,6 +25149,18 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.exception("user settings get fail")
             self._send_json(500, {"error": str(e)})
 
+    def _handle_fable_quota_get(self):
+        """GET /fable-quota - 肥波 (Fable) 周额度估计快照。鉴权走 do_GET 顶层 _require_auth。"""
+        tracker = getattr(self.state, "fable_quota_tracker", None)
+        if tracker is None:
+            self._send_json(503, {"ok": False, "error": "fable_quota_disabled"})
+            return
+        try:
+            self._send_json(200, {"ok": True, **tracker.snapshot()})
+        except Exception as e:
+            logger.exception("fable quota get fail")
+            self._send_json(500, {"ok": False, "error": str(e)})
+
     # ------------------------------------------------------------------
 
     def _handle_chat_delete(self, body: dict[str, Any]):
@@ -27656,6 +27693,19 @@ def run_server(state: ServerState):
         target=cleanup_loop, args=(state,), daemon=True, name="cleanup"
     )
     cleanup_thread.start()
+    # 肥波额度估计采样器：周期读 statusline 的 tmux 全局 option 记账，
+    # daemon 线程随服务进程退出，无需单独 stop 通道。
+    fable_tracker = getattr(state, "fable_quota_tracker", None)
+    if fable_tracker is not None:
+        threading.Thread(
+            target=fable_quota.sampler_loop,
+            args=(fable_tracker,),
+            kwargs={
+                "interval_seconds": getattr(state, "fable_quota_interval", 60.0),
+            },
+            daemon=True,
+            name="fable-quota-sampler",
+        ).start()
     # 重启孤儿回合 boot 对账：不等下一条 /chat/send，provider 可证明 idle
     # 时立刻收尾并发出 terminal SSE（后台线程，冷启动 provider 不挡 listen）。
     threading.Thread(

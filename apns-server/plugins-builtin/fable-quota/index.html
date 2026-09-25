@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>肥波额度</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <h1>肥波额度</h1>
+    <p class="hint">Fable 家族用量 ×2 的周额度估计，与官方 7d% 对照。</p>
+
+    <section id="status-box" class="card">
+      <div class="big-row">
+        <div class="metric">
+          <div class="metric-label">肥波估计</div>
+          <div class="metric-value" id="fable-pct">—</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">官方 7d</div>
+          <div class="metric-value alt" id="official-pct">—</div>
+        </div>
+      </div>
+      <div class="bar-track">
+        <div class="bar-fill" id="fable-bar"></div>
+      </div>
+      <div class="sub-row">
+        <span>当前模型：<b id="current-model">—</b></span>
+        <span id="model-badge" class="badge hidden">肥波</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>本周窗口</h2>
+      <div class="kv"><span>起始</span><b id="week-start">—</b></div>
+      <div class="kv"><span>重置</span><b id="week-reset">—</b></div>
+    </section>
+
+    <section class="card">
+      <h2>最近样本</h2>
+      <div class="kv"><span>时间</span><b id="sample-ts">—</b></div>
+      <div class="kv"><span>模型</span><b id="sample-model">—</b></div>
+      <div class="kv"><span>7d</span><b id="sample-7d">—</b></div>
+      <div class="kv"><span>5h</span><b id="sample-5h">—</b></div>
+    </section>
+
+    <section class="card">
+      <h2>口径说明</h2>
+      <p class="hint" id="methodology">—</p>
+    </section>
+
+    <p class="hint" id="error-line"></p>
+    <button id="refresh-btn" type="button">刷新</button>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,63 @@
+body {
+  margin: 0;
+  padding: 16px;
+  font-family: -apple-system, "PingFang SC", sans-serif;
+  background: #fafafa;
+  color: #222;
+}
+main { max-width: 480px; margin: 0 auto; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+h2 { font-size: 15px; margin: 0 0 8px; }
+.hint { font-size: 13px; color: #666; }
+.card {
+  background: #fff;
+  border: 1px solid #e5e5e5;
+  border-radius: 12px;
+  padding: 14px;
+  margin: 14px 0;
+}
+.big-row { display: flex; gap: 24px; }
+.metric { flex: 1; }
+.metric-label { font-size: 13px; color: #666; }
+.metric-value { font-size: 34px; font-weight: 700; margin-top: 2px; }
+.metric-value.alt { color: #555; }
+.bar-track {
+  height: 8px;
+  border-radius: 4px;
+  background: #eee;
+  margin: 12px 0 8px;
+  overflow: hidden;
+}
+.bar-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 4px;
+  background: #4a90d9;
+  transition: width 0.3s ease;
+}
+.bar-fill.hot { background: #d94a4a; }
+.sub-row { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.badge {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #e8f1fb;
+  color: #2b6cb0;
+}
+.badge.hidden { display: none; }
+.kv {
+  display: flex;
+  justify-content: space-between;
+  font-size: 14px;
+  padding: 4px 0;
+}
+.kv span { color: #666; }
+#error-line { color: #c00; min-height: 18px; }
+button {
+  padding: 8px 14px;
+  border: 1px solid #ccc;
+  border-radius: 8px;
+  background: #fff;
+  font-size: 14px;
+}
+button:active { background: #eee; }

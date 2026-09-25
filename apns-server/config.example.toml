@@ -254,6 +254,15 @@ max_cache_bytes = 256000000
 # xhs_api_token_env = "CC_LINK_PREVIEW_XHS_TOKEN"
 # windows_api_url = "https://your-optional-windows-node.example/preview"
 
+[fable_quota]
+# 肥波 (Fable) 周额度估计：周期采样 Claude Code statusline 缓存在 tmux 全局
+# option @claude-code-status-json 的账号级 7d%；7d% 上涨且当前样本模型是
+# Fable 家族时估计 += delta×2，其他模型不记；7d% 下降/周重置点变化清零重记。
+enabled = true
+sample_interval_seconds = 60
+# multiplier = 2.0
+# data_path = "~/CcCompanion/apns-server/tokens/fable_quota.json"  # 默认 tokens/ 下
+
 [auth]
 # Android 首次登录接口 POST /login 使用。
 # 不要把真实用户名、密码、GitHub token commit 到仓库；真实值只写本机 config.toml。
