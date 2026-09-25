@@ -25062,7 +25062,7 @@ class PushHandler(BaseHTTPRequestHandler):
         allowed_keys = {
             "avatar_url", "background_url", "font_size",
             "bubble_color", "theme_color", "display_name", "bot_name",
-            "appearance",
+            "appearance", "packing_list",
         }
         updates = {k: v for k, v in body.items() if k in allowed_keys}
         if "appearance" not in updates:
@@ -25085,6 +25085,11 @@ class PushHandler(BaseHTTPRequestHandler):
                 updates["appearance"] = appearance
         if "appearance" in updates and not isinstance(updates["appearance"], dict):
             self._send_json(400, {"error": "appearance must be an object"})
+            return
+        # packing_list 与 appearance 不同，不做深合并：App 总是推整份清单状态，
+        # 服务端整份替换，避免物品删除被合并逻辑复活。
+        if "packing_list" in updates and not isinstance(updates["packing_list"], dict):
+            self._send_json(400, {"error": "packing_list must be an object"})
             return
         if not updates:
             self._send_json(400, {"error": f"no valid fields provided. allowed: {', '.join(sorted(allowed_keys))}"})
