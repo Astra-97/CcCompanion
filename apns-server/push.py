@@ -9537,6 +9537,7 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "text required"})
             return
         # 2026-05-05 dedupe storm guard: client_msg_id 优先 没有则按 (sender, text) 3s 窗口
+        # 2026-09-25 命中窗口的重复不再 429: 只落库一条, 直接按已落库那条返回 (不重复派发)
         client_msg_id = body.get("client_msg_id")
         cache = getattr(type(self), "_group_dedupe_cache", None)
         if cache is None:
@@ -9547,13 +9548,14 @@ class PushHandler(BaseHTTPRequestHandler):
             cache_key = f"cmid:{client_msg_id}"
         else:
             cache_key = f"{sender_id}|{text[:200]}"
-        last_ts = cache.get(cache_key, 0)
-        if now_ts - last_ts < 3.0:
-            self._send_json(429, {"ok": False, "error": "duplicate within 3s window", "deduped": True})
+        cached = cache.get(cache_key)
+        if isinstance(cached, dict) and now_ts - float(cached.get("ts", 0)) < 3.0:
+            self._send_json(200, {"ok": True, "record": cached.get("record"), "targets": [], "deduped": True})
             return
-        cache[cache_key] = now_ts
         for k in list(cache.keys()):
-            if now_ts - cache[k] > 60:
+            entry = cache[k]
+            entry_ts = float(entry.get("ts", 0)) if isinstance(entry, dict) else float(entry)
+            if now_ts - entry_ts > 60:
                 del cache[k]
         # 2026-05-05 用户 push 加 agent 互相 @ 功能 移除 amian-only 限制
         # agent 发也 OK 走 targets_for 内 hop_count loop guard
@@ -9608,36 +9610,37 @@ class PushHandler(BaseHTTPRequestHandler):
         except ValueError as e:
             self._send_json(400, {"error": str(e)})
             return
+        cache[cache_key] = {"ts": now_ts, "record": rec}
 
         if targets:
-            context = "\n".join(self.state.group_chat.context_lines(limit=20))
             for agent_id in targets:
                 self.state.group_chat.set_typing(agent_id, True, dispatch_id=dispatch_id)
-            try:
-                subprocess.Popen(
-                    [
-                        "python3",
-                        self.state.bus_send_path,
-                        "--source", "ios-group",
-                        "--sender", sender_id,
-                        "--channel", "group",
-                        "--text", text,
-                        "--message-id", rec["id"],
-                        "--parent-msg-id", str(body.get("parent_msg_id") or ""),
-                        "--mentions", ",".join(mentions),
-                        "--to", ",".join(targets),
-                        "--context", context,
-                        "--hop-count", str(hop_count + 1),
-                        "--inject-only",
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except Exception as e:
-                logger.warning("group bus_send fail: %s", e)
-                delivery["failed"] = targets
-                delivery["targets"] = targets
-                for agent_id in targets:
+            for agent_id in targets:
+                # 2026-09-25 未读游标: 每个 target 只注入它游标之后的未读, 不再共享最后 20 条
+                context = "\n".join(self.state.group_chat.context_lines_for(agent_id))
+                try:
+                    subprocess.Popen(
+                        [
+                            "python3",
+                            self.state.bus_send_path,
+                            "--source", "ios-group",
+                            "--sender", sender_id,
+                            "--channel", "group",
+                            "--text", text,
+                            "--message-id", rec["id"],
+                            "--parent-msg-id", str(body.get("parent_msg_id") or ""),
+                            "--mentions", ",".join(mentions),
+                            "--to", agent_id,
+                            "--context", context,
+                            "--hop-count", str(hop_count + 1),
+                            "--inject-only",
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception as e:
+                    logger.warning("group bus_send fail: %s", e)
+                    delivery["failed"].append(agent_id)
                     self.state.group_chat.set_typing(agent_id, False, dispatch_id=dispatch_id)
 
         self._send_json(200, {"ok": True, "record": rec, "targets": targets})
@@ -9653,20 +9656,22 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         # 2026-05-05 dedupe storm guard: 同 sender 同 text 在 3 秒内重复 直接 reject
         # 防 ios client retry loop / double tap 把群刷爆
-        cache = getattr(self, "_group_dedupe_cache", None)
+        # 2026-09-25 命中窗口的重复不再 429: 只落库一条, 直接按已落库那条返回 (不重复派发)
+        cache = getattr(type(self), "_group_dedupe_cache", None)
         if cache is None:
             cache = {}
             type(self)._group_dedupe_cache = cache  # 类级共享
         cache_key = f"{sender_id}|{text[:200]}"
         now_ts = time.time()
-        last_ts = cache.get(cache_key, 0)
-        if now_ts - last_ts < 3.0:
-            self._send_json(429, {"ok": False, "error": "duplicate within 3s window", "deduped": True})
+        cached = cache.get(cache_key)
+        if isinstance(cached, dict) and now_ts - float(cached.get("ts", 0)) < 3.0:
+            self._send_json(200, {"ok": True, "record": cached.get("record"), "targets": [], "deduped": True})
             return
-        cache[cache_key] = now_ts
         # 清旧 entry (超过 60s 的)
         for k in list(cache.keys()):
-            if now_ts - cache[k] > 60:
+            entry = cache[k]
+            entry_ts = float(entry.get("ts", 0)) if isinstance(entry, dict) else float(entry)
+            if now_ts - entry_ts > 60:
                 del cache[k]
         mentions = self.state.group_chat.normalize_mentions(body.get("mentions"), text)
         message_type = str(body.get("message_type") or "chat").strip().lower()
@@ -9693,36 +9698,38 @@ class PushHandler(BaseHTTPRequestHandler):
         except ValueError as e:
             self._send_json(400, {"error": str(e)})
             return
+        cache[cache_key] = {"ts": now_ts, "record": rec}
         self.state.group_chat.set_typing(sender_id, False)
         # 2026-05-05 加 fan-out trigger 当 sender 是 agent + mentions 含 agent
         if targets:
             dispatch_id = f"dsp_{int(time.time() * 1000)}"
-            context = "\n".join(self.state.group_chat.context_lines(limit=20))
             for agent_id in targets:
                 self.state.group_chat.set_typing(agent_id, True, dispatch_id=dispatch_id)
-            try:
-                subprocess.Popen(
-                    [
-                        "python3",
-                        self.state.bus_send_path,
-                        "--source", "ios-group",
-                        "--sender", sender_id,
-                        "--channel", "group",
-                        "--text", text,
-                        "--message-id", rec["id"],
-                        "--parent-msg-id", str(body.get("parent_msg_id") or ""),
-                        "--mentions", ",".join(mentions),
-                        "--to", ",".join(targets),
-                        "--context", context,
-                        "--hop-count", str(hop_count + 1),
-                        "--inject-only",
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except Exception as e:
-                logger.warning("group fan-out fail: %s", e)
-                for agent_id in targets:
+            for agent_id in targets:
+                # 2026-09-25 未读游标: 每个 target 只注入它游标之后的未读, 不再共享最后 20 条
+                context = "\n".join(self.state.group_chat.context_lines_for(agent_id))
+                try:
+                    subprocess.Popen(
+                        [
+                            "python3",
+                            self.state.bus_send_path,
+                            "--source", "ios-group",
+                            "--sender", sender_id,
+                            "--channel", "group",
+                            "--text", text,
+                            "--message-id", rec["id"],
+                            "--parent-msg-id", str(body.get("parent_msg_id") or ""),
+                            "--mentions", ",".join(mentions),
+                            "--to", agent_id,
+                            "--context", context,
+                            "--hop-count", str(hop_count + 1),
+                            "--inject-only",
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception as e:
+                    logger.warning("group fan-out fail: %s", e)
                     self.state.group_chat.set_typing(agent_id, False, dispatch_id=dispatch_id)
         self._send_json(200, {"ok": True, "record": rec, "targets": targets})
 

@@ -104,6 +104,31 @@ MENTION_ALIASES = {
     "opus47-fresh": "opus47_fresh",
     "opus47_fresh": "opus47_fresh",
 }
+# 2026-05-09 用户 catch fan-out 上下文里 codex tool trace (Explored / Ran / Edited / Searched / Read 等)
+# 历史 jsonl 已经存着旧污染 这一层二级 filter 拦不让进 fan-out context
+# 只针对 agent (shu / sonnet / opus47_fresh) sender amian 跟 opia 不会发 tool trace 不动
+TOOL_TRACE_PREFIXES = (
+    "Explored",
+    "Ran ", "Ran\n",
+    "Read ", "Read\n",
+    "Edited ", "Edited\n",
+    "Wrote ", "Wrote\n",
+    "Searched", "Searching",
+    "Search ", "Search\n",
+    "Created ", "Created\n",
+    "Listed ", "List ",
+    "Deleted ", "Updated ", "Patched ",
+    "Bash(",
+    "Added ", "Added\n",
+    "Removed ", "Removed\n",
+    "Modified ", "Modified\n",
+    "Found ", "Fetched ",
+    "Reading ", "Editing ", "Writing ", "Running ",
+)
+TOOL_TRACE_SENDERS = {"shu", "sonnet", "opus47_fresh"}
+# 2026-09-25 未读游标: 每个 AI 成员只注入它 last_seen 游标之后的消息
+UNREAD_CAP = 50
+UNREAD_FALLBACK = 4
 
 
 def _now_iso() -> str:
@@ -279,6 +304,8 @@ class GroupChatStore:
             if member.get("can_reply"):
                 self.set_typing(sender_id, False, save=False)
                 self._state.setdefault("agents", {}).setdefault(sender_id, {})["last_seen"] = ts
+                # 2026-09-25 未读游标: 该成员发言即视为它已读到此处, 推进游标
+                self._set_read_cursor_locked(sender_id, record["id"], ts, conversation_id)
             self._save_state()
         return record
 
@@ -458,37 +485,13 @@ class GroupChatStore:
     def tail(self, limit: int = 20) -> list[dict[str, Any]]:
         return self.read_since(limit=limit)
 
-    def context_lines(self, limit: int = 20) -> list[str]:
-        # 2026-05-09 用户 catch fan-out 上下文里 codex tool trace (Explored / Ran / Edited / Searched / Read 等)
-        # 历史 jsonl 已经存着旧污染 这一层二级 filter 拦不让进 fan-out context
-        # 只针对 agent (shu / sonnet / opus47_fresh) sender amian 跟 opia 不会发 tool trace 不动
-        TOOL_TRACE_PREFIXES = (
-            "Explored",
-            "Ran ", "Ran\n",
-            "Read ", "Read\n",
-            "Edited ", "Edited\n",
-            "Wrote ", "Wrote\n",
-            "Searched", "Searching",
-            "Search ", "Search\n",
-            "Created ", "Created\n",
-            "Listed ", "List ",
-            "Deleted ", "Updated ", "Patched ",
-            "Bash(",
-            "Added ", "Added\n",
-            "Removed ", "Removed\n",
-            "Modified ", "Modified\n",
-            "Found ", "Fetched ",
-            "Reading ", "Editing ", "Writing ", "Running ",
-        )
-        AGENT_SENDERS = {"shu", "sonnet", "opus47_fresh"}
-        # 多拉一些 防 filter 后不足 limit 条
-        raw_pull = max(limit * 3, 60)
+    def _format_context_lines(self, records: list[dict[str, Any]], limit: int) -> list[str]:
         lines: list[str] = []
-        for rec in self.tail(raw_pull):
+        for rec in records:
             sender_id = rec.get("sender_id", "")
             text_raw = str(rec.get("text", "")).strip()
             # 二级 filter agent tool trace 跳过
-            if sender_id in AGENT_SENDERS and text_raw.startswith(TOOL_TRACE_PREFIXES):
+            if sender_id in TOOL_TRACE_SENDERS and text_raw.startswith(TOOL_TRACE_PREFIXES):
                 continue
             sender = self.member(sender_id) or {}
             name = sender.get("display_name") or sender_id
@@ -499,6 +502,72 @@ class GroupChatStore:
             lines.append(f"[{ts}] {name}: {text}")
             if len(lines) >= limit:
                 break
+        return lines
+
+    def context_lines(self, limit: int = 20) -> list[str]:
+        # 多拉一些 防 filter 后不足 limit 条
+        raw_pull = max(limit * 3, 60)
+        return self._format_context_lines(self.tail(raw_pull), limit)
+
+    # ---------- per-member read cursors (2026-09-25) ----------
+
+    def get_read_cursor(self, agent_id: str, conversation_id: str = "workgroup") -> dict[str, Any] | None:
+        cursor = (
+            self._state.get("read_cursors", {})
+            .get(conversation_id, {})
+            .get(agent_id)
+        )
+        return dict(cursor) if isinstance(cursor, dict) else None
+
+    def _set_read_cursor_locked(self, agent_id: str, msg_id: str, ts: str, conversation_id: str = "workgroup"):
+        conv = self._state.setdefault("read_cursors", {}).setdefault(conversation_id, {})
+        conv[agent_id] = {"msg_id": msg_id, "ts": ts}
+
+    def set_read_cursor(self, agent_id: str, msg_id: str, ts: str, conversation_id: str = "workgroup"):
+        with self._lock:
+            self._set_read_cursor_locked(agent_id, msg_id, ts, conversation_id)
+            self._save_state()
+
+    def unread_records(
+        self,
+        agent_id: str,
+        conversation_id: str = "workgroup",
+        *,
+        cap: int = UNREAD_CAP,
+        fallback: int = UNREAD_FALLBACK,
+    ) -> tuple[list[dict[str, Any]], int, bool]:
+        """该成员游标之后的未读消息。
+
+        返回 (records, omitted, used_fallback)：omitted 是因 cap 截断而省略的
+        较早未读条数；游标缺失/失效/指向的消息已不存在时回退最近 fallback 条
+        (参考 roundtable 兜底), used_fallback=True。
+        """
+        rows = self._iter_records()
+        cursor = self.get_read_cursor(agent_id, conversation_id)
+        if cursor:
+            cursor_id = str(cursor.get("msg_id") or "")
+            idx = next((i for i, r in enumerate(rows) if r.get("id") == cursor_id), None)
+            if idx is not None:
+                unread = rows[idx + 1:]
+                omitted = max(0, len(unread) - cap)
+                return (unread[-cap:] if cap > 0 else []), omitted, False
+        return rows[-fallback:], 0, True
+
+    def context_lines_for(
+        self,
+        agent_id: str,
+        conversation_id: str = "workgroup",
+        *,
+        cap: int = UNREAD_CAP,
+        fallback: int = UNREAD_FALLBACK,
+    ) -> list[str]:
+        """注入给某个 AI 成员的上下文：只有它游标之后的未读，不再是共享的最后 20 条。"""
+        records, omitted, _used_fallback = self.unread_records(
+            agent_id, conversation_id, cap=cap, fallback=fallback,
+        )
+        lines = self._format_context_lines(records, cap)
+        if omitted > 0:
+            lines.insert(0, f"[更早的 {omitted} 条未读消息已省略]")
         return lines
 
     def set_typing(self, agent_id: str, is_typing: bool, dispatch_id: str | None = None, *, status_text: str | None = None, save: bool = True):
