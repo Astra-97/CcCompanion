@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>打卡</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <h1>打卡</h1>
+    <button id="checkin-btn" type="button">打卡</button>
+    <p id="status"></p>
+    <ul id="records"></ul>
+    <details id="dev-box">
+      <summary>调试（纯浏览器用 scoped token）</summary>
+      <input id="token-input" type="password" placeholder="p1.xxx.yyy" autocomplete="off">
+      <button id="token-save" type="button">保存 token</button>
+    </details>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

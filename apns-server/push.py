@@ -79,6 +79,7 @@ from sticker_catalog import StickerCatalogService, is_valid_category_id, is_vali
 from diary_stream import DiaryStream
 from group_chat import GroupChatStore
 from apples_unread import ApplesCursorStore, format_unread_lines, split_unread
+from plugins_store import MAX_DOC_BODY_BYTES, PluginStore
 from calendar_store import CalendarStore, CATEGORIES, CATEGORY_LABELS
 from rp_history import RPHistory, validate_sid as validate_rp_sid
 from diary import Diary
@@ -5296,9 +5297,9 @@ class PushHandler(BaseHTTPRequestHandler):
         # browser cookie to become a substitute for the native admin secret.
         get_exact = {
             "/chat/contacts", "/chat/history", "/chat/draft", "/chat/status",
-            "/chat/stream", "/stickers/catalog",
+            "/chat/stream", "/stickers/catalog", "/plugins",
         }
-        get_prefixes = ("/memory/",)
+        get_prefixes = ("/memory/", "/plugins/")
         post_exact = {
             "/web/session/logout", "/chat/send", "/chat/stop", "/chat/upload", "/chat/upload/cancel",
             "/stickers/upload",
@@ -7038,6 +7039,11 @@ class PushHandler(BaseHTTPRequestHandler):
         if request_path == "/web/session":
             self._handle_web_session_get()
             return
+        # 插件系统 (2026-09-25): 清单/静态走 _require_auth (会话身份),
+        # /plugins/<id>/data/* 额外接受 scoped token, 各自处理器内 fail-closed。
+        if request_path == "/plugins" or request_path.startswith("/plugins/"):
+            self._handle_plugins_get(request_path)
+            return
         if not self._is_public_get() and not self._require_auth():
             return
         # MCP credentials are higher-impact than legacy read endpoints: unlike
@@ -7622,6 +7628,37 @@ class PushHandler(BaseHTTPRequestHandler):
                 return
             self._handle_web_pairing_create()
             return
+        # 插件 scoped token 签发 (2026-09-25): 与 pairing 同级 fail-closed,
+        # web session cookie 无权签发; scoped token 仅可用于 /plugins/<id>/data/*。
+        if request_path.startswith("/plugins/") and request_path.endswith("/token"):
+            if not self._check_ip_allowed():
+                return
+            parts = request_path.strip("/").split("/")
+            plugin_id = parts[1] if len(parts) == 3 and parts[0] == "plugins" else ""
+            if not plugin_id or self._plugin_store().load_manifest(plugin_id) is None:
+                self._send_json(404, {"ok": False, "error": "not found"})
+                return
+            body = self._read_pairing_json_object()
+            if body is None:
+                return
+            if not self._native_pairing_auth_matches():
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            try:
+                ttl = int(body.get("ttl_seconds") or 0) or None
+            except (TypeError, ValueError):
+                ttl = None
+            token, expires_at = self._plugin_store().mint_scoped_token(
+                plugin_id, str(self.state.shared_secret or ""), ttl_seconds=ttl
+            )
+            self._send_json(200, {
+                "ok": True,
+                "plugin_id": plugin_id,
+                "token": token,
+                "expires_at": expires_at,
+                "scope": f"/plugins/{plugin_id}/data/* GET+PUT",
+            })
+            return
         if request_path == "/web/session/pair":
             if not self._check_ip_allowed():
                 return
@@ -8122,6 +8159,18 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(401, {"error": "unauthorized"})
                 return
             self._handle_reading_proxy("DELETE")
+            return
+        self._send_json(404, {"error": "not found"})
+
+    def do_PUT(self):
+        """PUT is deliberately limited to plugin KV documents."""
+        from urllib.parse import urlsplit
+
+        request_path = urlsplit(self.path).path
+        if not self._check_ip_allowed():
+            return
+        if request_path.startswith("/plugins/"):
+            self._handle_plugin_data_put(request_path)
             return
         self._send_json(404, {"error": "not found"})
 
@@ -10071,6 +10120,153 @@ class PushHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(data)
+
+    # ---------- 插件系统 (2026-09-25 MVP) ----------
+
+    # MVP 禁远程脚本/样式/字体; 内联脚本/样式同样被挡, 插件须用独立 .js/.css 文件。
+    _PLUGIN_STATIC_CSP = "default-src 'self'"
+
+    def _plugin_store(self) -> PluginStore:
+        """插件清单/KV store, 懒加载。数据目录 plugins/ (gitignore) 优先,
+        内置目录 plugins-builtin/ (入库) 回落。"""
+        store = getattr(self, "_plugins_store", None)
+        if store is None:
+            base = Path(__file__).resolve().parent
+            store = PluginStore(data_dir=base / "plugins", builtin_dir=base / "plugins-builtin")
+            self._plugins_store = store
+        return store
+
+    def _plugin_scoped_token_matches(self, plugin_id: str) -> bool:
+        """scoped token 只在插件 data 处理器里校验, 对其他端点天然无效。"""
+        supplied = str(self.headers.get("X-Plugin-Token", "") or "")
+        if not supplied:
+            auth = str(self.headers.get("Authorization", "") or "")
+            if auth.startswith("Bearer "):
+                supplied = auth[len("Bearer "):].strip()
+        secret = str(getattr(self.state, "shared_secret", "") or "")
+        if not supplied or not secret:
+            return False
+        try:
+            return self._plugin_store().verify_scoped_token(supplied, plugin_id, secret)
+        except Exception:
+            return False
+
+    def _plugin_data_auth_matches(self, plugin_id: str) -> bool:
+        """插件数据读写: native token / web session / scoped token 三选一, fail-closed。
+
+        web session 的 PUT 被 _web_session_route_allowed 的方法门挡住 (仅 GET),
+        所以浏览器写数据走 scoped token; 与 /kimi/ 等控制面同级, 不享受
+        strict_auth=false 的 legacy 放行。
+        """
+        if self._native_pairing_auth_matches():
+            return True
+        if self._web_session_matches():
+            return True
+        return self._plugin_scoped_token_matches(plugin_id)
+
+    @staticmethod
+    def _plugin_data_target(request_path: str) -> tuple[str, str] | None:
+        parts = str(request_path or "")[len("/plugins/"):].split("/") if str(request_path or "").startswith("/plugins/") else []
+        if len(parts) != 3 or parts[1] != "data":
+            return None
+        return parts[0], parts[2]
+
+    def _handle_plugins_get(self, request_path: str) -> None:
+        store = self._plugin_store()
+        if request_path in {"/plugins", "/plugins/"}:
+            if not self._require_auth():
+                return
+            self._send_json(200, {"ok": True, "plugins": store.list_plugins()})
+            return
+        data_target = self._plugin_data_target(request_path)
+        if data_target is not None:
+            plugin_id, doc = data_target
+            if not self._plugin_data_auth_matches(plugin_id):
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            record = store.read_doc(plugin_id, doc)
+            if record is None:
+                self._send_json(404, {"ok": False, "error": "not_found", "doc": doc, "version": 0})
+                return
+            self._send_json(200, {
+                "ok": True,
+                "doc": doc,
+                "version": record["version"],
+                "body": record["body"],
+                "updated_at": record["updated_at"],
+            })
+            return
+        # 其余路径按静态托管: /plugins/<id>[/...] -> 插件目录下的文件 (默认 entry)。
+        if not self._require_auth():
+            return
+        rel = request_path[len("/plugins/"):].split("/", 1)
+        plugin_id = rel[0]
+        rel_path = rel[1] if len(rel) > 1 else ""
+        resolved = store.resolve_static(plugin_id, rel_path)
+        if resolved is None:
+            self._send_json(404, {"error": "not found"})
+            return
+        try:
+            data = resolved.read_bytes()
+        except OSError:
+            self._send_json(404, {"error": "not found"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", store.static_mime(resolved))
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Security-Policy", self._PLUGIN_STATIC_CSP)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _handle_plugin_data_put(self, request_path: str) -> None:
+        data_target = self._plugin_data_target(request_path)
+        if data_target is None:
+            self._send_json(404, {"error": "not found"})
+            return
+        plugin_id, doc = data_target
+        if not self._plugin_data_auth_matches(plugin_id):
+            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            self._send_json(400, {"ok": False, "error": "chunked request not supported"})
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            content_length = -1
+        if content_length < 0 or content_length > MAX_DOC_BODY_BYTES:
+            self.close_connection = True
+            self._send_json(413, {"ok": False, "error": "request_too_large"})
+            return
+        try:
+            raw = self.rfile.read(content_length) if content_length else b""
+            body = json.loads(raw) if raw else None
+        except Exception as exc:
+            self._send_json(400, {"ok": False, "error": f"bad json: {exc}"})
+            return
+        # If-Match: <int> 必带: 0 = 仅新建, N = 当前 version 为 N 才写。
+        if_match = str(self.headers.get("If-Match", "") or "").strip()
+        if not re.fullmatch(r"[0-9]+", if_match):
+            self._send_json(428, {"ok": False, "error": "if_match_required"})
+            return
+        status, info = self._plugin_store().write_doc(plugin_id, doc, body, int(if_match))
+        if status == "not_found":
+            self._send_json(404, {"ok": False, "error": "not_found"})
+            return
+        if status == "conflict":
+            self._send_json(409, {
+                "ok": False,
+                "error": "version_conflict",
+                "doc": doc,
+                "version": info["version"],
+                "body": info["body"],
+            })
+            return
+        self._send_json(200, {"ok": True, "doc": doc, "version": info["version"]})
 
     def _serve_web_chat(self, auth_token=None):
         html = WEB_CHAT_HTML

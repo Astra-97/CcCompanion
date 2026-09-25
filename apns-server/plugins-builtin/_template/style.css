@@ -1,0 +1,39 @@
+body {
+  margin: 0;
+  padding: 16px;
+  font-family: -apple-system, "PingFang SC", sans-serif;
+  background: #fafafa;
+  color: #222;
+}
+main { max-width: 480px; margin: 0 auto; }
+h1 { font-size: 20px; }
+.hint { font-size: 13px; color: #666; }
+section { margin: 16px 0; }
+button {
+  padding: 8px 14px;
+  border: 1px solid #ccc;
+  border-radius: 8px;
+  background: #fff;
+  font-size: 14px;
+}
+button:active { background: #eee; }
+input {
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 4px;
+  padding: 6px 8px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+}
+label { font-size: 13px; }
+#counter-view { margin-left: 10px; font-size: 18px; font-weight: 600; }
+#log {
+  background: #111;
+  color: #8f8;
+  font-size: 12px;
+  padding: 10px;
+  border-radius: 8px;
+  min-height: 60px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}

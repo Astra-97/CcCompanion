@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>插件模板</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <h1>插件模板</h1>
+    <p class="hint">
+      这是最小骨架。复制本目录、改 manifest.json 的 id/name，即是一个新插件。
+      注意 CSP 为 <code>default-src 'self'</code>：禁止内联脚本/样式与一切远程资源，
+      JS/CSS 必须像本页一样放在插件目录的独立文件里。
+    </p>
+    <section id="token-box">
+      <label>
+        scoped token（纯浏览器调试用，App 内由 bridge 代发可留空）：
+        <input id="token-input" type="password" placeholder="p1.xxx.yyy" autocomplete="off">
+      </label>
+      <button id="token-save" type="button">保存 token</button>
+    </section>
+    <section>
+      <button id="inc-btn" type="button">计数 +1（KV 读写 + 冲突重试示例）</button>
+      <span id="counter-view">—</span>
+    </section>
+    <pre id="log"></pre>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+{
+  "id": "demo-checkin",
+  "name": "打卡 Demo",
+  "version": "0.1.0",
+  "description": "最小打卡插件：一个按钮打卡，列表显示记录，数据存插件 KV（doc: checkins）。",
+  "entry": "index.html"
+}

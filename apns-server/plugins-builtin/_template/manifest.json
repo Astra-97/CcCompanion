@@ -1,0 +1,7 @@
+{
+  "id": "_template",
+  "name": "插件模板骨架",
+  "version": "0.1.0",
+  "description": "最小插件骨架：manifest + index.html + app.js，演示 App bridge / fetch+scoped token 两种 KV 读写方式与 409 版本冲突重试。id 以 _ 开头，不会被列出或托管，仅供复制。",
+  "entry": "index.html"
+}
