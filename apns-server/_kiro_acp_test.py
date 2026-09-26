@@ -1969,5 +1969,191 @@ class KiroParityHandlerTest(KiroChatHandlerTest):
         self.assertEqual(1, len(handler.state.kiro_recall_index.keys("kiro-session-1")))
 
 
+# ---------------------------------------------------------------------------
+# kiro 对齐 CC r3 (2026-09-26): 「忙活了 N 下」counts distinct toolCallIds.
+# ---------------------------------------------------------------------------
+
+def _wire(update_name, **fields):
+    return {"sessionId": "s", "update": {"sessionUpdate": update_name, **fields}}
+
+
+# Shapes recorded from kiro-cli 2.21.2 in an isolated /tmp ACP session.
+_PROBE_TOOL_STREAM = (
+    _wire("tool_call", toolCallId="toolu_1", title="Running: echo probe-ok", kind="execute",
+          rawInput={"command": "echo probe-ok"}, _meta={"kiro": {"toolName": "shell"}}),
+    _wire("tool_call", toolCallId="toolu_2", title="Reading hostname:1", kind="read",
+          locations=[{"path": "/etc/hostname"}], rawInput={"operations": []}),
+    _wire("tool_call_update", toolCallId="toolu_2", kind="read", status="completed",
+          title="Reading hostname:1", rawOutput={"items": [{"Text": "SECRET-HOST"}]}),
+    _wire("tool_call_update", toolCallId="toolu_1",
+          content=[{"type": "content", "content": {"type": "text", "text": "probe-ok\n"}}]),
+    _wire("tool_call_update", toolCallId="toolu_1", kind="execute", status="completed",
+          title="Running: echo probe-ok", rawOutput={"items": []}),
+    _wire("tool_call", toolCallId="toolu_3", title="Running: date -u", kind="execute"),
+    _wire("tool_call_update", toolCallId="toolu_3",
+          content=[{"type": "content", "content": {"type": "text", "text": "Sat\n"}}]),
+)
+
+
+class KiroToolCountProjectionTest(unittest.TestCase):
+    def test_tool_events_carry_only_bounded_identity_title_kind_status(self):
+        event = _activity_from_update(_PROBE_TOOL_STREAM[2])
+        self.assertEqual({
+            "kind": "activity", "label": "正在使用工具", "tool_call_id": "toolu_2",
+            "tool_update": True, "title": "Reading hostname:1", "tool_kind": "read",
+            "status": "completed",
+        }, event)
+        self.assertNotIn("SECRET-HOST", json.dumps(event, ensure_ascii=False))
+        self.assertNotIn("/etc/hostname", json.dumps(_activity_from_update(_PROBE_TOOL_STREAM[1])))
+        # Unknown kind/status values and malformed ids are dropped, not echoed.
+        odd = _activity_from_update(_wire("tool_call", toolCallId="bad id!", kind="rm -rf", status="x"))
+        self.assertEqual({"kind": "activity", "label": "正在使用工具"}, odd)
+
+    def test_tool_title_is_redacted_and_bounded(self):
+        event = _activity_from_update(_wire(
+            "tool_call", toolCallId="t1", kind="fetch",
+            title="Fetching https://x.test/a?token=url-secret#frag with Bearer abc.def token=raw-secret "
+                  + "y" * 200,
+        ))
+        title = event["title"]
+        self.assertLessEqual(len(title), 80)
+        for secret in ("url-secret", "abc.def", "raw-secret", "#frag"):
+            self.assertNotIn(secret, title)
+        self.assertTrue(title.startswith("Fetching https://x.test/a"))
+
+    def test_note_tool_event_counts_each_call_id_once(self):
+        tools = {}
+        for params in _PROBE_TOOL_STREAM:
+            event = _activity_from_update(params)
+            PushHandler._kiro_note_tool_event(tools, event)
+        self.assertEqual(["toolu_1", "toolu_2", "toolu_3"], list(tools))
+        self.assertEqual(
+            ["completed", "completed", "in_progress"], [t["status"] for t in tools.values()],
+        )
+        # A late update never reopens a finished call.
+        PushHandler._kiro_note_tool_event(tools, {"tool_call_id": "toolu_2", "status": "in_progress"})
+        self.assertEqual("completed", tools["toolu_2"]["status"])
+        self.assertEqual(
+            [
+                "Running: echo probe-ok · 执行命令 · 已完成",
+                "Reading hostname:1 · 读取 · 已完成",
+                "Running: date -u · 执行命令 · 进行中",
+            ],
+            PushHandler._kiro_tool_lines(tools),
+        )
+
+
+class KiroToolCountHandlerTest(KiroChatHandlerTest):
+    def _tool_acp(self, *, thoughts=270, failure=None, stream=_PROBE_TOOL_STREAM):
+        seen = {}
+
+        def prompt_existing(text, *, on_update=None, on_activity=None, **_kwargs):
+            # opus/max streams hundreds of thought chunks around 3 tool calls.
+            for _ in range(thoughts // 2):
+                on_activity(_activity_from_update(_wire("agent_thought_chunk", content={"type": "text", "text": "x"})))
+            for params in stream:
+                on_activity(_activity_from_update(params))
+                on_activity(_activity_from_update(_wire("agent_thought_chunk", content={"type": "text", "text": "y"})))
+            for _ in range(thoughts // 2):
+                on_activity(_activity_from_update(_wire("agent_thought_chunk", content={"type": "text", "text": "z"})))
+            live = dict(seen["handler"].state.chat_reply_states["kiro"])
+            seen["live"] = live
+            if on_update is not None:
+                on_update("完成了。")
+            if failure is not None:
+                raise failure
+
+        acp = types.SimpleNamespace(
+            prepare_session=lambda **_kw: "kiro-session-1",
+            prompt_existing=prompt_existing,
+            cancel=lambda _turn, _session: True,
+            close=lambda: None,
+            new_session=lambda **_kw: "kiro-session-2",
+        )
+        return acp, seen
+
+    def test_live_count_is_distinct_tool_calls_not_events(self):
+        acp, seen = self._tool_acp()
+        handler, kiro, _xiaoke = self._handler(acp)
+        seen["handler"] = handler
+        with patch("push.threading.Thread", _immediate_thread):
+            handler._handle_kiro_chat_send({"text": "查三样东西"}, "kiro")
+        live = seen["live"]
+        self.assertEqual(3, live["activity_count"])
+        self.assertEqual(3, len(live["activity_items"]))
+        self.assertIn("Reading hostname:1 · 读取 · 已完成", live["activity_items"])
+        self.assertIn(live["activity_text"], {"正在思考", "正在使用工具"})
+
+    def test_history_keeps_one_kimi_shaped_summary_before_the_answer(self):
+        acp, seen = self._tool_acp()
+        handler, kiro, _xiaoke = self._handler(acp)
+        seen["handler"] = handler
+        with patch("push.threading.Thread", _immediate_thread):
+            handler._handle_kiro_chat_send({"text": "查三样东西"}, "kiro")
+        roles = [(r["role"], r["source"]) for r in kiro.records]
+        self.assertEqual(
+            [("user", "android-app:kiro"), ("task", "kiro-acp:activity"), ("assistant", "kiro-acp")],
+            roles,
+        )
+        summary = kiro.records[1]["metadata"]
+        user_ts = kiro.records[0]["ts"]
+        self.assertEqual({
+            "activity_summary": True,
+            "activity_count": 3,
+            "activity_items": [
+                "Running: echo probe-ok · 执行命令 · 已完成",
+                "Reading hostname:1 · 读取 · 已完成",
+                # Never reported finished; the completed turn closes it.
+                "Running: date -u · 执行命令 · 已完成",
+            ],
+            "status": "completed",
+            "kiro_user_ts": user_ts,
+            "turn_terminal": False,
+            "turn_message_kind": "auxiliary_activity",
+        }, summary)
+        self.assertEqual("completed", handler.state.chat_reply_states["kiro"]["reply_state"])
+
+    def test_interrupted_turn_marks_open_calls_interrupted(self):
+        acp, seen = self._tool_acp(failure=KiroACPCancelled("stop"))
+        handler, kiro, _xiaoke = self._handler(acp)
+        seen["handler"] = handler
+        with patch("push.threading.Thread", _immediate_thread):
+            handler._handle_kiro_chat_send({"text": "查三样东西"}, "kiro")
+        summary = next(r for r in kiro.records if r["source"] == "kiro-acp:activity")["metadata"]
+        self.assertEqual("interrupted", summary["status"])
+        self.assertEqual("Running: date -u · 执行命令 · 已中断", summary["activity_items"][-1])
+        self.assertEqual("kiro-acp:interrupted", kiro.records[-1]["source"])
+
+    def test_failed_turn_summary_is_failed(self):
+        acp, seen = self._tool_acp(failure=KiroACPError("boom"))
+        handler, kiro, _xiaoke = self._handler(acp)
+        seen["handler"] = handler
+        with patch("push.threading.Thread", _immediate_thread):
+            handler._handle_kiro_chat_send({"text": "查三样东西"}, "kiro")
+        summary = next(r for r in kiro.records if r["source"] == "kiro-acp:activity")["metadata"]
+        self.assertEqual("failed", summary["status"])
+        self.assertEqual("Running: date -u · 执行命令 · 失败", summary["activity_items"][-1])
+
+    def test_thinking_only_turn_has_no_tool_card(self):
+        acp, seen = self._tool_acp(stream=())
+        handler, kiro, _xiaoke = self._handler(acp)
+        seen["handler"] = handler
+        with patch("push.threading.Thread", _immediate_thread):
+            handler._handle_kiro_chat_send({"text": "想一想"}, "kiro")
+        self.assertEqual(0, seen["live"]["activity_count"])
+        self.assertEqual([], seen["live"]["activity_items"])
+        self.assertEqual("正在思考", seen["live"]["activity_text"])
+        self.assertEqual(["user", "assistant"], [r["role"] for r in kiro.records])
+
+    def test_thought_chunks_do_not_republish_the_same_state(self):
+        acp, seen = self._tool_acp(stream=())
+        handler, _kiro, _xiaoke = self._handler(acp)
+        seen["handler"] = handler
+        with patch("push.threading.Thread", _immediate_thread):
+            handler._handle_kiro_chat_send({"text": "想一想"}, "kiro")
+        # queued/generating/one thinking transition/draft/completed — not 270+.
+        self.assertLess(handler.state.chat_stream_revisions.get("kiro", 0), 10)
+
+
 if __name__ == "__main__":
     unittest.main()

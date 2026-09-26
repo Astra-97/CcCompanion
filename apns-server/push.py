@@ -175,7 +175,16 @@ from kimi_preferences import (
     KimiPreferenceStore,
     effective_kimi_effort,
 )
-from kimi_terminal_observer import KimiTerminalObserver
+from kimi_terminal_observer import KimiTerminalObserver, KiroTerminalObserver
+# kiro 对齐 CC r3 (2026-09-26): 终端页 Kiro 标签（租约 TUI + 只读观察）。
+from kiro_terminal import (
+    KIRO_TERMINAL_ALIAS,
+    KIRO_TERMINAL_TMUX_SESSION,
+    KiroTerminalBridge,
+    KiroTerminalBusy,
+    KiroTerminalNoActiveSession,
+    KiroTerminalUnavailable,
+)
 # kiro 桥接 (2026-09-09): ACP 文本聊天联系人，Phase 1。
 from kiro_acp import (
     DEFAULT_KIRO_CWD,
@@ -4564,6 +4573,15 @@ class ServerState:
             contact_history_dir / "kiro_preferences.json",
             catalog_loader=self.kiro_acp.available_model_ids,
         )
+        # kiro 对齐 CC r3 (2026-09-26): the terminal tab's leased TUI and the
+        # read-only observer for App (ACP) turns.  ACP and TUI alternate as
+        # the session's single writer through the handler handoff.
+        self.kiro_terminal = KiroTerminalBridge(
+            command=server_cfg.get("kiro_bin", str(Path.home() / ".local" / "bin" / "kiro-cli")),
+            cwd=server_cfg.get("kiro_cwd", DEFAULT_KIRO_CWD),
+        )
+        self.kiro_terminal_observer = KiroTerminalObserver()
+        self.kiro_terminal_acquire_token = ""
         self.kimi_web = KimiWebClient(
             command=server_cfg.get("kimi_bin", "/root/.kimi-code/bin/kimi"),
             port=int(server_cfg.get("kimi_web_port", 58627)),
@@ -5052,6 +5070,13 @@ class ServerState:
             self.kairos_terminal.release()
         except KairosTerminalUnavailable:
             logger.exception("Kairos terminal did not confirm release during shutdown")
+        kiro_terminal = getattr(self, "kiro_terminal", None)
+        release_kiro_terminal = getattr(kiro_terminal, "release_for_shutdown", None)
+        if callable(release_kiro_terminal):
+            try:
+                release_kiro_terminal()
+            except Exception:
+                logger.exception("Kiro terminal did not confirm release during shutdown")
         kimi_terminal = getattr(self, "kimi_terminal", None)
         release_kimi_terminal = getattr(kimi_terminal, "release_for_shutdown", None)
         if callable(release_kimi_terminal):
@@ -7050,7 +7075,7 @@ class PushHandler(BaseHTTPRequestHandler):
         # reject before generic optional auth or bridge construction.
         if request_path == "/tmux/capture":
             requested = parse_qs(urlparse(self.path).query).get("session", [""])[0]
-            if str(requested).strip().lower() == KIMI_TERMINAL_ALIAS and not self._native_pairing_auth_matches():
+            if str(requested).strip().lower() in {KIMI_TERMINAL_ALIAS, KIRO_TERMINAL_ALIAS} and not self._native_pairing_auth_matches():
                 self._send_json(401, {"error": "unauthorized"})
                 return
         if request_path in {self._MEMORY_SYNC_PATH, self._MEMORY_DATE_SYNC_PATH}:
@@ -13954,6 +13979,112 @@ class PushHandler(BaseHTTPRequestHandler):
             cls._memory_recall_hook_module_cache = None
         return cls._memory_recall_hook_module_cache
 
+    # kiro 对齐 CC r3 (2026-09-26): 「Kiro 忙活了 N 下」counts real tool
+    # calls.  kiro_acp projects every ``tool_call``/``tool_call_update`` with
+    # its toolCallId; one id is one call however many updates it streams, and
+    # thought chunks never count.  Each call becomes one bounded row line
+    # (title · kind · status), live in the draft and durable in history.
+    _KIRO_TOOL_KIND_LABELS = {
+        "read": "读取", "edit": "编辑", "delete": "删除", "move": "移动",
+        "search": "搜索", "execute": "执行命令", "think": "思考", "fetch": "抓取",
+        "switch_mode": "切换模式", "other": "其他",
+    }
+    _KIRO_TOOL_STATUS_LABELS = {
+        "pending": "等待中", "in_progress": "进行中", "completed": "已完成",
+        "failed": "失败", "interrupted": "已中断",
+    }
+    _KIRO_TOOL_ITEMS_MAX = 50
+
+    @classmethod
+    def _kiro_tool_lines(cls, tool_calls: dict[str, dict[str, str]]) -> list[str]:
+        """Render the most recent calls, one ``title · kind · status`` line each."""
+        lines: list[str] = []
+        for tool in list(tool_calls.values())[-cls._KIRO_TOOL_ITEMS_MAX:]:
+            title = str(tool.get("title") or "").strip() or "工具调用"
+            kind = cls._KIRO_TOOL_KIND_LABELS.get(str(tool.get("tool_kind") or ""), "工具")
+            status = cls._KIRO_TOOL_STATUS_LABELS.get(str(tool.get("status") or ""), "进行中")
+            lines.append(f"{title} · {kind} · {status}")
+        return lines
+
+    @staticmethod
+    def _kiro_note_tool_event(tool_calls: dict[str, dict[str, str]], event: dict[str, Any]) -> bool:
+        """Upsert one projected ACP tool event by toolCallId; True when it changed."""
+        call_id = str(event.get("tool_call_id") or "")
+        if not call_id:
+            return False
+        tool = tool_calls.get(call_id)
+        created = tool is None
+        if tool is None:
+            if len(tool_calls) >= 999:
+                return False
+            tool = {"title": "", "tool_kind": "", "status": "pending"}
+            tool_calls[call_id] = tool
+        before = dict(tool)
+        for key in ("title", "tool_kind"):
+            value = str(event.get(key) or "")
+            if value:
+                tool[key] = value
+        status = str(event.get("status") or "")
+        if tool.get("status") in {"completed", "failed"}:
+            pass  # a late update never reopens a finished call
+        elif status:
+            tool["status"] = status
+        elif event.get("tool_update") and tool.get("status") == "pending":
+            tool["status"] = "in_progress"
+        return created or tool != before
+
+    @staticmethod
+    def _kiro_terminalize_tools(tool_calls: dict[str, dict[str, str]], outcome: str) -> None:
+        """Close calls Kiro never reported as finished with the turn's outcome."""
+        final = outcome if outcome in {"completed", "interrupted", "failed"} else "failed"
+        for tool in tool_calls.values():
+            if tool.get("status") not in {"completed", "failed"}:
+                tool["status"] = final
+
+    def _append_kiro_tool_summary(
+        self,
+        chat: ChatHistory,
+        *,
+        user_ts: str,
+        tool_calls: dict[str, dict[str, str]],
+        outcome: str,
+    ) -> bool:
+        """Persist one exact-turn tool card before Kiro's final answer (Kimi's shape)."""
+        user_ts = str(user_ts or "").strip()
+        if not user_ts or not tool_calls:
+            return False
+        status = str(outcome or "").strip().lower()
+        if status not in {"completed", "interrupted", "failed"}:
+            status = "failed"
+        try:
+            for row in chat.tail(200):
+                metadata = row.get("metadata") if isinstance(row, dict) else None
+                if (
+                    isinstance(metadata, dict)
+                    and metadata.get("activity_summary") is True
+                    and str(metadata.get("kiro_user_ts") or "") == user_ts
+                ):
+                    return False
+            lines = self._kiro_tool_lines(tool_calls)
+            chat.append(
+                role="task",
+                text=lines[-1],
+                source="kiro-acp:activity",
+                metadata={
+                    "activity_summary": True,
+                    "activity_count": min(999, len(tool_calls)),
+                    "activity_items": lines,
+                    "status": status,
+                    "kiro_user_ts": user_ts,
+                    "turn_terminal": False,
+                    "turn_message_kind": "auxiliary_activity",
+                },
+            )
+            return True
+        except Exception:
+            logger.exception("Kiro tool summary history append failed")
+            return False
+
     def _kiro_recall_allowed(self, text: str) -> bool:
         """CC parity: skip automation, too-short and symbol-only messages."""
         raw = str(text or "")
@@ -14039,6 +14170,28 @@ class PushHandler(BaseHTTPRequestHandler):
             self.state.kiro_prepare_token = prepare_token
 
         prepare_started = time.monotonic()
+        # kiro 对齐 CC r3: the terminal tab's TUI and ACP never write the
+        # session together — hand an idle TUI back first, refuse a busy one.
+        try:
+            handed_off = self._handoff_kiro_terminal_to_writer(prepare_token)
+        except KiroTerminalBusy:
+            self._release_kiro_prepare(prepare_token)
+            discard_uncommitted_attachments()
+            self._send_json(409, {
+                "ok": False,
+                "error": "kiro_terminal_busy",
+                "reason": "Kiro 终端里还有一轮在进行；等它结束（或在终端页按 ^C 停下）后再发。本次消息未发送。",
+            })
+            return
+        if not handed_off:
+            self._release_kiro_prepare(prepare_token)
+            discard_uncommitted_attachments()
+            self._send_json(503, {
+                "ok": False,
+                "error": "kiro_terminal_handoff_failed",
+                "reason": "Kiro 终端未能安全交还聊天，本次消息未发送。",
+            })
+            return
         try:
             # kiro 切模型 (2026-09-10)：每轮 prepare 重新钉住 App 选择的模型
             # （Kiro 不持久化 set_model，session/load 会回到默认）。
@@ -14148,10 +14301,33 @@ class PushHandler(BaseHTTPRequestHandler):
             chunks: list[str] = []
             last_published = 0.0
             terminalized = False
-            activity_count = 0
-            activity_items: list[str] = []
-            activity_labels_seen: set[str] = set()
+            # kiro 对齐 CC r3: toolCallId -> {title, tool_kind, status}, in call order.
+            tool_calls: dict[str, dict[str, str]] = {}
+            activity_label = ""
+            tool_summary_written = False
             turn_started = time.monotonic()
+            # kiro 对齐 CC r3: prompt-free observer for the terminal tab.
+            kiro_observer = getattr(self.state, "kiro_terminal_observer", None)
+            observer_epoch = None
+            observer_finished = False
+            try:
+                if kiro_observer is not None:
+                    observer_epoch = kiro_observer.begin(session_id, str(rec.get("ts") or ""))
+            except Exception:
+                observer_epoch = None
+
+            def observer_call(method: str, *args: Any) -> None:
+                if observer_epoch is None or observer_finished:
+                    return
+                try:
+                    getattr(kiro_observer, method)(session_id, str(rec.get("ts") or ""), observer_epoch, *args)
+                except Exception:
+                    logger.debug("Kiro terminal observer %s failed", method, exc_info=True)
+
+            def finish_observer(outcome: str) -> None:
+                nonlocal observer_finished
+                observer_call("finish", outcome)
+                observer_finished = True
             first_chunk_ms: list[int] = []
             recall_ms = 0
             recall_result: Any = None
@@ -14175,8 +14351,24 @@ class PushHandler(BaseHTTPRequestHandler):
                     logger.exception("Kiro assistant history append failed")
                     return ""
 
+            def write_tool_summary(outcome: str) -> None:
+                """Durable tool card before the terminal row, once per turn."""
+                nonlocal tool_summary_written
+                if tool_summary_written:
+                    return
+                tool_summary_written = True
+                self._kiro_terminalize_tools(tool_calls, outcome)
+                self._append_kiro_tool_summary(
+                    chat,
+                    user_ts=str(rec.get("ts") or ""),
+                    tool_calls=tool_calls,
+                    outcome=outcome,
+                )
+
             def set_completed(message: str, source: str, *, status: str = "completed") -> None:
                 nonlocal terminalized
+                finish_observer(status)
+                write_tool_summary(status)
                 final_ts = append_assistant_safely(message, source)
                 self._set_chat_completed(
                     contact_id,
@@ -14192,6 +14384,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 if not first_chunk_ms:
                     first_chunk_ms.append(int((time.monotonic() - turn_started) * 1000))
                 chunks.append(delta)
+                observer_call("record_assistant_text", delta)
                 now = time.monotonic()
                 if now - last_published >= 0.08:
                     self._set_chat_draft(
@@ -14201,28 +14394,36 @@ class PushHandler(BaseHTTPRequestHandler):
                         session_id=session_id,
                         user_ts=rec["ts"],
                         queued_at=rec["ts"],
-                        activity_text=activity_items[-1] if activity_items else "",
-                        activity_count=activity_count,
-                        activity_items=activity_items,
+                        activity_text=activity_label,
+                        activity_count=len(tool_calls),
+                        activity_items=self._kiro_tool_lines(tool_calls),
                     )
                     last_published = now
 
             def on_activity(event: dict[str, Any]) -> None:
-                nonlocal activity_count
+                nonlocal activity_label
                 if not isinstance(event, dict):
                     return
                 label = str(event.get("label") or "")
                 if label not in {"正在思考", "正在使用工具"}:
                     return
-                activity_count += 1
-                if label not in activity_labels_seen:
-                    activity_labels_seen.add(label)
-                    activity_items.append(label)
+                # Thought chunks and repeated tool_call_updates stream many
+                # events per unit of work: publish only real transitions, and
+                # count only distinct toolCallIds.
+                changed = label != activity_label
+                activity_label = label
+                if changed:
+                    # Fixed vocabulary only; never the tool title.
+                    observer_call("record_activity", {"kind": "activity", "label": label})
+                if label == "正在使用工具" and self._kiro_note_tool_event(tool_calls, event):
+                    changed = True
+                if not changed:
+                    return
                 self._set_chat_activity(
                     contact_id,
                     activity_text=label,
-                    activity_count=activity_count,
-                    activity_items=activity_items,
+                    activity_count=len(tool_calls),
+                    activity_items=self._kiro_tool_lines(tool_calls),
                     user_ts=rec["ts"],
                 )
 
@@ -14258,6 +14459,8 @@ class PushHandler(BaseHTTPRequestHandler):
                 answer = "".join(chunks).strip() or "Kiro 没有返回可展示内容。"
                 set_completed(answer, "kiro-acp")
             except KiroACPCancelled:
+                finish_observer("interrupted")
+                write_tool_summary("interrupted")
                 partial = "".join(chunks).strip()
                 final_ts = append_assistant_safely(
                     partial + "\n\n**[已停止生成]**" if partial else "已中断当前生成。",
@@ -14285,13 +14488,14 @@ class PushHandler(BaseHTTPRequestHandler):
                 )
             except (KiroACPBusy, KiroACPError) as exc:
                 logger.warning("Kiro ACP turn failed: %s", type(exc).__name__)
-                set_completed("Kiro 这次没有成功回复。请稍后重试；原消息已经保留。", "kiro-acp:error")
+                set_completed("Kiro 这次没有成功回复。请稍后重试；原消息已经保留。", "kiro-acp:error", status="failed")
                 self.state.kiro_acp.close()
             except Exception:
                 logger.exception("Kiro ACP worker failed")
-                set_completed("Kiro 接入进程异常退出。请稍后重试；原消息已经保留。", "kiro-acp:error")
+                set_completed("Kiro 接入进程异常退出。请稍后重试；原消息已经保留。", "kiro-acp:error", status="failed")
                 self.state.kiro_acp.close()
             finally:
+                finish_observer("completed" if terminalized else "failed")
                 if not terminalized:
                     try:
                         self._set_chat_failed(
@@ -14401,6 +14605,10 @@ class PushHandler(BaseHTTPRequestHandler):
                     "reason": "Kiro 正在回复，等当前回复结束后再开新会话。",
                 })
                 return
+            # kiro 对齐 CC r3: reserve Kiro so a terminal-tab acquire cannot
+            # close the ACP process underneath session/new.
+            prepare_token = secrets.token_hex(16)
+            self.state.kiro_prepare_token = prepare_token
         try:
             # kiro 推理强度 (2026-09-10)：新会话同样重放模型与 effort 钉选；
             # effort 空档不 pin。
@@ -14417,6 +14625,8 @@ class PushHandler(BaseHTTPRequestHandler):
             self.state.kiro_acp.close()
             self._send_json(503, {"ok": False, "error": "kiro_unavailable"})
             return
+        finally:
+            self._release_kiro_prepare(prepare_token)
         try:
             self._chat_for_contact("kiro").append(
                 role="assistant",
@@ -25844,6 +26054,12 @@ class PushHandler(BaseHTTPRequestHandler):
 
     # ---------- tmux 终端 endpoints ----------
 
+    def _is_reserved_kiro_physical_target(self, requested: Any) -> bool:
+        value = str(requested or "").strip().lower().lstrip("=")
+        terminal = getattr(self.state, "kiro_terminal", None)
+        owned_name = str(getattr(terminal, "tmux_session", "") or "").strip().lower()
+        return value in {KIRO_TERMINAL_TMUX_SESSION, owned_name} - {""}
+
     def _is_reserved_kimi_physical_target(self, requested: Any) -> bool:
         """Keep the bridge's tmux name private; only ``kimi`` is routable."""
         value = str(requested or "").strip().lower()
@@ -25860,6 +26076,10 @@ class PushHandler(BaseHTTPRequestHandler):
         """Return (physical tmux target, public identity, is_kairos)."""
         if self._is_reserved_kimi_physical_target(requested):
             raise KimiTerminalUnavailable("Kimi 终端必须通过 kimi 入口访问")
+        if self._is_reserved_kiro_physical_target(requested):
+            # kiro 对齐 CC r3: the Kiro TUI pane is reachable only through the
+            # leased ``kiro`` alias, never as a generic tmux target.
+            raise KimiTerminalUnavailable("Kiro 终端必须通过 kiro 入口访问")
         if requested.strip().lower() == KAIROS_TERMINAL_ALIAS:
             physical = self.state.kairos_terminal.ensure()
             if require_ready:
@@ -25920,8 +26140,256 @@ class PushHandler(BaseHTTPRequestHandler):
             "target": KAIROS_TERMINAL_ALIAS,
         })
 
+    # ---------- kiro 对齐 CC r3 (2026-09-26): 终端页 Kiro ----------
+    # Single-writer protocol (see kiro_terminal.py): an idle Kiro terminal
+    # acquire reserves the session against ACP, closes the ACP process and
+    # launches ``kiro-cli chat --resume-id``; an App turn hands an idle TUI
+    # back (release_for_writer) before ACP ``session/load``s it.  While ACP
+    # replies, the tab shows the prompt-free observer and rejects input.
+    # Lock order everywhere: terminal input transaction, then kiro_turn_lock.
+
+    # Commands that would detach the TUI from the production session or wipe
+    # it (/chat load|new, /clear, /rewind forks, /spawn|/switch move to
+    # another agent session).
+    _KIRO_TERMINAL_BLOCKED_COMMANDS = frozenset({"/chat", "/clear", "/rewind", "/spawn", "/switch"})
+    _KIRO_TERMINAL_KEYS = frozenset({
+        "Escape", "Tab", "Enter", "Space", "BSpace",
+        "Up", "Down", "Left", "Right",
+        "Home", "End", "PageUp", "PageDown", "DC",
+        "C-c", "C-d", "C-z", "C-a", "C-e", "C-k", "C-u", "C-l", "C-r", "C-w",
+        "C-b", "C-f", "C-n", "C-p", "C-s",
+        "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+    })
+
+    def _kiro_acp_turn_active(self) -> bool:
+        with self.state.kiro_turn_lock:
+            return bool(self.state.kiro_active_turn or self.state.kiro_prepare_token)
+
+    def _acquire_kiro_terminal(self) -> str:
+        """Own the production Kiro session in the TUI (caller holds the input transaction)."""
+        with self.state.kiro_turn_lock:
+            if self.state.kiro_active_turn or self.state.kiro_prepare_token:
+                raise KiroTerminalBusy("Kiro 正在回复，终端暂时只读")
+            session_id = str(self.state.kiro_acp.load_session_id() or "")
+            if not session_id:
+                raise KiroTerminalNoActiveSession("Kiro 当前没有可恢复的会话")
+            # Still under the turn lock: no App turn can reserve Kiro before
+            # the ACP process (and its kiro-cli session lock) is gone.  The
+            # next App turn starts a fresh process and session/loads the
+            # session, so it sees every terminal turn.
+            self.state.kiro_acp.close()
+        # A chat send that reserves Kiro now must first take the terminal
+        # input transaction we hold, so it hands this TUI back afterwards.
+        return self.state.kiro_terminal.ensure(
+            session_id,
+            model=self._kiro_model_selection() or None,
+            effort=self._kiro_effort_selection() or None,
+        )
+
+    def _kiro_terminal_observer_payload(self, message: str = "") -> dict[str, Any]:
+        observer = getattr(self.state, "kiro_terminal_observer", None)
+        session_id = ""
+        try:
+            session_id = str(self.state.kiro_acp.load_session_id() or "")
+        except Exception:
+            session_id = ""
+        try:
+            candidate = observer.snapshot(session_id) if observer is not None else None
+        except Exception:
+            candidate = None
+        snapshot = KiroTerminalObserver.project_snapshot(candidate)
+        return {
+            "ok": True,
+            "session": KIRO_TERMINAL_ALIAS,
+            "content": str(snapshot.get("content") or ""),
+            "state": "waiting",
+            "mode": "read_only",
+            "busy": True,
+            "message": message or "Kiro 正在回复，终端暂时只读",
+        }
+
+    def _handle_kiro_terminal_capture(self, lines: int) -> None:
+        terminal = self.state.kiro_terminal
+        with terminal.input_transaction():
+            try:
+                pane = self._acquire_kiro_terminal()
+            except KiroTerminalBusy as exc:
+                if self._kiro_acp_turn_active():
+                    self._send_json(200, self._kiro_terminal_observer_payload(str(exc)))
+                else:
+                    self._send_json(200, {
+                        "ok": True, "session": KIRO_TERMINAL_ALIAS,
+                        "content": f"{exc}\n", "state": "waiting", "busy": True,
+                    })
+                return
+            except KiroTerminalNoActiveSession:
+                self._send_json(200, {
+                    "ok": True, "session": KIRO_TERMINAL_ALIAS,
+                    "content": "当前没有可恢复的 Kiro 会话；在聊天页发一条消息即可创建。\n",
+                    "state": "waiting", "error": "no_active_kiro_session",
+                })
+                return
+            except KiroTerminalUnavailable as exc:
+                self._send_json(503, {"error": str(exc), "target": KIRO_TERMINAL_ALIAS})
+                return
+            try:
+                lease = terminal.lease_for_pane(pane)
+                content = _trim_terminal_capture(terminal.capture(pane, lines))
+                busy = terminal.tui_busy()
+            except KiroTerminalUnavailable as exc:
+                self._send_json(503, {"error": str(exc), "target": KIRO_TERMINAL_ALIAS})
+                return
+            except Exception:
+                logger.exception("Kiro terminal capture failed")
+                self._send_json(503, {"error": "Kiro 终端捕获失败", "target": KIRO_TERMINAL_ALIAS})
+                return
+        if not content.strip():
+            content = "Kiro 终端已连接，正在等待终端输出…\n"
+        # The TUI stays writable while its own turn runs (^C/ESC must reach
+        # it, like a real terminal); only the ACP observer is read-only.
+        self._send_json(200, {
+            "ok": True,
+            "session": KIRO_TERMINAL_ALIAS,
+            "content": content,
+            "state": "ready",
+            "busy": bool(busy),
+            "lease": lease,
+        })
+
+    def _send_kiro_terminal_error(self, exc: Exception) -> None:
+        if isinstance(exc, KiroTerminalBusy):
+            self._send_json(423, {
+                "ok": False, "error": "kiro_busy", "target": KIRO_TERMINAL_ALIAS,
+                "state": "waiting", "message": str(exc),
+            })
+        elif isinstance(exc, KiroTerminalNoActiveSession):
+            self._send_json(409, {
+                "ok": False, "error": "no_active_kiro_session", "target": KIRO_TERMINAL_ALIAS,
+            })
+        else:
+            self._send_json(503, {"ok": False, "error": str(exc) or "Kiro 终端不可用", "target": KIRO_TERMINAL_ALIAS})
+
+    def _handle_kiro_terminal_key(self, key_name: str) -> None:
+        if not key_name:
+            self._send_json(400, {"error": "key required"})
+            return
+        if key_name not in self._KIRO_TERMINAL_KEYS:
+            self._send_json(400, {"error": f"key '{key_name}' not in allowed list"})
+            return
+        terminal = self.state.kiro_terminal
+        with terminal.input_transaction():
+            try:
+                self._acquire_kiro_terminal()
+                delivered = terminal.send_control_key(key_name)
+            except KiroTerminalUnavailable as exc:
+                self._send_kiro_terminal_error(exc)
+                return
+            except Exception:
+                logger.exception("Kiro terminal key failed")
+                self._send_json(503, {"error": "Kiro 终端按键失败", "target": KIRO_TERMINAL_ALIAS})
+                return
+        if not delivered:
+            self._send_json(503, {"error": "Kiro 终端 pane 不可验证，按键未送达", "target": KIRO_TERMINAL_ALIAS})
+            return
+        self._send_json(200, {"ok": True, "key": key_name, "session": KIRO_TERMINAL_ALIAS})
+
+    def _handle_kiro_terminal_send(self, body: dict[str, Any]) -> None:
+        keys = body.get("keys", "")
+        if not isinstance(keys, str):
+            self._send_json(400, {"error": "keys must be a string"})
+            return
+        if len(keys) > 8000:
+            self._send_json(413, {"error": "input too long", "target": KIRO_TERMINAL_ALIAS})
+            return
+        special_key = str(body.get("key") or "").strip()
+        if special_key:
+            self._handle_kiro_terminal_key(special_key)
+            return
+        command = keys.strip().split(None, 1)[0].lower() if keys.strip() else ""
+        if command in self._KIRO_TERMINAL_BLOCKED_COMMANDS:
+            self._send_json(400, {
+                "ok": False,
+                "error": "kiro_session_command_blocked",
+                "target": KIRO_TERMINAL_ALIAS,
+                "message": "这个命令会切换或清空 App 正在用的 Kiro 会话，终端页不允许使用。",
+            })
+            return
+        enter = bool(body.get("enter", True))
+        terminal = self.state.kiro_terminal
+        with terminal.input_transaction():
+            try:
+                self._acquire_kiro_terminal()
+                delivered = terminal.send_text(keys, enter)
+            except KiroTerminalUnavailable as exc:
+                self._send_kiro_terminal_error(exc)
+                return
+            except Exception:
+                logger.exception("Kiro terminal input failed")
+                self._send_json(503, {"error": "Kiro 终端输入失败", "target": KIRO_TERMINAL_ALIAS})
+                return
+        if not delivered:
+            self._send_json(503, {"error": "Kiro 终端 pane 不可验证，输入未送达", "target": KIRO_TERMINAL_ALIAS})
+            return
+        self._send_json(200, {"ok": True, "session": KIRO_TERMINAL_ALIAS, "direct": True})
+
+    def _handle_kiro_terminal_resize(self, columns: int, rows: int) -> None:
+        terminal = self.state.kiro_terminal
+        with terminal.input_transaction():
+            try:
+                resized = terminal.resize(columns, rows)
+            except KiroTerminalUnavailable as exc:
+                self._send_json(503, {"error": str(exc), "target": KIRO_TERMINAL_ALIAS})
+                return
+            except Exception:
+                resized = False
+        # Pure layout: with no owned pane it is deferred, never an error.
+        self._send_json(200, {
+            "ok": True, "session": KIRO_TERMINAL_ALIAS,
+            "columns": columns, "rows": rows, "deferred": not resized,
+        })
+
+    def _handle_kiro_terminal_release(self, body: dict[str, Any]) -> None:
+        terminal = self.state.kiro_terminal
+        with terminal.input_transaction():
+            try:
+                released = terminal.release(str(body.get("lease") or ""))
+            except KiroTerminalUnavailable as exc:
+                self._send_json(503, {"error": str(exc), "target": KIRO_TERMINAL_ALIAS})
+                return
+        self._send_json(200, {"ok": True, "target": KIRO_TERMINAL_ALIAS, "released": released})
+
+    def _handoff_kiro_terminal_to_writer(self, prepare_token: str) -> bool:
+        """Release an idle Kiro TUI after an App turn reserved Kiro.
+
+        Raises KiroTerminalBusy when the TUI may be mid-turn; the caller then
+        rejects the message instead of interleaving two writers.
+        """
+        terminal = getattr(self.state, "kiro_terminal", None)
+        release = getattr(terminal, "release_for_writer", None)
+        input_transaction = getattr(terminal, "input_transaction", None)
+        if not callable(release) or not callable(input_transaction):
+            return True
+        try:
+            session_id = str(self.state.kiro_acp.load_session_id() or "")
+        except Exception:
+            session_id = ""
+        try:
+            with input_transaction():
+                with self.state.kiro_turn_lock:
+                    if self.state.kiro_prepare_token != prepare_token:
+                        return False
+                return bool(release(session_id))
+        except KiroTerminalBusy:
+            raise
+        except KiroTerminalUnavailable:
+            logger.warning("Kiro terminal-to-writer handoff failed", exc_info=True)
+            return False
+
     def _handle_terminal_release(self, body: dict[str, Any]) -> None:
         target = str(body.get("target") or "").strip().lower()
+        if target == KIRO_TERMINAL_ALIAS:
+            self._handle_kiro_terminal_release(body)
+            return
         if target == KIMI_TERMINAL_ALIAS:
             lease = str(body.get("lease") or "")
             with self.state.kimi_terminal.input_transaction():
@@ -25967,6 +26435,9 @@ class PushHandler(BaseHTTPRequestHandler):
                 if self._is_reserved_kimi_physical_target(name):
                     if KIMI_TERMINAL_ALIAS not in exposed:
                         exposed.append(KIMI_TERMINAL_ALIAS)
+                elif self._is_reserved_kiro_physical_target(name):
+                    if KIRO_TERMINAL_ALIAS not in exposed:
+                        exposed.append(KIRO_TERMINAL_ALIAS)
                 else:
                     exposed.append(name)
             self._send_json(200, {"ok": True, "sessions": exposed})
@@ -25981,6 +26452,9 @@ class PushHandler(BaseHTTPRequestHandler):
             lines = int(qs.get("lines", ["120"])[0])
         except Exception:
             lines = 120
+        if str(requested_session).strip().lower() == KIRO_TERMINAL_ALIAS:
+            self._handle_kiro_terminal_capture(lines)
+            return
         if str(requested_session).strip().lower() == KIMI_TERMINAL_ALIAS:
             with self.state.kimi_terminal.input_transaction():
                 self._handle_tmux_capture_transaction(requested_session, lines)
@@ -26175,6 +26649,9 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _handle_terminal_key(self, body: dict[str, Any]):
         requested_session = str(body.get("session", "cctg")).strip() or "cctg"
+        if requested_session.lower() == KIRO_TERMINAL_ALIAS:
+            self._handle_kiro_terminal_key(str(body.get("key", "")).strip())
+            return
         if requested_session.lower() == KAIROS_TERMINAL_ALIAS:
             with self.state.kairos_terminal.input_transaction():
                 self._handle_terminal_key_transaction(body)
@@ -26199,6 +26676,9 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "terminal size out of range"})
             return
         target = requested_session.lower()
+        if target == KIRO_TERMINAL_ALIAS:
+            self._handle_kiro_terminal_resize(columns, rows)
+            return
         transaction = (
             self.state.kairos_terminal.input_transaction()
             if target == KAIROS_TERMINAL_ALIAS else
@@ -26337,6 +26817,9 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _handle_tmux_send(self, body: dict[str, Any]):
         requested_session = body.get("session") or self.state.active_session or self.state.default_session
+        if str(requested_session).strip().lower() == KIRO_TERMINAL_ALIAS:
+            self._handle_kiro_terminal_send(body)
+            return
         if str(requested_session).strip().lower() == KAIROS_TERMINAL_ALIAS:
             with self.state.kairos_terminal.input_transaction():
                 self._handle_tmux_send_transaction(body)

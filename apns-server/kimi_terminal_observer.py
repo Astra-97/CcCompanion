@@ -58,6 +58,11 @@ class KimiTerminalObserver:
     select a record.  Neither becomes part of :meth:`snapshot`.
     """
 
+    # kiro 对齐 CC r3 (2026-09-26): KiroTerminalObserver reuses this exact
+    # projection; only the public target and the display name differ.
+    TARGET = KIMI_TERMINAL_TARGET
+    DISPLAY_NAME = "Kimi"
+
     def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
         self._clock = clock
         self._lock = threading.RLock()
@@ -86,10 +91,10 @@ class KimiTerminalObserver:
     def unavailable_snapshot(cls) -> dict[str, Any]:
         return {
             "ok": True,
-            "target": KIMI_TERMINAL_TARGET,
+            "target": cls.TARGET,
             "mode": "read_only",
             "state": "unavailable",
-            "content": "Kimi 观察器暂不可用。\n",
+            "content": f"{cls.DISPLAY_NAME} 观察器暂不可用。\n",
             "events": [],
         }
 
@@ -271,7 +276,7 @@ class KimiTerminalObserver:
             content = cls._render_content(safe_state, safe_events, safe_assistant_text)
             payload = {
                 "ok": True,
-                "target": KIMI_TERMINAL_TARGET,
+                "target": cls.TARGET,
                 "mode": "read_only",
                 "state": safe_state,
                 "content": content,
@@ -286,11 +291,11 @@ class KimiTerminalObserver:
                 return cls.unavailable_snapshot()
             safe_events.pop(0)
 
-    @staticmethod
-    def _render_content(state: str, events: list[dict[str, Any]], assistant_text: str = "") -> str:
+    @classmethod
+    def _render_content(cls, state: str, events: list[dict[str, Any]], assistant_text: str = "") -> str:
         phase = "正在处理" if state == "working" else "空闲"
         lines = [
-            "Kimi 实时观察 · 只读",
+            f"{cls.DISPLAY_NAME} 实时观察 · 只读",
             "命令参数、路径、思考内容与工具输出已隐藏",
             "",
             f"状态：{phase}",
@@ -311,3 +316,10 @@ class KimiTerminalObserver:
         text = re.sub(r"(?i)\b(?:authorization|bearer|token|api[_-]?key|password|secret)\b\s*[:=]\s*[^\s,;]+", "[已隐藏敏感内容]", text)
         text = re.sub(r"/(?:root|home|etc|var|tmp|private|Users)(?:/[\w.\-]+)+", "[已隐藏路径]", text)
         return text[-KIMI_TERMINAL_MAX_ASSISTANT_CHARS:]
+
+
+class KiroTerminalObserver(KimiTerminalObserver):
+    """Kiro ACP turns in the terminal tab: same prompt-free projection as Kimi."""
+
+    TARGET = "kiro"
+    DISPLAY_NAME = "Kiro"

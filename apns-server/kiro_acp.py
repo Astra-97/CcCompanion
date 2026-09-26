@@ -127,8 +127,63 @@ def _activity_from_update(params: Any) -> dict[str, Any] | None:
     if kind in {"agentthoughtchunk", "agentthought", "thinking"}:
         return {"kind": "activity", "label": "正在思考"}
     if kind in {"toolcall", "toolcallupdate", "tooluse"}:
-        return {"kind": "activity", "label": "正在使用工具"}
+        event: dict[str, Any] = {"kind": "activity", "label": "正在使用工具"}
+        # kiro 对齐 CC r3 (2026-09-26): identify the call so callers count
+        # one tool per toolCallId (a call streams one ``tool_call`` plus any
+        # number of ``tool_call_update``s).  Only the bounded, redacted title,
+        # the closed-set ACP kind and status are projected — never rawInput,
+        # rawOutput, content or locations.
+        tool_call_id = _safe_tool_call_id(update.get("toolCallId"))
+        if tool_call_id:
+            event["tool_call_id"] = tool_call_id
+            event["tool_update"] = kind == "toolcallupdate"
+            title = _safe_tool_title(update.get("title"))
+            if title:
+                event["title"] = title
+            tool_kind = str(update.get("kind") or "").strip().lower()
+            if tool_kind in KIRO_TOOL_KINDS:
+                event["tool_kind"] = tool_kind
+            status = str(update.get("status") or "").strip().lower()
+            if status in KIRO_TOOL_STATUSES:
+                event["status"] = status
+        return event
     return None
+
+
+# kiro 对齐 CC r3 (2026-09-26): ACP ToolKind / ToolCallStatus closed sets.
+KIRO_TOOL_KINDS = frozenset({
+    "read", "edit", "delete", "move", "search", "execute", "think", "fetch",
+    "switch_mode", "other",
+})
+KIRO_TOOL_STATUSES = frozenset({"pending", "in_progress", "completed", "failed"})
+_TOOL_CALL_ID_RE = re.compile(r"[A-Za-z0-9._:\-]{1,128}")
+_TOOL_TITLE_MAX = 80
+_TOOL_TITLE_SECRET_RES = (
+    re.compile(r"(?i)\b(?:authorization\s*:\s*bearer|bearer)\s+[A-Za-z0-9._~+/=\-]+"),
+    re.compile(
+        r"(?i)\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|token|password|passwd|secret)"
+        r"\s*[:=]\s*[^\s,;&]+"
+    ),
+    re.compile(r"\b(?:sk|ghp|gho|github_pat|xox[bp])[-_][A-Za-z0-9_\-]{12,}\b"),
+)
+
+
+def _safe_tool_call_id(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if _TOOL_CALL_ID_RE.fullmatch(text) else ""
+
+
+def _safe_tool_title(value: Any) -> str:
+    """Kiro's human title ("Running: …", "Reading x:1") bounded and redacted."""
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
+    # URL query strings and fragments routinely carry credentials.
+    text = re.sub(r"(https?://[^\s?#]+)[?#][^\s]*", r"\1", text, flags=re.IGNORECASE)
+    for pattern in _TOOL_TITLE_SECRET_RES:
+        text = pattern.sub("[已隐藏]", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > _TOOL_TITLE_MAX:
+        text = text[: _TOOL_TITLE_MAX - 1].rstrip() + "…"
+    return text
 
 
 # Auth/quota classification is message-based because Kiro's ACP error codes
