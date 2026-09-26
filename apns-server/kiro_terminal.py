@@ -166,8 +166,10 @@ class KiroTerminalBridge:
         process_killer: Any = os.kill,
         shutdown_wait_seconds: float = 2.0,
         resume_wait_seconds: float = 10.0,
+        lock_release_wait_seconds: float = 10.0,
         turn_probe: KiroSessionTurnProbe | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        pid_alive: Callable[[int], bool] | None = None,
     ) -> None:
         self.command = Path(command).expanduser()
         self.cwd = Path(cwd).expanduser()
@@ -178,8 +180,10 @@ class KiroTerminalBridge:
         self._process_killer = process_killer
         self.shutdown_wait_seconds = max(0.05, min(float(shutdown_wait_seconds), 5.0))
         self.resume_wait_seconds = max(0.5, float(resume_wait_seconds))
+        self.lock_release_wait_seconds = max(0.2, float(lock_release_wait_seconds))
         self.turn_probe = turn_probe or KiroSessionTurnProbe(self.sessions_dir)
         self._sleep = sleep
+        self._pid_alive_check = pid_alive or self._pid_alive
         self._lock = threading.RLock()
         # Serializes every App terminal operation (capture/paste/keys/release)
         # with the reaper and the chat handoff, so a pane is never killed
@@ -368,6 +372,53 @@ class KiroTerminalBridge:
             return pid if pid > 1 else 0
         except (OSError, ValueError, TypeError, AttributeError):
             return 0
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        """A live (non-zombie) process; unreadable /proc counts as alive."""
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        try:
+            return stat.rsplit(")", 1)[1].split()[0] not in {"Z", "X"}
+        except IndexError:
+            return True
+
+    def _wait_for_lock_release_locked(self, session_id: str, our_pid: int) -> bool:
+        """kiro r4: True once ``<id>.lock`` no longer names a live process.
+
+        Called after the owned TUI was torn down, before ACP ``session/load``.
+        ``our_pid`` is the lock owner verified (by ancestry) to belong to that
+        pane before teardown.  kiro-cli's session engine runs in its own
+        process group, so if exactly that process outlives the pane it gets
+        one direct SIGTERM.  A lock held by any other live process is never
+        ours to break: the handoff fails instead.
+        """
+        deadline = time.monotonic() + self.lock_release_wait_seconds
+        signalled = False
+        while True:
+            owner = self._lock_owner_pid(session_id)
+            if not owner or not self._pid_alive_check(owner):
+                return True
+            if owner != our_pid:
+                logger.warning("Kiro session lock is held by a process outside the terminal pane")
+                return False
+            if time.monotonic() >= deadline:
+                if signalled:
+                    logger.warning("Kiro session lock was not released after the terminal closed")
+                    return False
+                signalled = True
+                try:
+                    self._process_killer(owner, signal.SIGTERM)
+                except ProcessLookupError:
+                    return True
+                except OSError:
+                    return False
+                deadline = time.monotonic() + self.lock_release_wait_seconds
+            self._sleep(0.1)
 
     @staticmethod
     def _parent_pid(pid: int) -> int:
@@ -672,10 +723,38 @@ class KiroTerminalBridge:
                     raise KiroTerminalBusy("Kiro 终端状态未确认")
                 if self._tui_busy_locked(session_id, pane_id):
                     raise KiroTerminalBusy("Kiro 终端里还有一轮在进行")
+            # kiro r4: remember which process holds the session lock *before*
+            # teardown, while its ancestry still proves it belongs to the pane.
+            lock_owner = self._lock_owner_pid(session_id) if session_id else 0
+            our_lock_owner = (
+                lock_owner if lock_owner and not pane_dead and self._belongs_to_pane(lock_owner, pane_pid) else 0
+            )
             released = self._shutdown_exact_pane_locked(pane_id, pane_pid, pane_dead)
             if released:
                 self._clear_lease_locked()
+            if released and session_id:
+                # ACP must not session/load until kiro-cli's own lock is gone.
+                released = self._wait_for_lock_release_locked(session_id, our_lock_owner)
             return released
+
+    def writer_blocked(self, session_id: str) -> bool:
+        """kiro r4: read-only precheck — would ``release_for_writer`` refuse now?
+
+        Lets the App send queue wait for a running TUI turn without reserving
+        Kiro (which would briefly turn the terminal tab read-only).  The real
+        handoff re-checks everything; this never tears anything down.
+        """
+        with self._lock:
+            try:
+                current = self._owned_pane_locked()
+            except KiroTerminalUnavailable:
+                return True
+            if current is None or current[1]:
+                return False
+            bound = self._bound_fingerprint_locked()
+            if not session_id or not hmac.compare_digest(bound, self._fingerprint(session_id)):
+                return not bound
+            return self._tui_busy_locked(session_id, current[0])
 
     def release_for_shutdown(self) -> bool:
         with self._lock:

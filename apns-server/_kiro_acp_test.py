@@ -632,7 +632,9 @@ class KiroChatHandlerTest(unittest.TestCase):
         self.assertEqual(400, handler.responses[-1][0])
         self.assertEqual([], kiro.records)
 
-    def test_busy_turn_rejects_before_history_or_prompt(self):
+    def test_busy_turn_queues_without_prompting(self):
+        # kiro r4 (2026-09-26): Kimi parity — a message sent while an App turn
+        # runs is accepted into the queue (was 409 kiro_turn_active).
         acp = self._acp()
         handler, kiro, _xiaoke = self._handler(acp)
         handler.state.kiro_active_turn = {
@@ -640,10 +642,14 @@ class KiroChatHandlerTest(unittest.TestCase):
             "cancel_event": threading.Event(),
             "session_id": "kiro-session-1",
         }
-        handler._handle_kiro_chat_send({"text": "第二条"}, "kiro")
-        self.assertEqual(409, handler.responses[-1][0])
-        self.assertEqual("kiro_turn_active", handler.responses[-1][1]["error"])
-        self.assertEqual([], kiro.records)
+        with patch("push.threading.Thread"):
+            handler._handle_kiro_chat_send({"text": "第二条"}, "kiro")
+        status, payload = handler.responses[-1]
+        self.assertEqual(200, status)
+        self.assertEqual((True, 1, "kiro_turn_active"),
+                         (payload["queued"], payload["queue_position"], payload["reason"]))
+        self.assertEqual(["第二条"], [row["text"] for row in kiro.records])
+        self.assertEqual(1, len(handler.state.kiro_chat_queue))
 
     def test_auth_required_at_prepare_is_clean_503_without_history(self):
         def prepare(**_kwargs):
@@ -1758,7 +1764,7 @@ class KiroParityHandlerTest(KiroChatHandlerTest):
         from contacts import dispatch_contact_stop
 
         calls = []
-        stub = types.SimpleNamespace(_handle_kiro_chat_stop=lambda user_ts: calls.append(user_ts))
+        stub = types.SimpleNamespace(_handle_kiro_chat_stop=lambda user_ts, body=None: calls.append(user_ts))
         self.assertTrue(dispatch_contact_stop(stub, {"contact_id": "kiro", "user_ts": " ts-3 "}))
         self.assertEqual(["ts-3"], calls)
 
@@ -1848,9 +1854,15 @@ class KiroParityHandlerTest(KiroChatHandlerTest):
         handler, kiro, _xiaoke = self._handler(acp)
         doc = self._staged(handler, "a.txt", b"hello", kind="file", media_type="text/plain")
         handler.state.kiro_active_turn = {"user_ts": "t", "cancel_event": threading.Event(), "session_id": "s"}
-        handler._handle_kiro_chat_send({"text": "x", "_pwa_staged_attachments": [doc]}, "kiro")
-        self.assertEqual(409, handler.responses[-1][0])
-        self.assertFalse(Path(doc["stored_path"]).exists())
+        # kiro r4: busy now queues (Kimi parity) — the attachment is committed
+        # with the queued history row and must stay valid until delivery.
+        with patch("push.threading.Thread"):
+            handler._handle_kiro_chat_send({"text": "x", "_pwa_staged_attachments": [doc]}, "kiro")
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertTrue(handler.responses[-1][1]["queued"])
+        self.assertTrue(Path(doc["stored_path"]).exists())
+        self.assertEqual(1, len(kiro.records))
+        handler.state.kiro_chat_queue.clear()
 
         handler.state.kiro_active_turn = {}
         doc2 = self._staged(handler, "b.txt", b"hello", kind="file", media_type="text/plain")
@@ -1862,7 +1874,7 @@ class KiroParityHandlerTest(KiroChatHandlerTest):
         handler._handle_kiro_chat_send({"text": "x", "_pwa_staged_attachments": [doc2]}, "kiro")
         self.assertEqual(503, handler.responses[-1][0])
         self.assertFalse(Path(doc2["stored_path"]).exists())
-        self.assertEqual([], kiro.records)
+        self.assertEqual(1, len(kiro.records))  # only the queued row above
 
     # ----- Memory recall -----
 

@@ -1240,6 +1240,16 @@ KIMI_CHAT_QUEUE_BUSY_REQUEUE_REASONS = frozenset({
 # 忙类重投的兜底：不允许无限重投无兜底，入队超过此时长仍投不出去才判死，
 # 照旧落可见失败卡片。取保守值，覆盖「过夜长任务」级别的合法忙。
 KIMI_CHAT_QUEUE_MAX_WAIT_SECONDS = 6 * 3600
+# kiro r4 (2026-09-26)：Kiro 私聊排队复用同一套队列核心（_contact_chat_queue_*），
+# 上限/配额/时长与 Kimi 相同但各自独立，互不影响。「合法忙」= App 回合或
+# 终端 TUI 回合尚未结束。
+KIRO_CHAT_QUEUE_MAX = 20
+KIRO_CHAT_QUEUE_MAX_ATTEMPTS = 3
+KIRO_CHAT_QUEUE_BUSY_REQUEUE_REASONS = frozenset({
+    "kiro_turn_active",
+    "kiro_terminal_busy",
+})
+KIRO_CHAT_QUEUE_MAX_WAIT_SECONDS = 6 * 3600
 # 终端输入不排队：与真实终端一致，忙时键盘字节同样直达底层 pane，由 tty
 # 缓冲到进程消费。只有 pane 归属/存活无法验证这类真实错误才返回失败，
 # 用户入口永不 423、永不等待"就绪"。
@@ -4582,6 +4592,11 @@ class ServerState:
         )
         self.kiro_terminal_observer = KiroTerminalObserver()
         self.kiro_terminal_acquire_token = ""
+        # kiro r4 (2026-09-26): 与 Kimi 同款待发送队列——终端 TUI 回合进行中
+        # 收到的 App 消息入库入队，TUI 回合结束、会话交还 ACP 后按序投递。
+        # 仅内存态（与 Kimi 相同）。
+        self.kiro_chat_queue: deque[dict[str, Any]] = deque()
+        self.kiro_chat_queue_worker_running = False
         self.kimi_web = KimiWebClient(
             command=server_cfg.get("kimi_bin", "/root/.kimi-code/bin/kimi"),
             port=int(server_cfg.get("kimi_web_port", 58627)),
@@ -5187,6 +5202,24 @@ def _should_generate_chat_append_tts(
         and not attachment_url
         and enabled
     )
+
+
+class _ChatQueueSpec:
+    """Per-contact wiring for the shared private-chat send queue (Kimi, Kiro).
+
+    Every limit and hook is a callable resolved at use time so module-level
+    constants and handler methods stay patchable exactly as before.
+    """
+
+    __slots__ = (
+        "label", "lock", "queue_attr", "running_attr", "max_len", "max_attempts",
+        "busy_reasons", "wait_expired", "fail", "idle_locked", "ready", "dispatch",
+        "worker", "full_reason",
+    )
+
+    def __init__(self, **fields: Any) -> None:
+        for name in self.__slots__:
+            setattr(self, name, fields[name])
 
 
 class _QueuedSendResponderProxy:
@@ -14139,52 +14172,135 @@ class PushHandler(BaseHTTPRequestHandler):
                 continue
         return "\n".join(hints), images
 
-    def _handle_kiro_chat_send(self, body: dict[str, Any], contact_id: str) -> None:
-        """Queue-free text/attachment turn into Kiro's own ACP session."""
+    def _handle_kiro_chat_send(
+        self, body: dict[str, Any], contact_id: str, *, queue_item: dict[str, Any] | None = None,
+    ) -> None:
+        """Text/attachment turn into Kiro's own ACP session.
+
+        kiro r4 (2026-09-26): while the terminal tab's TUI runs a turn (or
+        earlier messages are still queued) the message is accepted into the
+        Kimi-shaped send queue instead of 409; the queue worker re-enters this
+        handler with ``queue_item`` (server-internal only, never from a
+        request body) once the TUI turn is over.
+        """
+        queued_item = queue_item if isinstance(queue_item, dict) else None
+        precommitted_record = queued_item.get("record") if queued_item is not None else None
+        if not (isinstance(precommitted_record, dict) and str(precommitted_record.get("ts") or "")):
+            precommitted_record = None
         text = str(body.get("text") or "").strip()
         quoted_ts = body.get("quoted_ts") or None
         staged_attachments = [
             item for item in list(body.get("_pwa_staged_attachments") or []) if isinstance(item, dict)
         ]
         metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else None
-        attachments_committed = False
+        # A queued message's attachments were committed with its history row.
+        attachments_committed = precommitted_record is not None
 
         def discard_uncommitted_attachments() -> None:
             if not attachments_committed:
                 self._discard_uncommitted_staged_attachments(staged_attachments)
 
-        if not text and not staged_attachments:
+        if queued_item is not None and precommitted_record is None:
+            logger.warning("queued Kiro send lacks a committed history record, dropped")
+            self._send_json(500, {"ok": False, "error": "kiro_history_unavailable"})
+            return
+        if not text and not staged_attachments and precommitted_record is None:
             self._send_json(400, {"ok": False, "error": "text required"})
             return
 
-        with self.state.kiro_turn_lock:
-            if self.state.kiro_active_turn or self.state.kiro_prepare_token:
-                discard_uncommitted_attachments()
-                self._send_json(409, {
-                    "ok": False,
-                    "error": "kiro_turn_active",
-                    "reason": "Kiro 正在回复上一条消息，请等它完成后再发。",
+        def enqueue_busy(reason: str) -> None:
+            """忙时唯一出口（同 Kimi）：新消息入库入队（200 queued），队列重入只重投。"""
+            nonlocal attachments_committed
+            if queued_item is not None:
+                kept = self._requeue_kiro_chat_turn(queued_item, reason=reason)
+                self._send_json(200, {
+                    "ok": True, "queued": kept, "record": precommitted_record, "reason": reason,
                 })
+                return
+            chat = self._chat_for_contact(contact_id)
+            primary_attachment = staged_attachments[0] if staged_attachments else {}
+            try:
+                rec = chat.append(
+                    role="user",
+                    text=text,
+                    source=self._source_for_request("kiro"),
+                    quoted_ts=quoted_ts,
+                    metadata=metadata,
+                    attachment_url=primary_attachment.get("attachment_url") or None,
+                    attachment_type=primary_attachment.get("type") or None,
+                    attachment_filename=primary_attachment.get("filename") or None,
+                )
+            except Exception:
+                logger.exception("Kiro busy-queue history append failed")
+                discard_uncommitted_attachments()
+                self._send_json(500, {"ok": False, "error": "kiro_history_unavailable"})
+                return
+            attachments_committed = True
+            position = self._enqueue_kiro_chat_turn({
+                "kind": "acp",
+                "contact_id": contact_id,
+                "text": text,
+                "quoted_ts": quoted_ts,
+                "metadata": metadata,
+                "record": rec,
+                # Committed with the history row; kept for the ACP prompt
+                # (image blocks + local path hints) at delivery time.
+                "staged_attachments": staged_attachments,
+                "attempts": 0,
+                "queued_at": str(rec.get("ts") or ""),
+            })
+            if position is None:
+                self._set_chat_failed(contact_id, user_ts=rec["ts"], source="kiro-acp:queue-full")
+                self._send_json(429, {
+                    "ok": False,
+                    "error": "kiro_queue_full",
+                    "reason": "排队消息过多，请等当前回复完成后再发。",
+                    "record": rec,
+                })
+                return
+            self._set_chat_queued(
+                contact_id,
+                user_ts=str(rec.get("ts") or ""),
+                queued_at=str(rec.get("ts") or ""),
+                queue_position=position,
+                source="cc-app:kiro",
+            )
+            self._send_json(200, {
+                "ok": True,
+                "queued": True,
+                "record": rec,
+                "queue_position": position,
+                "reason": reason,
+            })
+
+        with self.state.kiro_turn_lock:
+            # Same gate as Kimi: an App turn/prepare in progress (including a
+            # queued message being delivered right now) queues the new message
+            # too, so it can never overtake or be rejected in favour of an
+            # earlier one.
+            turn_busy = bool(self.state.kiro_active_turn or self.state.kiro_prepare_token)
+            # 保序：已有排队消息时新消息一律排到队尾，不在 worker 轮询窗口内插队。
+            queue_ahead = queued_item is None and bool(self._kiro_chat_queue())
+            if turn_busy or queue_ahead:
+                enqueue_busy("kiro_turn_active" if turn_busy else "kiro_queue_ahead")
                 return
             prepare_token = secrets.token_hex(16)
             self.state.kiro_prepare_token = prepare_token
 
         prepare_started = time.monotonic()
         # kiro 对齐 CC r3: the terminal tab's TUI and ACP never write the
-        # session together — hand an idle TUI back first, refuse a busy one.
+        # session together — hand an idle TUI back first (r4: and wait for
+        # kiro-cli's session lock to be released); a busy one queues the message.
         try:
             handed_off = self._handoff_kiro_terminal_to_writer(prepare_token)
         except KiroTerminalBusy:
             self._release_kiro_prepare(prepare_token)
-            discard_uncommitted_attachments()
-            self._send_json(409, {
-                "ok": False,
-                "error": "kiro_terminal_busy",
-                "reason": "Kiro 终端里还有一轮在进行；等它结束（或在终端页按 ^C 停下）后再发。本次消息未发送。",
-            })
+            enqueue_busy("kiro_terminal_busy")
             return
         if not handed_off:
             self._release_kiro_prepare(prepare_token)
+            if queued_item is not None:
+                self._fail_queued_kiro_chat(queued_item, "kiro_terminal_handoff_failed")
             discard_uncommitted_attachments()
             self._send_json(503, {
                 "ok": False,
@@ -14205,6 +14321,8 @@ class PushHandler(BaseHTTPRequestHandler):
             )
         except KiroACPAuthRequired:
             self._release_kiro_prepare(prepare_token)
+            if queued_item is not None:
+                self._fail_queued_kiro_chat(queued_item, "kiro_auth_required")
             discard_uncommitted_attachments()
             self.state.kiro_acp.close()
             self._send_json(503, {
@@ -14215,6 +14333,8 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         except KiroACPQuotaExceeded:
             self._release_kiro_prepare(prepare_token)
+            if queued_item is not None:
+                self._fail_queued_kiro_chat(queued_item, "kiro_quota_exceeded")
             discard_uncommitted_attachments()
             self.state.kiro_acp.close()
             self._send_json(503, {
@@ -14225,9 +14345,15 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         except (KiroACPBusy, KiroACPError) as exc:
             self._release_kiro_prepare(prepare_token)
-            discard_uncommitted_attachments()
             logger.warning("Kiro ACP prepare failed: %s", type(exc).__name__)
             self.state.kiro_acp.close()
+            if queued_item is not None:
+                # Same as Kimi Web: a transient provider failure re-queues
+                # (attempt-bounded), it does not drop the queued message.
+                kept = self._requeue_kiro_chat_turn(queued_item, reason="kiro_unavailable")
+                self._send_json(200, {"ok": True, "queued": kept, "reason": "kiro_unavailable"})
+                return
+            discard_uncommitted_attachments()
             self._send_json(503, {
                 "ok": False,
                 "error": "kiro_unavailable",
@@ -14236,9 +14362,13 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         except Exception:
             self._release_kiro_prepare(prepare_token)
-            discard_uncommitted_attachments()
             logger.exception("Kiro ACP prepare crashed")
             self.state.kiro_acp.close()
+            if queued_item is not None:
+                kept = self._requeue_kiro_chat_turn(queued_item, reason="kiro_unavailable")
+                self._send_json(200, {"ok": True, "queued": kept, "reason": "kiro_unavailable"})
+                return
+            discard_uncommitted_attachments()
             self._send_json(503, {
                 "ok": False,
                 "error": "kiro_unavailable",
@@ -14250,32 +14380,31 @@ class PushHandler(BaseHTTPRequestHandler):
         with self.state.kiro_turn_lock:
             if self.state.kiro_prepare_token != prepare_token or self.state.kiro_active_turn:
                 self._release_kiro_prepare(prepare_token)
-                discard_uncommitted_attachments()
-                self._send_json(409, {
-                    "ok": False,
-                    "error": "kiro_turn_active",
-                    "reason": "Kiro 正在回复上一条消息，请等它完成后再发。",
-                })
+                enqueue_busy("kiro_turn_active")
                 return
             chat = self._chat_for_contact(contact_id)
-            primary_attachment = staged_attachments[0] if staged_attachments else {}
-            try:
-                rec = chat.append(
-                    role="user",
-                    text=text,
-                    source=self._source_for_request("kiro"),
-                    quoted_ts=quoted_ts,
-                    metadata=metadata,
-                    attachment_url=primary_attachment.get("attachment_url") or None,
-                    attachment_type=primary_attachment.get("type") or None,
-                    attachment_filename=primary_attachment.get("filename") or None,
-                )
-            except Exception:
-                logger.exception("Kiro history append failed")
-                self._release_kiro_prepare(prepare_token)
-                discard_uncommitted_attachments()
-                self._send_json(500, {"ok": False, "error": "kiro_history_unavailable"})
-                return
+            if precommitted_record is not None:
+                # 队列重入：历史在入队时已写入（含附件），这里绝不重复 append。
+                rec = precommitted_record
+            else:
+                primary_attachment = staged_attachments[0] if staged_attachments else {}
+                try:
+                    rec = chat.append(
+                        role="user",
+                        text=text,
+                        source=self._source_for_request("kiro"),
+                        quoted_ts=quoted_ts,
+                        metadata=metadata,
+                        attachment_url=primary_attachment.get("attachment_url") or None,
+                        attachment_type=primary_attachment.get("type") or None,
+                        attachment_filename=primary_attachment.get("filename") or None,
+                    )
+                except Exception:
+                    logger.exception("Kiro history append failed")
+                    self._release_kiro_prepare(prepare_token)
+                    discard_uncommitted_attachments()
+                    self._send_json(500, {"ok": False, "error": "kiro_history_unavailable"})
+                    return
             attachments_committed = True
             cancel_event = threading.Event()
             self.state.kiro_active_turn = {
@@ -14538,14 +14667,29 @@ class PushHandler(BaseHTTPRequestHandler):
             },
         })
 
-    def _handle_kiro_chat_stop(self, user_ts: str) -> None:
+    def _handle_kiro_chat_stop(self, user_ts: str, body: dict[str, Any] | None = None) -> None:
         """Exact-turn Stop for Kiro, same contract as the Kimi ACP path.
 
         kiro 对齐 CC (2026-09-26): the cancel event makes the turn worker send
         ACP ``session/cancel``; the worker persists the partial answer as the
         interrupted final message, exactly like Kimi.
+
+        kiro r4: queued messages follow Kimi too — only an explicit
+        ``clear_queued`` empties the queue (marking each interrupted); a plain
+        Stop never drops messages the user deliberately sent.
         """
+        clear_queued = bool((body or {}).get("clear_queued"))
+        cleared_queued = self._clear_kiro_chat_queue() if clear_queued else 0
+        cleared_extra = {"cleared_queued": cleared_queued} if clear_queued else {}
         if not user_ts:
+            if clear_queued:
+                self._send_json(200, {
+                    "ok": True,
+                    "stopped": False,
+                    "cleared_queued": cleared_queued,
+                    "message": f"已清空 {cleared_queued} 条排队消息。",
+                })
+                return
             self._send_json(400, {
                 "ok": False,
                 "error": "missing_turn_identity",
@@ -14560,6 +14704,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     "stopped": False,
                     "already_finished": True,
                     "message": "这轮 Kiro 生成已经结束。",
+                    **cleared_extra,
                 })
                 return
             active_ts = str(active.get("user_ts") or "")
@@ -14584,12 +14729,168 @@ class PushHandler(BaseHTTPRequestHandler):
             "stopped": True,
             "user_ts": active_ts,
             "message": "已停止 Kiro 生成。",
+            **cleared_extra,
         })
 
     def _release_kiro_prepare(self, prepare_token: str) -> None:
         with self.state.kiro_turn_lock:
             if self.state.kiro_prepare_token == prepare_token:
                 self.state.kiro_prepare_token = ""
+
+    # ---------- kiro r4 (2026-09-26): Kiro 私聊消息排队（与 Kimi 共用队列核心） ----------
+
+    def _kiro_chat_queue_spec(self) -> "_ChatQueueSpec":
+        return _ChatQueueSpec(
+            label="Kiro",
+            lock=self.state.kiro_turn_lock,
+            queue_attr="kiro_chat_queue",
+            running_attr="kiro_chat_queue_worker_running",
+            max_len=lambda: KIRO_CHAT_QUEUE_MAX,
+            max_attempts=lambda: KIRO_CHAT_QUEUE_MAX_ATTEMPTS,
+            busy_reasons=lambda: KIRO_CHAT_QUEUE_BUSY_REQUEUE_REASONS,
+            wait_expired=lambda item: self._kiro_chat_queue_wait_expired(item),
+            fail=lambda item, reason: self._fail_queued_kiro_chat(item, reason),
+            idle_locked=lambda: self._kiro_chat_idle_locked(),
+            ready=lambda: self._kiro_chat_queue_ready(),
+            dispatch=lambda item: self._dispatch_queued_kiro_chat(item),
+            worker=lambda: self._kiro_chat_queue_worker(),
+            full_reason="kiro_queue_full",
+        )
+
+    def _kiro_chat_queue(self) -> deque[dict[str, Any]]:
+        return self._contact_chat_queue(self._kiro_chat_queue_spec())
+
+    def _kiro_chat_idle_locked(self) -> bool:
+        """调用方须持有 kiro_turn_lock：没有 App 回合、也没有 prepare 预约。"""
+        return not (
+            self.state.kiro_active_turn
+            or self.state.kiro_prepare_token
+            or getattr(self.state, "kiro_terminal_acquire_token", "")
+        )
+
+    def _kiro_chat_queue_ready(self) -> bool:
+        """Lock-free precheck: don't reserve Kiro while the TUI is mid-turn.
+
+        Reserving would flip the terminal tab to the read-only observer on
+        every retry.  An expired head item is let through so the handler's
+        busy path can fail it visibly instead of waiting forever.
+        """
+        with self.state.kiro_turn_lock:
+            queue = self._kiro_chat_queue()
+            head = queue[0] if queue else None
+        if head is not None and self._kiro_chat_queue_wait_expired(head):
+            return True
+        terminal = getattr(self.state, "kiro_terminal", None)
+        blocked = getattr(terminal, "writer_blocked", None)
+        if not callable(blocked):
+            return True
+        try:
+            session_id = str(self.state.kiro_acp.load_session_id() or "")
+        except Exception:
+            session_id = ""
+        try:
+            return not bool(blocked(session_id))
+        except Exception:
+            logger.debug("Kiro terminal writer precheck failed", exc_info=True)
+            return False
+
+    def _enqueue_kiro_chat_turn(self, item: dict[str, Any]) -> int | None:
+        with self.state.kiro_turn_lock:
+            return self._push_contact_chat_queue_locked(self._kiro_chat_queue_spec(), item)
+
+    @staticmethod
+    def _kiro_chat_queue_wait_expired(item: dict[str, Any]) -> bool:
+        return PushHandler._chat_queue_wait_expired(item, KIRO_CHAT_QUEUE_MAX_WAIT_SECONDS)
+
+    def _requeue_kiro_chat_turn(self, item: dict[str, Any], *, reason: str) -> bool:
+        return self._requeue_contact_chat_turn(self._kiro_chat_queue_spec(), item, reason=reason)
+
+    _KIRO_QUEUE_FAILURE_TEXT = {
+        "kiro_terminal_handoff_failed": "Kiro 终端未能安全交还聊天，这条排队消息没有发出，请重新发送一次。",
+        "kiro_auth_required": "Kiro 还没有完成登录，这条排队消息没有发出；完成登录后请重新发送一次。",
+        "kiro_quota_exceeded": "Kiro 额度已用完，这条排队消息没有发出；额度恢复后请重新发送一次。",
+    }
+
+    def _fail_queued_kiro_chat(self, item: dict[str, Any], reason: str) -> None:
+        """排队消息最终失败（同 Kimi）：清理随队附件，历史留可见失败说明。"""
+        record = item.get("record") if isinstance(item.get("record"), dict) else {}
+        user_ts = str(record.get("ts") or "")
+        logger.warning("Kiro queued send failed permanently reason=%s user_ts=%s", reason, user_ts)
+        try:
+            self._discard_uncommitted_staged_attachments(item.get("staged_attachments"))
+        except Exception:
+            logger.warning("Kiro queued-send staged attachment cleanup failed", exc_info=True)
+        if reason.endswith("_wait_expired"):
+            text = "这条消息排队等待 Kiro 超过 6 小时仍未能送出，已放弃发送，请重新发送一次。"
+        else:
+            text = self._KIRO_QUEUE_FAILURE_TEXT.get(
+                reason, "这条消息在 Kiro 状态切换期间多次未能送出，请重新发送一次。",
+            )
+        try:
+            contact_id = str(item.get("contact_id") or "kiro")
+            self._chat_for_contact(contact_id).append(
+                role="assistant",
+                text=text,
+                source="kiro-acp:queue-failed",
+                metadata={"kiro_user_ts": user_ts, "turn_terminal": True},
+            )
+            if user_ts:
+                self._set_chat_failed(contact_id, user_ts=user_ts, source="kiro-acp:queue-failed")
+        except Exception:
+            logger.warning("Kiro queued-send failure note append failed", exc_info=True)
+
+    def _kiro_chat_queue_worker(self) -> None:
+        self._contact_chat_queue_worker(self._kiro_chat_queue_spec())
+
+    def _dispatch_queued_kiro_chat(self, item: dict[str, Any]) -> str:
+        """投递一条排队消息；返回 started / requeued / failed 供 worker 退避。"""
+        contact_id = str(item.get("contact_id") or "kiro")
+        record = item.get("record") if isinstance(item.get("record"), dict) else None
+        if not record or not str(record.get("ts") or ""):
+            logger.warning("queued Kiro send lacks a committed history record, dropped")
+            return "failed"
+        proxy = _QueuedSendResponderProxy(self)
+        body = {
+            "text": str(item.get("text") or ""),
+            "quoted_ts": item.get("quoted_ts"),
+            "metadata": item.get("metadata"),
+            "_pwa_staged_attachments": list(item.get("staged_attachments") or []),
+        }
+        try:
+            proxy._handle_kiro_chat_send(body, contact_id, queue_item=item)
+        except Exception:
+            logger.exception("queued Kiro send dispatch crashed")
+            spec = self._kiro_chat_queue_spec()
+            return "requeued" if self._requeue_contact_after_dispatch_crash(spec, item) else "failed"
+        for status, payload in proxy.responses:
+            if status == 200 and isinstance(payload, dict) and payload.get("turn"):
+                return "started"
+        saw_queued = any(
+            status == 200 and isinstance(payload, dict) and payload.get("queued")
+            for status, payload in proxy.responses
+        )
+        return "requeued" if saw_queued else "failed"
+
+    def _clear_kiro_chat_queue(self) -> int:
+        """Stop 链路的队列清空途径（同 Kimi）：排队消息标记 interrupted，返回条数。"""
+        with self.state.kiro_turn_lock:
+            queue = self._kiro_chat_queue()
+            items = list(queue)
+            queue.clear()
+        for item in items:
+            record = item.get("record") if isinstance(item.get("record"), dict) else {}
+            user_ts = str(record.get("ts") or "")
+            if not user_ts:
+                continue
+            try:
+                self._set_chat_interrupted(
+                    str(item.get("contact_id") or "kiro"),
+                    user_ts=user_ts,
+                    source="cc-app:kiro:cancelled-before-run",
+                )
+            except Exception:
+                logger.debug("queued Kiro send interrupt-mark failed", exc_info=True)
+        return len(items)
 
     def _handle_kiro_new_session(self, body: dict[str, Any]) -> None:
         """Explicit recovery: abandon the persisted pointer, start fresh.
@@ -16521,49 +16822,59 @@ class PushHandler(BaseHTTPRequestHandler):
             if self.state.kimi_prepare_token == token:
                 self.state.kimi_prepare_token = ""
 
-    # ---------- Kimi 私聊消息排队（忙时不 409，轮结束自动发送） ----------
+    # ---------- 私聊消息排队核心（Kimi 与 Kiro 共用；忙时不 409，轮结束自动发送） ----------
+    # kiro r4 (2026-09-26)：原 Kimi 队列实现参数化为 _ChatQueueSpec 驱动的共享
+    # 核心，Kimi 的方法名/签名/行为保持不变（薄封装），Kiro 用自己的 spec。
 
-    def _kimi_chat_queue(self) -> deque[dict[str, Any]]:
-        """惰性兼容测试夹具的队列访问；真实 ServerState 已在 __init__ 建好。"""
-        queue = getattr(self.state, "kimi_chat_queue", None)
-        if queue is None:
-            queue = deque()
-            self.state.kimi_chat_queue = queue
-        return queue
-
-    def _kimi_chat_idle_locked(self) -> bool:
-        """调用方须持有 kimi_turn_lock。所有 writer/过渡预约都空闲才可投递。"""
-        return not (
-            self.state.kimi_active_turn
-            or self.state.kimi_prepare_token
-            or getattr(self.state, "kimi_recovery_token", "")
-            or getattr(self.state, "kimi_terminal_acquire_token", "")
+    def _kimi_chat_queue_spec(self) -> "_ChatQueueSpec":
+        # 常量与可打补丁的方法都在调用时解析（lambda），测试 patch 依旧生效。
+        return _ChatQueueSpec(
+            label="Kimi",
+            lock=self.state.kimi_turn_lock,
+            queue_attr="kimi_chat_queue",
+            running_attr="kimi_chat_queue_worker_running",
+            max_len=lambda: KIMI_CHAT_QUEUE_MAX,
+            max_attempts=lambda: KIMI_CHAT_QUEUE_MAX_ATTEMPTS,
+            busy_reasons=lambda: KIMI_CHAT_QUEUE_BUSY_REQUEUE_REASONS,
+            wait_expired=lambda item: self._kimi_chat_queue_wait_expired(item),
+            fail=lambda item, reason: self._fail_queued_kimi_chat(item, reason),
+            idle_locked=lambda: self._kimi_chat_idle_locked(),
+            ready=lambda: True,
+            dispatch=lambda item: self._dispatch_queued_kimi_chat(item),
+            worker=lambda: self._kimi_chat_queue_worker(),
+            full_reason="kimi_queue_full",
         )
 
-    def _push_kimi_chat_queue_locked(self, item: dict[str, Any], *, front: bool = False) -> int | None:
-        """入队并按需唤醒 worker；返回队列位置，满则 None。须持有 turn lock。
+    def _contact_chat_queue(self, spec: "_ChatQueueSpec") -> deque[dict[str, Any]]:
+        """惰性兼容测试夹具的队列访问；真实 ServerState 已在 __init__ 建好。"""
+        queue = getattr(self.state, spec.queue_attr, None)
+        if queue is None:
+            queue = deque()
+            setattr(self.state, spec.queue_attr, queue)
+        return queue
+
+    def _push_contact_chat_queue_locked(
+        self, spec: "_ChatQueueSpec", item: dict[str, Any], *, front: bool = False,
+    ) -> int | None:
+        """入队并按需唤醒 worker；返回队列位置，满则 None。须持有 spec.lock。
 
         ``front=True`` 用于重投： item 本就排在新到消息之前，放回队首保序。
         """
-        queue = self._kimi_chat_queue()
-        if len(queue) >= KIMI_CHAT_QUEUE_MAX:
+        queue = self._contact_chat_queue(spec)
+        if len(queue) >= spec.max_len():
             return None
         if front:
             queue.appendleft(item)
         else:
             queue.append(item)
         position = len(queue)
-        if not getattr(self.state, "kimi_chat_queue_worker_running", False):
-            self.state.kimi_chat_queue_worker_running = True
-            threading.Thread(target=self._kimi_chat_queue_worker, daemon=True).start()
+        if not getattr(self.state, spec.running_attr, False):
+            setattr(self.state, spec.running_attr, True)
+            threading.Thread(target=spec.worker, daemon=True).start()
         return position
 
-    def _enqueue_kimi_chat_turn(self, item: dict[str, Any]) -> int | None:
-        with self.state.kimi_turn_lock:
-            return self._push_kimi_chat_queue_locked(item)
-
     @staticmethod
-    def _kimi_chat_queue_wait_expired(item: dict[str, Any]) -> bool:
+    def _chat_queue_wait_expired(item: dict[str, Any], max_wait_seconds: float) -> bool:
         """忙类重投的时间兜底：入队（queued_at）至今超过上限视为卡死。
 
         时间戳缺失或不可解析时不判死：生产路径入队必写 ISO 时间，解析失败
@@ -16577,32 +16888,106 @@ class PushHandler(BaseHTTPRequestHandler):
         if queued_dt.tzinfo is None:
             queued_dt = queued_dt.replace(tzinfo=timezone.utc)
         wait = (datetime.now(timezone.utc) - queued_dt).total_seconds()
-        return wait > KIMI_CHAT_QUEUE_MAX_WAIT_SECONDS
+        return wait > max_wait_seconds
 
-    def _requeue_kimi_chat_turn(self, item: dict[str, Any], *, reason: str) -> bool:
+    def _requeue_contact_chat_turn(self, spec: "_ChatQueueSpec", item: dict[str, Any], *, reason: str) -> bool:
         """过渡态重投：放回队首保序。
 
-        「合法忙」类原因（KIMI_CHAT_QUEUE_BUSY_REQUEUE_REASONS，等忙完就能
-        成）不消耗 attempts 判死配额，以入队时长兜底：排队超过
-        KIMI_CHAT_QUEUE_MAX_WAIT_SECONDS 仍投不出去才落失败卡片。真故障
-        （崩溃、503、网络错误）照旧按 attempts 计数，超限判死。队列满同样
-        落失败卡片——任何终态都对用户可见，绝不静默吞消息。
+        「合法忙」类原因（spec.busy_reasons，等忙完就能成）不消耗 attempts
+        判死配额，以入队时长兜底：排队超过上限仍投不出去才落失败卡片。真
+        故障（崩溃、503、网络错误）照旧按 attempts 计数，超限判死。队列满
+        同样落失败卡片——任何终态都对用户可见，绝不静默吞消息。
         """
-        if reason in KIMI_CHAT_QUEUE_BUSY_REQUEUE_REASONS:
-            if self._kimi_chat_queue_wait_expired(item):
-                self._fail_queued_kimi_chat(item, f"{reason}_wait_expired")
+        if reason in spec.busy_reasons():
+            if spec.wait_expired(item):
+                spec.fail(item, f"{reason}_wait_expired")
                 return False
         else:
             item["attempts"] = int(item.get("attempts") or 0) + 1
-            if item["attempts"] > KIMI_CHAT_QUEUE_MAX_ATTEMPTS:
-                self._fail_queued_kimi_chat(item, reason)
+            if item["attempts"] > spec.max_attempts():
+                spec.fail(item, reason)
                 return False
-        with self.state.kimi_turn_lock:
-            position = self._push_kimi_chat_queue_locked(item, front=True)
+        with spec.lock:
+            position = self._push_contact_chat_queue_locked(spec, item, front=True)
         if position is None:
-            self._fail_queued_kimi_chat(item, "kimi_queue_full")
+            spec.fail(item, spec.full_reason)
             return False
         return True
+
+    def _contact_chat_queue_worker(self, spec: "_ChatQueueSpec") -> None:
+        """串行投递待发送队列：只在完全空闲时弹出一条，重入正常发送管线。
+
+        不挂任何轮结束钩子——worker 以 0.5s 轮询空闲态，活跃轮、prepare、
+        recovery、终端 acquire 任一存在都继续等待，因此过渡态下的消息既不
+        丢失也不乱序。``spec.ready`` 是锁外的额外就绪预检（Kiro：终端 TUI
+        回合未结束时不去抢预约），Kimi 恒为 True。重投（requeue）由处理器
+        内部的忙时分支完成，worker 只负责在两次尝试之间退避，避免状态持续
+        冲突时空转。循环体整体兜底异常：单次迭代崩溃只记日志继续跑，绝不
+        带走线程让 running 标志卡死、队列静默积压。
+        """
+        while True:
+            try:
+                ready = spec.ready()
+                with spec.lock:
+                    queue = self._contact_chat_queue(spec)
+                    if not queue:
+                        setattr(self.state, spec.running_attr, False)
+                        return
+                    item = queue.popleft() if ready and spec.idle_locked() else None
+                if item is None:
+                    time.sleep(0.5)
+                    continue
+                outcome = spec.dispatch(item)
+                if outcome == "requeued":
+                    time.sleep(min(1.0 * max(1, int(item.get("attempts") or 1)), 5.0))
+            except Exception:
+                logger.exception("%s chat queue worker iteration crashed; continuing", spec.label)
+                time.sleep(0.5)
+
+    def _requeue_contact_after_dispatch_crash(self, spec: "_ChatQueueSpec", item: dict[str, Any]) -> bool:
+        """投递崩溃后的兜底：重投而不是永久失败，返回是否仍在队列中。
+
+        fd 失效、上游进程刚重启这类瞬时崩溃下一次投递多半自愈，直接判
+        永久失败会把用户消息静默吞掉。重投走 attempts 计数兜底，超限落可
+        见失败卡片。若处理器内部已把本项重投回队列（其后的收尾步骤才崩），
+        按身份判重，不重复入队。
+        """
+        with spec.lock:
+            already_queued = any(existing is item for existing in self._contact_chat_queue(spec))
+        if already_queued:
+            return True
+        return self._requeue_contact_chat_turn(spec, item, reason="dispatch_crashed")
+
+    # ---------- Kimi 私聊消息排队（共享核心的薄封装，行为不变） ----------
+
+    def _kimi_chat_queue(self) -> deque[dict[str, Any]]:
+        """惰性兼容测试夹具的队列访问；真实 ServerState 已在 __init__ 建好。"""
+        return self._contact_chat_queue(self._kimi_chat_queue_spec())
+
+    def _kimi_chat_idle_locked(self) -> bool:
+        """调用方须持有 kimi_turn_lock。所有 writer/过渡预约都空闲才可投递。"""
+        return not (
+            self.state.kimi_active_turn
+            or self.state.kimi_prepare_token
+            or getattr(self.state, "kimi_recovery_token", "")
+            or getattr(self.state, "kimi_terminal_acquire_token", "")
+        )
+
+    def _push_kimi_chat_queue_locked(self, item: dict[str, Any], *, front: bool = False) -> int | None:
+        """入队并按需唤醒 worker；返回队列位置，满则 None。须持有 turn lock。"""
+        return self._push_contact_chat_queue_locked(self._kimi_chat_queue_spec(), item, front=front)
+
+    def _enqueue_kimi_chat_turn(self, item: dict[str, Any]) -> int | None:
+        with self.state.kimi_turn_lock:
+            return self._push_kimi_chat_queue_locked(item)
+
+    @staticmethod
+    def _kimi_chat_queue_wait_expired(item: dict[str, Any]) -> bool:
+        return PushHandler._chat_queue_wait_expired(item, KIMI_CHAT_QUEUE_MAX_WAIT_SECONDS)
+
+    def _requeue_kimi_chat_turn(self, item: dict[str, Any], *, reason: str) -> bool:
+        """过渡态重投：放回队首保序（语义见 _requeue_contact_chat_turn）。"""
+        return self._requeue_contact_chat_turn(self._kimi_chat_queue_spec(), item, reason=reason)
 
     def _fail_queued_kimi_chat(self, item: dict[str, Any], reason: str) -> None:
         """排队消息最终失败：历史里留下可见的失败说明，绝不静默吞掉。"""
@@ -16640,46 +17025,12 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.warning("Kimi queued-send failure note append failed", exc_info=True)
 
     def _kimi_chat_queue_worker(self) -> None:
-        """串行投递待发送队列：只在完全空闲时弹出一条，重入正常发送管线。
-
-        不挂任何轮结束钩子——worker 以 0.5s 轮询空闲态，活跃轮、prepare、
-        recovery、终端 acquire 任一存在都继续等待，因此过渡态下的消息既不
-        丢失也不乱序。重投（requeue）由处理器内部的忙时分支完成，worker
-        只负责在两次尝试之间退避，避免状态持续冲突时空转。循环体整体兜
-        底异常：单次迭代崩溃只记日志继续跑，绝不带走线程让 running 标志
-        卡死、队列静默积压。
-        """
-        while True:
-            try:
-                with self.state.kimi_turn_lock:
-                    queue = self._kimi_chat_queue()
-                    if not queue:
-                        self.state.kimi_chat_queue_worker_running = False
-                        return
-                    item = queue.popleft() if self._kimi_chat_idle_locked() else None
-                if item is None:
-                    time.sleep(0.5)
-                    continue
-                outcome = self._dispatch_queued_kimi_chat(item)
-                if outcome == "requeued":
-                    time.sleep(min(1.0 * max(1, int(item.get("attempts") or 1)), 5.0))
-            except Exception:
-                logger.exception("Kimi chat queue worker iteration crashed; continuing")
-                time.sleep(0.5)
+        """串行投递 Kimi 待发送队列（见 _contact_chat_queue_worker）。"""
+        self._contact_chat_queue_worker(self._kimi_chat_queue_spec())
 
     def _requeue_after_dispatch_crash(self, item: dict[str, Any]) -> bool:
-        """投递崩溃后的兜底：重投而不是永久失败，返回是否仍在队列中。
-
-        fd 失效、上游进程刚重启这类瞬时崩溃下一次投递多半自愈，直接判
-        永久失败会把用户消息静默吞掉。重投走 attempts 计数兜底，超限由
-        _requeue_kimi_chat_turn 落可见失败卡片。若处理器内部已把本项重投
-        回队列（其后的收尾步骤才崩），按身份判重，不重复入队。
-        """
-        with self.state.kimi_turn_lock:
-            already_queued = any(existing is item for existing in self._kimi_chat_queue())
-        if already_queued:
-            return True
-        return self._requeue_kimi_chat_turn(item, reason="dispatch_crashed")
+        """Kimi 投递崩溃兜底（见 _requeue_contact_after_dispatch_crash）。"""
+        return self._requeue_contact_after_dispatch_crash(self._kimi_chat_queue_spec(), item)
 
     def _dispatch_queued_kimi_chat(self, item: dict[str, Any]) -> str:
         """投递一条排队消息；返回 started / requeued / failed 供 worker 退避。"""

@@ -55,7 +55,7 @@ def send(handler: Any, body: dict[str, Any]) -> None:
 
 
 def stop(handler: Any, body: dict[str, Any]) -> bool:
-    handler._handle_kiro_chat_stop(str(body.get("user_ts") or "").strip())
+    handler._handle_kiro_chat_stop(str(body.get("user_ts") or "").strip(), body=body)
     return True
 
 

@@ -47,6 +47,9 @@ class FakeTmux:
         self.screen = "›  ask a question or describe a task ↵\n"
         self.sessions_dir = sessions_dir
         self.resume_ok = resume_ok
+        # kiro r4: simulate kiro-cli's own-process-group session engine
+        # outliving the pane (its lock stays until it is signalled directly).
+        self.keep_lock_on_kill = False
         self._next_pane = 10
         self._next_pid = 4000
         self.lock = threading.Lock()
@@ -108,6 +111,8 @@ class FakeTmux:
                 session = self.sessions.pop(name, None)
                 if session is None:
                     return _done(returncode=1)
+                if self.keep_lock_on_kill:
+                    return _done()
                 for lock in self.sessions_dir.glob("*.lock"):
                     try:
                         if json.loads(lock.read_text())["pid"] == session["pid"]:
@@ -380,6 +385,10 @@ class FakeKiroACP:
         self.session_id = session_id
         self.closed = 0
         self.prepared = []
+        # kiro r4: (TUI alive, session lock file present) at each session/load.
+        self.load_state = []
+        self.prompts = []
+        self.prepare_errors = []
 
     def load_session_id(self):
         return self.session_id
@@ -390,9 +399,16 @@ class FakeKiroACP:
     def prepare_session(self, **_kw):
         # Single writer: ACP must never load while the TUI pane is alive.
         self.prepared.append("ccc-kiro-terminal" in self.tmux.sessions)
+        self.load_state.append((
+            "ccc-kiro-terminal" in self.tmux.sessions,
+            (self.tmux.sessions_dir / f"{self.session_id}.lock").exists(),
+        ))
+        if self.prepare_errors:
+            raise self.prepare_errors.pop(0)
         return self.session_id
 
-    def prompt_existing(self, text, *, on_update=None, **_kw):
+    def prompt_existing(self, text, *, on_update=None, images=None, **_kw):
+        self.prompts.append({"text": text, "images": list(images or [])})
         if on_update:
             on_update("好的。")
 
@@ -501,16 +517,18 @@ class KiroTerminalHandlerTest(BridgeTestBase):
         self.assertNotIn("ccc-kiro-terminal", self.tmux.sessions)
         self.assertEqual(["user", "assistant"], [r["role"] for r in chat.records])
 
-    def test_chat_send_while_tui_turn_runs_is_rejected_not_interleaved(self):
+    def test_chat_send_while_tui_turn_runs_is_queued_not_interleaved(self):
+        # kiro r4: formerly 409 kiro_terminal_busy (message lost); now queued.
         handler, acp, chat = self._handler()
         handler._handle_kiro_terminal_capture(80)
         self.probe.value = (7, 6)
-        handler._handle_kiro_chat_send({"text": "你好呀"}, "kiro")
+        with mock.patch("push.threading.Thread", _ThreadFactory()):
+            handler._handle_kiro_chat_send({"text": "你好呀"}, "kiro")
         status, payload = handler.responses[-1]
-        self.assertEqual(409, status)
-        self.assertEqual("kiro_terminal_busy", payload["error"])
+        self.assertEqual(200, status)
+        self.assertTrue(payload["queued"])
         self.assertEqual([], acp.prepared)
-        self.assertEqual([], chat.records)
+        self.assertEqual(["user"], [r["role"] for r in chat.records])
         self.assertEqual("", handler.state.kiro_prepare_token)
         self.assertIn("ccc-kiro-terminal", self.tmux.sessions)
 
@@ -552,6 +570,339 @@ class KiroTerminalHandlerTest(BridgeTestBase):
         handler._send_json = lambda status, payload: handler.responses.append((status, payload))
         handler.do_GET()
         self.assertEqual(401, handler.responses[-1][0])
+
+
+class _ThreadFactory:
+    """kiro r4: Kiro turn workers run inline; the queue worker is only recorded.
+
+    Tests drive the recorded queue worker explicitly, once the TUI state they
+    want to exercise is in place.
+    """
+
+    def __init__(self):
+        self.queue_workers = []
+
+    def __call__(self, target=None, name=None, **_kwargs):
+        factory = self
+
+        class _Thread:
+            def start(self_inner):
+                if name == "kiro-acp-chat-turn":
+                    target()
+                else:
+                    factory.queue_workers.append(target)
+
+        return _Thread()
+
+
+class KiroChatQueueTest(BridgeTestBase):
+    """kiro r4 (2026-09-26): App messages queue while the terminal TUI runs a turn."""
+
+    _handler = KiroTerminalHandlerTest._handler
+
+    def setUp(self):
+        super().setUp()
+        self.threads = _ThreadFactory()
+        # Replace Thread only as push.py sees it (threading.Timer, used by the
+        # bridge's reaper, subclasses the real Thread).
+        fake_threading = types.SimpleNamespace(**vars(threading))
+        fake_threading.Thread = self.threads
+        patcher = mock.patch("push.threading", fake_threading)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # The queue worker's idle polls/backoff must not slow the suite down.
+        sleeper = mock.patch("push.time.sleep", lambda _s: None)
+        sleeper.start()
+        self.addCleanup(sleeper.stop)
+
+    def _busy_tui(self):
+        handler, acp, chat = self._handler()
+        handler._handle_kiro_terminal_capture(80)
+        self.assertEqual("ready", handler.responses[-1][1]["state"])
+        self.probe.value = (7, 6)  # a TUI turn is running
+        return handler, acp, chat
+
+    def _run_queue_worker(self, handler):
+        self.assertTrue(self.threads.queue_workers, "queue worker was never started")
+        self.threads.queue_workers.pop(0)()
+        self.assertFalse(handler.state.kiro_chat_queue_worker_running)
+
+    def _attachment(self, name="shot.png", payload=b"\x89PNG\r\n\x1a\nfake"):
+        root = self.root / "attachments"
+        root.mkdir(exist_ok=True)
+        path = root / name
+        path.write_bytes(payload)
+        return root, {
+            "attachment_id": "att-1", "attachment_url": f"/attachments/{name}", "filename": name,
+            "type": "image", "media_type": "image/png", "size": len(payload), "stored_path": str(path),
+        }
+
+    def test_message_during_tui_turn_is_accepted_and_queued_like_kimi(self):
+        handler, acp, chat = self._busy_tui()
+        handler._handle_kiro_chat_send({"text": "终端忙时发的"}, "kiro")
+        status, payload = handler.responses[-1]
+        self.assertEqual(200, status)
+        # Same response shape as Kimi's enqueue_busy.
+        self.assertEqual({"ok", "queued", "record", "queue_position", "reason"}, set(payload))
+        self.assertEqual((True, True, 1, "kiro_terminal_busy"),
+                         (payload["ok"], payload["queued"], payload["queue_position"], payload["reason"]))
+        self.assertEqual("ts-1", payload["record"]["ts"])
+        # History: the user row is written once, now (Kimi-shaped).
+        self.assertEqual([("user", "终端忙时发的")], [(r["role"], r["text"]) for r in chat.records])
+        state = handler.state.chat_reply_states["kiro"]
+        self.assertEqual(("queued", "ts-1", 1), (state["reply_state"], state["user_ts"], state["queue_position"]))
+        # Not prepared, not interleaved, reservation released, TUI untouched.
+        self.assertEqual([], acp.prepared)
+        self.assertEqual("", handler.state.kiro_prepare_token)
+        self.assertIn("ccc-kiro-terminal", self.tmux.sessions)
+        self.assertEqual(1, len(handler.state.kiro_chat_queue))
+        self.assertTrue(handler.state.kiro_chat_queue_worker_running)
+        # The worker does not even reserve Kiro while the TUI turn runs.
+        self.assertFalse(handler._kiro_chat_queue_ready())
+        self.assertEqual("", handler.state.kiro_prepare_token)
+
+    def test_tui_turn_end_hands_back_releases_lock_then_delivers_in_order(self):
+        handler, acp, chat = self._busy_tui()
+        handler._handle_kiro_chat_send({"text": "第一条"}, "kiro")
+        handler._handle_kiro_chat_send({"text": "第二条"}, "kiro")
+        self.assertEqual([1, 2], [r[1]["queue_position"] for r in handler.responses[-2:]])
+        self.assertEqual("kiro_queue_ahead", handler.responses[-1][1]["reason"])
+        self.probe.value = (7, 7)  # the TUI turn finished
+        # Even with the TUI idle, a new message goes behind the queued ones.
+        handler._handle_kiro_chat_send({"text": "第三条"}, "kiro")
+        self.assertEqual((3, "kiro_queue_ahead"),
+                         (handler.responses[-1][1]["queue_position"], handler.responses[-1][1]["reason"]))
+        self.assertEqual([], acp.prepared)
+        self._run_queue_worker(handler)
+        self.assertEqual(["第一条", "第二条", "第三条"], [p["text"].split("\n")[0] for p in acp.prompts])
+        # Handoff: TUI gone and kiro-cli's <id>.lock released before the first session/load.
+        self.assertEqual((False, False), acp.load_state[0])
+        self.assertNotIn("ccc-kiro-terminal", self.tmux.sessions)
+        roles = [(r["role"], r.get("text")) for r in chat.records if r["role"] in {"user", "assistant"}]
+        self.assertEqual(
+            [("user", "第一条"), ("user", "第二条"), ("user", "第三条"),
+             ("assistant", "好的。"), ("assistant", "好的。"), ("assistant", "好的。")],
+            roles,
+        )
+        answers = [r for r in chat.records if r["role"] == "assistant"]
+        self.assertEqual(["ts-1", "ts-2", "ts-3"], [a["metadata"]["kiro_user_ts"] for a in answers])
+        self.assertEqual(3, sum(1 for r in chat.records if r["role"] == "user"))  # never re-appended
+        self.assertEqual("completed", handler.state.chat_reply_states["kiro"]["reply_state"])
+        self.assertEqual({}, handler.state.kiro_active_turn)
+        self.assertEqual(0, len(handler.state.kiro_chat_queue))
+
+    def test_lingering_session_engine_is_signalled_and_lock_awaited_before_load(self):
+        handler, acp, _chat = self._busy_tui()
+        pane_pid = self.tmux.sessions["ccc-kiro-terminal"]["pid"]
+        handler._handle_kiro_chat_send({"text": "等锁"}, "kiro")
+        self.tmux.keep_lock_on_kill = True
+        lock = self.sessions_dir / f"{SID}.lock"
+        signalled = []
+
+        def killer(pid, sig):
+            self.killed.append((pid, sig))
+            if pid == pane_pid:  # direct signal to the lock owner itself
+                signalled.append(pid)
+                lock.unlink()
+
+        self.bridge._process_killer = killer
+        self.bridge._pid_alive_check = lambda pid: lock.exists()
+        self.bridge.lock_release_wait_seconds = 0.2
+        self.probe.value = (7, 7)
+        self._run_queue_worker(handler)
+        self.assertEqual([pane_pid], signalled)
+        self.assertEqual([(False, False)], acp.load_state)
+        self.assertEqual(1, len(acp.prompts))
+
+    def test_handoff_failure_fails_the_queued_message_visibly_and_cleans_attachments(self):
+        handler, acp, chat = self._busy_tui()
+        handler.state.attachments_dir, staged = self._attachment()
+        handler._handle_kiro_chat_send({"text": "带图", "_pwa_staged_attachments": [staged]}, "kiro")
+        self.assertTrue(Path(staged["stored_path"]).exists())
+        # Another live process (not the terminal pane) grabs the session lock.
+        self.tmux.keep_lock_on_kill = True
+        (self.sessions_dir / f"{SID}.lock").write_text(json.dumps({"pid": 999999}), encoding="utf-8")
+        self.bridge._pid_alive_check = lambda pid: True
+        self.probe.value = (7, 7)
+        self._run_queue_worker(handler)
+        self.assertEqual([], acp.prepared)  # never session/loaded over a foreign lock
+        note = chat.records[-1]
+        self.assertEqual(("assistant", "kiro-acp:queue-failed"), (note["role"], note["source"]))
+        self.assertIn("未能安全交还", note["text"])
+        self.assertEqual({"kiro_user_ts": "ts-1", "turn_terminal": True}, note["metadata"])
+        self.assertEqual("failed", handler.state.chat_reply_states["kiro"]["reply_state"])
+        self.assertFalse(Path(staged["stored_path"]).exists())
+        self.assertEqual(0, len(handler.state.kiro_chat_queue))
+        self.assertEqual("", handler.state.kiro_prepare_token)
+
+    def test_expired_queued_message_fails_visibly_without_touching_the_tui(self):
+        from datetime import datetime, timedelta, timezone
+        import push
+
+        handler, acp, chat = self._busy_tui()
+        handler.state.attachments_dir, staged = self._attachment()
+        handler._handle_kiro_chat_send({"text": "等太久", "_pwa_staged_attachments": [staged]}, "kiro")
+        item = handler.state.kiro_chat_queue[0]
+        item["queued_at"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=push.KIRO_CHAT_QUEUE_MAX_WAIT_SECONDS + 60)
+        ).isoformat()
+        # The TUI turn is still running: an expired head is let through only
+        # so that the busy path can fail it visibly.
+        self.assertTrue(handler._kiro_chat_queue_ready())
+        self._run_queue_worker(handler)
+        self.assertEqual([], acp.prepared)
+        self.assertIn("ccc-kiro-terminal", self.tmux.sessions)
+        note = chat.records[-1]
+        self.assertEqual("kiro-acp:queue-failed", note["source"])
+        self.assertIn("6 小时", note["text"])
+        self.assertEqual("failed", handler.state.chat_reply_states["kiro"]["reply_state"])
+        self.assertFalse(Path(staged["stored_path"]).exists())
+        self.assertEqual(0, len(handler.state.kiro_chat_queue))
+
+    def test_busy_requeues_do_not_consume_attempts(self):
+        import push
+
+        handler, acp, _chat = self._busy_tui()
+        handler._handle_kiro_chat_send({"text": "耐心等"}, "kiro")
+        item = handler.state.kiro_chat_queue[0]
+        for _ in range(push.KIRO_CHAT_QUEUE_MAX_ATTEMPTS + 3):
+            handler.state.kiro_chat_queue.popleft()
+            self.assertEqual("requeued", handler._dispatch_queued_kiro_chat(item))
+        self.assertEqual(0, int(item.get("attempts") or 0))
+        self.assertEqual([item], list(handler.state.kiro_chat_queue))
+        self.assertEqual([], acp.prepared)
+
+    def test_stop_while_queued_follows_kimi_semantics(self):
+        from contacts import dispatch_contact_stop
+
+        handler, acp, chat = self._busy_tui()
+        handler._handle_kiro_chat_send({"text": "排队一"}, "kiro")
+        handler._handle_kiro_chat_send({"text": "排队二"}, "kiro")
+        # A plain Stop never drops what the user deliberately sent.
+        handler._handle_kiro_chat_stop("ts-2")
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertTrue(handler.responses[-1][1]["already_finished"])
+        self.assertEqual(2, len(handler.state.kiro_chat_queue))
+        # Explicit clear_queued (the same /chat/stop contract as Kimi).
+        self.assertTrue(dispatch_contact_stop(handler, {"contact_id": "kiro", "clear_queued": True}))
+        status, payload = handler.responses[-1]
+        self.assertEqual((200, 2, False), (status, payload["cleared_queued"], payload["stopped"]))
+        self.assertEqual(0, len(handler.state.kiro_chat_queue))
+        self.assertEqual("interrupted", handler.state.chat_reply_states["kiro"]["reply_state"])
+        self.probe.value = (7, 7)
+        self._run_queue_worker(handler)
+        self.assertEqual([], acp.prepared)
+        self.assertEqual(["user", "user"], [r["role"] for r in chat.records])
+
+    def test_queued_attachment_stays_valid_and_reaches_acp(self):
+        handler, acp, chat = self._busy_tui()
+        handler.state.attachments_dir, staged = self._attachment()
+        handler._handle_kiro_chat_send({"text": "看图", "_pwa_staged_attachments": [staged]}, "kiro")
+        user = chat.records[0]
+        self.assertEqual(("/attachments/shot.png", "image", "shot.png"),
+                         (user["attachment_url"], user["attachment_type"], user["attachment_filename"]))
+        self.assertTrue(Path(staged["stored_path"]).exists())
+        self.probe.value = (7, 7)
+        self._run_queue_worker(handler)
+        self.assertEqual(1, len(acp.prompts))
+        prompt = acp.prompts[0]
+        self.assertIn("本地路径: " + staged["stored_path"], prompt["text"])
+        self.assertEqual(["image/png"], [image["mime_type"] for image in prompt["images"]])
+        self.assertTrue(Path(staged["stored_path"]).exists())  # committed with history, kept
+
+    def test_each_delivered_message_is_recalled_exactly_once(self):
+        handler, acp, _chat = self._busy_tui()
+        recalls, commits = [], []
+        result = types.SimpleNamespace(context="[记忆] x")
+        handler._kiro_recall_allowed = lambda text: True
+        handler._contact_semantic_recall = lambda contact, text, **_kw: recalls.append(text) or result
+        handler._append_contact_recall_card = lambda *a, **k: None
+        handler._commit_contact_recall = lambda contact, res, sid: commits.append(sid)
+        handler._handle_kiro_chat_send({"text": "记忆一"}, "kiro")
+        handler._handle_kiro_chat_send({"text": "记忆二"}, "kiro")
+        item = handler.state.kiro_chat_queue[0]
+        for _ in range(3):  # busy retries must not recall
+            handler.state.kiro_chat_queue.popleft()
+            handler._dispatch_queued_kiro_chat(item)
+        self.assertEqual([], recalls)
+        self.probe.value = (7, 7)
+        self._run_queue_worker(handler)
+        self.assertEqual(["记忆一", "记忆二"], recalls)
+        self.assertEqual([SID, SID], commits)
+        self.assertTrue(all("[记忆] x" in p["text"] for p in acp.prompts))
+
+    def test_transient_prepare_failure_requeues_then_delivers(self):
+        from kiro_acp import KiroACPError
+
+        handler, acp, chat = self._busy_tui()
+        handler._handle_kiro_chat_send({"text": "重试"}, "kiro")
+        acp.prepare_errors.append(KiroACPError("load failed"))
+        self.probe.value = (7, 7)
+        self._run_queue_worker(handler)
+        self.assertEqual(2, len(acp.prepared))
+        self.assertEqual(1, len(acp.prompts))
+        self.assertEqual("completed", handler.state.chat_reply_states["kiro"]["reply_state"])
+        self.assertEqual(1, sum(1 for r in chat.records if r["role"] == "user"))
+
+    def test_message_during_queued_delivery_is_queued_behind_it(self):
+        # Probe finding: while the worker delivers item 1 (popped, prepare
+        # reservation held) a new message must queue, never 409.
+        handler, acp, chat = self._busy_tui()
+        handler._handle_kiro_chat_send({"text": "先到"}, "kiro")
+        self.probe.value = (7, 7)
+        real_prepare = acp.prepare_session
+
+        def prepare_and_race(**kw):
+            if not acp.prepared:
+                handler._handle_kiro_chat_send({"text": "投递中到达"}, "kiro")
+                racing = handler.responses[-1]
+                self.assertEqual((200, True, "kiro_turn_active"),
+                                 (racing[0], racing[1]["queued"], racing[1]["reason"]))
+            return real_prepare(**kw)
+
+        acp.prepare_session = prepare_and_race
+        self._run_queue_worker(handler)
+        self.assertEqual(["先到", "投递中到达"], [p["text"].split("\n")[0] for p in acp.prompts])
+        self.assertEqual(2, sum(1 for r in chat.records if r["role"] == "assistant"))
+
+    def test_app_turn_in_progress_queues_like_kimi(self):
+        handler, acp, chat = self._handler()
+        handler.state.kiro_active_turn = {"user_ts": "turn-x"}
+        handler._handle_kiro_chat_send({"text": "并发"}, "kiro")
+        status, payload = handler.responses[-1]
+        self.assertEqual((200, True, "kiro_turn_active"), (status, payload["queued"], payload["reason"]))
+        self.assertEqual(["并发"], [r["text"] for r in chat.records])
+        self.assertEqual([], acp.prepared)
+        handler.state.kiro_active_turn = {}
+        self._run_queue_worker(handler)
+        self.assertEqual(1, len(acp.prompts))
+
+    def test_kiro_queue_is_independent_of_kimi(self):
+        handler, _acp, _chat = self._busy_tui()
+        handler.state.kimi_turn_lock = threading.RLock()
+        handler._handle_kiro_chat_send({"text": "只进 Kiro 队列"}, "kiro")
+        self.assertEqual(1, len(handler.state.kiro_chat_queue))
+        self.assertEqual(0, len(handler._kimi_chat_queue()))
+
+
+class KiroWriterBlockedTest(BridgeTestBase):
+    def test_writer_blocked_is_a_read_only_mirror_of_the_handoff(self):
+        self.assertFalse(self.bridge.writer_blocked(SID))  # no pane
+        self.bridge.ensure(SID)
+        self.probe.value = (4, 3)
+        self.assertTrue(self.bridge.writer_blocked(SID))
+        self.probe.value = (4, 4)
+        self.assertFalse(self.bridge.writer_blocked(SID))
+        self.assertTrue(self.bridge.has_live_pane())  # nothing was torn down
+        self.assertFalse(self.bridge.writer_blocked(OTHER_SID))  # bound to another session
+
+    def test_release_for_writer_waits_for_the_lock_file(self):
+        self.bridge.ensure(SID)
+        self.tmux.keep_lock_on_kill = True
+        lock = self.sessions_dir / f"{SID}.lock"
+        self.bridge._pid_alive_check = lambda pid: False  # stale lock of a dead process
+        self.assertTrue(self.bridge.release_for_writer(SID))
+        self.assertTrue(lock.exists())  # stale file tolerated, owner is gone
 
 
 def _immediate_thread(target, **_kwargs):
