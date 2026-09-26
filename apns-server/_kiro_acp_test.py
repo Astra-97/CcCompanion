@@ -600,20 +600,28 @@ class KiroChatHandlerTest(unittest.TestCase):
         contacts = {c["id"]: c for c in chat_contact_directory(handler.state)}
         self.assertIn("kiro", contacts)
         self.assertIn("chat", contacts["kiro"]["capabilities"])
-        self.assertFalse(contacts["kiro"]["stop"]["supported"])
+        # kiro 对齐 CC (2026-09-26): Stop + attachments are now advertised
+        # with the same exact-turn stop contract as Kimi.
+        self.assertIn("attachments", contacts["kiro"]["capabilities"])
+        self.assertTrue(contacts["kiro"]["stop"]["supported"])
+        self.assertEqual("/chat/stop", contacts["kiro"]["stop"]["endpoint"])
+        self.assertEqual(["contact_id", "user_ts"], contacts["kiro"]["stop"]["required_fields"])
         handler2 = types.SimpleNamespace(calls=[])
         handler2._handle_kiro_chat_send = lambda body, contact_id: handler2.calls.append((body, contact_id))
         self.assertTrue(dispatch_contact_send(handler2, "kiro", {"text": "hi"}))
 
     def test_text_only_ingress_rejects_attachments_and_cards(self):
         self.assertFalse(rejects_inbound({"text": "plain"}))
-        self.assertTrue(rejects_inbound({"text": "x", "attachment_ids": ["a"]}))
+        # kiro 对齐 CC (2026-09-26): opaque staged IDs are allowed (Kimi parity);
+        # every legacy attachment/voice/card shape is still rejected.
+        self.assertFalse(rejects_inbound({"text": "x", "attachment_ids": ["a"]}))
         self.assertTrue(rejects_inbound({"text": "x", "attachment_url": "/attachments/a"}))
+        self.assertTrue(rejects_inbound({"text": "x", "attachment_path": "/tmp/a.png"}))
         self.assertTrue(rejects_inbound({"text": "x", "voice_mode": "conversation"}))
         self.assertTrue(rejects_inbound({"text": "x", "metadata": {"via": "card"}}))
 
         handler, kiro, _xiaoke = self._handler(self._acp())
-        handler._handle_chat_send({"contact_id": "kiro", "text": "x", "attachment_ids": ["a"]})
+        handler._handle_chat_send({"contact_id": "kiro", "text": "x", "attachment_url": "/attachments/a"})
         self.assertEqual(415, handler.responses[-1][0])
         self.assertEqual("kiro_text_only", handler.responses[-1][1]["error"])
         self.assertEqual([], kiro.records)
@@ -1566,6 +1574,399 @@ class KiroPreferencesHandlerTest(unittest.TestCase):
                 handler._handle_kiro_chat_send({"text": "你好"}, "kiro")
             self.assertEqual(200, handler.responses[-1][0])
             self.assertEqual(("prepare", "auto", None), calls[0])
+
+
+# ---------------------------------------------------------------------------
+# kiro 对齐 CC (2026-09-26): image blocks, bounded cancel, Stop, attachments,
+# memory recall
+# ---------------------------------------------------------------------------
+
+_PNG_BYTES = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06"
+    b"\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\xf8\x0f\x00\x00\x01\x01"
+    b"\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+
+def _image_capable_handler(image=True):
+    base = _basic_handler()
+
+    def handle(process, message):
+        if message.get("method") == "initialize":
+            return [{"jsonrpc": "2.0", "id": message["id"], "result": {
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "loadSession": True,
+                    "promptCapabilities": {"image": image, "audio": False, "embeddedContext": False},
+                },
+            }}]
+        return base(process, message)
+
+    return handle
+
+
+class KiroParityProtocolTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state_path = str(Path(self.tmp.name) / "kiro_acp_session.json")
+
+    def _client(self, factory, **kwargs):
+        return KiroACPClient(
+            command="/fake/kiro-cli",
+            cwd=self.tmp.name,
+            state_path=self.state_path,
+            request_timeout=5,
+            prompt_timeout=10,
+            popen_factory=factory,
+            **kwargs,
+        )
+
+    def _prompt_blocks(self, process):
+        prompts = [req for req in process.requests if req.get("method") == "session/prompt"]
+        self.assertEqual(1, len(prompts))
+        return prompts[0]["params"]["prompt"]
+
+    def test_image_blocks_precede_text_when_agent_advertises_images(self):
+        process = FakeKiroACPProcess(_image_capable_handler(image=True))
+        client = self._client(_scripted_factory([process]))
+        session_id = client.prepare_session()
+        self.assertTrue(client.image_prompt_supported())
+        client.prompt_existing(
+            "看图",
+            session_id=session_id,
+            turn_id="turn-1",
+            images=[
+                {"mime_type": "image/png", "data": "QUJD"},
+                {"mime_type": "image/heic", "data": "REVG"},  # not an ACP-safe type
+                {"mime_type": "image/jpeg", "data": ""},      # empty payload dropped
+                "junk",
+            ],
+        )
+        self.assertEqual(
+            [{"type": "image", "mimeType": "image/png", "data": "QUJD"}, {"type": "text", "text": "看图"}],
+            self._prompt_blocks(process),
+        )
+
+    def test_images_are_dropped_when_agent_does_not_advertise_them(self):
+        for handler in (_image_capable_handler(image=False), _basic_handler()):
+            process = FakeKiroACPProcess(handler)
+            client = self._client(_scripted_factory([process]))
+            session_id = client.prepare_session()
+            self.assertFalse(client.image_prompt_supported())
+            client.prompt_existing(
+                "看图", session_id=session_id, turn_id="turn-1",
+                images=[{"mime_type": "image/png", "data": "QUJD"}],
+            )
+            self.assertEqual([{"type": "text", "text": "看图"}], self._prompt_blocks(process))
+
+    def test_unacknowledged_cancel_recycles_process_after_grace(self):
+        client = self._client(_scripted_factory([]), cancel_grace_seconds=0.3)
+        client._process_alive = lambda: True
+        client._loaded_session_id = "s1"
+        release = threading.Event()
+        self.addCleanup(release.set)
+        cancelled, closed = [], []
+
+        def request(method, params, timeout, ensure_started=True):
+            release.wait(5)  # Kiro never answers the cancelled prompt
+            return {"stopReason": "cancelled"}
+
+        client._request = request
+        client.cancel = lambda turn_id, session_id: cancelled.append(turn_id) or True
+        client.close = lambda: closed.append(True)
+        gate = threading.Event()
+        threading.Timer(0.05, gate.set).start()
+        import time as _time
+        begin = _time.monotonic()
+        with self.assertRaises(KiroACPCancelled):
+            client.prompt_existing("hello", session_id="s1", turn_id="turn-1", cancel_event=gate)
+        self.assertLess(_time.monotonic() - begin, 3.0)
+        self.assertEqual(["turn-1"], cancelled)
+        self.assertEqual([True], closed)
+        self.assertFalse(client.busy)
+
+
+class KiroParityHandlerTest(KiroChatHandlerTest):
+    """Reuses the Kiro handler harness; only the new tests live here."""
+
+    # Do not re-run every inherited test a second time.
+    def run(self, result=None):
+        if not self._testMethodName.startswith("test_parity_"):
+            return result
+        return super().run(result)
+
+    def _handler(self, kiro_acp):
+        handler, kiro, xiaoke = super()._handler(kiro_acp)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        handler.state.attachments_dir = Path(self._tmp.name) / "attachments"
+        handler.state.attachments_dir.mkdir()
+        return handler, kiro, xiaoke
+
+    def _recording_acp(self, reply="Kiro 回复。", failure=None):
+        acp = self._acp(reply=reply, failure=failure)
+        acp.prompts = []
+
+        def prompt_existing(text, *, on_update=None, images=(), **kwargs):
+            acp.prompts.append({"text": text, "images": list(images), **kwargs})
+            if reply and on_update is not None:
+                on_update(reply)
+            if failure is not None:
+                raise failure
+
+        acp.prompt_existing = prompt_existing
+        return acp
+
+    def _staged(self, handler, name, data, *, kind, media_type):
+        path = handler.state.attachments_dir / f"{len(list(handler.state.attachments_dir.iterdir()))}{Path(name).suffix}"
+        path.write_bytes(data)
+        return {
+            "attachment_id": f"id-{name}",
+            "attachment_url": f"/attachments/{path.name}",
+            "filename": name,
+            "type": kind,
+            "media_type": media_type,
+            "size": len(data),
+            "stored_path": str(path),
+        }
+
+    # ----- Stop -----
+
+    def test_parity_stop_contract_matches_kimi(self):
+        handler, _kiro, _xiaoke = self._handler(self._acp())
+        handler._handle_kiro_chat_stop("")
+        self.assertEqual((400, "missing_turn_identity"), (handler.responses[-1][0], handler.responses[-1][1]["error"]))
+
+        handler._handle_kiro_chat_stop("ts-1")
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertTrue(handler.responses[-1][1]["already_finished"])
+
+        cancel_event = threading.Event()
+        handler.state.kiro_active_turn = {"user_ts": "ts-7", "cancel_event": cancel_event, "session_id": "s"}
+        handler._handle_kiro_chat_stop("ts-6")
+        self.assertEqual((409, "stale_turn"), (handler.responses[-1][0], handler.responses[-1][1]["error"]))
+        self.assertFalse(cancel_event.is_set())
+
+        handler._handle_kiro_chat_stop("ts-7")
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertTrue(handler.responses[-1][1]["stopped"])
+        self.assertEqual("ts-7", handler.responses[-1][1]["user_ts"])
+        self.assertTrue(cancel_event.is_set())
+
+    def test_parity_chat_stop_routes_kiro_through_registry(self):
+        from contacts import dispatch_contact_stop
+
+        calls = []
+        stub = types.SimpleNamespace(_handle_kiro_chat_stop=lambda user_ts: calls.append(user_ts))
+        self.assertTrue(dispatch_contact_stop(stub, {"contact_id": "kiro", "user_ts": " ts-3 "}))
+        self.assertEqual(["ts-3"], calls)
+
+        handler, _kiro, _xiaoke = self._handler(self._acp())
+        handler._handle_chat_stop({"contact_id": "kiro", "user_ts": "missing"})
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertTrue(handler.responses[-1][1]["already_finished"])
+
+    def test_parity_stop_mid_turn_persists_partial_as_interrupted(self):
+        holder = {}
+
+        def prompt_existing(text, *, on_update=None, cancel_event=None, **_kwargs):
+            on_update("写到一半")
+            handler_ref = holder["handler"]
+            handler_ref._handle_kiro_chat_stop(handler_ref.state.kiro_active_turn["user_ts"])
+            self.assertTrue(cancel_event.is_set())
+            raise KiroACPCancelled("Kiro generation cancelled")
+
+        acp = self._acp()
+        acp.prompt_existing = prompt_existing
+        handler, kiro, _xiaoke = self._handler(acp)
+        holder["handler"] = handler
+        with patch("push.threading.Thread", _immediate_thread):
+            handler._handle_kiro_chat_send({"text": "你好"}, "kiro")
+        self.assertEqual("写到一半\n\n**[已停止生成]**", kiro.records[-1]["text"])
+        self.assertEqual("kiro-acp:interrupted", kiro.records[-1]["source"])
+        self.assertEqual("interrupted", handler.state.chat_reply_states["kiro"]["reply_state"])
+        self.assertEqual({}, handler.state.kiro_active_turn)
+
+    # ----- Attachments -----
+
+    def test_parity_staged_image_and_file_reach_kiro(self):
+        acp = self._recording_acp()
+        handler, kiro, _xiaoke = self._handler(acp)
+        image = self._staged(handler, "猫.png", _PNG_BYTES, kind="image", media_type="image/png")
+        heic = self._staged(handler, "live.heic", b"heic", kind="image", media_type="image/heic")
+        doc = self._staged(handler, "报告.pdf", b"%PDF-1.4", kind="file", media_type="application/pdf")
+        handler._consume_staged_attachments = lambda body, contact_id: (
+            body.pop("attachment_ids", None), [image, heic, doc]
+        )[1]
+        with patch("push.threading.Thread", _immediate_thread):
+            handler._handle_chat_send({"contact_id": "kiro", "text": "看看", "attachment_ids": ["a", "b", "c"]})
+
+        self.assertEqual(200, handler.responses[-1][0])
+        user = kiro.records[0]
+        self.assertEqual(image["attachment_url"], user["attachment_url"])
+        self.assertEqual("image", user["attachment_type"])
+        self.assertEqual(3, len(user["metadata"]["attachments"]))
+        prompt = acp.prompts[0]
+        import base64 as _b64
+        self.assertEqual(
+            [{"mime_type": "image/png", "data": _b64.b64encode(_PNG_BYTES).decode("ascii")}],
+            prompt["images"],
+        )
+        self.assertTrue(prompt["text"].startswith("看看\n\n"))
+        for item, kind in ((image, "图片"), (heic, "图片"), (doc, "文件")):
+            self.assertIn(f"[用户发了{kind}: {item['filename']}]\n本地路径: {item['stored_path']}", prompt["text"])
+        self.assertEqual("Kiro 回复。", kiro.records[-1]["text"])
+
+    def test_parity_attachment_only_message_is_accepted(self):
+        acp = self._recording_acp()
+        handler, kiro, _xiaoke = self._handler(acp)
+        doc = self._staged(handler, "a.txt", b"hello", kind="file", media_type="text/plain")
+        with patch("push.threading.Thread", _immediate_thread):
+            handler._handle_kiro_chat_send({"text": "", "_pwa_staged_attachments": [doc]}, "kiro")
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertEqual("", kiro.records[0]["text"])
+        self.assertTrue(acp.prompts[0]["text"].startswith("[用户发了文件: a.txt]"))
+        self.assertEqual([], acp.prompts[0]["images"])
+
+    def test_parity_oversized_or_foreign_image_is_path_only(self):
+        acp = self._recording_acp()
+        handler, _kiro, _xiaoke = self._handler(acp)
+        big = self._staged(handler, "big.png", b"x" * 16, kind="image", media_type="image/png")
+        outside = Path(self._tmp.name) / "outside.png"
+        outside.write_bytes(_PNG_BYTES)
+        foreign = {**big, "filename": "o.png", "stored_path": str(outside)}
+        handler._KIRO_INLINE_IMAGE_MAX_BYTES = 8
+        with patch("push.threading.Thread", _immediate_thread):
+            handler._handle_kiro_chat_send({"text": "图", "_pwa_staged_attachments": [big, foreign]}, "kiro")
+        self.assertEqual([], acp.prompts[0]["images"])
+        self.assertIn("big.png", acp.prompts[0]["text"])
+        self.assertIn("o.png", acp.prompts[0]["text"])
+
+    def test_parity_busy_or_failed_prepare_discards_uncommitted_attachments(self):
+        acp = self._recording_acp()
+        handler, kiro, _xiaoke = self._handler(acp)
+        doc = self._staged(handler, "a.txt", b"hello", kind="file", media_type="text/plain")
+        handler.state.kiro_active_turn = {"user_ts": "t", "cancel_event": threading.Event(), "session_id": "s"}
+        handler._handle_kiro_chat_send({"text": "x", "_pwa_staged_attachments": [doc]}, "kiro")
+        self.assertEqual(409, handler.responses[-1][0])
+        self.assertFalse(Path(doc["stored_path"]).exists())
+
+        handler.state.kiro_active_turn = {}
+        doc2 = self._staged(handler, "b.txt", b"hello", kind="file", media_type="text/plain")
+
+        def prepare(**_kw):
+            raise KiroACPError("down")
+
+        acp.prepare_session = prepare
+        handler._handle_kiro_chat_send({"text": "x", "_pwa_staged_attachments": [doc2]}, "kiro")
+        self.assertEqual(503, handler.responses[-1][0])
+        self.assertFalse(Path(doc2["stored_path"]).exists())
+        self.assertEqual([], kiro.records)
+
+    # ----- Memory recall -----
+
+    def _enable_recall(self, handler, result):
+        from push import KairosRecallIndex
+
+        class Recall:
+            def __init__(self):
+                self.calls = []
+
+            def recall_result(self, query, *, exclude_memory_keys=()):
+                self.calls.append((query, tuple(exclude_memory_keys)))
+                return result
+
+        recall = Recall()
+        handler.state.kiro_semantic_memory_recall_enabled = True
+        handler.state.kiro_semantic_memory_recall_lock = threading.Lock()
+        handler.state.kiro_semantic_memory_recall = recall
+        handler.state.kiro_semantic_memory_recall_init_attempted = True
+        handler.state.kiro_recall_card_lock = threading.Lock()
+        handler.state.kiro_recall_index = KairosRecallIndex(Path(self._tmp.name) / "kiro_recall_index.json")
+        return recall
+
+    def _recall_result(self):
+        return types.SimpleNamespace(
+            context="【记忆浮现·自动检索】\n<retrieved_memory_data>安全上下文</retrieved_memory_data>",
+            items=(
+                {"date": "2026-09-01", "title": "记忆一", "snippet": "第一条", "memory_id": "cb1d1274-a604-4dab-928c-99e907a1eeec"},
+                {"date": "2026-09-02", "title": "记忆二", "snippet": "第二条"},
+            ),
+            memory_keys=("v1:" + "c" * 64,),
+        )
+
+    def test_parity_recall_injects_context_and_card_then_commits(self):
+        acp = self._recording_acp()
+        handler, kiro, _xiaoke = self._handler(acp)
+        recall = self._enable_recall(handler, self._recall_result())
+        with patch("push.threading.Thread", _immediate_thread):
+            handler._handle_kiro_chat_send({"text": "你还记得我喜欢吃什么吗"}, "kiro")
+
+        self.assertEqual([("你还记得我喜欢吃什么吗", ())], recall.calls)
+        roles = [(r["role"], r["source"]) for r in kiro.records]
+        self.assertEqual(
+            [("user", "android-app:kiro"), ("assistant", "memory-recall:kiro"), ("assistant", "kiro-acp")],
+            roles,
+        )
+        card = kiro.records[1]
+        self.assertEqual("💭 浮现了 2 条记忆（摘要见卡片）", card["text"])
+        self.assertTrue(card["metadata"]["recall_card"])
+        self.assertEqual(kiro.records[0]["ts"], card["metadata"]["kiro_user_ts"])
+        self.assertFalse(card["metadata"]["turn_terminal"])
+        self.assertEqual("cb1d1274-a604-4dab-928c-99e907a1eeec", card["metadata"]["items"][0]["memory_id"])
+        self.assertEqual(
+            "你还记得我喜欢吃什么吗\n\n" + self._recall_result().context,
+            acp.prompts[0]["text"],
+        )
+        # Committed after the prompt succeeded: the next turn excludes it.
+        self.assertEqual(("v1:" + "c" * 64,), handler.state.kiro_recall_index.keys("kiro-session-1"))
+        with patch("push.threading.Thread", _immediate_thread):
+            handler._handle_kiro_chat_send({"text": "那我最讨厌什么呢"}, "kiro")
+        self.assertEqual(("v1:" + "c" * 64,), recall.calls[-1][1])
+
+    def test_parity_recall_gate_matches_cc_hook(self):
+        acp = self._recording_acp()
+        handler, kiro, _xiaoke = self._handler(acp)
+        recall = self._enable_recall(handler, self._recall_result())
+        for text in ("好", "👋👋👋👋👋👋👋", "   嗯嗯  ", "【日程·自动触发】明天九点开会记得带电脑"):
+            with patch("push.threading.Thread", _immediate_thread):
+                handler._handle_kiro_chat_send({"text": text}, "kiro")
+        self.assertEqual([], recall.calls)
+        self.assertFalse(any(r["source"] == "memory-recall:kiro" for r in kiro.records))
+        self.assertEqual(text, acp.prompts[-1]["text"])
+
+    def test_parity_recall_not_committed_when_turn_fails(self):
+        acp = self._recording_acp(reply="", failure=KiroACPError("x"))
+        handler, _kiro, _xiaoke = self._handler(acp)
+        self._enable_recall(handler, self._recall_result())
+        with patch("push.threading.Thread", _immediate_thread):
+            handler._handle_kiro_chat_send({"text": "你还记得我喜欢吃什么吗"}, "kiro")
+        self.assertEqual((), handler.state.kiro_recall_index.keys("kiro-session-1"))
+
+    def test_parity_recall_failure_is_fail_open(self):
+        acp = self._recording_acp()
+        handler, kiro, _xiaoke = self._handler(acp)
+        recall = self._enable_recall(handler, None)
+        recall.recall_result = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("memory down"))
+        with patch("push.threading.Thread", _immediate_thread):
+            handler._handle_kiro_chat_send({"text": "你还记得我喜欢吃什么吗"}, "kiro")
+        self.assertEqual("你还记得我喜欢吃什么吗", acp.prompts[0]["text"])
+        self.assertEqual("Kiro 回复。", kiro.records[-1]["text"])
+
+    def test_parity_kiro_recall_never_touches_kimi_state(self):
+        acp = self._recording_acp()
+        handler, _kiro, _xiaoke = self._handler(acp)
+        self._enable_recall(handler, self._recall_result())
+        kimi_index = types.SimpleNamespace(
+            keys=lambda _s: self.fail("kimi index read"),
+            add=lambda *_a: self.fail("kimi index write"),
+        )
+        handler.state.kimi_recall_index = kimi_index
+        handler.state.kimi_semantic_memory_recall_enabled = True
+        with patch("push.threading.Thread", _immediate_thread):
+            handler._handle_kiro_chat_send({"text": "你还记得我喜欢吃什么吗"}, "kiro")
+        self.assertEqual(1, len(handler.state.kiro_recall_index.keys("kiro-session-1")))
 
 
 if __name__ == "__main__":

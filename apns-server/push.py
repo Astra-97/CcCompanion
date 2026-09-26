@@ -31,6 +31,7 @@ POST /push 触发 SPOKE / 状态切换 等
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import OrderedDict, deque
 from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
@@ -184,6 +185,7 @@ from kiro_acp import (
     KiroACPClient,
     KiroACPError,
     KiroACPQuotaExceeded,
+    KIRO_PROMPT_IMAGE_TYPES,
 )
 # kiro 切模型 (2026-09-10): App 模型选择持久化，allowlist 来自 ACP 动态目录。
 # kiro 推理强度 (2026-09-10): effort 走封闭五档，不依赖动态目录。
@@ -4396,6 +4398,20 @@ class ServerState:
         self.kimi_recall_index = KairosRecallIndex(
             Path(self.token_store_path).expanduser().parent / "kimi_recall_index.json"
         )
+        # kiro 对齐 CC (2026-09-26): Kiro reuses the same shared recall
+        # implementation with its own client, seen ledger and card lock so a
+        # Kiro turn never consumes (or is suppressed by) a Kimi/Kairos recall.
+        self.kiro_semantic_memory_recall_enabled: bool = bool(
+            server_cfg.get("kiro_semantic_memory_recall_enabled", True)
+        )
+        self.kiro_semantic_memory_recall_timeout_sec: float = self.kairos_semantic_memory_recall_timeout_sec
+        self.kiro_semantic_memory_recall: Any = None
+        self.kiro_semantic_memory_recall_init_attempted = False
+        self.kiro_semantic_memory_recall_lock = threading.Lock()
+        self.kiro_recall_card_lock = threading.Lock()
+        self.kiro_recall_index = KairosRecallIndex(
+            Path(self.token_store_path).expanduser().parent / "kiro_recall_index.json"
+        )
         self.codex_kairos_backend: str = str(
             server_cfg.get("codex_kairos_backend", "app-server") or "app-server"
         ).strip().lower()
@@ -7988,8 +8004,10 @@ class PushHandler(BaseHTTPRequestHandler):
             # XiaoKe Stop emits literal tmux Ctrl-C and remains under the
             # remote-control gate. Kairos and Kimi use independent in-process
             # exact-turn fences, so neither inherits a tmux-only switch.
+            # kiro 对齐 CC (2026-09-26): Kiro's Stop is an in-process ACP
+            # session/cancel fenced by exact user_ts, like Kimi.
             requested_stop_contact = str(body.get("contact_id") or "").strip()
-            if requested_stop_contact not in {"kairos", "kimi"} and not self.state.allow_remote_control:
+            if requested_stop_contact not in {"kairos", "kimi", "kiro"} and not self.state.allow_remote_control:
                 self._send_json(403, {"error": "remote_control disabled", "hint": "set allow_remote_control=true in config.toml"})
                 return
             self._handle_chat_stop(body)
@@ -11000,12 +11018,13 @@ class PushHandler(BaseHTTPRequestHandler):
                 "reason": "Kimi 当前只接受直接发送的文字消息。",
             })
             return
-        # kiro 桥接 (2026-09-09)：Phase 1 仅文本，附件/语音/卡片在入口拒绝。
+        # kiro 桥接 (2026-09-09)：旧式附件/语音/卡片在入口拒绝。
+        # kiro 对齐 CC (2026-09-26)：与 Kimi 同款，只放行 staged attachment_ids。
         if contact_id == "kiro" and self._kiro_inbound_not_text_only(body):
             self._send_json(415, {
                 "ok": False,
                 "error": "kiro_text_only",
-                "reason": "Kiro 当前只接受直接发送的文字消息。",
+                "reason": "Kiro 只接受文字消息和聊天框里上传的附件。",
             })
             return
         # Group attachment ownership is deliberately narrow: one human turn
@@ -11777,25 +11796,31 @@ class PushHandler(BaseHTTPRequestHandler):
             ])
         return "\n".join(sections) + self._kimi_bqb_protocol()
 
-    def _kimi_seen_memory_keys(self, session_id: str | None) -> tuple[str, ...]:
+    # kiro 对齐 CC (2026-09-26): the recall trio below is shared by Kimi and
+    # Kiro.  ``prefix`` selects that contact's own ServerState attributes
+    # (``<prefix>_semantic_memory_recall*``, ``<prefix>_recall_index``,
+    # ``<prefix>_recall_card_lock``), so clients, seen ledgers and card locks
+    # never cross contacts.  The Kimi wrappers keep their exact behavior.
+
+    def _contact_seen_memory_keys(self, prefix: str, session_id: str | None) -> tuple[str, ...]:
         try:
-            index = getattr(self.state, "kimi_recall_index", None)
+            index = getattr(self.state, f"{prefix}_recall_index", None)
             return tuple(index.keys(session_id)) if index is not None else ()
         except Exception:
             return ()
 
-    def _kimi_semantic_recall(self, query: str, *, session_id: str | None) -> Any:
-        if not bool(getattr(self.state, "kimi_semantic_memory_recall_enabled", False)) or not str(query or "").strip():
+    def _contact_semantic_recall(self, prefix: str, query: str, *, session_id: str | None) -> Any:
+        if not bool(getattr(self.state, f"{prefix}_semantic_memory_recall_enabled", False)) or not str(query or "").strip():
             return None
         try:
-            lock = getattr(self.state, "kimi_semantic_memory_recall_lock", None)
+            lock = getattr(self.state, f"{prefix}_semantic_memory_recall_lock", None)
             if lock is None:
                 return None
             with lock:
-                client = getattr(self.state, "kimi_semantic_memory_recall", None)
-                attempted = bool(getattr(self.state, "kimi_semantic_memory_recall_init_attempted", False))
+                client = getattr(self.state, f"{prefix}_semantic_memory_recall", None)
+                attempted = bool(getattr(self.state, f"{prefix}_semantic_memory_recall_init_attempted", False))
                 if client is None and not attempted:
-                    self.state.kimi_semantic_memory_recall_init_attempted = True
+                    setattr(self.state, f"{prefix}_semantic_memory_recall_init_attempted", True)
                     module_root = "/root/Windows-Codex-TG"
                     if module_root not in sys.path:
                         sys.path.insert(0, module_root)
@@ -11806,16 +11831,16 @@ class PushHandler(BaseHTTPRequestHandler):
                         token_file=Path("/root/.codex/config.toml"),
                         total_timeout_sec=float(getattr(
                             self.state,
-                            "kimi_semantic_memory_recall_timeout_sec",
+                            f"{prefix}_semantic_memory_recall_timeout_sec",
                             2.5,
                         )),
                     ))
-                    self.state.kimi_semantic_memory_recall = client
+                    setattr(self.state, f"{prefix}_semantic_memory_recall", client)
             if client is None:
                 return None
             result = client.recall_result(
                 str(query),
-                exclude_memory_keys=self._kimi_seen_memory_keys(session_id),
+                exclude_memory_keys=self._contact_seen_memory_keys(prefix, session_id),
             )
             context = str(getattr(result, "context", "") or "").strip()
             items = getattr(result, "items", ())
@@ -11823,26 +11848,28 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception:
             return None
 
-    def _commit_kimi_recall(self, result: Any, session_id: str | None) -> bool:
+    def _commit_contact_recall(self, prefix: str, result: Any, session_id: str | None) -> bool:
         try:
-            index = getattr(self.state, "kimi_recall_index", None)
+            index = getattr(self.state, f"{prefix}_recall_index", None)
             return bool(index and index.add(session_id, getattr(result, "memory_keys", ())))
         except Exception:
             return False
 
-    def _append_kimi_recall_card(
+    def _append_contact_recall_card(
         self,
+        prefix: str,
         chat: ChatHistory,
         result: Any,
         *,
         user_ts: str,
         session_id: str,
     ) -> bool:
-        """Persist a Kimi-only recall card without sharing Kairos state."""
+        """Persist one contact-scoped recall card without sharing other contacts' state."""
+        user_ts_key = f"{prefix}_user_ts"
         try:
             if not user_ts or not session_id:
                 return False
-            lock = getattr(self.state, "kimi_recall_card_lock", None)
+            lock = getattr(self.state, f"{prefix}_recall_card_lock", None)
             if lock is None:
                 return False
             with lock:
@@ -11851,7 +11878,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     if (
                         isinstance(metadata, dict)
                         and metadata.get("recall_card") is True
-                        and str(metadata.get("kimi_user_ts") or "") == user_ts
+                        and str(metadata.get(user_ts_key) or "") == user_ts
                     ):
                         return False
                 items: list[dict[str, str]] = []
@@ -11877,11 +11904,11 @@ class PushHandler(BaseHTTPRequestHandler):
                 chat.append(
                     role="assistant",
                     text=f"💭 浮现了 {len(items)} 条记忆（摘要见卡片）",
-                    source="memory-recall:kimi",
+                    source=f"memory-recall:{prefix}",
                     metadata={
                         "recall_card": True,
                         "items": items,
-                        "kimi_user_ts": user_ts,
+                        user_ts_key: user_ts,
                         # A recall card is attached to the foreground turn for
                         # ordering, but it is not that turn's final assistant
                         # answer.  Clients must not use it as completion
@@ -11895,6 +11922,28 @@ class PushHandler(BaseHTTPRequestHandler):
                 return True
         except Exception:
             return False
+
+    def _kimi_seen_memory_keys(self, session_id: str | None) -> tuple[str, ...]:
+        return self._contact_seen_memory_keys("kimi", session_id)
+
+    def _kimi_semantic_recall(self, query: str, *, session_id: str | None) -> Any:
+        return self._contact_semantic_recall("kimi", query, session_id=session_id)
+
+    def _commit_kimi_recall(self, result: Any, session_id: str | None) -> bool:
+        return self._commit_contact_recall("kimi", result, session_id)
+
+    def _append_kimi_recall_card(
+        self,
+        chat: ChatHistory,
+        result: Any,
+        *,
+        user_ts: str,
+        session_id: str,
+    ) -> bool:
+        """Persist a Kimi-only recall card without sharing Kairos state."""
+        return self._append_contact_recall_card(
+            "kimi", chat, result, user_ts=user_ts, session_id=session_id,
+        )
 
     def _append_kimi_memory_write_card(
         self,
@@ -13871,20 +13920,115 @@ class PushHandler(BaseHTTPRequestHandler):
 
     # ---------- kiro 桥接 (2026-09-09) — Phase 1：文本聊天 + 会话连续 ----------
     # 对照 Kimi ACP 回滚通道的收发骨架，刻意简化：无队列（忙时 409）、无终端
-    # 仲裁（Kiro 侧没有第二写者）、无记忆召回/链接预览/登录卡。ACP 常驻进程
-    # 跨轮复用，仅在失败路径 close 重置；session 指针持久化在
+    # 仲裁（Kiro 侧没有第二写者）、无链接预览/登录卡。ACP 常驻进程跨轮复用，
+    # 仅在失败路径 close 重置；session 指针持久化在
     # tokens/kiro_acp_session.json，重启后经 session/load 续会话。
+    # kiro 对齐 CC (2026-09-26)：补齐记忆浮现（共享 semantic_memory_recall +
+    # 浮现卡片，闸门复用 CC 的 recall_hook.should_skip）、附件（staged 上传
+    # 管线 → ACP image block + 同 CC 的「本地路径」提示）、Stop（/chat/stop →
+    # session/cancel）。召回放在 worker 线程里做，不拖慢 /chat/send 的返回。
+
+    # Same byte budget Anthropic accepts for one base64 image (5 MB encoded).
+    _KIRO_INLINE_IMAGE_MAX_BYTES = 3_750_000
+    _KIRO_RECALL_MIN_BODY_CHARS = 6
+    _memory_recall_hook_module_cache: Any = None
+    _memory_recall_hook_import_attempted = False
+
+    @classmethod
+    def _memory_recall_hook_module(cls) -> Any:
+        """Import CC's recall_hook once so Kiro shares its exact skip gate."""
+        if cls._memory_recall_hook_import_attempted:
+            return cls._memory_recall_hook_module_cache
+        cls._memory_recall_hook_import_attempted = True
+        try:
+            module_root = "/root/memory-recall-hook"
+            if module_root not in sys.path:
+                sys.path.insert(0, module_root)
+            import recall_hook  # type: ignore[import-not-found]
+
+            if callable(getattr(recall_hook, "should_skip", None)) and callable(
+                getattr(recall_hook, "extract_body", None)
+            ):
+                cls._memory_recall_hook_module_cache = recall_hook
+        except Exception:
+            cls._memory_recall_hook_module_cache = None
+        return cls._memory_recall_hook_module_cache
+
+    def _kiro_recall_allowed(self, text: str) -> bool:
+        """CC parity: skip automation, too-short and symbol-only messages."""
+        raw = str(text or "")
+        if not raw.strip():
+            return False
+        hook = self._memory_recall_hook_module()
+        if hook is not None:
+            try:
+                return not bool(hook.should_skip(raw, hook.extract_body(raw)))
+            except Exception:
+                return False
+        compact = re.sub(r"\s", "", raw)
+        return len(compact) >= self._KIRO_RECALL_MIN_BODY_CHARS and bool(re.search(r"\w", raw, re.UNICODE))
+
+    def _kiro_attachment_prompt(self, attachments: list[dict[str, Any]]) -> tuple[str, list[dict[str, str]]]:
+        """Build CC's path hint for every attachment plus inline image blocks.
+
+        Only authoritative staged records (consumed by this server into
+        ``attachments_dir``) are read.  Unsupported or oversized images, and
+        every non-image file, reach Kiro as the local path only.
+        """
+        hints: list[str] = []
+        images: list[dict[str, str]] = []
+        try:
+            root = Path(getattr(self.state, "attachments_dir")).resolve()
+        except Exception:
+            root = None
+        for item in attachments:
+            if not isinstance(item, dict):
+                continue
+            kind = "图片" if item.get("type") == "image" else "文件"
+            stored_path = str(item.get("stored_path") or "")
+            hints.append(f"[用户发了{kind}: {item.get('filename')}]\n本地路径: {stored_path}")
+            if item.get("type") != "image" or root is None or not stored_path:
+                continue
+            mime_type = str(item.get("media_type") or "").lower()
+            if mime_type == "image/jpg":
+                mime_type = "image/jpeg"
+            if mime_type not in KIRO_PROMPT_IMAGE_TYPES:
+                continue
+            try:
+                target = Path(stored_path).resolve(strict=True)
+                if target.parent != root or not target.is_file():
+                    continue
+                if target.stat().st_size > self._KIRO_INLINE_IMAGE_MAX_BYTES:
+                    continue
+                images.append({
+                    "mime_type": mime_type,
+                    "data": base64.b64encode(target.read_bytes()).decode("ascii"),
+                })
+            except OSError:
+                continue
+        return "\n".join(hints), images
 
     def _handle_kiro_chat_send(self, body: dict[str, Any], contact_id: str) -> None:
-        """Queue-free text turn into Kiro's own ACP session."""
+        """Queue-free text/attachment turn into Kiro's own ACP session."""
         text = str(body.get("text") or "").strip()
         quoted_ts = body.get("quoted_ts") or None
-        if not text:
+        staged_attachments = [
+            item for item in list(body.get("_pwa_staged_attachments") or []) if isinstance(item, dict)
+        ]
+        metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else None
+        attachments_committed = False
+
+        def discard_uncommitted_attachments() -> None:
+            if not attachments_committed:
+                self._discard_uncommitted_staged_attachments(staged_attachments)
+
+        if not text and not staged_attachments:
             self._send_json(400, {"ok": False, "error": "text required"})
             return
 
         with self.state.kiro_turn_lock:
             if self.state.kiro_active_turn or self.state.kiro_prepare_token:
+                discard_uncommitted_attachments()
                 self._send_json(409, {
                     "ok": False,
                     "error": "kiro_turn_active",
@@ -13894,6 +14038,7 @@ class PushHandler(BaseHTTPRequestHandler):
             prepare_token = secrets.token_hex(16)
             self.state.kiro_prepare_token = prepare_token
 
+        prepare_started = time.monotonic()
         try:
             # kiro 切模型 (2026-09-10)：每轮 prepare 重新钉住 App 选择的模型
             # （Kiro 不持久化 set_model，session/load 会回到默认）。
@@ -13907,6 +14052,7 @@ class PushHandler(BaseHTTPRequestHandler):
             )
         except KiroACPAuthRequired:
             self._release_kiro_prepare(prepare_token)
+            discard_uncommitted_attachments()
             self.state.kiro_acp.close()
             self._send_json(503, {
                 "ok": False,
@@ -13916,6 +14062,7 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         except KiroACPQuotaExceeded:
             self._release_kiro_prepare(prepare_token)
+            discard_uncommitted_attachments()
             self.state.kiro_acp.close()
             self._send_json(503, {
                 "ok": False,
@@ -13925,6 +14072,7 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         except (KiroACPBusy, KiroACPError) as exc:
             self._release_kiro_prepare(prepare_token)
+            discard_uncommitted_attachments()
             logger.warning("Kiro ACP prepare failed: %s", type(exc).__name__)
             self.state.kiro_acp.close()
             self._send_json(503, {
@@ -13935,6 +14083,7 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         except Exception:
             self._release_kiro_prepare(prepare_token)
+            discard_uncommitted_attachments()
             logger.exception("Kiro ACP prepare crashed")
             self.state.kiro_acp.close()
             self._send_json(503, {
@@ -13943,10 +14092,12 @@ class PushHandler(BaseHTTPRequestHandler):
                 "reason": "Kiro 暂时不可用，请稍后重试；本次消息未发送。",
             })
             return
+        prepare_ms = int((time.monotonic() - prepare_started) * 1000)
 
         with self.state.kiro_turn_lock:
             if self.state.kiro_prepare_token != prepare_token or self.state.kiro_active_turn:
                 self._release_kiro_prepare(prepare_token)
+                discard_uncommitted_attachments()
                 self._send_json(409, {
                     "ok": False,
                     "error": "kiro_turn_active",
@@ -13954,18 +14105,25 @@ class PushHandler(BaseHTTPRequestHandler):
                 })
                 return
             chat = self._chat_for_contact(contact_id)
+            primary_attachment = staged_attachments[0] if staged_attachments else {}
             try:
                 rec = chat.append(
                     role="user",
                     text=text,
                     source=self._source_for_request("kiro"),
                     quoted_ts=quoted_ts,
+                    metadata=metadata,
+                    attachment_url=primary_attachment.get("attachment_url") or None,
+                    attachment_type=primary_attachment.get("type") or None,
+                    attachment_filename=primary_attachment.get("filename") or None,
                 )
             except Exception:
                 logger.exception("Kiro history append failed")
                 self._release_kiro_prepare(prepare_token)
+                discard_uncommitted_attachments()
                 self._send_json(500, {"ok": False, "error": "kiro_history_unavailable"})
                 return
+            attachments_committed = True
             cancel_event = threading.Event()
             self.state.kiro_active_turn = {
                 "user_ts": str(rec.get("ts") or ""),
@@ -13993,6 +14151,11 @@ class PushHandler(BaseHTTPRequestHandler):
             activity_count = 0
             activity_items: list[str] = []
             activity_labels_seen: set[str] = set()
+            turn_started = time.monotonic()
+            first_chunk_ms: list[int] = []
+            recall_ms = 0
+            recall_result: Any = None
+            images: list[dict[str, str]] = []
 
             def append_assistant_safely(message: str, source: str) -> str:
                 try:
@@ -14026,6 +14189,8 @@ class PushHandler(BaseHTTPRequestHandler):
 
             def on_update(delta: str) -> None:
                 nonlocal last_published
+                if not first_chunk_ms:
+                    first_chunk_ms.append(int((time.monotonic() - turn_started) * 1000))
                 chunks.append(delta)
                 now = time.monotonic()
                 if now - last_published >= 0.08:
@@ -14062,14 +14227,34 @@ class PushHandler(BaseHTTPRequestHandler):
                 )
 
             try:
+                recall_started = time.monotonic()
+                if not cancel_event.is_set() and self._kiro_recall_allowed(text):
+                    recall_result = self._contact_semantic_recall("kiro", text, session_id=session_id)
+                    if recall_result is not None:
+                        self._append_contact_recall_card(
+                            "kiro",
+                            chat,
+                            recall_result,
+                            user_ts=str(rec.get("ts") or ""),
+                            session_id=session_id,
+                        )
+                recall_ms = int((time.monotonic() - recall_started) * 1000)
+                recall_context = str(getattr(recall_result, "context", "") or "").strip()
+                attachment_hint, images = self._kiro_attachment_prompt(staged_attachments)
+                prompt = "\n\n".join(
+                    part for part in (text, attachment_hint, recall_context) if part
+                )
                 self.state.kiro_acp.prompt_existing(
-                    text,
+                    prompt,
                     session_id=session_id,
                     turn_id=str(rec.get("ts") or ""),
                     on_update=on_update,
                     on_activity=on_activity,
                     cancel_event=cancel_event,
+                    images=images,
                 )
+                if recall_result is not None:
+                    self._commit_contact_recall("kiro", recall_result, session_id)
                 answer = "".join(chunks).strip() or "Kiro 没有返回可展示内容。"
                 set_completed(answer, "kiro-acp")
             except KiroACPCancelled:
@@ -14123,6 +14308,17 @@ class PushHandler(BaseHTTPRequestHandler):
                     if str(current.get("user_ts") or "") == str(rec.get("ts") or ""):
                         self.state.kiro_active_turn = {}
                 self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
+                # Timing only; never message text, paths or provider output.
+                logger.info(
+                    "Kiro turn timing: prepare_ms=%d recall_ms=%d recall_hit=%s images=%d files=%d first_chunk_ms=%s total_ms=%d",
+                    prepare_ms,
+                    recall_ms,
+                    recall_result is not None,
+                    len(images),
+                    len(staged_attachments),
+                    first_chunk_ms[0] if first_chunk_ms else "none",
+                    int((time.monotonic() - turn_started) * 1000),
+                )
 
         threading.Thread(target=worker, name="kiro-acp-chat-turn", daemon=True).start()
         self._send_json(200, {
@@ -14136,6 +14332,54 @@ class PushHandler(BaseHTTPRequestHandler):
                 "session_id": session_id,
                 "transport": "kiro-acp",
             },
+        })
+
+    def _handle_kiro_chat_stop(self, user_ts: str) -> None:
+        """Exact-turn Stop for Kiro, same contract as the Kimi ACP path.
+
+        kiro 对齐 CC (2026-09-26): the cancel event makes the turn worker send
+        ACP ``session/cancel``; the worker persists the partial answer as the
+        interrupted final message, exactly like Kimi.
+        """
+        if not user_ts:
+            self._send_json(400, {
+                "ok": False,
+                "error": "missing_turn_identity",
+                "reason": "缺少本轮 Kiro 消息标识，未发送停止指令。",
+            })
+            return
+        with self.state.kiro_turn_lock:
+            active = dict(self.state.kiro_active_turn)
+            if not active:
+                self._send_json(200, {
+                    "ok": True,
+                    "stopped": False,
+                    "already_finished": True,
+                    "message": "这轮 Kiro 生成已经结束。",
+                })
+                return
+            active_ts = str(active.get("user_ts") or "")
+            if not active_ts or user_ts != active_ts:
+                self._send_json(409, {
+                    "ok": False,
+                    "error": "stale_turn",
+                    "reason": "当前 Kiro 轮次与停止目标不一致，未发送停止指令。",
+                })
+                return
+            cancel_event = active.get("cancel_event")
+            if not isinstance(cancel_event, threading.Event):
+                self._send_json(409, {
+                    "ok": False,
+                    "error": "invalid_turn_identity",
+                    "reason": "当前 Kiro 轮次缺少停止句柄，未发送停止指令。",
+                })
+                return
+            cancel_event.set()
+        self._send_json(200, {
+            "ok": True,
+            "stopped": True,
+            "user_ts": active_ts,
+            "message": "已停止 Kiro 生成。",
         })
 
     def _release_kiro_prepare(self, prepare_token: str) -> None:
@@ -21701,6 +21945,16 @@ class PushHandler(BaseHTTPRequestHandler):
                 "ok": False,
                 "error": "kimi_staged_attachment_required",
                 "reason": "Kimi 附件必须先上传，再随 /chat/send 原子提交。",
+            })
+            return
+        # kiro 对齐 CC (2026-09-26)：Kiro 同样只走 staged 管线；旧式直传会
+        # 写历史却不唤醒 Kiro，直接拒绝。
+        if contact_id == "kiro":
+            self.close_connection = True
+            self._send_json(415, {
+                "ok": False,
+                "error": "kiro_staged_attachment_required",
+                "reason": "Kiro 附件必须先上传，再随 /chat/send 原子提交。",
             })
             return
 

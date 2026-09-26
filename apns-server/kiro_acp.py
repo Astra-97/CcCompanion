@@ -32,6 +32,15 @@ Kiro itself persists effort across session/new|load is unproven (no
 thinking-capable model on this account to observe it), so the client fails
 closed: the read-back cache is cleared on every session transition and the
 pin is re-applied after every new/load, exactly like the model pin.
+
+kiro 对齐 CC (2026-09-26): ``initialize`` advertises
+``agentCapabilities.promptCapabilities.image`` (2.21.2 wire probe: ``true``;
+``embeddedContext``/``audio`` are ``false``).  The client records that flag and
+``prompt_existing`` sends caller-supplied images as ACP ``image`` content
+blocks only when it is set.  ``session/cancel`` is bounded by a grace period:
+if Kiro has not answered the cancelled ``session/prompt`` in time, the process
+is recycled so the next turn cannot inherit a still-running one (the durable
+session pointer makes the next prepare ``session/load`` the same session).
 """
 from __future__ import annotations
 
@@ -45,10 +54,12 @@ import signal
 import subprocess
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 KIRO_DEFAULT_COMMAND = str(Path.home() / ".local" / "bin" / "kiro-cli")
 DEFAULT_KIRO_CWD = "/root/Karami-Workspace"
+# kiro 对齐 CC (2026-09-26): image MIME types sent as ACP image blocks.
+KIRO_PROMPT_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 
 
 class KiroACPError(RuntimeError):
@@ -220,6 +231,7 @@ class KiroACPClient:
         logger: logging.Logger | None = None,
         request_timeout: float = 30.0,
         prompt_timeout: float = 900.0,
+        cancel_grace_seconds: float = 10.0,
         popen_factory: Callable[..., subprocess.Popen[str]] = subprocess.Popen,
         catalog_path: str | Path | None = None,
     ):
@@ -251,6 +263,11 @@ class KiroACPClient:
         self.logger = logger or logging.getLogger(__name__)
         self.request_timeout = max(1.0, float(request_timeout))
         self.prompt_timeout = max(self.request_timeout, float(prompt_timeout))
+        # kiro 对齐 CC (2026-09-26): how long a cancelled prompt may take to
+        # acknowledge before the process is recycled.
+        self.cancel_grace_seconds = max(0.2, float(cancel_grace_seconds))
+        # kiro 对齐 CC (2026-09-26): promptCapabilities.image from initialize.
+        self._prompt_image_supported = False
         self._popen_factory = popen_factory
         self._process: subprocess.Popen[str] | None = None
         self._write_lock = threading.Lock()
@@ -528,6 +545,10 @@ class KiroACPClient:
             return ""
         return session_id
 
+    def image_prompt_supported(self) -> bool:
+        """Whether the running agent advertised ACP image prompt blocks."""
+        return bool(self._prompt_image_supported and self._initialized)
+
     def _process_alive(self) -> bool:
         return self._process is not None and self._process.poll() is None
 
@@ -577,7 +598,7 @@ class KiroACPClient:
             )
             self._reader.start()
             self._stderr_reader.start()
-            self._request(
+            init_result = self._request(
                 "initialize",
                 {
                     "protocolVersion": 1,
@@ -589,6 +610,13 @@ class KiroACPClient:
                 },
                 timeout=self.request_timeout,
                 ensure_started=False,
+            )
+            capabilities = init_result.get("agentCapabilities")
+            prompt_caps = (
+                capabilities.get("promptCapabilities") if isinstance(capabilities, dict) else None
+            )
+            self._prompt_image_supported = bool(
+                isinstance(prompt_caps, dict) and prompt_caps.get("image") is True
             )
             self._initialized = True
 
@@ -888,6 +916,7 @@ class KiroACPClient:
         on_update: Callable[[str], None] | None = None,
         on_activity: Callable[[dict[str, Any]], None] | None = None,
         cancel_event: threading.Event | None = None,
+        images: Sequence[dict[str, str]] = (),
     ) -> KiroACPResult:
         session_id = str(session_id or "").strip()
         turn_id = str(turn_id or "").strip()
@@ -907,12 +936,25 @@ class KiroACPClient:
                 raise KiroACPCancelled("Kiro generation cancelled before prompt")
             finished = threading.Event()
             outcome: dict[str, Any] = {}
+            # kiro 对齐 CC (2026-09-26): image blocks go first (the order the
+            # user attached them), then the text block.  Unsupported agents
+            # get text only; callers always also describe the file path.
+            blocks: list[dict[str, Any]] = []
+            if self.image_prompt_supported():
+                for image in images or ():
+                    if not isinstance(image, dict):
+                        continue
+                    mime_type = str(image.get("mime_type") or "")
+                    data = str(image.get("data") or "")
+                    if mime_type in KIRO_PROMPT_IMAGE_TYPES and data:
+                        blocks.append({"type": "image", "mimeType": mime_type, "data": data})
+            blocks.append({"type": "text", "text": text})
 
             def request_prompt() -> None:
                 try:
                     outcome["result"] = self._request(
                         "session/prompt",
-                        {"sessionId": session_id, "prompt": [{"type": "text", "text": text}]},
+                        {"sessionId": session_id, "prompt": blocks},
                         timeout=self.prompt_timeout,
                     )
                 except Exception as exc:
@@ -924,10 +966,19 @@ class KiroACPClient:
             worker.start()
             deadline = time.monotonic() + self.prompt_timeout
             cancelled = False
+            cancel_deadline = 0.0
             while not finished.wait(0.1):
                 if cancel_event is not None and cancel_event.is_set() and not cancelled:
                     self.cancel(turn_id, session_id)
                     cancelled = True
+                    cancel_deadline = time.monotonic() + self.cancel_grace_seconds
+                if cancelled and time.monotonic() >= cancel_deadline:
+                    # Kiro did not acknowledge session/cancel in time.  Recycle
+                    # the process so the next turn never shares it with a
+                    # still-running prompt; session/load resumes the pointer.
+                    self.logger.warning("Kiro ACP cancel was not acknowledged; recycling the process")
+                    self.close()
+                    raise KiroACPCancelled("Kiro generation cancelled")
                 if time.monotonic() >= deadline:
                     if not cancelled:
                         self.cancel(turn_id, session_id)
