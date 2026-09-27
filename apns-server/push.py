@@ -3872,6 +3872,7 @@ def _inject_to_tmux_session(state: "ServerState", session: str, text: str) -> tu
 TOOLBOT_MODEL_ALLOWLIST: frozenset = frozenset({
     "claude-fable-5",
     "claude-fable-5-1",
+    "claude-opus-5-5",
     "claude-opus-5",
     "claude-opus-5[1m]",
     "claude-sonnet-5",
@@ -3901,6 +3902,8 @@ TOOLBOT_MODEL_ALIASES: dict[str, str] = {
     "opus4.8": "claude-opus-4-8",
     "opus5": "claude-opus-5",
     "opus5-1m": "claude-opus-5[1m]",
+    "opus5.5": "claude-opus-5-5",
+    "claude-opus-5-5": "claude-opus-5-5",
     "sonnet5": "claude-sonnet-5",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
