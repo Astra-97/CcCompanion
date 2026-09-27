@@ -610,6 +610,39 @@ class KiroChatHandlerTest(unittest.TestCase):
         handler2._handle_kiro_chat_send = lambda body, contact_id: handler2.calls.append((body, contact_id))
         self.assertTrue(dispatch_contact_send(handler2, "kiro", {"text": "hi"}))
 
+    def test_contact_directory_offers_kiro_as_forward_target(self):
+        handler, _kiro, _xiaoke = self._handler(self._acp())
+        contacts = {c["id"]: c for c in chat_contact_directory(handler.state)}
+        self.assertIn("forward", contacts["kiro"]["capabilities"])
+        self.assertFalse(contacts["kiro"]["read_only"])
+        # Forwarding is presentation only: Kiro is still not a group member.
+        self.assertNotIn("group_member", contacts["kiro"]["capabilities"])
+
+    def test_forwarded_text_with_note_is_one_ordinary_kiro_turn(self):
+        handler, kiro, _xiaoke = self._handler(self._acp())
+        forwarded = "看看这个\n\n[转发自小克]\n原文 @Kairos"
+        self.assertFalse(rejects_inbound({"contact_id": "kiro", "text": forwarded}))
+        with patch("push.threading.Thread", _immediate_thread):
+            handler._handle_chat_send({"contact_id": "kiro", "text": forwarded})
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertEqual(
+            [("user", forwarded), ("assistant", "Kiro 回复。")],
+            [(r["role"], r["text"]) for r in kiro.records],
+        )
+
+    def test_forwarded_text_while_kiro_is_replying_is_queued(self):
+        handler, kiro, _xiaoke = self._handler(self._acp())
+        handler.state.kiro_active_turn = {"user_ts": "ts-busy", "cancel_event": threading.Event(), "session_id": "kiro-session-1"}
+        forwarded = "[转发自Kimi]\n原文"
+        with patch("push.threading.Thread"):
+            handler._handle_chat_send({"contact_id": "kiro", "text": forwarded})
+        status, payload = handler.responses[-1]
+        self.assertEqual(200, status)
+        self.assertTrue(payload["queued"])
+        self.assertEqual((1, "kiro_turn_active"), (payload["queue_position"], payload["reason"]))
+        self.assertEqual(1, len(handler.state.kiro_chat_queue))
+        self.assertEqual([("user", forwarded)], [(r["role"], r["text"]) for r in kiro.records])
+
     def test_text_only_ingress_rejects_attachments_and_cards(self):
         self.assertFalse(rejects_inbound({"text": "plain"}))
         # kiro 对齐 CC (2026-09-26): opaque staged IDs are allowed (Kimi parity);

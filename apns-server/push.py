@@ -20692,6 +20692,11 @@ class PushHandler(BaseHTTPRequestHandler):
         if explicit:
             # astra (self) 不应该作为路由目标 — 她是发消息的人
             targets = {mid for mid in explicit if mid != self._apples_self_id()}
+        elif meta.get("forward") is True:
+            # app-bundle-20260927: 转发进群（App 把她的留言放最前、空一行接
+            # 「[转发自X]」本体合成一条）。只按她自己留言里的 @ 路由；本体里别人
+            # 原话中的 @（如小克原话里的 @Kairos）不能多叫起她没点名的成员。
+            targets = self._detect_apples_mentions(str(meta.get("forward_note") or ""))
         else:
             targets = self._detect_apples_mentions(text)
         # 2026-09-25 dedupe storm guard (同 workgroup 链路 c5edc9f): 3s 窗口内同

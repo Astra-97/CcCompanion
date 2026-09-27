@@ -21,6 +21,10 @@ CONTACT = {
     "terminal_target": "",
     "capabilities": [
         "chat", "history", "draft", "busy", "stop", "attachments", "realtime",
+        # app-bundle-20260927: other chats can forward messages to Kiro. A
+        # forward is an ordinary text send (``[转发自X]`` body, optional note
+        # first); it takes the normal Kiro path (recall, queue, Stop).
+        "forward",
         "kiro_model_preferences",
     ],
     "stop_fields": ["contact_id", "user_ts"],
