@@ -1,7 +1,8 @@
 """应用使用感知（2026-09-27 v4）：被监 App 开/关气泡 + AI 查询用最新快照。
 
 - App 上报被勾应用的开/关事件（POST /device/app-event），这里做归一化与
-  每包名 60 秒气泡防抖（防快速切换刷屏）；事件经 push.py 进小克会话。
+  按 包名+事件类型 分别 60 秒气泡防抖（open/close 各报各的，同类型不重复）；
+  事件经 push.py 进小克会话。
 - App 在电池/应用事件上报或轻量心跳（POST /device/activity）里捎带
   「当前前台 App + 最近窗口前台 Top N」快照；只存最新值
   （tokens/device_activity.json），AI 查询（GET /device/status）读它，
@@ -19,7 +20,7 @@ from pathlib import Path
 APP_EVENT_OPEN = "open"
 APP_EVENT_CLOSE = "close"
 APP_EVENTS = frozenset({APP_EVENT_OPEN, APP_EVENT_CLOSE})
-# 同一 App 开/关气泡的最小间隔（防抖，防快速切换刷屏）。
+# 同一 App 同一类型（open/close 分别计）相邻气泡的最小间隔（防快速切换刷屏）。
 APP_EVENT_BUBBLE_DEBOUNCE_SECONDS = 60.0
 # 防抖表的驻留上限：超过 10 分钟未再事件的包名清出防抖表（防抖表只是
 # 瞬态状态，不是历史记录）。
@@ -164,19 +165,24 @@ class DeviceActivityStore:
             return {"snapshot": self._snapshot, "updated_at": self._updated_at}
 
     def record_app_event(self, event: dict, *, now: float | None = None) -> bool:
-        """登记一次开/关事件，返回是否应冒泡（每包名 60 秒防抖）。"""
+        """登记一次开/关事件，返回是否应冒泡（按 包名+事件类型 分别 60 秒防抖）。
+
+        open 与 close 各自计时：「开了又关」两条都能看到，同一类型 60 秒内
+        不重复（防快速切换刷屏）。
+        """
 
         normalized = normalize_app_event(event)
         if normalized is None:
             raise ValueError("invalid app event")
         now = time.time() if now is None else float(now)
+        debounce_key = f"{normalized['package']}|{normalized['event']}"
         with self._lock:
             # 顺手清掉早已过期的防抖位，表保持有界。
             for key in [k for k, ts in self._last_bubble_at.items() if now - ts > _APP_EVENT_DEBOUNCE_KEEP_SECONDS]:
                 del self._last_bubble_at[key]
-            last = self._last_bubble_at.get(normalized["package"])
+            last = self._last_bubble_at.get(debounce_key)
             should_bubble = last is None or now - last >= APP_EVENT_BUBBLE_DEBOUNCE_SECONDS
             if should_bubble:
-                self._last_bubble_at[normalized["package"]] = now
+                self._last_bubble_at[debounce_key] = now
                 self._persist_locked()
             return should_bubble

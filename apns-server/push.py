@@ -11243,6 +11243,10 @@ class PushHandler(BaseHTTPRequestHandler):
                 "ai_reading",
                 "ai_reading_event",
                 "system",
+                # 手机感知 v4（2026-09-27）：metadata 水印已砍，但升级窗口期
+                # 的旧 App（v1.9.209）仍会在每条消息带 metadata.device（电量
+                # 快照）——按隐私红线只当下用、绝不落聊天历史，这里一并洗掉。
+                "device",
             ):
                 raw_metadata.pop(reserved_key, None)
             if raw_metadata:

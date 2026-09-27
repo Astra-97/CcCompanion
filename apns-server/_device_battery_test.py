@@ -11,6 +11,7 @@ import types
 import unittest
 from pathlib import Path
 
+import push
 from device_activity import (
     DeviceActivityStore,
     normalize_activity_snapshot,
@@ -196,14 +197,19 @@ class DeviceActivityStoreTest(unittest.TestCase):
     def make_store(self):
         return DeviceActivityStore(self.path)
 
-    def test_app_event_debounce_per_package(self):
+    def test_app_event_debounce_per_package_and_event_type(self):
         store = self.make_store()
-        event = {"event": "open", "package": "a.b", "label": "A"}
-        self.assertTrue(store.record_app_event(event, now=1000.0))
-        # 60 秒内同包名再事件：不冒泡。
-        self.assertFalse(store.record_app_event(event, now=1030.0))
+        open_event = {"event": "open", "package": "a.b", "label": "A"}
+        close_event = {"event": "close", "package": "a.b", "label": "A"}
+        self.assertTrue(store.record_app_event(open_event, now=1000.0))
+        # open/close 分别防抖：60 秒内「开了又关」两条都能看到。
+        self.assertTrue(store.record_app_event(close_event, now=1030.0))
+        # 同类型 60 秒内重复：不冒泡。
+        self.assertFalse(store.record_app_event(open_event, now=1030.0))
+        self.assertFalse(store.record_app_event(close_event, now=1089.0))
         # 过 60 秒：再次冒泡。
-        self.assertTrue(store.record_app_event(event, now=1061.0))
+        self.assertTrue(store.record_app_event(open_event, now=1061.0))
+        self.assertTrue(store.record_app_event(close_event, now=1091.0))
         # 不同包名互不影响。
         other = {"event": "open", "package": "c.d", "label": "C"}
         self.assertTrue(store.record_app_event(other, now=1062.0))
@@ -332,9 +338,12 @@ class DeviceAppEventHandlerTest(DeviceHandlerTestBase):
         self.assertEqual(200, status)
         self.assertTrue(payload["bubbled"])
         self.assertIn("🎮方小南打开了《恋与深空》", self.bubbles())
-        self.report({"event": "close", "package": "com.papegames.lysk.cn", "label": "恋与深空"})
-        # 60 秒防抖：紧跟着的关闭不冒泡。
-        self.assertEqual(["🎮方小南打开了《恋与深空》"], self.bubbles())
+        # open/close 分别防抖：紧跟着的关闭也能冒泡（不挂没有下文的「打开了」）。
+        _status, payload = self.report({
+            "event": "close", "package": "com.papegames.lysk.cn", "label": "恋与深空",
+        })
+        self.assertTrue(payload["bubbled"])
+        self.assertIn("👋方小南关闭了《恋与深空》", self.bubbles())
 
     def test_debounced_second_event_not_bubbled(self):
         body = {"event": "open", "package": "a.b", "label": "A"}
@@ -348,14 +357,16 @@ class DeviceAppEventHandlerTest(DeviceHandlerTestBase):
         self.assertEqual(400, status)
         self.assertFalse(payload["ok"])
 
-    def test_close_after_debounce_window_bubbles(self):
-        body_open = {"event": "open", "package": "a.b", "label": "A"}
-        self.report(body_open)
-        # 直接拨防抖表模拟 61 秒后。
-        self.activity_store._last_bubble_at["a.b"] -= 61.0
-        _status, payload = self.report({"event": "close", "package": "a.b", "label": "A"})
+    def test_same_event_after_debounce_window_bubbles(self):
+        body = {"event": "open", "package": "a.b", "label": "A"}
+        self.report(body)
+        # 直接拨防抖表模拟 61 秒后，同类型再次冒泡。
+        self.activity_store._last_bubble_at["a.b|open"] -= 61.0
+        _status, payload = self.report(body)
         self.assertTrue(payload["bubbled"])
-        self.assertIn("👋方小南关闭了《A》", self.bubbles())
+        self.assertEqual(
+            ["🎮方小南打开了《A》", "🎮方小南打开了《A》"], self.bubbles(),
+        )
 
 
 class DeviceActivityAndStatusHandlerTest(DeviceHandlerTestBase):
@@ -400,6 +411,56 @@ class DeviceActivityAndStatusHandlerTest(DeviceHandlerTestBase):
         status, payload = self.handler.responses[-1]
         self.assertEqual(400, status)
         self.assertFalse(payload["ok"])
+
+
+class ChatSendDeviceScrubTest(unittest.TestCase):
+    """升级窗口期隐私回退：旧 App（v1.9.209）的 metadata.device 在 _handle_chat_send
+    入口随保留字清洗被丢弃，绝不落聊天历史（2026-09-27 审核返工）。"""
+
+    def setUp(self):
+        handler = object.__new__(PushHandler)
+        handler.state = types.SimpleNamespace()
+        handler.responses = []
+        handler.captured = []
+        handler._send_json = lambda status, payload: handler.responses.append((status, payload))
+        handler._contact_id_from_body = lambda body: str(body.get("contact_id") or "xiaoke")
+        handler._chat_contact_directory = lambda: [
+            {"id": "xiaoke", "capabilities": ["chat"]},
+            {"id": "kimi", "capabilities": ["chat"]},
+        ]
+        handler._consume_staged_attachments = lambda body, contact_id: []
+        self.handler = handler
+        self._real_dispatch = push.dispatch_contact_send
+
+        def fake_dispatch(proxy, contact_id, body):
+            handler.captured.append((contact_id, dict(body)))
+            return True
+
+        push.dispatch_contact_send = fake_dispatch
+        self.addCleanup(setattr, push, "dispatch_contact_send", self._real_dispatch)
+
+    def send(self, body):
+        self.handler._handle_chat_send(body)
+        return self.handler
+
+    def test_legacy_device_metadata_is_scrubbed_before_dispatch(self):
+        self.send({
+            "text": "hi",
+            "contact_id": "xiaoke",
+            "metadata": {"device": {"battery_pct": 23, "charging": False}, "via": "card"},
+        })
+        self.assertEqual(1, len(self.handler.captured))
+        _contact, body = self.handler.captured[0]
+        self.assertNotIn("device", body.get("metadata") or {})
+        self.assertEqual("card", (body.get("metadata") or {}).get("via"))
+
+    def test_device_only_metadata_leaves_no_metadata_key(self):
+        self.send({
+            "text": "hi",
+            "metadata": {"device": {"battery_pct": 80, "charging": True}},
+        })
+        _contact, body = self.handler.captured[0]
+        self.assertNotIn("device", (body.get("metadata") or {}))
 
 
 class NativePairingGateTest(unittest.TestCase):
