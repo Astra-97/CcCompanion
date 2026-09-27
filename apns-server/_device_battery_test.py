@@ -1,8 +1,8 @@
-"""手机电量感知（2026-09-27）— 安静级注入 + 打扰级边缘触发。
+"""手机感知 v4（2026-09-27）— 打扰级气泡 + AI 主动查询，无 metadata 水印。
 
-覆盖：metadata 归一化 / 上下文一行渲染 / 低电边缘触发与滞回武装 /
-/device/battery 处理器与 native pairing 闸门语义 / _handle_chat_send 在入库前
-摘除 metadata.device（电量绝不进聊天历史）。
+覆盖：电量/阈值归一化、充拔切换与低电滞回事件、应用开/关事件归一化与
+60s 气泡防抖、活动快照归一化与只存最新值、/device/battery、/device/app-event、
+/device/activity、GET /device/status 四个处理器与 native pairing 闸门语义。
 """
 from __future__ import annotations
 
@@ -11,10 +11,13 @@ import types
 import unittest
 from pathlib import Path
 
-import push
+from device_activity import (
+    DeviceActivityStore,
+    normalize_activity_snapshot,
+    normalize_app_event,
+)
 from device_battery import (
     DeviceBatteryStore,
-    format_device_battery_prompt,
     normalize_device_battery,
     normalize_low_threshold_percent,
 )
@@ -45,30 +48,14 @@ class NormalizeDeviceBatteryTest(unittest.TestCase):
             self.assertIsNone(normalize_device_battery(bad), bad)
 
     def test_threshold_normalization(self):
-        self.assertEqual(20, normalize_low_threshold_percent(None))
-        self.assertEqual(20, normalize_low_threshold_percent("abc"))
+        self.assertEqual(25, normalize_low_threshold_percent(None))
+        self.assertEqual(25, normalize_low_threshold_percent("abc"))
         self.assertEqual(15, normalize_low_threshold_percent(15))
         self.assertEqual(5, normalize_low_threshold_percent(1))
         self.assertEqual(95, normalize_low_threshold_percent(200))
 
 
-class FormatDeviceBatteryPromptTest(unittest.TestCase):
-    def test_renders_one_line(self):
-        self.assertEqual(
-            "[设备状态] 手机电量 23%（未充电）",
-            format_device_battery_prompt({"battery_pct": 23, "charging": False}),
-        )
-        self.assertEqual(
-            "[设备状态] 手机电量 80%（充电中）",
-            format_device_battery_prompt({"battery_pct": 80, "charging": True}),
-        )
-
-    def test_missing_or_invalid_data_is_silent(self):
-        self.assertEqual("", format_device_battery_prompt(None))
-        self.assertEqual("", format_device_battery_prompt({"battery_pct": 300, "charging": False}))
-
-
-class DeviceBatteryStoreEdgeTriggerTest(unittest.TestCase):
+class DeviceBatteryStoreEventsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -77,42 +64,56 @@ class DeviceBatteryStoreEdgeTriggerTest(unittest.TestCase):
     def make_store(self):
         return DeviceBatteryStore(self.path)
 
-    def test_crossing_notifies_once_then_requires_rearm(self):
+    def test_first_report_is_silent(self):
+        _state, events = self.make_store().update({"battery_pct": 80, "charging": True}, 25)
+        self.assertEqual([], events)
+
+    def test_charging_switch_events(self):
         store = self.make_store()
-        _state, notify = store.update({"battery_pct": 19, "charging": False}, 20)
-        self.assertTrue(notify)
+        store.update({"battery_pct": 60, "charging": False}, 25)
+        _state, events = store.update({"battery_pct": 61, "charging": True}, 25)
+        self.assertEqual(["charging_started"], events)
+        # 持续充电：不重复。
+        _state, events = store.update({"battery_pct": 70, "charging": True}, 25)
+        self.assertEqual([], events)
+        # 拔电。
+        _state, events = store.update({"battery_pct": 70, "charging": False}, 25)
+        self.assertEqual(["charging_stopped"], events)
+
+    def test_low_battery_fires_once_then_requires_rearm(self):
+        store = self.make_store()
+        _state, events = store.update({"battery_pct": 24, "charging": False}, 25)
+        self.assertEqual(["low_battery"], events)
         # 继续在低位徘徊：不重复轰炸。
-        _state, notify = store.update({"battery_pct": 18, "charging": False}, 20)
-        self.assertFalse(notify)
-        _state, notify = store.update({"battery_pct": 10, "charging": False}, 20)
-        self.assertFalse(notify)
+        _state, events = store.update({"battery_pct": 20, "charging": False}, 25)
+        self.assertEqual([], events)
 
     def test_rearm_only_at_threshold_plus_five(self):
         store = self.make_store()
-        store.update({"battery_pct": 19, "charging": False}, 20)
-        # 回到 22（低于 20+5）：尚未重新武装。
-        _state, notify = store.update({"battery_pct": 22, "charging": False}, 20)
-        self.assertFalse(notify)
-        _state, notify = store.update({"battery_pct": 19, "charging": False}, 20)
-        self.assertFalse(notify)
-        # 回升到 25：重新武装；再次跌破才提醒。
-        store.update({"battery_pct": 25, "charging": False}, 20)
-        _state, notify = store.update({"battery_pct": 19, "charging": False}, 20)
-        self.assertTrue(notify)
+        store.update({"battery_pct": 24, "charging": False}, 25)
+        # 回到 29（低于 25+5）：尚未重新武装。
+        store.update({"battery_pct": 29, "charging": False}, 25)
+        _state, events = store.update({"battery_pct": 24, "charging": False}, 25)
+        self.assertEqual([], events)
+        # 回升到 30：重新武装；再次跌破才提醒。
+        store.update({"battery_pct": 30, "charging": False}, 25)
+        _state, events = store.update({"battery_pct": 24, "charging": False}, 25)
+        self.assertEqual(["low_battery"], events)
 
     def test_charging_suppresses_and_rearms(self):
         store = self.make_store()
-        # 低电但充电中：不提醒，且重新武装。
-        _state, notify = store.update({"battery_pct": 12, "charging": True}, 20)
-        self.assertFalse(notify)
-        # 拔掉电源仍低电：穿越提醒。
-        _state, notify = store.update({"battery_pct": 12, "charging": False}, 20)
-        self.assertTrue(notify)
+        # 低电但充电中（首次上报）：不提醒低电，且重新武装；首报不报切换事件。
+        _state, events = store.update({"battery_pct": 12, "charging": True}, 25)
+        self.assertEqual([], events)
+        # 拔掉电源仍低电：穿越提醒 + 拔电事件一起出。
+        _state, events = store.update({"battery_pct": 12, "charging": False}, 25)
+        self.assertIn("low_battery", events)
+        self.assertIn("charging_stopped", events)
 
     def test_state_file_keeps_only_latest_value(self):
         store = self.make_store()
-        store.update({"battery_pct": 60, "charging": True}, 20)
-        state, _notify = store.update({"battery_pct": 55, "charging": False}, 20)
+        store.update({"battery_pct": 60, "charging": True}, 25)
+        state, _events = store.update({"battery_pct": 55, "charging": False}, 25)
         reloaded = self.make_store().snapshot()
         self.assertEqual(55, reloaded["battery_pct"])
         self.assertEqual(False, reloaded["charging"])
@@ -121,34 +122,150 @@ class DeviceBatteryStoreEdgeTriggerTest(unittest.TestCase):
 
     def test_armed_bit_survives_restart(self):
         store = self.make_store()
-        _state, notify = store.update({"battery_pct": 19, "charging": False}, 20)
-        self.assertTrue(notify)
+        _state, events = store.update({"battery_pct": 24, "charging": False}, 25)
+        self.assertEqual(["low_battery"], events)
         # 重启后仍处于解除武装状态，不会补发一次提醒。
-        _state, notify = self.make_store().update({"battery_pct": 18, "charging": False}, 20)
-        self.assertFalse(notify)
+        _state, events = self.make_store().update({"battery_pct": 23, "charging": False}, 25)
+        self.assertEqual([], events)
 
 
-def _battery_handler(store, *, threshold=20, secret="s3cret"):
+class NormalizeAppEventTest(unittest.TestCase):
+    def test_accepts_open_and_close(self):
+        self.assertEqual(
+            {"event": "open", "package": "com.papegames.lysk.cn", "label": "恋与深空"},
+            normalize_app_event({
+                "event": "open", "package": "com.papegames.lysk.cn", "label": "恋与深空",
+            }),
+        )
+        self.assertEqual(
+            "close",
+            normalize_app_event({"event": "CLOSE", "package": "a.b", "label": "x"})["event"],
+        )
+
+    def test_rejects_bad_event_or_package(self):
+        for bad in (
+            None, [], {"event": "peek", "package": "a.b"},
+            {"event": "open"}, {"event": "open", "package": ""},
+            {"event": "open", "package": "a\nb"}, {"event": "open", "package": "x" * 200},
+        ):
+            self.assertIsNone(normalize_app_event(bad), bad)
+
+    def test_label_falls_back_to_package_and_strips_newlines(self):
+        event = normalize_app_event({"event": "open", "package": "a.b", "label": ""})
+        self.assertEqual("a.b", event["label"])
+        event = normalize_app_event({"event": "open", "package": "a.b", "label": "一\n二"})
+        self.assertEqual("一 二", event["label"])
+
+
+class NormalizeActivitySnapshotTest(unittest.TestCase):
+    def test_sorts_usage_top_desc_and_caps(self):
+        snapshot = normalize_activity_snapshot({
+            "foreground": {"package": "a.b", "label": "A"},
+            "usage_top": [
+                {"package": "p1", "label": "P1", "minutes": 5},
+                {"package": "p2", "label": "P2", "minutes": 42},
+                {"package": "bad"},  # minutes 非法，丢弃
+            ] + [{"package": f"p{i}", "label": "x", "minutes": 1} for i in range(12)],
+            "window_minutes": 60,
+        })
+        self.assertEqual("a.b", snapshot["foreground"]["package"])
+        minutes = [item["minutes"] for item in snapshot["usage_top"]]
+        self.assertEqual(sorted(minutes, reverse=True), minutes)
+        self.assertLessEqual(len(snapshot["usage_top"]), 10)
+        self.assertEqual(60, snapshot["window_minutes"])
+
+    def test_window_minutes_clamped(self):
+        self.assertEqual(
+            1, normalize_activity_snapshot({"window_minutes": 0})["window_minutes"],
+        )
+        self.assertEqual(
+            1440, normalize_activity_snapshot({"window_minutes": 99999})["window_minutes"],
+        )
+
+    def test_rejects_non_dict(self):
+        self.assertIsNone(normalize_activity_snapshot(None))
+        self.assertIsNone(normalize_activity_snapshot([]))
+
+
+class DeviceActivityStoreTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "device_activity.json"
+
+    def make_store(self):
+        return DeviceActivityStore(self.path)
+
+    def test_app_event_debounce_per_package(self):
+        store = self.make_store()
+        event = {"event": "open", "package": "a.b", "label": "A"}
+        self.assertTrue(store.record_app_event(event, now=1000.0))
+        # 60 秒内同包名再事件：不冒泡。
+        self.assertFalse(store.record_app_event(event, now=1030.0))
+        # 过 60 秒：再次冒泡。
+        self.assertTrue(store.record_app_event(event, now=1061.0))
+        # 不同包名互不影响。
+        other = {"event": "open", "package": "c.d", "label": "C"}
+        self.assertTrue(store.record_app_event(other, now=1062.0))
+
+    def test_snapshot_keeps_only_latest_and_survives_reload(self):
+        store = self.make_store()
+        store.record_snapshot({"foreground": {"package": "a.b", "label": "A"}, "usage_top": []})
+        state = store.record_snapshot({
+            "foreground": {"package": "c.d", "label": "C"},
+            "usage_top": [{"package": "c.d", "label": "C", "minutes": 12}],
+            "window_minutes": 60,
+        })
+        self.assertEqual("c.d", state["snapshot"]["foreground"]["package"])
+        reloaded = self.make_store().snapshot()
+        self.assertEqual("c.d", reloaded["snapshot"]["foreground"]["package"])
+        self.assertEqual(state["updated_at"], reloaded["updated_at"])
+
+    def test_invalid_inputs_raise(self):
+        store = self.make_store()
+        with self.assertRaises(ValueError):
+            store.record_app_event({"event": "peek", "package": "a.b"})
+        with self.assertRaises(ValueError):
+            store.record_snapshot(None)
+
+
+class _FakeChat:
+    def __init__(self):
+        self.appended = []
+
+    def append(self, **kwargs):
+        self.appended.append(kwargs)
+
+
+def _device_handler(battery_store, activity_store, *, threshold=25, secret="s3cret"):
     handler = object.__new__(PushHandler)
     handler.state = types.SimpleNamespace(
-        device_battery=store,
+        device_battery=battery_store,
+        device_activity=activity_store,
         battery_low_threshold_percent=threshold,
         shared_secret=secret,
     )
     handler.responses = []
-    handler.notifications = []
+    handler.chat = _FakeChat()
     handler._send_json = lambda status, payload: handler.responses.append((status, payload))
-    handler._send_chat_notification = lambda title, body: handler.notifications.append((title, body))
+    handler._chat_for_contact = lambda contact_id: handler.chat
     return handler
 
 
-class DeviceBatteryReportHandlerTest(unittest.TestCase):
+class DeviceHandlerTestBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.store = DeviceBatteryStore(Path(self.tmp.name) / "device_battery.json")
-        self.handler = _battery_handler(self.store)
+        base = Path(self.tmp.name)
+        self.battery_store = DeviceBatteryStore(base / "device_battery.json")
+        self.activity_store = DeviceActivityStore(base / "device_activity.json")
+        self.handler = _device_handler(self.battery_store, self.activity_store)
 
+    def bubbles(self):
+        return [item["text"] for item in self.handler.chat.appended]
+
+
+class DeviceBatteryReportHandlerTest(DeviceHandlerTestBase):
     def report(self, body):
         self.handler._handle_device_battery_report(body)
         return self.handler.responses[-1]
@@ -157,37 +274,136 @@ class DeviceBatteryReportHandlerTest(unittest.TestCase):
         status, payload = self.report({"battery_pct": "low"})
         self.assertEqual(400, status)
         self.assertFalse(payload["ok"])
-        self.assertEqual([], self.handler.notifications)
+        self.assertEqual([], self.bubbles())
 
-    def test_low_battery_pushes_once_with_configured_threshold(self):
-        status, payload = self.report({"battery_pct": 14, "charging": False})
+    def test_charge_unplug_bubbles(self):
+        self.report({"battery_pct": 60, "charging": False})
+        status, payload = self.report({"battery_pct": 61, "charging": True})
         self.assertEqual(200, status)
-        self.assertTrue(payload["ok"])
-        self.assertTrue(payload["notified"])
-        self.assertEqual(20, payload["threshold_percent"])
-        self.assertEqual(1, len(self.handler.notifications))
-        self.assertIn("14%", self.handler.notifications[0][1])
-        # 再次上报不再提醒。
-        _status, payload = self.report({"battery_pct": 13, "charging": False})
-        self.assertFalse(payload["notified"])
-        self.assertEqual(1, len(self.handler.notifications))
+        self.assertEqual(["charging_started"], payload["events"])
+        self.assertIn("🔋方小南在充电，电量为61%", self.bubbles())
+        _status, payload = self.report({"battery_pct": 70, "charging": False})
+        self.assertEqual(["charging_stopped"], payload["events"])
+        self.assertIn("🔌方小南拔掉了充电器，电量为70%", self.bubbles())
+        # 气泡进小克会话、带 system_event/no_model_context 元数据。
+        meta = self.handler.chat.appended[0]["metadata"]
+        self.assertTrue(meta["system_event"])
+        self.assertTrue(meta["no_model_context"])
+        self.assertEqual("system", self.handler.chat.appended[0]["role"])
 
-    def test_charging_never_notifies(self):
-        _status, payload = self.report({"battery_pct": 5, "charging": True})
-        self.assertFalse(payload["notified"])
-        self.assertEqual([], self.handler.notifications)
+    def test_low_battery_bubble_once(self):
+        status, payload = self.report({"battery_pct": 24, "charging": False})
+        self.assertEqual(200, status)
+        self.assertEqual(["low_battery"], payload["events"])
+        self.assertEqual(["🪫方小南手机电量低于 25%，建议充电"], self.bubbles())
+        _status, payload = self.report({"battery_pct": 23, "charging": False})
+        self.assertEqual([], payload["events"])
+        self.assertEqual(1, len(self.bubbles()))
 
     def test_threshold_comes_from_state_config(self):
-        handler = _battery_handler(self.store, threshold=30)
-        handler._handle_device_battery_report({"battery_pct": 25, "charging": False})
-        status, payload = handler.responses[-1]
-        self.assertEqual(200, status)
-        self.assertTrue(payload["notified"])
+        handler = _device_handler(self.battery_store, self.activity_store, threshold=30)
+        handler._handle_device_battery_report({"battery_pct": 28, "charging": False})
+        _status, payload = handler.responses[-1]
         self.assertEqual(30, payload["threshold_percent"])
+        self.assertIn("🪫方小南手机电量低于 30%，建议充电", [i["text"] for i in handler.chat.appended])
+
+    def test_piggybacked_activity_is_recorded(self):
+        self.report({
+            "battery_pct": 80, "charging": True,
+            "activity": {
+                "foreground": {"package": "a.b", "label": "A"},
+                "usage_top": [{"package": "a.b", "label": "A", "minutes": 30}],
+                "window_minutes": 60,
+            },
+        })
+        snapshot = self.activity_store.snapshot()["snapshot"]
+        self.assertEqual("a.b", snapshot["foreground"]["package"])
+
+
+class DeviceAppEventHandlerTest(DeviceHandlerTestBase):
+    def report(self, body):
+        self.handler._handle_device_app_event(body)
+        return self.handler.responses[-1]
+
+    def test_open_close_bubbles(self):
+        status, payload = self.report({
+            "event": "open", "package": "com.papegames.lysk.cn", "label": "恋与深空",
+        })
+        self.assertEqual(200, status)
+        self.assertTrue(payload["bubbled"])
+        self.assertIn("🎮方小南打开了《恋与深空》", self.bubbles())
+        self.report({"event": "close", "package": "com.papegames.lysk.cn", "label": "恋与深空"})
+        # 60 秒防抖：紧跟着的关闭不冒泡。
+        self.assertEqual(["🎮方小南打开了《恋与深空》"], self.bubbles())
+
+    def test_debounced_second_event_not_bubbled(self):
+        body = {"event": "open", "package": "a.b", "label": "A"}
+        self.report(body)
+        _status, payload = self.report(body)
+        self.assertFalse(payload["bubbled"])
+        self.assertEqual(1, len(self.bubbles()))
+
+    def test_bad_body_is_400(self):
+        status, payload = self.report({"event": "peek", "package": "a.b"})
+        self.assertEqual(400, status)
+        self.assertFalse(payload["ok"])
+
+    def test_close_after_debounce_window_bubbles(self):
+        body_open = {"event": "open", "package": "a.b", "label": "A"}
+        self.report(body_open)
+        # 直接拨防抖表模拟 61 秒后。
+        self.activity_store._last_bubble_at["a.b"] -= 61.0
+        _status, payload = self.report({"event": "close", "package": "a.b", "label": "A"})
+        self.assertTrue(payload["bubbled"])
+        self.assertIn("👋方小南关闭了《A》", self.bubbles())
+
+
+class DeviceActivityAndStatusHandlerTest(DeviceHandlerTestBase):
+    def test_activity_report_and_status_shape(self):
+        self.handler._handle_device_activity_report({
+            "foreground": {"package": "a.b", "label": "A"},
+            "usage_top": [
+                {"package": "p1", "label": "P1", "minutes": 3},
+                {"package": "p2", "label": "P2", "minutes": 45},
+            ],
+            "window_minutes": 60,
+        })
+        status, payload = self.handler.responses[-1]
+        self.assertEqual(200, status)
+        self.assertTrue(payload["ok"])
+
+        self.handler._handle_device_battery_report({"battery_pct": 66, "charging": True})
+        self.handler._handle_device_status_get()
+        status, payload = self.handler.responses[-1]
+        self.assertEqual(200, status)
+        self.assertEqual(66, payload["battery"]["battery_pct"])
+        self.assertEqual(True, payload["battery"]["charging"])
+        self.assertTrue(payload["battery"]["updated_at"] > 0)
+        self.assertEqual("a.b", payload["activity"]["foreground"]["package"])
+        # usage_top 按分钟数降序。
+        self.assertEqual(
+            ["p2", "p1"], [item["package"] for item in payload["activity"]["usage_top"]],
+        )
+        self.assertEqual(60, payload["activity"]["window_minutes"])
+        self.assertEqual(25, payload["battery_low_threshold_percent"])
+
+    def test_status_without_any_report_is_empty_not_dead(self):
+        self.handler._handle_device_status_get()
+        status, payload = self.handler.responses[-1]
+        self.assertEqual(200, status)
+        self.assertIsNone(payload["battery"]["battery_pct"])
+        self.assertIsNone(payload["activity"]["foreground"])
+        self.assertEqual([], payload["activity"]["usage_top"])
+
+    def test_bad_activity_body_is_400(self):
+        self.handler._handle_device_activity_report([1, 2, 3])
+        status, payload = self.handler.responses[-1]
+        self.assertEqual(400, status)
+        self.assertFalse(payload["ok"])
 
 
 class NativePairingGateTest(unittest.TestCase):
-    """/device/battery 走与 /kimi/ 相同的 fail-closed native pairing 闸门。"""
+    """/device/* 走与 /kimi/ 相同的 fail-closed native pairing 闸门。"""
 
     def make_handler(self, headers, secret="s3cret"):
         handler = object.__new__(PushHandler)
@@ -206,127 +422,6 @@ class NativePairingGateTest(unittest.TestCase):
     def test_exact_token_passes(self):
         handler = self.make_handler({"X-Auth-Token": "s3cret"})
         self.assertTrue(handler._native_pairing_auth_matches())
-
-
-class ChatSendDeviceExtractionTest(unittest.TestCase):
-    """metadata.device 在 _handle_chat_send 入口摘除：进内部字段，不进历史。"""
-
-    def setUp(self):
-        handler = object.__new__(PushHandler)
-        handler.state = types.SimpleNamespace()
-        handler.responses = []
-        handler.captured = []
-        handler._send_json = lambda status, payload: handler.responses.append((status, payload))
-        handler._contact_id_from_body = lambda body: str(body.get("contact_id") or "xiaoke")
-        handler._chat_contact_directory = lambda: [
-            {"id": "xiaoke", "capabilities": ["chat"]},
-            {"id": "kimi", "capabilities": ["chat"]},
-        ]
-        handler._consume_staged_attachments = lambda body, contact_id: []
-        self.handler = handler
-        self._real_dispatch = push.dispatch_contact_send
-
-        def fake_dispatch(proxy, contact_id, body):
-            handler.captured.append((contact_id, dict(body)))
-            return True
-
-        push.dispatch_contact_send = fake_dispatch
-        self.addCleanup(setattr, push, "dispatch_contact_send", self._real_dispatch)
-
-    def send(self, body):
-        self.handler._handle_chat_send(body)
-        return self.handler
-
-    def test_device_battery_moves_to_internal_field_only(self):
-        self.send({
-            "text": "hi",
-            "contact_id": "xiaoke",
-            "metadata": {"device": {"battery_pct": 23, "charging": False}, "via": "card"},
-        })
-        self.assertEqual(1, len(self.handler.captured))
-        _contact, body = self.handler.captured[0]
-        self.assertEqual(
-            {"battery_pct": 23, "charging": False}, body.get("_device_battery"),
-        )
-        self.assertNotIn("device", body.get("metadata") or {})
-        self.assertEqual("card", (body.get("metadata") or {}).get("via"))
-
-    def test_device_only_metadata_leaves_no_metadata_key(self):
-        self.send({
-            "text": "hi",
-            "metadata": {"device": {"battery_pct": 80, "charging": True}},
-        })
-        _contact, body = self.handler.captured[0]
-        self.assertNotIn("metadata", body)
-        self.assertEqual({"battery_pct": 80, "charging": True}, body.get("_device_battery"))
-
-    def test_caller_supplied_internal_field_is_dropped(self):
-        self.send({
-            "text": "hi",
-            "_device_battery": {"battery_pct": 1, "charging": False},
-        })
-        _contact, body = self.handler.captured[0]
-        self.assertIsNone(body.get("_device_battery"))
-
-    def test_invalid_device_is_silently_dropped(self):
-        self.send({"text": "hi", "metadata": {"device": {"battery_pct": "?"}}})
-        _contact, body = self.handler.captured[0]
-        self.assertIsNone(body.get("_device_battery"))
-        self.assertNotIn("metadata", body)
-
-    def test_old_app_without_device_is_untouched(self):
-        self.send({"text": "hi"})
-        _contact, body = self.handler.captured[0]
-        self.assertIsNone(body.get("_device_battery"))
-        self.assertNotIn("metadata", body)
-
-
-class PromptDeviceLineTest(unittest.TestCase):
-    def make_handler(self):
-        handler = object.__new__(PushHandler)
-        handler.state = types.SimpleNamespace()
-        return handler
-
-    def test_kimi_prompt_carries_line_inside_source_block(self):
-        handler = self.make_handler()
-        prompt = handler._kimi_prompt(
-            "在吗",
-            device_line="[设备状态] 手机电量 23%（未充电）",
-        )
-        self.assertIn(
-            "contact_id: kimi\n[设备状态] 手机电量 23%（未充电）\n\nAstra 正在",
-            prompt,
-        )
-
-    def test_kimi_prompt_without_device_line_keeps_old_shape(self):
-        handler = self.make_handler()
-        prompt = handler._kimi_prompt("在吗")
-        self.assertIn("contact_id: kimi\n\nAstra 正在", prompt)
-        self.assertNotIn("设备状态", prompt)
-
-    def test_kimi_group_prompt_appends_device_block(self):
-        handler = self.make_handler()
-        prompt = handler._kimi_group_prompt(
-            "你们好", sender_name="Astra",
-            device_line="[设备状态] 手机电量 15%（未充电）",
-        )
-        self.assertIn("[设备状态] 手机电量 15%（未充电）", prompt)
-        self.assertNotIn("设备状态", handler._kimi_group_prompt("你们好", sender_name="Astra"))
-
-    def test_kairos_task_prompt_renders_device_line(self):
-        handler = self.make_handler()
-        prompt = handler._kairos_prompt_for_task({
-            "text": "看看这个",
-            "device_battery": {"battery_pct": 42, "charging": True},
-        })
-        self.assertIn(
-            "contact_id: kairos\n[设备状态] 手机电量 42%（充电中）\n",
-            prompt,
-        )
-        self.assertNotIn(
-            "设备状态",
-            handler._kairos_prompt_for_task({"text": "看看这个"}),
-        )
 
 
 if __name__ == "__main__":
