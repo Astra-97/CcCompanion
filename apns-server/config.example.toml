@@ -45,6 +45,12 @@ shared_secret = ""
 # 默认 true (secure-by-default)。调试时可改 false，上线前改回 true。
 strict_auth = true
 
+# 手机电量感知（2026-09-27）：低电主动提醒阈值（百分比，默认 20，钳位 5–95）。
+# Android App 通过 POST /device/battery 边缘触发上报；电量低于阈值且未充电时
+# 经既有 APNs 链路网关提醒一次，回升到 阈值+5 以上（或开始充电）才重新武装。
+# 状态只存 tokens/device_battery.json 最新值，不做历史/统计。
+# battery_low_threshold_percent = 20
+
 # Co-Reading proxy credentials are deliberately *not* TOML values.  Set one
 # deployment-only environment variable for cc-companion.service instead:
 #   CC_COMPANION_READING_TOKEN=...
