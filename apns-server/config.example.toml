@@ -48,7 +48,9 @@ strict_auth = true
 # 手机感知（2026-09-27 v4）：低电提醒阈值（百分比，默认 25，钳位 5–95）。
 # Android App 通过 POST /device/battery 边缘触发上报；充/拔切换与低电事件
 # （低于阈值且未充电，回升到 阈值+5 以上或开始充电才重新武装）以小克会话
-# 系统气泡呈现，不走 APNs banner。被监 App 开/关走 POST /device/app-event；
+# 居中事件胶囊呈现（同米家/小石榴 mihome_event 胶囊），并以知悉级低调通知
+# 注入小克 tmux 会话（小克忙时排队），不走 APNs banner。被监 App 开/关走
+# POST /device/app-event（同样胶囊 + 低调注入）；
 # AI 主动查询最新电量与前台应用快照走 GET /device/status（只存最新值，
 # 不做历史/统计，均受 native pairing 闸门保护）。
 # battery_low_threshold_percent = 25

@@ -1,5 +1,8 @@
 """手机感知 v4（2026-09-27）— 打扰级气泡 + AI 主动查询，无 metadata 水印。
 
+2026-09-28：气泡改为米家/小石榴同款事件胶囊（mihome_event），并以低调模式
+注入 cctg（device_notice.XiaokeLowKeyNotifier，小克忙时排队）。
+
 覆盖：电量/阈值归一化、充拔切换与低电滞回事件、应用开/关事件归一化与
 60s 气泡防抖、活动快照归一化与只存最新值、/device/battery、/device/app-event、
 /device/activity、GET /device/status 四个处理器与 native pairing 闸门语义。
@@ -7,11 +10,19 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import types
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 import push
+from device_notice import (
+    SILENT_SUFFIX,
+    TZ_BEIJING,
+    XiaokeLowKeyNotifier,
+    build_device_notice,
+)
 from device_activity import (
     DeviceActivityStore,
     normalize_activity_snapshot,
@@ -243,6 +254,15 @@ class _FakeChat:
         self.appended.append(kwargs)
 
 
+class _FakeNotifier:
+    def __init__(self):
+        self.notices = []
+
+    def enqueue(self, text):
+        self.notices.append(text)
+        return True
+
+
 def _device_handler(battery_store, activity_store, *, threshold=25, secret="s3cret"):
     handler = object.__new__(PushHandler)
     handler.state = types.SimpleNamespace(
@@ -250,6 +270,7 @@ def _device_handler(battery_store, activity_store, *, threshold=25, secret="s3cr
         device_activity=activity_store,
         battery_low_threshold_percent=threshold,
         shared_secret=secret,
+        xiaoke_low_key_notifier=_FakeNotifier(),
     )
     handler.responses = []
     handler.chat = _FakeChat()
@@ -269,6 +290,9 @@ class DeviceHandlerTestBase(unittest.TestCase):
 
     def bubbles(self):
         return [item["text"] for item in self.handler.chat.appended]
+
+    def notices(self):
+        return self.handler.state.xiaoke_low_key_notifier.notices
 
 
 class DeviceBatteryReportHandlerTest(DeviceHandlerTestBase):
@@ -291,20 +315,49 @@ class DeviceBatteryReportHandlerTest(DeviceHandlerTestBase):
         _status, payload = self.report({"battery_pct": 70, "charging": False})
         self.assertEqual(["charging_stopped"], payload["events"])
         self.assertIn("🔌方小南拔掉了充电器，电量为70%", self.bubbles())
-        # 气泡进小克会话、带 system_event/no_model_context 元数据。
-        meta = self.handler.chat.appended[0]["metadata"]
-        self.assertTrue(meta["system_event"])
-        self.assertTrue(meta["no_model_context"])
-        self.assertEqual("system", self.handler.chat.appended[0]["role"])
+        # 气泡走米家/小石榴同款胶囊：mihome_event + severity + 非空 items。
+        rec = self.handler.chat.appended[0]
+        self.assertEqual("assistant", rec["role"])
+        self.assertEqual("device-event", rec["source"])
+        meta = rec["metadata"]
+        self.assertTrue(meta["mihome_event"])
+        self.assertEqual("info", meta["severity"])
+        self.assertEqual([{
+            "device": "手机",
+            "change": "charging_started",
+            "human": "🔋方小南在充电，电量为61%",
+        }], meta["items"])
+        self.assertEqual("charging_started", meta["device_event"]["kind"])
+        # 她要这些事件进小克会话：不再带 system_event/no_model_context。
+        self.assertNotIn("system_event", meta)
+        self.assertNotIn("no_model_context", meta)
+        # 每条胶囊同步一条 cctg 低调通知（电量主语 + 低调后缀）。
+        notices = self.notices()
+        self.assertEqual(2, len(notices))
+        self.assertTrue(notices[0].startswith("【🔋 手机电量·自动触发】"))
+        self.assertIn("🔋方小南在充电，电量为61%", notices[0])
+        self.assertTrue(notices[0].endswith(SILENT_SUFFIX))
+        self.assertIn("🔌方小南拔掉了充电器，电量为70%", notices[1])
+
+    def test_first_report_is_silent_no_notice(self):
+        self.report({"battery_pct": 60, "charging": False})
+        self.assertEqual([], self.bubbles())
+        self.assertEqual([], self.notices())
 
     def test_low_battery_bubble_once(self):
         status, payload = self.report({"battery_pct": 24, "charging": False})
         self.assertEqual(200, status)
         self.assertEqual(["low_battery"], payload["events"])
         self.assertEqual(["🪫方小南手机电量低于 25%，建议充电"], self.bubbles())
+        meta = self.handler.chat.appended[0]["metadata"]
+        self.assertEqual("warn", meta["severity"])
+        self.assertEqual("low_battery", meta["items"][0]["change"])
+        self.assertEqual(1, len(self.notices()))
+        self.assertIn("🪫方小南手机电量低于 25%，建议充电", self.notices()[0])
         _status, payload = self.report({"battery_pct": 23, "charging": False})
         self.assertEqual([], payload["events"])
         self.assertEqual(1, len(self.bubbles()))
+        self.assertEqual(1, len(self.notices()))
 
     def test_threshold_comes_from_state_config(self):
         handler = _device_handler(self.battery_store, self.activity_store, threshold=30)
@@ -344,6 +397,14 @@ class DeviceAppEventHandlerTest(DeviceHandlerTestBase):
         })
         self.assertTrue(payload["bubbled"])
         self.assertIn("👋方小南关闭了《恋与深空》", self.bubbles())
+        metas = [item["metadata"] for item in self.handler.chat.appended]
+        self.assertEqual(["app_open", "app_close"], [m["items"][0]["change"] for m in metas])
+        self.assertTrue(all(m["mihome_event"] and m["severity"] == "info" for m in metas))
+        notices = self.notices()
+        self.assertEqual(2, len(notices))
+        self.assertTrue(all(n.startswith("【📱 手机应用·自动触发】") for n in notices))
+        self.assertIn("🎮方小南打开了《恋与深空》", notices[0])
+        self.assertIn("👋方小南关闭了《恋与深空》", notices[1])
 
     def test_debounced_second_event_not_bubbled(self):
         body = {"event": "open", "package": "a.b", "label": "A"}
@@ -351,6 +412,7 @@ class DeviceAppEventHandlerTest(DeviceHandlerTestBase):
         _status, payload = self.report(body)
         self.assertFalse(payload["bubbled"])
         self.assertEqual(1, len(self.bubbles()))
+        self.assertEqual(1, len(self.notices()))
 
     def test_bad_body_is_400(self):
         status, payload = self.report({"event": "peek", "package": "a.b"})
@@ -367,6 +429,130 @@ class DeviceAppEventHandlerTest(DeviceHandlerTestBase):
         self.assertEqual(
             ["🎮方小南打开了《A》", "🎮方小南打开了《A》"], self.bubbles(),
         )
+
+
+class DeviceNoticeTextTest(unittest.TestCase):
+    def test_single_line_with_tag_time_and_suffix(self):
+        now = datetime(2026, 9, 28, 1, 5, tzinfo=TZ_BEIJING)
+        text = build_device_notice("battery", "🔋方小南在充电，\n电量为76%", now=now)
+        self.assertEqual(
+            "【🔋 手机电量·自动触发】01:05 🔋方小南在充电， 电量为76%" + SILENT_SUFFIX,
+            text,
+        )
+        self.assertNotIn("\n", text)
+        self.assertTrue(build_device_notice("app", "x", now=now).startswith("【📱 手机应用·自动触发】"))
+
+
+class XiaokeLowKeyNotifierTest(unittest.TestCase):
+    def make(self, busy_seq, *, inject_ok=True, max_wait=10.0):
+        self.injected = []
+        self.slept = []
+        self.clock_now = 0.0
+        busy_iter = iter(busy_seq)
+        self.lock = threading.RLock()
+
+        def is_busy():
+            # 断言在锁内判定忙闲（与 App 回合注入同一把锁）。
+            self.assertTrue(self.lock._is_owned())
+            return next(busy_iter, False)
+
+        def inject(text):
+            self.assertTrue(self.lock._is_owned())
+            self.injected.append(text)
+            return inject_ok
+
+        def sleep(seconds):
+            self.slept.append(seconds)
+            self.clock_now += seconds
+
+        return XiaokeLowKeyNotifier(
+            is_busy=is_busy, inject=inject, lock=self.lock,
+            poll_seconds=2.0, max_wait_seconds=max_wait,
+            sleep=sleep, clock=lambda: self.clock_now, start_worker=False,
+        )
+
+    def test_idle_injects_immediately(self):
+        n = self.make([False])
+        self.assertTrue(n.enqueue("a"))
+        self.assertTrue(n.drain_once())
+        self.assertEqual(["a"], self.injected)
+        self.assertEqual([], self.slept)
+
+    def test_waits_while_busy_then_injects_fifo(self):
+        n = self.make([True, True, False, False])
+        n.enqueue("first")
+        n.enqueue("second")
+        n.drain_once()
+        n.drain_once()
+        self.assertEqual(["first", "second"], self.injected)
+        self.assertEqual([2.0, 2.0], self.slept)
+        self.assertFalse(n.drain_once())
+
+    def test_busy_timeout_still_injects(self):
+        n = self.make([True] * 100, max_wait=5.0)
+        n.enqueue("late")
+        self.assertTrue(n.drain_once())
+        self.assertEqual(["late"], self.injected)
+        self.assertEqual([2.0, 2.0, 2.0], self.slept)
+
+    def test_inject_failure_reported_not_raised(self):
+        n = self.make([False], inject_ok=False)
+        n.enqueue("x")
+        self.assertFalse(n.drain_once())
+
+    def test_blank_text_rejected(self):
+        n = self.make([])
+        self.assertFalse(n.enqueue("  \n "))
+        self.assertEqual(0, n.pending())
+
+    def test_worker_thread_delivers(self):
+        done = threading.Event()
+        got = []
+
+        def inject(text):
+            got.append(text)
+            done.set()
+            return True
+
+        n = XiaokeLowKeyNotifier(is_busy=lambda: False, inject=inject, lock=threading.RLock())
+        n.enqueue("bg")
+        self.assertTrue(done.wait(5))
+        self.assertEqual(["bg"], got)
+
+
+class XiaokeBusyProbeTest(unittest.TestCase):
+    def state(self, **kw):
+        base = dict(xiaoke_stopping_claim={}, xiaoke_send_reservation={},
+                    typing_state={"is_typing": False, "since": None})
+        base.update(kw)
+        return types.SimpleNamespace(**base)
+
+    def test_idle(self):
+        self.assertFalse(push._xiaoke_busy_for_low_key_notice(self.state()))
+
+    def test_busy_signals(self):
+        self.assertTrue(push._xiaoke_busy_for_low_key_notice(
+            self.state(typing_state={"is_typing": True, "since": "x"})))
+        self.assertTrue(push._xiaoke_busy_for_low_key_notice(
+            self.state(xiaoke_send_reservation={"turn_token": "t"})))
+        self.assertTrue(push._xiaoke_busy_for_low_key_notice(
+            self.state(xiaoke_stopping_claim={"turn_token": "t"})))
+
+    def test_inject_targets_default_session(self):
+        calls = []
+        orig = push._direct_tmux_injection
+        push._direct_tmux_injection = lambda session, text, **kw: (
+            calls.append((session, text)) or push.TmuxInjectionResult(True)
+        )
+        try:
+            ok = push._inject_xiaoke_low_key_notice(
+                types.SimpleNamespace(default_session="cctg"), "hello")
+            ok_fallback = push._inject_xiaoke_low_key_notice(
+                types.SimpleNamespace(default_session=""), "hi")
+        finally:
+            push._direct_tmux_injection = orig
+        self.assertTrue(ok and ok_fallback)
+        self.assertEqual([("cctg", "hello"), ("cctg", "hi")], calls)
 
 
 class DeviceActivityAndStatusHandlerTest(DeviceHandlerTestBase):

@@ -167,6 +167,12 @@ from device_activity import (
     normalize_activity_snapshot,
     normalize_app_event,
 )
+from device_notice import (
+    NOTICE_KIND_APP,
+    NOTICE_KIND_BATTERY,
+    XiaokeLowKeyNotifier,
+    build_device_notice,
+)
 from xhs_login import XhsLoginError, XhsLoginManager
 from netease_login import NeteaseLoginError, NeteaseLoginManager
 from jd_login import JdLoginError, JdLoginManager
@@ -3874,6 +3880,30 @@ def _direct_tmux_injection(
     return result or TmuxInjectionResult(False, "tmux injection failed", "unknown")
 
 
+def _xiaoke_busy_for_low_key_notice(state: "ServerState") -> bool:
+    """小克是否正处在 App 回合 / Stop 收尾 / 发送预留中（调用方持 xiaoke_stop_lock）。"""
+    if getattr(state, "xiaoke_stopping_claim", None):
+        return True
+    if getattr(state, "xiaoke_send_reservation", None):
+        return True
+    return bool((getattr(state, "typing_state", None) or {}).get("is_typing"))
+
+
+def _inject_xiaoke_low_key_notice(state: "ServerState", text: str) -> bool:
+    """把一条知悉级通知注入小克 tmux 会话（同 roborock/mihome watcher 的 cctg）。"""
+    session = (
+        str(getattr(state, "default_session", "") or "").strip()
+        or rollback_driver.PRODUCTION_TMUX_SESSION
+    )
+    result = _direct_tmux_injection(session, text)
+    if not result.success:
+        logger.warning(
+            "device notice inject failed session=%s phase=%s error=%s",
+            session, result.phase, result.error,
+        )
+    return bool(result.success)
+
+
 def _inject_to_tmux_session(state: "ServerState", session: str, text: str) -> tuple[bool, str]:
     """Direct tmux fallback used by scheduled dispatcher delivery."""
 
@@ -4553,6 +4583,13 @@ class ServerState:
         self.xiaoke_stop_tombstone: dict[str, Any] = {}
         self.xiaoke_stopping_claim: dict[str, Any] = {}
         self.xiaoke_send_reservation: dict[str, Any] = {}
+        # 手机感知事件的 cctg 低调注入（2026-09-28）：单 worker FIFO，小克忙时
+        # 排队等空闲，空闲判定与注入同在 xiaoke_stop_lock 内，不插进 App 回合。
+        self.xiaoke_low_key_notifier = XiaokeLowKeyNotifier(
+            is_busy=lambda: _xiaoke_busy_for_low_key_notice(self),
+            inject=lambda text: _inject_xiaoke_low_key_notice(self, text),
+            lock=self.xiaoke_stop_lock,
+        )
         # In-memory assistant drafts for polling clients. Drafts are transient UI
         # state only; final assistant replies remain in chat_history jsonl.
         self.chat_draft_lock = threading.Lock()
@@ -8608,28 +8645,50 @@ class PushHandler(BaseHTTPRequestHandler):
                 logger.warning("device push exception token=%s...: %s", token[:8], e)
 
     # ------------------------------------------------------------------
-    # /device/* — 手机/应用使用感知（2026-09-27 v4）
-    # 打扰级事件进小克会话的系统气泡（复用 reading-ai 的 system_event /
-    # no_model_context 形态：她看得到、AI 不当轮上下文）。AI 想看时走
-    # GET /device/status 主动查询最新快照。只存最新值，不留历史。
+    # /device/* — 手机/应用使用感知（2026-09-27 v4，2026-09-28 修正）
+    # 打扰级事件 = 小克会话里的居中事件胶囊（复用米家/小石榴 mihome_event
+    # 渲染通道，App 无需发版）+ 同一条事件以知悉级低调通知注入 cctg，让小克
+    # 本体知道（她 2026-09-28 明确要进会话）。AI 想看最新值时走 GET
+    # /device/status。只存最新值，不留历史，不进日记/健康页。
     # ------------------------------------------------------------------
 
-    def _append_device_event_bubble(self, text: str, event_meta: dict[str, Any]) -> None:
-        """把一条设备事件落成小克会话里的系统气泡；失败只记日志不炸上报。"""
+    def _append_device_event_bubble(
+        self,
+        text: str,
+        event_meta: dict[str, Any],
+        *,
+        notice_kind: str = NOTICE_KIND_BATTERY,
+        severity: str = "info",
+        change: str = "",
+    ) -> None:
+        """设备事件落成小克会话的事件胶囊并低调注入 cctg；失败只记日志不炸上报。"""
         try:
             chat = self._chat_for_contact("xiaoke")
             chat.append(
-                role="system",
+                role="assistant",
                 text=text,
                 source="device-event",
                 metadata={
-                    "system_event": True,
-                    "no_model_context": True,
+                    # mihome_event + severity + 非空 items 是 Android 端
+                    # MihomeEventPill 的渲染开关（同 roborock-watch）。
+                    "mihome_event": True,
+                    "severity": "warn" if severity == "warn" else "info",
+                    "items": [{
+                        "device": "手机",
+                        "change": change or str(event_meta.get("kind") or ""),
+                        "human": text,
+                    }],
                     "device_event": event_meta,
                 },
             )
         except Exception:
             logger.warning("device event bubble append failed", exc_info=True)
+        try:
+            notifier = getattr(self.state, "xiaoke_low_key_notifier", None)
+            if notifier is not None:
+                notifier.enqueue(build_device_notice(notice_kind, text))
+        except Exception:
+            logger.warning("device event notice enqueue failed", exc_info=True)
 
     def _maybe_record_device_activity(self, body: dict[str, Any]) -> None:
         """电池/应用事件上报可捎带 activity 快照；非法快照不拖垮主上报。"""
@@ -8669,7 +8728,9 @@ class PushHandler(BaseHTTPRequestHandler):
                 "kind": event,
                 "battery_pct": state["battery_pct"],
                 "charging": state["charging"],
-            })
+            }, notice_kind=NOTICE_KIND_BATTERY,
+                severity="warn" if event == EVENT_LOW_BATTERY else "info",
+                change=event)
             logger.info("device battery event %s pct=%d", event, state["battery_pct"])
         self._send_json(200, {
             "ok": True,
@@ -8699,7 +8760,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 "kind": f"app_{event['event']}",
                 "package": event["package"],
                 "label": event["label"],
-            })
+            }, notice_kind=NOTICE_KIND_APP, change=f"app_{event['event']}")
             logger.info("device app event %s package=%s", event["event"], event["package"])
         self._send_json(200, {
             "ok": True,

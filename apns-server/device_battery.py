@@ -1,7 +1,7 @@
 """手机电量感知（2026-09-27 v4 Astra 决议：打扰级气泡 + AI 主动查询，无 metadata 水印）。
 
 - App 通过 POST /device/battery 边缘触发上报最新电量；这里只做状态与事件
-  判定，气泡投递在 push.py（进小克会话的系统气泡，不走 APNs banner）。
+  判定，气泡投递在 push.py（小克会话事件胶囊 + cctg 低调注入，不走 APNs banner）。
 - 事件（平时完全安静）：
   - charging_started / charging_stopped：充↔不充切换各报一次；转换检测天然
     边缘触发（拔电后才会重新武装充电事件，反之亦然）。首次上报（无先前
