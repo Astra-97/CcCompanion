@@ -338,6 +338,28 @@ class StickerCatalogTests(unittest.TestCase):
         self.assertNotIn("token", request.header_items().__repr__().lower())
         self.assertNotIn("secret", request.header_items().__repr__().lower())
 
+    def test_failed_source_falls_back_to_last_good_manifest(self):
+        with TemporaryDirectory() as tmp:
+            manifest = self._manifest(Path(tmp), {"stickers": [{"name": "爱", "file": "爱.gif"}]})
+            service = StickerCatalogService({"enabled": True, "sources": [{
+                "manifest_path": str(manifest), "public_base_url": "https://assets.example/stickers",
+            }]})
+            self.assertEqual(["爱"], [item["name"] for item in service.snapshot()["stickers"]])
+            manifest.unlink()
+            service.invalidate()
+            self.assertEqual(["爱"], [item["name"] for item in service.snapshot()["stickers"]])
+            self._manifest(Path(tmp), {"stickers": [{"name": "新", "file": "新.png"}]})
+            service.invalidate()
+            self.assertEqual(["新"], [item["name"] for item in service.snapshot()["stickers"]])
+
+    def test_source_that_never_loaded_still_fails_closed(self):
+        with TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing.json"
+            service = StickerCatalogService({"enabled": True, "sources": [{
+                "manifest_path": str(missing), "public_base_url": "https://assets.example/stickers",
+            }]})
+            self.assertEqual([], service.snapshot()["stickers"])
+
 
 if __name__ == "__main__":
     unittest.main()

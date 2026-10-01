@@ -36,6 +36,9 @@ _MAX_STICKERS = 512
 _MAX_NAME_CHARS = 80
 _MAX_CATEGORY_ID_CHARS = 48
 _IMAGE_EXTENSIONS = {".gif", ".png", ".jpg", ".jpeg", ".webp"}
+# The configured static host can take >5s to answer through Cloudflare; a short
+# timeout made the whole catalog vanish whenever a cache rebuild was unlucky.
+_FETCH_TIMEOUT_SECONDS = 20
 # Cloudflare's bot policy rejects urllib's default user agent on the existing
 # static host. This is a fixed product identifier, not an auth credential.
 STICKER_CATALOG_USER_AGENT = "CcCompanion-StickerCatalog/1.0"
@@ -172,6 +175,7 @@ class StickerCatalogService:
             self.max_items = _MAX_STICKERS
         self.sources = self._parse_sources(cfg)
         self._lock = threading.Lock()
+        self._last_good_manifests: dict[int, Any] = {}
         self._cached_at = float("-inf")
         self._cached: dict[str, Any] = {
             "ok": True,
@@ -233,7 +237,7 @@ class StickerCatalogService:
                 },
             )
             opener = build_opener(_NoRedirect())
-            with opener.open(request, timeout=5) as response:  # nosec B310: operator-configured HTTPS only
+            with opener.open(request, timeout=_FETCH_TIMEOUT_SECONDS) as response:  # nosec B310: operator-configured HTTPS only
                 data = response.read(_MAX_MANIFEST_BYTES + 1)
         if len(data) > _MAX_MANIFEST_BYTES:
             raise ValueError("sticker manifest exceeds size limit")
@@ -246,14 +250,20 @@ class StickerCatalogService:
         categories: list[dict[str, str]] = []
         categories_by_id: dict[str, dict[str, str]] = {}
         seen_names: set[str] = set()
-        for source in self.sources:
+        for index, source in enumerate(self.sources):
             try:
                 raw_manifest = self._read_source(source)
+                self._last_good_manifests[index] = raw_manifest
             except Exception as exc:
                 # One unavailable source does not make existing stickers turn
-                # into arbitrary text/URLs.  Preserve any healthy sources.
-                logger.warning("sticker catalog source unavailable: %s", exc)
-                continue
+                # into arbitrary text/URLs.  Preserve any healthy sources, and
+                # fall back to this source's last good manifest so a transient
+                # timeout does not make its stickers vanish from clients.
+                raw_manifest = self._last_good_manifests.get(index)
+                if raw_manifest is None:
+                    logger.warning("sticker catalog source unavailable: %s", exc)
+                    continue
+                logger.warning("sticker catalog source unavailable, serving last good manifest: %s", exc)
             raw_items = raw_manifest.get("stickers") if isinstance(raw_manifest, dict) else raw_manifest
             if not isinstance(raw_items, list):
                 continue
