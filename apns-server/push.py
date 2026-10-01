@@ -132,6 +132,7 @@ from voice_protocol import (
 )
 import translate_api
 import voice_acoustics
+import voice_duration
 import voice_gemini
 import voice_message
 import fable_quota
@@ -23311,6 +23312,11 @@ class PushHandler(BaseHTTPRequestHandler):
         audio_url = f"/attachments/{stored_name}"
         mime_type = payload.get("mime_type") or "audio/wav"
         audio_bytes = payload.get("bytes") or 0
+        # 真实时长（2026-10-01）：TTS 产物落盘后立即探测，wav 走标准库、
+        # mp3 走系统 ffprobe；探测失败为 0，App 端下载进缓存后再实测兜底。
+        duration_ms = voice_duration.audio_duration_ms(
+            self.state.attachments_dir / stored_name, mime_type,
+        )
 
         chat = self._chat_for_contact(contact_id)
         try:
@@ -23326,6 +23332,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     "audio_url": audio_url,
                     "mime_type": mime_type,
                     "bytes": audio_bytes,
+                    "duration_ms": duration_ms,
                 },
             )
         except Exception as e:
@@ -23346,6 +23353,7 @@ class PushHandler(BaseHTTPRequestHandler):
             "audio_url": audio_url,
             "mime_type": mime_type,
             "bytes": audio_bytes,
+            "duration_ms": duration_ms,
             "record": rec,
         })
 
