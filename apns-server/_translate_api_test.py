@@ -89,6 +89,14 @@ class TranslateTextTest(unittest.TestCase):
         sent_prompt = captured["json"]["messages"][0]["content"]
         self.assertEqual(sent_prompt, prompt)
 
+    def test_system_prompt_preserves_tts_tone_tags(self) -> None:
+        # 2026-10-01 修复：方括号语气/情绪标签（[laughs] 等）是 TTS 控制标记，
+        # 译文必须逐字原样保留，不得翻译、增删——否则语音消息译文丢语气。
+        prompt = translate_api.TRANSLATE_SYSTEM_PROMPT
+        self.assertIn("[laughs]", prompt)
+        self.assertIn("TTS", prompt)
+        self.assertIn("原样保留", prompt)
+
     def test_cache_key_includes_prompt_version(self) -> None:
         # 缓存键 = sha256(PROMPT_VERSION + text)：prompt 改动后旧译文不得再命中，
         # 否则会复用旧 prompt 产出的"中文被翻成英文"错误译文（2026-09-11 事故）。
