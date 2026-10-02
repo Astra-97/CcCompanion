@@ -7,6 +7,8 @@ import hashlib
 import json
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -281,6 +283,107 @@ class ChatTranslateHandlerTest(unittest.TestCase):
         status, payload = self.responses[0]
         self.assertEqual(status, 500)
         self.assertFalse(payload["ok"])
+
+
+class InflightCoalescingTest(unittest.TestCase):
+    """在途合并（2026-10-02）：同文本并发翻译只发一次 OpenRouter，搭车者命中缓存。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cache_dir = Path(self.tmp.name) / "cache"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _call(self, text: str = SAMPLE_THINKING, **kwargs):
+        kwargs.setdefault("cache_dir", self.cache_dir)
+        kwargs.setdefault("api_key", "sk-test")
+        return translate_api.translate_text(text, **kwargs)
+
+    def test_concurrent_same_text_calls_api_once_and_waiter_hits_cache(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _post(*_args, **_kwargs):
+            entered.set()
+            release.wait(timeout=10)
+            return _ok_response()
+
+        results = {}
+        with patch.object(translate_api.httpx, "post", side_effect=_post) as post:
+            t1 = threading.Thread(target=lambda: results.__setitem__("owner", self._call()))
+            t1.start()
+            self.assertTrue(entered.wait(5))  # owner 已占 owner 位并进入网络段
+            t2 = threading.Thread(target=lambda: results.__setitem__("waiter", self._call()))
+            t2.start()
+            time.sleep(0.1)  # 让 waiter 进入搭车等待
+            release.set()
+            t1.join(10)
+            t2.join(10)
+
+        self.assertFalse(t1.is_alive() or t2.is_alive())
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(results["owner"]["translated"], "让我先看一下配置文件。")
+        self.assertFalse(results["owner"]["cached"])
+        self.assertEqual(results["waiter"]["translated"], "让我先看一下配置文件。")
+        self.assertTrue(results["waiter"]["cached"])
+
+    def test_waiter_becomes_owner_after_owner_failure(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def _post(*_args, **_kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                entered.set()
+                release.wait(timeout=10)
+                raise TimeoutError("boom")
+            return _ok_response()
+
+        errors = []
+        results = {}
+
+        def _owner():
+            try:
+                self._call()
+            except translate_api.TranslateError as exc:
+                errors.append(str(exc))
+
+        with patch.object(translate_api.httpx, "post", side_effect=_post) as post:
+            t1 = threading.Thread(target=_owner)
+            t1.start()
+            self.assertTrue(entered.wait(5))
+            t2 = threading.Thread(target=lambda: results.__setitem__("r", self._call()))
+            t2.start()
+            time.sleep(0.1)
+            release.set()
+            t1.join(10)
+            t2.join(10)
+
+        self.assertEqual(errors, ["openrouter_request_failed: TimeoutError"])
+        self.assertEqual(post.call_count, 2)  # 在途失败不落缓存，搭车者自己当 owner 重翻
+        self.assertEqual(results["r"]["translated"], "让我先看一下配置文件。")
+        self.assertFalse(results["r"]["cached"])
+
+    def test_waiter_timeout_raises_stable_code(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _post(*_args, **_kwargs):
+            entered.set()
+            release.wait(timeout=10)
+            return _ok_response()
+
+        with patch.object(translate_api.httpx, "post", side_effect=_post):
+            t1 = threading.Thread(target=lambda: self._call())
+            t1.start()
+            self.assertTrue(entered.wait(5))
+            with self.assertRaises(translate_api.TranslateError) as ctx:
+                self._call(timeout=0.2)
+            release.set()
+            t1.join(10)
+        self.assertEqual(str(ctx.exception), "translate_inflight_timeout")
 
 
 if __name__ == "__main__":

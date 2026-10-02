@@ -73,6 +73,9 @@ class TranslateError(RuntimeError):
 
 
 _cache_lock = threading.Lock()
+# 在途合并注册表：cache key -> 「在途那次翻译完成」事件（见 translate_text）。
+_inflight_lock = threading.Lock()
+_inflight: dict[str, threading.Event] = {}
 
 _CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 
@@ -146,6 +149,8 @@ def translate_text(
     "usage": dict}``. Overlong input is truncated to ``max_chars`` before
     sending (the cache key is taken over the text actually sent).
     中文为主的输入恒等短路、直接原样返回（见 :func:`_is_chinese_dominant`）。
+    同一文本已有翻译在途（如语音后台预热）时搭车等待其结果，不重复发起
+    OpenRouter 请求（2026-10-02 在途合并）。
     """
 
     source = str(text or "")
@@ -168,6 +173,66 @@ def translate_text(
         hit = _cache_read(cache_path, key, model)
     if hit:
         return {"translated": hit, "cached": True, "truncated": truncated, "usage": {}}
+
+    # 在途合并（2026-10-02 语音「译」慢的根因）：语音入库的后台预热与 App 点
+    # 「译」常撞进同一文本的翻译窗口——缓存还没写好，点的人另起一次冷调，
+    # 同一段文字烧两份钱、先点的人干等一整次。同 key 已有翻译在跑时搭车等
+    # 待，在途那次写完缓存即命中返回；等待上限 timeout，超时抛 TranslateError
+    # 走调用方既有失败降级。在途那次失败没落缓存时绕回争取自己当 owner，
+    # 不因为别人失败而放弃本次翻译。
+    deadline = time.monotonic() + timeout
+    while True:
+        with _inflight_lock:
+            event = _inflight.get(key)
+            if event is None:
+                event = threading.Event()
+                _inflight[key] = event
+                owner = True
+            else:
+                owner = False
+        if owner:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not event.wait(remaining):
+            raise TranslateError("translate_inflight_timeout")
+        with _cache_lock:
+            hit = _cache_read(cache_path, key, model)
+        if hit:
+            return {"translated": hit, "cached": True, "truncated": truncated, "usage": {}}
+
+    try:
+        return _translate_network(
+            source,
+            cache_path=cache_path,
+            key=key,
+            api_key=api_key,
+            timeout=timeout,
+            url=url,
+            model=model,
+            truncated=truncated,
+        )
+    finally:
+        with _inflight_lock:
+            _inflight.pop(key, None)
+            event.set()
+
+
+def _translate_network(
+    source: str,
+    *,
+    cache_path: Path,
+    key: str,
+    api_key: str | None,
+    timeout: float,
+    url: str,
+    model: str,
+    truncated: bool,
+) -> dict[str, Any]:
+    """translate_text 的网络段：唯一发起 OpenRouter 请求的地方。
+
+    调用前必须已持有 key 的在途 owner 位（或确认无在途），返回前由
+    translate_text 的 finally 释放 owner 并唤醒搭车者。
+    """
 
     effective_key = api_key if api_key is not None else openrouter_api_key()
     if not effective_key:
