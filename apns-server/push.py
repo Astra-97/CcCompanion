@@ -23278,6 +23278,22 @@ class PushHandler(BaseHTTPRequestHandler):
             "bytes": payload.get("bytes"),
         })
 
+    def _prewarm_voice_translation(self, text: str) -> None:
+        """后台预热语音译文的 /chat/translate 磁盘缓存（2026-10-02 Astra 拍板「加」）。
+
+        思维链快是因为入库前 translate_thinking_auto 已同步翻好；语音此前是
+        App 点「译」才冷调 OpenRouter。这里趁 TTS 生成的窗口后台预跑一次
+        translate_text，同一文本同一缓存键，App 点「译」即缓存命中秒出。
+        任何失败静默，绝不影响推送主流程。
+        """
+        def _run() -> None:
+            try:
+                translate_api.translate_text(text)
+            except Exception as exc:
+                logger.warning("voice translate prewarm failed: %s", exc)
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def _handle_voice_push(self, body: dict[str, Any]):
         """小克主动推语音消息 — TTS 生成 wav + 写 assistant chat record (type=voice).
 
@@ -23296,6 +23312,8 @@ class PushHandler(BaseHTTPRequestHandler):
                 "reason": "Kimi 当前不接受语音消息。",
             })
             return
+
+        self._prewarm_voice_translation(text)
 
         ok, payload = self._run_stackchan_voice_helper(
             ["tts", "--text", text, "--output-dir", str(self.state.attachments_dir)],
