@@ -22101,9 +22101,16 @@ class PushHandler(BaseHTTPRequestHandler):
         出参 {"ok", "translated", "cached", "truncated"}。OpenRouter 失败
         返回 502 + 稳定错误码，app 端静默降级；绝不影响聊天主流程。
         """
+        # 诊断日志（2026-10-02 语音「译」转圈排查）：App 端收到秒级 200 仍转圈，
+        # 需要确认到达的文本与语音记录是否一致、缓存是否命中、服务端耗时。
+        req_text = str(body.get("text") or "")
+        req_sha = hashlib.sha256(req_text.encode("utf-8")).hexdigest()[:8]
+        t0 = time.monotonic()
         try:
-            result = translate_api.translate_text(str(body.get("text") or ""))
+            result = translate_api.translate_text(req_text)
         except translate_api.TranslateError as exc:
+            logger.info("chat_translate: sha=%s len=%d error=%s ms=%d",
+                        req_sha, len(req_text), exc, int((time.monotonic() - t0) * 1000))
             status = 400 if str(exc) == "empty_text" else 502
             self._send_json(status, {"ok": False, "error": str(exc)})
             return
@@ -22111,6 +22118,9 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.exception("chat translate unexpected failure")
             self._send_json(500, {"ok": False, "error": "translate_internal_error"})
             return
+        logger.info("chat_translate: sha=%s len=%d cached=%s ms=%d",
+                    req_sha, len(req_text), result.get("cached"),
+                    int((time.monotonic() - t0) * 1000))
         self._send_json(200, {
             "ok": True,
             "translated": result["translated"],
