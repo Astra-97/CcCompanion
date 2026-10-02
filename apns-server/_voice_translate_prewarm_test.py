@@ -9,12 +9,16 @@ App 点「译」即命中缓存。任何失败静默，绝不影响推送主流�
 
 from __future__ import annotations
 
+import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from chat_history import ChatHistory
 from push import PushHandler
 
 
@@ -119,6 +123,89 @@ class VoiceTranslatePrewarmTest(unittest.TestCase):
 
             self.assertEqual(400, handler.responses[-1][0])
             self.assertEqual([], calls)
+
+
+class ChatAppendPrewarmTest(unittest.TestCase):
+    """/chat/append 挂点：小克语音消息实际从这里入库（assistant + audio 附件）。
+
+    第一版只挂了 /voice/push，而小克语音走 bus_stop_hook → /chat/append
+    （source=claude-code），预热从未触发（2026-10-02 Astra 实测仍转圈）。
+    """
+
+    def _append_handler(self):
+        handler = object.__new__(PushHandler)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        chat = ChatHistory(Path(tmp.name) / "history.jsonl")
+        handler.state = types.SimpleNamespace(
+            shared_secret="",
+            strict_auth=True,
+            contact_chats={"xiaoke": chat},
+            attachments_dir=Path(tmp.name),
+            settings={},
+            tokens=types.SimpleNamespace(all_active=lambda: []),
+            apns_enabled=False,
+        )
+        handler.headers = {}
+        handler._chat_for_contact = lambda _contact: chat
+        handler._source_for_request = lambda *a: "claude-code"
+        handler._has_pending_group_reply = lambda: False
+        handler.responses = []
+        handler._send_json = lambda status, payload: handler.responses.append((status, payload))
+        handler.chat = chat
+        return handler
+
+    def _voice_body(self, text="hello [softly] world"):
+        return {
+            "contact_id": "xiaoke",
+            "role": "assistant",
+            "source": "claude-code",
+            "text": text,
+            "attachment_url": "/attachments/abc123.mp3",
+            "attachment_type": "audio",
+            "attachment_filename": "abc123.mp3",
+            "metadata": {"type": "voice", "audio_url": "/attachments/abc123.mp3"},
+        }
+
+    def test_assistant_audio_append_prewarms_with_record_text(self):
+        handler = self._append_handler()
+        calls = []
+        handler._prewarm_voice_translation = lambda text: calls.append(text)
+
+        handler._handle_chat_append(self._voice_body())
+
+        status, payload = handler.responses[-1]
+        self.assertEqual(200, status, payload)
+        self.assertEqual(["hello [softly] world"], calls)
+
+    def test_non_audio_assistant_append_does_not_prewarm(self):
+        handler = self._append_handler()
+        calls = []
+        handler._prewarm_voice_translation = lambda text: calls.append(text)
+
+        body = self._voice_body()
+        body["attachment_type"] = None
+        body.pop("attachment_url")
+        body.pop("attachment_filename")
+        body.pop("metadata")
+        handler._handle_chat_append(body)
+
+        status, payload = handler.responses[-1]
+        self.assertEqual(200, status, payload)
+        self.assertEqual([], calls)
+
+    def test_user_audio_append_does_not_prewarm(self):
+        handler = self._append_handler()
+        calls = []
+        handler._prewarm_voice_translation = lambda text: calls.append(text)
+
+        body = self._voice_body()
+        body["role"] = "user"
+        handler._handle_chat_append(body)
+
+        status, payload = handler.responses[-1]
+        self.assertEqual(200, status, payload)
+        self.assertEqual([], calls)
 
 
 if __name__ == "__main__":

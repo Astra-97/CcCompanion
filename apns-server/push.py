@@ -22503,6 +22503,13 @@ class PushHandler(BaseHTTPRequestHandler):
         else:
             rec = append_record()
 
+        # 语音译文预热补挂点（2026-10-02）：小克的语音消息实际走 /chat/append
+        #（assistant + audio 附件），不走 /voice/push——第一版只挂了后者，从没
+        # 触发（Astra 实测「最新一条还是转圈」）。assistant 语音记录在此同样
+        # 后台预跑翻译，App 点「译」即磁盘缓存命中。
+        if role == "assistant" and attachment_type == "audio" and str(text or "").strip():
+            self._prewarm_voice_translation(text)
+
         self._publish_persisted_assistant_completion(contact_id, rec)
 
         # move 成功 append 后缓存 client_msg_id (LRU 100)
