@@ -1169,6 +1169,64 @@ class LinkPreviewTests(unittest.TestCase):
             )
             self.assertEqual(service.enrich("https://example.com").previews, ())
 
+    def test_failure_notice_reaches_prompt_and_record_without_url_secrets(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(
+                td, fetcher=QueueFetcher([link_preview.LinkPreviewError("total timeout exceeded")])
+            )
+            with self.assertLogs("link_preview", level="WARNING") as logs:
+                bundle = service.enrich("看看 https://xhslink.cn/o/abc?xsec_token=supersecret123")
+            self.assertEqual(bundle.previews, ())
+            self.assertIn("[链接全文资料]", bundle.prompt_context)
+            self.assertIn("抓取失败：xhslink.cn（超时）", bundle.prompt_context)
+            self.assertIn("不得凭分享标题臆测内容", bundle.prompt_context)
+            self.assertEqual(bundle.failures, ({"host": "xhslink.cn", "reason": "total timeout exceeded"},))
+            meta = link_preview.merge_preview_metadata({"via": "card"}, bundle)
+            handler = object.__new__(push.PushHandler)
+            handler.state = types.SimpleNamespace(attachments_dir=Path(td))
+            rebuilt = handler._link_context_from_record({"metadata": meta})
+            self.assertIn("抓取失败：xhslink.cn（超时）", rebuilt)
+            combined = bundle.prompt_context + json.dumps(meta) + rebuilt + "\n".join(logs.output)
+            self.assertNotIn("supersecret123", combined)
+            self.assertNotIn("/o/abc", combined)
+        forged = link_preview.merge_preview_metadata(
+            {"link_preview_failures": [{"host": "evil.example", "reason": "x"}]},
+            link_preview.LinkPreviewBundle(),
+        )
+        self.assertIsNone(forged)
+
+    def test_slow_images_keep_text_and_ordered_partial_images(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = link_preview.LinkPreviewService(td, total_timeout=2)
+            image_urls = tuple(f"https://cdn.example.com/{index}.jpg" for index in range(6))
+            page = link_preview.ExtractedPage(
+                **{**self._page("https://example.com/slow-images").__dict__, "image_urls": image_urls}
+            )
+            service._fetch_page = lambda url, deadline: page
+
+            def download(image_url, deadline, **_kwargs):
+                index = image_urls.index(image_url)
+                if index == 0:
+                    time.sleep(0.1)
+                elif index != 3:
+                    # Straggler: still running well past the image deadline.
+                    time.sleep(max(0.0, deadline - time.monotonic()) + 0.5)
+                return Path(td) / f"link_image_{service._url_key(image_url)}.jpg", image_url.encode()
+
+            service._download_image_candidate = download
+            started = time.monotonic()
+            bundle = service.enrich("https://example.com/slow-images")
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 2.0)
+            preview = bundle.previews[0]
+            self.assertTrue(Path(preview["content_path"]).is_file())
+            expected = [
+                str(Path(td).resolve() / f"link_image_{service._url_key(image_urls[index])}.jpg")
+                for index in (0, 3)
+            ]
+            self.assertEqual(preview["image_paths"], expected)
+            self.assertTrue(all(Path(path).is_file() for path in expected))
+
     def test_windows_renderer_handles_http_or_parse_failure(self):
         bad = link_preview.HTTPPayload(
             "https://example.com/private", 403, {"content-type": "text/html"}, b"forbidden"

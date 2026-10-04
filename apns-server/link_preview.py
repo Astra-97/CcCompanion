@@ -8,6 +8,7 @@ operator; normal chat delivery never depends on them.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from dataclasses import dataclass
 from html import unescape
 from html.parser import HTMLParser
@@ -15,6 +16,7 @@ import hashlib
 import http.client
 import ipaddress
 import json
+import logging
 import os
 from pathlib import Path
 import queue
@@ -41,6 +43,8 @@ from urllib.parse import (
 )
 import zlib
 
+
+logger = logging.getLogger(__name__)
 
 URL_RE = re.compile(
     r"https?://[^\s<>\"'\u3000\u3002\uff0c\uff1b\uff1a\uff01\uff1f\uff09\u3011\u300b\u201d\u2019]+",
@@ -139,6 +143,12 @@ XIACHUFANG_CACHE_SCHEMA_VERSION = 1
 MEITUAN_CACHE_SCHEMA_VERSION = 2
 DNS_WORKERS = 4
 DNS_QUEUE_SIZE = 8
+# 配图并发下载；图片截止时间比整体 deadline 提前（预留给缓存事务写盘），
+# 慢 CDN 最多只丢图，不会连已抓到的正文一起回滚。
+IMAGE_DOWNLOAD_WORKERS = 4
+IMAGE_WRITE_RESERVE_SECONDS = 3.0
+_SAFE_FAILURE_HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?")
+_SAFE_FAILURE_REASON_RE = re.compile(r"[A-Za-z0-9 _.,()/-]{1,100}")
 
 
 class LinkPreviewError(RuntimeError):
@@ -217,6 +227,43 @@ class ExtractedPage:
 class LinkPreviewBundle:
     previews: tuple[dict[str, Any], ...] = ()
     prompt_context: str = ""
+    # 抓取失败记录：只含 host 与固定错误原因，不含 URL/查询串/响应内容。
+    failures: tuple[dict[str, str], ...] = ()
+
+
+def _failure_host(url: str) -> str:
+    try:
+        host = (urlsplit(str(url or "")).hostname or "").lower().rstrip(".")
+    except ValueError:
+        host = ""
+    host = _redact_url_echoes(host, url)
+    return host if _SAFE_FAILURE_HOST_RE.fullmatch(host) else ""
+
+
+def _failure_reason(exc: BaseException) -> str:
+    # LinkPreviewError messages are fixed literals; anything else is reduced to
+    # its class name so URLs, cookies or response text can never leak.
+    message = str(exc) if isinstance(exc, LinkPreviewError) else ""
+    return message if _SAFE_FAILURE_REASON_RE.fullmatch(message) else type(exc).__name__
+
+
+def link_failure_notice_lines(failures: Any) -> list[str]:
+    """Render failure records (possibly read back from stored metadata)."""
+    if not isinstance(failures, (list, tuple)):
+        return []
+    lines: list[str] = []
+    for item in list(failures)[:3]:
+        if not isinstance(item, dict):
+            continue
+        host = str(item.get("host") or "")
+        if not _SAFE_FAILURE_HOST_RE.fullmatch(host):
+            host = "未知站点"
+        reason = str(item.get("reason") or "").lower()
+        label = "超时" if "timeout" in reason or "timed out" in reason else "抓取出错"
+        lines.append(
+            f"- 抓取失败：{host}（{label}），本链接内容未获取；请如实告诉用户，不得凭分享标题臆测内容。"
+        )
+    return lines
 
 
 @dataclass
@@ -3255,6 +3302,52 @@ class LinkPreviewService:
         except Exception:
             return None
 
+    def _download_image_candidates(
+        self,
+        image_urls: list[str],
+        deadline: float,
+        *,
+        xhs_only: bool = False,
+    ) -> list[tuple[Path, bytes | None]]:
+        """Download page images concurrently, keeping the original order.
+
+        Stragglers still running at ``deadline`` are abandoned (their socket
+        timeouts are clamped to the same deadline), so whatever finished in
+        time is kept and the caller retains its remaining budget.
+        """
+        results: list[tuple[Path, bytes | None] | None] = [None] * len(image_urls)
+        if len(image_urls) == 1:
+            results[0] = self._download_image_candidate(image_urls[0], deadline, xhs_only=xhs_only)
+        elif image_urls and time.monotonic() < deadline:
+            executor = ThreadPoolExecutor(
+                max_workers=min(IMAGE_DOWNLOAD_WORKERS, len(image_urls)),
+                thread_name_prefix="link-preview-image",
+            )
+            try:
+                futures = {
+                    executor.submit(
+                        self._download_image_candidate, image_url, deadline, xhs_only=xhs_only
+                    ): index
+                    for index, image_url in enumerate(image_urls)
+                }
+                try:
+                    for future in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
+                        try:
+                            results[futures[future]] = future.result()
+                        except Exception:
+                            pass
+                except FuturesTimeoutError:
+                    pass
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+        candidates: list[tuple[Path, bytes | None]] = []
+        seen_image_paths: set[Path] = set()
+        for candidate in results:
+            if candidate is not None and candidate[0] not in seen_image_paths:
+                seen_image_paths.add(candidate[0])
+                candidates.append(candidate)
+        return candidates
+
     def _cache_image(self, image_url: str, deadline: float, *, protected_key: str = "") -> str:
         """Compatibility helper for direct image caching under the hard budget."""
         candidate = self._download_image_candidate(image_url, deadline)
@@ -3368,19 +3461,25 @@ class LinkPreviewService:
         if len(content) > self.max_text_chars * 2:
             content = content[: self.max_text_chars * 2] + "\n[内容已按上限截断]\n"
         content_bytes = content.encode("utf-8")
-        image_candidates: list[tuple[Path, bytes | None]] = []
-        seen_image_paths: set[Path] = set()
-        for image_url in remote_image_urls:
-            candidate = self._download_image_candidate(image_url, deadline, xhs_only=is_xhs)
-            if candidate is not None and candidate[0] not in seen_image_paths:
-                seen_image_paths.add(candidate[0])
-                image_candidates.append(candidate)
+        # Images stop early so the cache transaction below always keeps time to
+        # commit: a slow CDN can cost images, never the already-fetched text.
+        image_deadline = deadline - min(IMAGE_WRITE_RESERVE_SECONDS, self.total_timeout * 0.1)
+        image_candidates = self._download_image_candidates(
+            remote_image_urls, image_deadline, xhs_only=is_xhs
+        )
         host = ""
         try:
             host = (urlsplit(page.final_url).hostname or urlsplit(url).hostname or "").lower()
         except ValueError:
             pass
         safe_host = _redact_url_echoes(host, *source_urls)
+        if len(image_candidates) < len(remote_image_urls):
+            logger.info(
+                "link preview images partial: host=%s cached=%d/%d",
+                safe_host if _SAFE_FAILURE_HOST_RE.fullmatch(safe_host) else "-",
+                len(image_candidates),
+                len(remote_image_urls),
+            )
         meta_base: dict[str, Any] = {
             "schema_version": (
                 XHS_CACHE_SCHEMA_VERSION
@@ -3611,6 +3710,7 @@ class LinkPreviewService:
             return LinkPreviewBundle()
         deadline = time.monotonic() + self.total_timeout
         previews: list[dict[str, Any]] = []
+        failures: list[dict[str, str]] = []
         protected_keys: set[str] = set()
         try:
             for url in urls:
@@ -3625,16 +3725,24 @@ class LinkPreviewService:
                         image_key = self._cache_file_key(Path(str(cache_url or "")).name)
                         if image_key:
                             protected_keys.add(image_key)
-                except Exception:
-                    # Chat is the primary feature.  Network, parsing, adapter and
-                    # filesystem errors are intentionally silent and fail open.
+                except Exception as exc:
+                    # Chat is the primary feature, so errors still fail open,
+                    # but never silently: log host + fixed reason and tell the
+                    # model explicitly that this link was not fetched.
+                    failure = {"host": _failure_host(url), "reason": _failure_reason(exc)}
+                    failures.append(failure)
+                    logger.warning(
+                        "link preview failed: host=%s reason=%s",
+                        failure["host"] or "-",
+                        failure["reason"],
+                    )
                     continue
         finally:
             try:
                 self._cleanup_cache(protected_keys)
             except Exception:
                 pass
-        if not previews:
+        if not previews and not failures:
             return LinkPreviewBundle()
         lines = [
             "[链接全文资料]",
@@ -3667,8 +3775,10 @@ class LinkPreviewService:
                 lines.append("- 抓取范围：评论已抓取，当前返回为空。")
             elif item.get("comments_status") == "fetched_empty_partial":
                 lines.append("- 抓取范围：已抓取首批但返回为空，仍可能有更多评论。")
-        lines.append("请先读取这些文件，再结合用户原话作答；若文件内容不足或抓取不完整，请明确说明。")
-        return LinkPreviewBundle(tuple(previews), "\n".join(lines))
+        lines.extend(link_failure_notice_lines(failures))
+        if previews:
+            lines.append("请先读取这些文件，再结合用户原话作答；若文件内容不足或抓取不完整，请明确说明。")
+        return LinkPreviewBundle(tuple(previews), "\n".join(lines), tuple(failures))
 
 
 def merge_preview_metadata(existing: Any, bundle: LinkPreviewBundle) -> dict[str, Any] | None:
@@ -3676,6 +3786,10 @@ def merge_preview_metadata(existing: Any, bundle: LinkPreviewBundle) -> dict[str
     meta = dict(existing) if isinstance(existing, dict) else {}
     # Client-supplied paths must never become AI filesystem instructions.
     meta.pop("link_previews", None)
+    meta.pop("link_preview_failures", None)
     if bundle.previews:
         meta["link_previews"] = [dict(item) for item in bundle.previews]
+    failures = getattr(bundle, "failures", ())
+    if failures:
+        meta["link_preview_failures"] = [dict(item) for item in failures]
     return meta or None
