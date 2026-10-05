@@ -27,6 +27,34 @@ const SEED_NAMES = [
 
 const bridge = typeof window !== "undefined" ? window.CCBridge : null;
 
+/* ---- 外观: 复用 App 壁纸 + 玻璃风 ----
+ * App 插件 WebView 会对同源 /plugins/ 下的 GET 自动代加 X-Auth-Token;
+ * 纯浏览器带 web session cookie 也可命中。无凭据/无壁纸时静默回落渐变底。 */
+async function applyAppearance() {
+  try {
+    const res = await fetch(`/plugins/${PLUGIN_ID}/appearance`, { cache: "no-store" });
+    if (!res.ok) return;
+    const data = await res.json().catch(() => null);
+    const bgUrl = data && data.ok && typeof data.bg_url === "string" ? data.bg_url : "";
+    if (!bgUrl) return;
+    const img = document.getElementById("bg-image");
+    const veil = document.getElementById("bg-veil");
+    img.addEventListener("error", () => {
+      img.classList.add("hidden");
+      veil.classList.add("hidden");
+      document.body.classList.remove("has-wallpaper");
+    });
+    img.addEventListener("load", () => {
+      img.classList.remove("hidden");
+      veil.classList.remove("hidden");
+      document.body.classList.add("has-wallpaper");
+    });
+    img.src = bgUrl;
+  } catch (e) { /* 静默回落: 无壁纸不代表页面坏了 */ }
+}
+
+applyAppearance();
+
 function getToken() {
   try { return localStorage.getItem("cc_plugin_token_" + PLUGIN_ID) || ""; }
   catch (e) { return ""; }

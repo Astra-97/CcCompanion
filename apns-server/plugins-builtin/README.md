@@ -29,7 +29,8 @@ plugins-builtin/
 ```
 
 保留路径：插件命名空间下的 `data/` 是 KV 接口（`/plugins/<id>/data/<doc>`），
-不要在插件里放真实 `data/` 目录。
+`appearance` / `appearance-asset` 是外观壁纸端点（见下表），都不要在插件里放同名
+真实文件/目录。
 
 ## 端点与鉴权
 
@@ -37,9 +38,17 @@ plugins-builtin/
 | --- | --- |
 | `GET /plugins` 插件清单 | `_require_auth`：X-Auth-Token（shared_secret）或 PWA web session cookie |
 | `GET /plugins/<id>/...` 静态托管 | 同上 |
+| `GET /plugins/<id>/appearance` | 同上。→ `{"ok":true,"bg_url":"/plugins/<id>/appearance-asset" 或 null, "veil": {...如有}}`；bg_url 为 null 表示用户用 App 内置默认壁纸（bgUri 为空/文件缺失），页面回落纯色/渐变底 |
+| `GET /plugins/<id>/appearance-asset` | 同上。流式返回当前聊天壁纸图片（`no-cache`，换壁纸即生效）；无壁纸 → `404 {"ok":false,"error":"no_wallpaper"}` |
 | `GET /plugins/<id>/data/<doc>` | fail-closed 三选一：X-Auth-Token / web session（仅 GET）/ scoped token |
 | `PUT /plugins/<id>/data/<doc>` | fail-closed 二选一：X-Auth-Token / scoped token（web session 不能写） |
 | `POST /plugins/<id>/token` 签发 scoped token | 仅 X-Auth-Token（native pairing 闸门，web session 无权） |
+
+外观端点对所有插件 id 生效（未知插件 404），只暴露壁纸相关子集、不倒整份
+appearance settings；读取顺序 `user_settings.appearance` 优先、旧版独立
+`appearance_settings.json` 回落。App 插件 WebView 只对 `/plugins/` 命名空间内
+的同源请求自动代加 X-Auth-Token，壁纸必须经这两个端点拿，直连
+`/appearance-assets/...` 拿不到鉴权。scoped token 对外观端点无效。
 
 shared_secret **绝不**下发到页面。App 内 WebView 走原生 bridge 代发请求
 （主链路）；纯浏览器测试用 scoped token 直连 fetch（降级通道）。

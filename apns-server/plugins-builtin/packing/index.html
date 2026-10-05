@@ -7,6 +7,10 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <!-- 壁纸层: 用 <img> 而非 CSS background, 规避 CSP style-src 对动态内联样式的限制;
+       bg-veil 为深色半透明罩 (对齐 App 聊天页 ~42% 暗罩)。无壁纸时保持 hidden。 -->
+  <img id="bg-image" class="bg-image hidden" alt="" aria-hidden="true">
+  <div id="bg-veil" class="bg-veil hidden" aria-hidden="true"></div>
   <main>
     <header>
       <h1>打包清单</h1>

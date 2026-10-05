@@ -10569,10 +10569,20 @@ class PushHandler(BaseHTTPRequestHandler):
                 "updated_at": record["updated_at"],
             })
             return
+        # 保留子路径 (2026-10-05): 外观壁纸。先于静态文件查找, 对所有插件 id 生效;
+        # 鉴权与静态托管同级 (_require_auth), scoped token 不放行。
+        rel = request_path[len("/plugins/"):].split("/", 1)
+        if len(rel) == 2 and rel[1] in {"appearance", "appearance-asset"}:
+            if not self._require_auth():
+                return
+            if rel[1] == "appearance":
+                self._handle_plugin_appearance_get(rel[0])
+            else:
+                self._handle_plugin_appearance_asset_get(rel[0])
+            return
         # 其余路径按静态托管: /plugins/<id>[/...] -> 插件目录下的文件 (默认 entry)。
         if not self._require_auth():
             return
-        rel = request_path[len("/plugins/"):].split("/", 1)
         plugin_id = rel[0]
         rel_path = rel[1] if len(rel) > 1 else ""
         resolved = store.resolve_static(plugin_id, rel_path)
@@ -10640,6 +10650,77 @@ class PushHandler(BaseHTTPRequestHandler):
             })
             return
         self._send_json(200, {"ok": True, "doc": doc, "version": info["version"]})
+
+    # ------------------------------------------------------------------
+    # 插件命名空间下的外观壁纸端点 (2026-10-05)
+    # App 插件 WebView 只对 /plugins/ 内的同源请求自动代加 X-Auth-Token,
+    # 所以壁纸必须经 /plugins/<id>/appearance* 暴露, 插件页面才能拿到。
+    # ------------------------------------------------------------------
+
+    def _plugin_appearance_effective(self) -> dict[str, Any]:
+        """插件视角的外观设置: user_settings.appearance 优先,
+        旧版独立 appearance_settings.json 回落 (同 _handle_user_settings_get)。"""
+        with self._USER_SETTINGS_LOCK:
+            settings = self._user_settings_load()
+        appearance = settings.get("appearance")
+        if isinstance(appearance, dict):
+            return appearance
+        with self._APPEARANCE_SETTINGS_LOCK:
+            fallback = self._appearance_settings_load()
+        return fallback
+
+    def _plugin_appearance_bg_target(self) -> Path | None:
+        """当前聊天壁纸 (bgUri) 对应的资源文件; 无壁纸/非法文件名/文件缺失 -> None。
+
+        bgUri 上传后是 /appearance-assets/<文件名> 形态; 空字符串表示用 App
+        内置默认壁纸, 此时插件侧回落纯色/渐变底, 不给 bg_url。
+        """
+        prefix = "/appearance-assets/"
+        bg_uri = str(self._plugin_appearance_effective().get("bgUri") or "").strip()
+        if not bg_uri.startswith(prefix):
+            return None
+        filename = bg_uri[len(prefix):]
+        # 与 _handle_appearance_assets_get 同一套校验, 不复制路径穿越漏洞。
+        if not filename or "/" in filename or "\\" in filename or ".." in filename or filename.startswith("."):
+            return None
+        target = self._APPEARANCE_ASSETS_DIR / filename
+        if not target.is_file():
+            return None
+        return target
+
+    def _handle_plugin_appearance_get(self, plugin_id: str) -> None:
+        """GET /plugins/<id>/appearance — 壁纸相关子集, 不倒整份 settings。"""
+        if self._plugin_store().load_manifest(plugin_id) is None:
+            self._send_json(404, {"ok": False, "error": "not_found"})
+            return
+        try:
+            appearance = self._plugin_appearance_effective()
+            payload: dict[str, Any] = {
+                "ok": True,
+                "bg_url": (
+                    f"/plugins/{plugin_id}/appearance-asset"
+                    if self._plugin_appearance_bg_target() is not None else None
+                ),
+            }
+            veil = appearance.get("veil")
+            if isinstance(veil, dict):
+                payload["veil"] = veil
+            self._send_json(200, payload)
+        except Exception as e:
+            logger.exception("plugin appearance get fail")
+            self._send_json(500, {"ok": False, "error": str(e)})
+
+    def _handle_plugin_appearance_asset_get(self, plugin_id: str) -> None:
+        """GET /plugins/<id>/appearance-asset — 流式返回当前壁纸图片。"""
+        if self._plugin_store().load_manifest(plugin_id) is None:
+            self._send_json(404, {"ok": False, "error": "not_found"})
+            return
+        target = self._plugin_appearance_bg_target()
+        if target is None:
+            self._send_json(404, {"ok": False, "error": "no_wallpaper"})
+            return
+        # 壁纸可换而 URL 不变, 插件端点不缓存, 保证总是当前壁纸。
+        self._serve_appearance_asset_file(target, cache_control="no-cache")
 
     def _serve_web_chat(self, auth_token=None):
         html = WEB_CHAT_HTML
@@ -25995,6 +26076,12 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.exception("appearance assets upload fail")
             self._send_json(500, {"error": str(e)})
 
+    _APPEARANCE_ASSET_MIME = {
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+        ".gif": "image/gif", ".webp": "image/webp",
+        ".heic": "image/heic", ".heif": "image/heif",
+    }
+
     def _handle_appearance_assets_get(self):
         """GET /appearance-assets/{filename} — serve stored appearance asset."""
         from urllib.parse import unquote
@@ -26011,13 +26098,10 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
             return
 
-        ext = target.suffix.lower()
-        mime_map = {
-            ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-            ".gif": "image/gif", ".webp": "image/webp",
-            ".heic": "image/heic", ".heif": "image/heif",
-        }
-        mime = mime_map.get(ext, "application/octet-stream")
+        self._serve_appearance_asset_file(target)
+
+    def _serve_appearance_asset_file(self, target: Path, *, cache_control: str = "public, max-age=86400") -> None:
+        mime = self._APPEARANCE_ASSET_MIME.get(target.suffix.lower(), "application/octet-stream")
 
         try:
             file_size = target.stat().st_size
@@ -26028,7 +26112,7 @@ class PushHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(file_size))
-        self.send_header("Cache-Control", "public, max-age=86400")
+        self.send_header("Cache-Control", cache_control)
         self.end_headers()
 
         try:
