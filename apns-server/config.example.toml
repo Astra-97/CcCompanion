@@ -326,6 +326,11 @@ server_url = "https://companion-vps2.xiaonancaleb.xyz"
 # affect URL construction. It must be NFC, trimmed, at most 80 characters, and
 # contain no controls or protocol delimiters; an invalid/missing label falls
 # back to `name` and is omitted from the response for old-client compatibility.
+# Optional `aliases` lists legacy `[bqb:name]` tokens from before a
+# 「分类·真名」 rename (at most 8 per sticker, same safety rules as `name`).
+# Aliases are passed through so clients can still render historical messages;
+# they never affect URL construction, and a live name always wins over an
+# alias (colliding or duplicate aliases are dropped, first sticker wins).
 # Configure either a local `manifest_path` or an HTTPS `manifest_url`.
 [stickers]
 enabled = false

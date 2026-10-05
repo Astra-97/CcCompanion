@@ -21682,7 +21682,19 @@ class PushHandler(BaseHTTPRequestHandler):
         catalog = getattr(self.state, "sticker_catalog", None)
         snapshot = getattr(catalog, "snapshot", None)
         current = snapshot() if callable(snapshot) else {"categories": []}
-        if any(isinstance(item, dict) and item.get("name") == query["name"] for item in current.get("stickers", []) if isinstance(current, dict)):
+        # A new upload must not collide with a live name or a legacy alias:
+        # name-exact matching wins over alias fallback on clients, so reusing
+        # an alias would silently rerender historical messages as the new sticker.
+        taken_names: set[str] = set()
+        for item in current.get("stickers", []) if isinstance(current, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("name"), str):
+                taken_names.add(item["name"])
+            aliases = item.get("aliases")
+            if isinstance(aliases, list):
+                taken_names.update(alias for alias in aliases if isinstance(alias, str))
+        if query["name"] in taken_names:
             self.close_connection = True
             self._send_json(409, {"ok": False, "error": "duplicate_sticker"})
             return

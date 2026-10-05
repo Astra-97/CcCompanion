@@ -86,6 +86,13 @@ class StickerUploadRouteTests(unittest.TestCase):
         PushHandler._handle_sticker_upload(handler)
         self.assertEqual(409, handler._send_json.call_args.args[0]); self.assertTrue(handler.close_connection)
 
+    def test_upload_name_colliding_with_legacy_alias_is_duplicate(self):
+        handler = self.handler({"X-Auth-Token": "native", "Content-Length": "3", "Content-Type": "image/png"})
+        handler.state.sticker_catalog = _Catalog(stickers=[{"name": "自嘲熊·团团", "aliases": ["团团"]}])
+        handler.rfile = MagicMock(side_effect=AssertionError("body must not be read"))
+        PushHandler._handle_sticker_upload(handler)
+        self.assertEqual(409, handler._send_json.call_args.args[0]); self.assertTrue(handler.close_connection)
+
     def test_filename_limits_and_controls_are_prebody_rejections(self):
         handler = self.handler({"X-Auth-Token": "native", "Content-Length": "3", "Content-Type": "image/png"})
         handler.path = "/stickers/upload?name=%E5%9B%A2%E5%9B%A2&filename=" + ("a" * 241) + ".png"; handler.rfile = MagicMock(side_effect=AssertionError("body must not be read"))

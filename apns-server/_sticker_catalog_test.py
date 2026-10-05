@@ -360,6 +360,64 @@ class StickerCatalogTests(unittest.TestCase):
             }]})
             self.assertEqual([], service.snapshot()["stickers"])
 
+    def test_aliases_pass_through_and_never_affect_tokens_or_urls(self):
+        with TemporaryDirectory() as tmp:
+            manifest = self._manifest(Path(tmp), {"stickers": [
+                {"name": "自嘲熊·大哭", "file": "自嘲熊·大哭.gif", "label": "大哭", "aliases": ["大哭"]},
+                {"name": "坏别名", "file": "坏别名.gif", "aliases": ["[bqb:注入]", "ok别名", "坏别名", "ok别名"]},
+                {"name": "无别名", "file": "无别名.gif"},
+            ]})
+            service = StickerCatalogService({"enabled": True, "sources": [{
+                "manifest_path": str(manifest), "public_base_url": "https://assets.example/stickers",
+            }]})
+            entries = service.snapshot()["stickers"]
+            self.assertEqual(["大哭"], entries[0]["aliases"])
+            self.assertEqual(
+                "https://assets.example/stickers/%E8%87%AA%E5%98%B2%E7%86%8A%C2%B7%E5%A4%A7%E5%93%AD.gif",
+                entries[0]["url"],
+            )
+            self.assertEqual(["ok别名"], entries[1]["aliases"])
+            self.assertNotIn("aliases", entries[2])
+
+    def test_alias_colliding_with_live_name_or_earlier_alias_is_dropped(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = self._manifest(root / "first", {"stickers": [
+                {"name": "抱抱", "file": "抱抱.gif"},
+                {"name": "哥哥熊·蹭蹭", "file": "哥哥熊·蹭蹭.gif", "aliases": ["蹭蹭", "抱抱"]},
+            ]})
+            second = self._manifest(root / "second", {"stickers": [
+                {"name": "哥哥熊·不可以", "file": "哥哥熊·不可以.gif", "aliases": ["蹭蹭"]},
+            ]})
+            service = StickerCatalogService({"enabled": True, "sources": [
+                {"manifest_path": str(first), "public_base_url": "https://assets.example/first"},
+                {"manifest_path": str(second), "public_base_url": "https://assets.example/second"},
+            ]})
+            entries = service.snapshot()["stickers"]
+            self.assertEqual(["蹭蹭"], entries[1]["aliases"])
+            self.assertNotIn("aliases", entries[2])
+
+    def test_aliases_are_included_in_fingerprint_and_last_good_fallback(self):
+        with TemporaryDirectory() as tmp:
+            manifest = self._manifest(Path(tmp), {"stickers": [
+                {"name": "自嘲熊·大哭", "file": "自嘲熊·大哭.gif", "aliases": ["大哭"]},
+            ]})
+            config = {"enabled": True, "sources": [{
+                "manifest_path": str(manifest), "public_base_url": "https://assets.example/stickers",
+            }]}
+            service = StickerCatalogService(config)
+            before = service.snapshot()
+            self.assertEqual(["大哭"], before["stickers"][0]["aliases"])
+            manifest.unlink()
+            service.invalidate()
+            self.assertEqual(["大哭"], service.snapshot()["stickers"][0]["aliases"])
+            self._manifest(Path(tmp), {"stickers": [
+                {"name": "自嘲熊·大哭", "file": "自嘲熊·大哭.gif", "aliases": ["大哭旧"]},
+            ]})
+            after = StickerCatalogService(config).snapshot()
+            self.assertEqual(["大哭旧"], after["stickers"][0]["aliases"])
+            self.assertNotEqual(before["version"], after["version"])
+
 
 if __name__ == "__main__":
     unittest.main()

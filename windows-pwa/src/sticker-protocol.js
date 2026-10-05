@@ -19,8 +19,21 @@ export function normalizeStickerCatalog(raw = {}) {
     if (url.protocol !== 'https:' || !TRUSTED_ASSET_ORIGINS.has(url.origin) || url.username || url.password || url.search || url.hash
         || /[\\\u0000-\u001f\u007f]/u.test(url.pathname) || !/^\/(?:[^/]+\/)*[^/]+\.(?:png|jpe?g|gif|webp)$/iu.test(url.pathname)) return null;
     const categoryId = categoryIds.has(item.category_id) ? item.category_id : '__uncategorized';
-    seen.add(item.name); return { name: item.name, label: isSafeStickerName(item.label) ? item.label : item.name, url: url.href, categoryId };
+    const aliases = Array.isArray(item.aliases)
+      ? [...new Set(item.aliases.filter((alias) => isSafeStickerName(alias) && alias !== item.name))].slice(0, 8)
+      : [];
+    seen.add(item.name); return { name: item.name, label: isSafeStickerName(item.label) ? item.label : item.name, url: url.href, categoryId, ...(aliases.length ? { aliases } : {}) };
   }).filter(Boolean) : [];
+  // Names always win over aliases: a legacy alias colliding with a live name
+  // or already claimed by an earlier sticker is dropped, keeping old tokens unambiguous.
+  const liveNames = new Set(stickers.map(({ name }) => name));
+  const claimedAliases = new Set();
+  stickers.forEach((sticker) => {
+    if (!sticker.aliases) return;
+    const kept = sticker.aliases.filter((alias) => !liveNames.has(alias) && !claimedAliases.has(alias));
+    kept.forEach((alias) => claimedAliases.add(alias));
+    if (kept.length) sticker.aliases = kept; else delete sticker.aliases;
+  });
   const pickerCategories = [...categories];
   if (stickers.some(({ categoryId }) => categoryId === '__uncategorized')) pickerCategories.push({ id: '__uncategorized', name: '未分类' });
   const upload = raw.upload && typeof raw.upload === 'object' ? {
@@ -39,8 +52,15 @@ export function insertStickerToken(text, start, end, name) {
 }
 
 export function stickerTokens(text, catalog) {
-  const byName = new Map((catalog?.stickers || []).map((item) => [item.name, item])); const result = []; const pattern = /\[bqb:([^\]\r\n]{1,80})\]/gu; let match;
-  while ((match = pattern.exec(String(text || ''))) && result.length < MAX_STICKERS_PER_MESSAGE) if (byName.has(match[1])) result.push({ ...byName.get(match[1]), token: match[0], index: match.index });
+  const stickers = catalog?.stickers || [];
+  const byName = new Map(stickers.map((item) => [item.name, item]));
+  const byAlias = new Map();
+  stickers.forEach((item) => (item.aliases || []).forEach((alias) => { if (!byName.has(alias) && !byAlias.has(alias)) byAlias.set(alias, item); }));
+  const result = []; const pattern = /\[bqb:([^\]\r\n]{1,80})\]/gu; let match;
+  while ((match = pattern.exec(String(text || ''))) && result.length < MAX_STICKERS_PER_MESSAGE) {
+    const hit = byName.get(match[1]) || byAlias.get(match[1]);
+    if (hit) result.push({ ...hit, token: match[0], index: match.index });
+  }
   return result;
 }
 

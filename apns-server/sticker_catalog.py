@@ -8,8 +8,13 @@ URL from an operator-configured HTTPS base plus a filename in a manifest.
 Manifests are intentionally tiny JSON documents, for example::
 
     {"version": 1, "category": {"id": "xiaodou", "name": "小黄豆"}, "stickers": [
-      {"name": "小黄豆·抱抱·2", "file": "小黄豆·抱抱·2.gif", "label": "抱抱"}
+      {"name": "小黄豆·抱抱·2", "file": "小黄豆·抱抱·2.gif", "label": "抱抱",
+       "aliases": ["抱抱"]}
     ]}
+
+``aliases`` are legacy ``[bqb:name]`` tokens kept so historical messages still
+resolve after a 「分类·真名」 rename; they never affect URL construction and a
+visible name always wins over any alias.
 
 They may be local files or HTTPS URLs configured by the operator.  A manifest
 may not provide arbitrary image URLs.
@@ -34,6 +39,7 @@ logger = logging.getLogger(__name__)
 _MAX_MANIFEST_BYTES = 512 * 1024
 _MAX_STICKERS = 512
 _MAX_NAME_CHARS = 80
+_MAX_ALIASES_PER_STICKER = 8
 _MAX_CATEGORY_ID_CHARS = 48
 _IMAGE_EXTENSIONS = {".gif", ".png", ".jpg", ".jpeg", ".webp"}
 # The configured static host can take >5s to answer through Cloudflare; a short
@@ -68,6 +74,26 @@ def _safe_display_label(raw: Any, fallback: str) -> str:
     manifests while keeping untrusted display text out of the catalog.
     """
     return raw if is_valid_sticker_name(raw) else fallback
+
+
+def _safe_aliases(raw: Any, name: str) -> list[str]:
+    """Validate optional legacy ``[bqb:name]`` tokens kept after a rename.
+
+    Aliases let clients resolve historical messages whose tokens predate the
+    「分类·真名」 rename.  They follow the exact same safety rules as names,
+    never participate in URL construction, and malformed entries are dropped
+    individually so one bad alias cannot hide the sticker itself.
+    """
+    aliases: list[str] = []
+    if not isinstance(raw, list):
+        return aliases
+    for candidate in raw:
+        if (isinstance(candidate, str) and candidate != name
+                and is_valid_sticker_name(candidate) and candidate not in aliases):
+            aliases.append(candidate)
+        if len(aliases) >= _MAX_ALIASES_PER_STICKER:
+            break
+    return aliases
 
 
 def is_valid_category_id(value: Any) -> bool:
@@ -125,7 +151,7 @@ def _normalise_base_url(raw: Any) -> str | None:
     return candidate.rstrip("/")
 
 
-def _safe_catalog_entry(item: Any, base_url: str) -> dict[str, str] | None:
+def _safe_catalog_entry(item: Any, base_url: str) -> dict[str, Any] | None:
     if not isinstance(item, dict):
         return None
     name = item.get("name")
@@ -141,12 +167,15 @@ def _safe_catalog_entry(item: Any, base_url: str) -> dict[str, str] | None:
     # impossible even when somebody accidentally publishes a bad manifest.
     if suffix not in _IMAGE_EXTENSIONS or stem != name:
         return None
-    entry = {"name": name, "url": f"{base_url}/{quote(filename, safe='-._~()')}"}
+    entry: dict[str, Any] = {"name": name, "url": f"{base_url}/{quote(filename, safe='-._~()')}"}
     label = _safe_display_label(item.get("label"), name)
     # Omit the field when it is equivalent to the protocol token.  That keeps
     # legacy payloads stable; newer clients fall back to `name` when absent.
     if label != name:
         entry["label"] = label
+    aliases = _safe_aliases(item.get("aliases"), name)
+    if aliases:
+        entry["aliases"] = aliases
     return entry
 
 
@@ -246,7 +275,7 @@ class StickerCatalogService:
     def _build_catalog(self) -> dict[str, Any]:
         if not self.enabled or not self.sources:
             return {"ok": True, "version": "disabled", "categories": [], "stickers": []}
-        stickers: list[dict[str, str]] = []
+        stickers: list[dict[str, Any]] = []
         categories: list[dict[str, str]] = []
         categories_by_id: dict[str, dict[str, str]] = {}
         seen_names: set[str] = set()
@@ -313,6 +342,22 @@ class StickerCatalogService:
                     break
             if len(stickers) >= self.max_items:
                 break
+        # Names always win over aliases: an alias equal to any visible sticker
+        # name, or already claimed by an earlier sticker, is dropped so a
+        # legacy token can never become ambiguous or shadow a live name.
+        visible_names = {entry["name"] for entry in stickers}
+        claimed_aliases: set[str] = set()
+        for entry in stickers:
+            aliases = entry.get("aliases")
+            if not aliases:
+                continue
+            kept = [alias for alias in aliases
+                    if alias not in visible_names and alias not in claimed_aliases]
+            claimed_aliases.update(kept)
+            if kept:
+                entry["aliases"] = kept
+            else:
+                del entry["aliases"]
         fingerprint = hashlib.sha256(
             json.dumps(
                 {"categories": categories, "stickers": stickers},

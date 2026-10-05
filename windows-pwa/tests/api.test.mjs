@@ -95,6 +95,23 @@ test('sticker catalog trusts only the exact asset origin and exact known BQB tok
   assert.deepEqual(parseStickerParts('[bqb:爱] [bqb:未知]', catalog).map((part) => part.type === 'text' ? part.value : part.sticker.name), ['爱', ' [bqb:未知]']);
 });
 
+test('sticker aliases resolve legacy tokens with name-exact priority and no ambiguity', () => {
+  const catalog = normalizeStickerCatalog({ stickers: [
+    { name: '自嘲熊·大哭', url: 'https://test.xiaonancaleb.xyz/stickers/a.gif', aliases: ['大哭', '[bqb:注入]', '自嘲熊·大哭'] },
+    { name: '哥哥熊·蹭蹭', url: 'https://test.xiaonancaleb.xyz/stickers/b.gif', aliases: ['抱抱', '蹭蹭'] },
+    { name: '抱抱', url: 'https://test.xiaonancaleb.xyz/stickers/c.gif' },
+    { name: '哥哥熊·不可以', url: 'https://test.xiaonancaleb.xyz/stickers/d.gif', aliases: ['蹭蹭'] },
+  ] });
+  assert.deepEqual(catalog.stickers[0].aliases, ['大哭']);
+  assert.deepEqual(catalog.stickers[1].aliases, ['蹭蹭']);
+  assert.equal(catalog.stickers[2].aliases, undefined);
+  assert.equal(catalog.stickers[3].aliases, undefined);
+  const resolved = stickerTokens('[bqb:大哭] [bqb:抱抱] [bqb:蹭蹭]', catalog);
+  assert.deepEqual(resolved.map(({ name }) => name), ['自嘲熊·大哭', '抱抱', '哥哥熊·蹭蹭']);
+  assert.equal(resolved[0].token, '[bqb:大哭]');
+  assert.deepEqual(stickerTokens('[bqb:不可以]', catalog), []);
+});
+
 test('sticker insertion is exact at the cursor, stays contact scoped, and never sends', () => {
   const composers = createComposerState(); composers.get('xiaoke').text = '前后'; composers.get('kairos').text = 'Kairos 草稿'; let sends = 0;
   const inserted = insertStickerToken(composers.get('xiaoke').text, 1, 1, '爱'); composers.get('xiaoke').text = inserted.text;
