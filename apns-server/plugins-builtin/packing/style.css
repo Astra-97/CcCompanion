@@ -1,0 +1,145 @@
+:root {
+  --bg: #12141a;
+  --card: #1c2029;
+  --card-border: #2a2f3b;
+  --text: #e8e8ec;
+  --text-dim: #9aa0ae;
+  --accent: #7ee2a8;
+  --packed: #34c77b;
+  --pending: #8b93a5;
+  --muted: #5a606e;
+  --danger: #e2737e;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 16px;
+  font-family: -apple-system, "PingFang SC", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+main { max-width: 520px; margin: 0 auto; }
+
+h1 { font-size: 20px; margin: 0 0 6px; }
+.summary { font-size: 13px; color: var(--text-dim); margin: 0 0 8px; }
+
+.progress-track {
+  height: 6px;
+  border-radius: 3px;
+  background: #232836;
+  overflow: hidden;
+  margin-bottom: 16px;
+}
+.progress-bar {
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background: var(--packed);
+  transition: width 0.25s ease;
+}
+
+.add-row { display: flex; gap: 8px; margin-bottom: 16px; }
+.add-row input {
+  flex: 1;
+  padding: 9px 12px;
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  background: var(--card);
+  color: var(--text);
+  font-size: 14px;
+}
+.add-row input::placeholder { color: var(--muted); }
+.add-row input:focus { outline: none; border-color: var(--accent); }
+
+button {
+  padding: 9px 14px;
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  background: var(--card);
+  color: var(--text);
+  font-size: 14px;
+  cursor: pointer;
+}
+button:active { background: #262c38; }
+
+.item-list { list-style: none; margin: 0; padding: 0; }
+
+.item-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 12px;
+  padding: 11px 12px;
+  margin-bottom: 8px;
+}
+
+.status-badge {
+  flex-shrink: 0;
+  min-width: 58px;
+  text-align: center;
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  user-select: none;
+}
+.status-pending { color: var(--pending); border-color: var(--pending); }
+.status-packed { color: var(--packed); border-color: var(--packed); background: rgba(52, 199, 123, 0.12); }
+.status-not_bringing { color: var(--muted); border-color: var(--muted); }
+
+.item-name {
+  flex: 1;
+  font-size: 15px;
+  cursor: pointer;
+  user-select: none;
+  word-break: break-all;
+}
+.item-card.is-packed .item-name { color: var(--packed); }
+.item-card.is-not-bringing .item-name { color: var(--muted); text-decoration: line-through; }
+.item-card.is-not-bringing { opacity: 0.6; }
+
+.del-btn {
+  flex-shrink: 0;
+  padding: 4px 10px;
+  font-size: 13px;
+  color: var(--danger);
+  border-color: transparent;
+  background: transparent;
+}
+.del-btn:active { background: rgba(226, 115, 126, 0.12); }
+
+.empty-hint { text-align: center; color: var(--muted); font-size: 13px; padding: 24px 0; }
+.hidden { display: none; }
+
+.footer-row { margin: 16px 0; text-align: center; }
+.ghost-btn { color: var(--text-dim); font-size: 13px; }
+
+.token-box { margin-top: 16px; }
+.token-box label { font-size: 13px; color: var(--text-dim); }
+.token-box input {
+  width: 100%;
+  margin-top: 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--text);
+}
+.token-box button { margin-top: 6px; }
+
+.log {
+  background: #0c0e12;
+  color: #8f8;
+  font-size: 12px;
+  padding: 10px;
+  border-radius: 8px;
+  min-height: 20px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.log:empty { display: none; }

@@ -1,0 +1,7 @@
+{
+  "id": "packing",
+  "name": "打包清单",
+  "version": "1.0.0",
+  "description": "出行打包清单：三态循环（待打包→已打包→不带），与原生打包页同源数据（已迁移云端 packing_list）。",
+  "entry": "index.html"
+}

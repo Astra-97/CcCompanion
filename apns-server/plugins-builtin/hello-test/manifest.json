@@ -1,0 +1,7 @@
+{
+  "id": "hello-test",
+  "name": "链路测试",
+  "version": "0.1.0",
+  "description": "最小链路验证：页面渲染 + KV 读写往返（计数器存 doc state）。",
+  "entry": "index.html"
+}
