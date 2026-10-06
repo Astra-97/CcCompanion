@@ -4406,19 +4406,44 @@ class ServerState:
 
         # chat history 持久化跟 token 同目录
         chat_history_path = Path(self.token_store_path).parent / "chat_history.jsonl"
-        self.chat = ChatHistory(chat_history_path)
+        # All contact assistant replies funnel through ChatHistory.append —
+        # that is the choke point where [bqb:] tokens get one normalization
+        # pass against the sticker catalog before persistence.  User messages
+        # (role="user") never pass through the normalizer.
+        bqb_normalizer = self.sticker_catalog.normalize_outgoing_text
+        self.chat = ChatHistory(
+            chat_history_path, assistant_text_normalizer=bqb_normalizer
+        )
         contact_history_dir = Path(self.token_store_path).parent
         self.contact_chats: dict[str, ChatHistory] = {
             "xiaoke": self.chat,
-            "kairos": ChatHistory(contact_history_dir / "chat_history_kairos.jsonl"),
-            "kimi": ChatHistory(contact_history_dir / "chat_history_kimi.jsonl"),
+            "kairos": ChatHistory(
+                contact_history_dir / "chat_history_kairos.jsonl",
+                assistant_text_normalizer=bqb_normalizer,
+            ),
+            "kimi": ChatHistory(
+                contact_history_dir / "chat_history_kimi.jsonl",
+                assistant_text_normalizer=bqb_normalizer,
+            ),
             # kiro 桥接 (2026-09-09)
-            "kiro": ChatHistory(contact_history_dir / "chat_history_kiro.jsonl"),
-            "hajiki": ChatHistory(contact_history_dir / "chat_history_hajiki.jsonl"),
-            "apples": ChatHistory(contact_history_dir / "chat_history_apples.jsonl"),
+            "kiro": ChatHistory(
+                contact_history_dir / "chat_history_kiro.jsonl",
+                assistant_text_normalizer=bqb_normalizer,
+            ),
+            "hajiki": ChatHistory(
+                contact_history_dir / "chat_history_hajiki.jsonl",
+                assistant_text_normalizer=bqb_normalizer,
+            ),
+            "apples": ChatHistory(
+                contact_history_dir / "chat_history_apples.jsonl",
+                assistant_text_normalizer=bqb_normalizer,
+            ),
             # 小克·工具版 (toolbot) — 只读派活存档窗口。scheduler 往这里写派活记录，
             # app 端围观；用户不能往这个 contact 发消息 (chat/send 会 501)。
-            "toolbot": ChatHistory(contact_history_dir / "chat_history_toolbot.jsonl"),
+            "toolbot": ChatHistory(
+                contact_history_dir / "chat_history_toolbot.jsonl",
+                assistant_text_normalizer=bqb_normalizer,
+            ),
         }
         # This is a registration table, not merely a presentation catalog.
         # A contact becomes chat/forward-capable only after a concrete handler

@@ -123,12 +123,20 @@ class EphemeralTaskBuffer:
 
 
 class ChatHistory:
-    def __init__(self, path: str | Path):
+    def __init__(
+        self,
+        path: str | Path,
+        assistant_text_normalizer: Any = None,
+    ):
         self.path = Path(path).expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._cache: list[dict[str, Any]] | None = None
         self._CACHE_SIZE = 1000
+        # Optional callable str -> str applied to assistant texts right before
+        # persistence (e.g. [bqb:] token rescue).  User messages never pass
+        # through it, and a raising normalizer must not lose a reply.
+        self._assistant_text_normalizer = assistant_text_normalizer
 
     def _read_tail_from_file(self, n: int) -> list[dict[str, Any]]:
         """Read last n records by seeking from end of file. O(n) not O(file)."""
@@ -192,6 +200,18 @@ class ChatHistory:
         sender_name: str | None = None,
         mentions: list[str] | None = None,
     ) -> dict[str, Any]:
+        if (
+            role == "assistant"
+            and self._assistant_text_normalizer is not None
+            and isinstance(text, str)
+        ):
+            try:
+                text = self._assistant_text_normalizer(text)
+            except Exception:
+                logger.warning(
+                    "assistant text normalizer failed; storing original text",
+                    exc_info=True,
+                )
         rec: dict[str, Any] = {
             "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds"),
             "role": role,

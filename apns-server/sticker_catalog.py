@@ -26,6 +26,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+import re
 import threading
 import time
 import unicodedata
@@ -380,3 +381,141 @@ class StickerCatalogService:
         """Force the next request to fetch configured manifests again."""
         with self._lock:
             self._cached_at = float("-inf")
+
+    def normalize_outgoing_text(self, text: str) -> str:
+        """Fail-open ``normalize_bqb_tokens`` over the live catalog snapshot.
+
+        A catalog that cannot be built (or a bug in the normalizer itself)
+        must never eat or corrupt an assistant reply, so every failure path
+        returns the original text untouched.
+        """
+        if not text or "[bqb" not in text:
+            return text
+        try:
+            snapshot = self.snapshot()
+        except Exception:
+            logger.warning(
+                "sticker catalog snapshot unavailable; leaving [bqb:] tokens untouched",
+                exc_info=True,
+            )
+            return text
+        try:
+            return normalize_bqb_tokens(text, snapshot)
+        except Exception:
+            logger.warning(
+                "bqb token normalization failed; leaving text untouched",
+                exc_info=True,
+            )
+            return text
+
+
+# Same token shape as the clients (windows-pwa sticker-protocol.js /
+# StickerProtocol.kt), plus the full-width colon variant models keep emitting:
+# ``[bqb：名字]`` would otherwise stay dead text.  No ``[``/``]``/newline
+# inside, 1..80 chars: a greedy match must not swallow a second token, and
+# half-written or nested text is never captured (catalog names themselves may
+# never contain brackets per is_valid_sticker_name).
+_BQB_TOKEN_RE = re.compile(r"\[bqb[:：]([^\[\]\r\n]{1,80})\]")
+# 「哥哥熊」 is an exclusive pack: it may only be hit by an exact full name or
+# an explicit ``哥哥熊·`` prefix.  Bare-true-name / wrong-prefix rescue must
+# never rewrite a token into this pack — dead text beats a misfired sticker.
+_EXCLUSIVE_CATEGORY_NAME = "哥哥熊"
+
+
+def _token_truename(name: str) -> str:
+    """Strip the leading ``分类·`` segment; the remainder is the true name."""
+    parts = name.split("·")
+    return "·".join(parts[1:]) if len(parts) > 1 else name
+
+
+def normalize_bqb_tokens(text: str, snapshot: dict[str, Any]) -> str:
+    """Best-effort rescue of ``[bqb:name]`` tokens in an outgoing AI message.
+
+    For every token (half-width ``:`` or full-width ``：`` colon):
+
+    1. exact catalog ``name`` hit → keep the name (colon normalized to ``:``);
+    2. exact ``aliases`` hit → rewrite to that entry's ``name``;
+    3. otherwise strip the (possibly wrong) category prefix and match the true
+       name against every entry's name-truename / label / aliases:
+       exactly one match → that entry's ``name``; several → prefer an entry
+       whose ``label`` equals the true name, ties broken by catalog order;
+       none → keep the token byte-for-byte (dead text over wrong sticker).
+
+    「哥哥熊」 entries only participate in steps 2/3 when the token explicitly
+    starts with ``哥哥熊·``; an explicit prefix searches inside that category.
+    """
+    if not text or "[bqb" not in text or not isinstance(snapshot, dict):
+        return text
+    entries = [
+        entry
+        for entry in (snapshot.get("stickers") or [])
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+    ]
+    if not entries:
+        return text
+    category_names = {
+        category.get("id"): category.get("name")
+        for category in (snapshot.get("categories") or [])
+        if isinstance(category, dict)
+    }
+
+    def is_exclusive(entry: dict[str, Any]) -> bool:
+        category_id = entry.get("category_id")
+        return (
+            category_id is not None
+            and category_names.get(category_id) == _EXCLUSIVE_CATEGORY_NAME
+        )
+
+    by_name: dict[str, dict[str, Any]] = {}
+    by_alias: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        by_name.setdefault(entry["name"], entry)
+        for alias in entry.get("aliases") or []:
+            if isinstance(alias, str):
+                by_alias.setdefault(alias, entry)
+
+    def rewrite(match: re.Match[str]) -> str:
+        raw = match.group(1)
+        explicit_exclusive = (
+            "·" in raw and raw.split("·", 1)[0] == _EXCLUSIVE_CATEGORY_NAME
+        )
+        resolved: str | None = None
+        hit = by_name.get(raw)
+        if hit is not None:
+            # Exact full name always wins, 「哥哥熊·…」 included (rule 4).
+            resolved = hit["name"]
+        else:
+            hit = by_alias.get(raw)
+            if hit is not None and (explicit_exclusive or not is_exclusive(hit)):
+                resolved = hit["name"]
+            else:
+                true_name = _token_truename(raw)
+                if explicit_exclusive:
+                    pool = [entry for entry in entries if is_exclusive(entry)]
+                else:
+                    pool = [entry for entry in entries if not is_exclusive(entry)]
+                matches: list[dict[str, Any]] = []
+                for entry in pool:
+                    candidates = {_token_truename(entry["name"])}
+                    label = entry.get("label")
+                    if isinstance(label, str):
+                        candidates.add(label)
+                    for alias in entry.get("aliases") or []:
+                        if isinstance(alias, str):
+                            candidates.add(alias)
+                    if true_name in candidates:
+                        matches.append(entry)
+                if matches:
+                    label_hits = [
+                        entry for entry in matches if entry.get("label") == true_name
+                    ]
+                    resolved = (label_hits or matches)[0]["name"]
+        if resolved is None:
+            # 宁缺毋滥: keep the original token exactly, colon included.
+            return match.group(0)
+        new_token = f"[bqb:{resolved}]"
+        if new_token != match.group(0):
+            logger.info("bqb token rewrite: %s -> %s", match.group(0), new_token)
+        return new_token
+
+    return _BQB_TOKEN_RE.sub(rewrite, text)
