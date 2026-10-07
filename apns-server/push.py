@@ -10304,7 +10304,7 @@ class PushHandler(BaseHTTPRequestHandler):
             cat = CATEGORY_LABELS.get(ev.get("category", "personal"), "")
             note_part = f" ({ev.get('notes')})" if ev.get("notes") else ""
             ping_text = f"[日程·{cat}] {now} {ev.get('title', '事件')}{note_part}"
-            self.state.chat.append({"role": "assistant", "text": ping_text, "source": "calendar:tick"})
+            self.state.chat.append(role="assistant", text=ping_text, source="calendar:tick")
         except Exception as e:
             logger.warning("calendar chat ping fail: %s", e)
 
