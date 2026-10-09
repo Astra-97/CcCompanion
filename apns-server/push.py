@@ -2560,6 +2560,33 @@ def _clamp_kimi_forge_seed_retain(value: Any) -> int:
     return max(0, min(KIMI_FORGE_SEED_RETAIN_MAX, retain))
 
 
+def _cap_forge_message_tail(
+    messages: list[tuple[str, str]],
+    max_bytes: int,
+) -> dict[str, Any]:
+    """Byte-cap a chronological [(role, text)] tail, dropping oldest first.
+
+    A single message larger than the cap is byte-truncated instead of
+    dropping the entire tail.  Shared by the Kimi archive reader and the
+    Kiro chat-history reader (kiro 自动 forge 2026-10-08).
+    """
+    tail = list(messages)
+    sizes = [len(text.encode("utf-8")) for _role, text in tail]
+    total = sum(sizes)
+    dropped = 0
+    while len(tail) > 1 and total > max_bytes:
+        total -= sizes.pop(0)
+        tail.pop(0)
+        dropped += 1
+    truncated = False
+    if tail and total > max_bytes:
+        role, text = tail[0]
+        encoded = text.encode("utf-8")[:max_bytes]
+        tail[0] = (role, encoded.decode("utf-8", errors="ignore") + " …[截断]")
+        truncated = True
+    return {"messages": tail, "dropped": dropped, "truncated": truncated}
+
+
 def _load_kimi_session_recent_messages(
     session_id: str,
     *,
@@ -2637,22 +2664,56 @@ def _load_kimi_session_recent_messages(
             if text:
                 messages.append(("assistant", text))
     tail = messages[-limit:]
-    sizes = [len(text.encode("utf-8")) for _role, text in tail]
-    total = sum(sizes)
-    dropped = 0
-    while len(tail) > 1 and total > max_bytes:
-        total -= sizes.pop(0)
-        tail.pop(0)
-        dropped += 1
-    truncated = False
-    if tail and total > max_bytes:
-        # A single message larger than the cap is byte-truncated instead of
-        # dropping the entire tail.
-        role, text = tail[0]
-        encoded = text.encode("utf-8")[:max_bytes]
-        tail[0] = (role, encoded.decode("utf-8", errors="ignore") + " …[截断]")
-        truncated = True
-    return {"messages": tail, "dropped": dropped, "truncated": truncated}
+    return _cap_forge_message_tail(tail, max_bytes)
+
+
+def _classify_forge_task_files(
+    task_files: list[Path],
+    *,
+    reports_dir: Path | None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Classify forge task JSON files into finished/pending inventories.
+
+    Shared by the Kimi and Kiro session task scanners (kiro 自动 forge
+    2026-10-08).  A corrupt or unreadable task file is skipped: task
+    bookkeeping must never block or break a forge.
+    """
+    result: dict[str, list[dict[str, Any]]] = {"finished": [], "pending": []}
+    for task_file in task_files[:256]:
+        try:
+            if not task_file.is_file() or task_file.stat().st_size > 256 * 1024:
+                continue
+            raw = json.loads(task_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        task_id = str(raw.get("taskId") or task_file.stem).strip()
+        # The id is joined into a report path below and echoed into prompts,
+        # so it gets the same whitelist as the session id (real ids are
+        # "agent-…"/"bash-…"); anything else is treated as corrupt.
+        if not task_id or not all(
+            char.isalnum() or char in {"-", "_"} for char in task_id
+        ):
+            continue
+        entry: dict[str, Any] = {
+            "task_id": task_id[:120],
+            "description": str(raw.get("description") or "")[:120],
+            "status": str(raw.get("status") or "unknown")[:40],
+            "kind": str(raw.get("kind") or "")[:40],
+        }
+        if reports_dir is not None:
+            try:
+                report = reports_dir / f"{task_id}.md"
+                if report.is_file():
+                    entry["report_path"] = str(report)
+            except OSError:
+                pass
+        if entry["status"] in KIMI_TASK_TERMINAL_STATUSES:
+            result["finished"].append(entry)
+        else:
+            result["pending"].append(entry)
+    return result
 
 
 def _scan_kimi_session_tasks(
@@ -2679,47 +2740,111 @@ def _scan_kimi_session_tasks(
         else Path.home() / ".kimi-code" / "task-reports"
     )
     clean = str(session_id or "").strip()
-    result: dict[str, list[dict[str, Any]]] = {"finished": [], "pending": []}
+    empty: dict[str, list[dict[str, Any]]] = {"finished": [], "pending": []}
     if not clean or not all(char.isalnum() or char in {"-", "_"} for char in clean):
-        return result
+        return empty
     try:
         candidates = sorted(root.glob(f"wd_*/{clean}/agents/*/tasks/*.json"))
     except OSError:
-        return result
-    for task_file in candidates[:256]:
-        try:
-            if not task_file.is_file() or task_file.stat().st_size > 256 * 1024:
-                continue
-            raw = json.loads(task_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        return empty
+    return _classify_forge_task_files(candidates, reports_dir=reports)
+
+
+# kiro 自动 forge (2026-10-08): forge seed verbatim tail from the server-side
+# Kiro chat history (chat_history_kiro.jsonl).  Kiro's own session archive is
+# kiro-cli-private with no documented format, so the tail reads the same rows
+# the App shows.  Same retain clamp and byte cap as Kimi.
+KIRO_FORGE_SEED_TAIL_MAX_BYTES = 64 * 1024
+# Assistant rows with these sources are system noise (forge/session notices,
+# recall cards), never verbatim conversation.
+_KIRO_FORGE_TAIL_SKIP_SOURCE_PREFIXES = ("system:", "memory-recall:")
+_KIRO_FORGE_TAIL_SKIP_SOURCES = frozenset({"kiro-acp:new-session"})
+
+
+def _parse_kiro_auto_forge_threshold(value: Any) -> float:
+    """Validate the kiro_auto_forge_threshold_percent config (default 80).
+
+    Out-of-range or unparseable values (including NaN/inf) fall back to 80,
+    same policy as codex_auto_forge_threshold_percent.
+    """
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError):
+        return 80.0
+    return threshold if 1.0 <= threshold <= 100.0 else 80.0
+
+
+def _scan_kiro_session_tasks(
+    session_id: str,
+    *,
+    sessions_root: str | Path | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Inventory one Kiro session's background tasks before a controlled forge.
+
+    kiro-cli 2.21.x exposes no background-task store on the wire or on disk
+    (sessions live under ~/.kiro/sessions with no tasks model), so today this
+    always returns empty lists.  The scanner keeps Kimi's exact contract —
+    same entry shape, same whitelist, same terminal statuses — so a future
+    Kiro task store in the same layout is picked up without touching the
+    forge pipeline.
+    """
+    root = (
+        Path(sessions_root).expanduser()
+        if sessions_root
+        else Path.home() / ".kiro" / "sessions"
+    )
+    clean = str(session_id or "").strip()
+    empty: dict[str, list[dict[str, Any]]] = {"finished": [], "pending": []}
+    if not clean or not all(char.isalnum() or char in {"-", "_"} for char in clean):
+        return empty
+    try:
+        candidates = sorted(root.glob(f"*/{clean}/agents/*/tasks/*.json"))
+        candidates += sorted(root.glob(f"{clean}/agents/*/tasks/*.json"))
+    except OSError:
+        return empty
+    # No Kiro task-report directory exists; report paths stay absent.
+    return _classify_forge_task_files(candidates, reports_dir=None)
+
+
+def _load_kiro_recent_messages(
+    chat: Any,
+    *,
+    limit: int,
+    max_bytes: int | None = None,
+) -> dict[str, Any] | None:
+    """Read the last ``limit`` user/assistant text messages from Kiro's chat history.
+
+    Returns the same dict shape as ``_load_kimi_session_recent_messages`` in
+    chronological order, or ``None`` when the history is unreadable — a forge
+    must never fail because of this best-effort read.  Hidden rows, non-text
+    roles (tool cards), system notices and recall cards are skipped; only
+    verbatim conversation survives.
+    """
+    if limit <= 0:
+        return {"messages": [], "dropped": 0, "truncated": False}
+    if max_bytes is None:
+        max_bytes = KIRO_FORGE_SEED_TAIL_MAX_BYTES
+    try:
+        rows = chat.tail(max(limit * 4, limit))
+    except Exception:
+        return None
+    messages: list[tuple[str, str]] = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict) or row.get("hidden_in_ui"):
             continue
-        if not isinstance(raw, dict):
+        role = row.get("role")
+        if role not in {"user", "assistant"}:
             continue
-        task_id = str(raw.get("taskId") or task_file.stem).strip()
-        # The id is joined into a report path below and echoed into prompts,
-        # so it gets the same whitelist as the session id (real ids are
-        # "agent-…"/"bash-…"); anything else is treated as corrupt.
-        if not task_id or not all(
-            char.isalnum() or char in {"-", "_"} for char in task_id
+        source = str(row.get("source") or "")
+        if role == "assistant" and (
+            source in _KIRO_FORGE_TAIL_SKIP_SOURCES
+            or source.startswith(_KIRO_FORGE_TAIL_SKIP_SOURCE_PREFIXES)
         ):
             continue
-        entry: dict[str, Any] = {
-            "task_id": task_id[:120],
-            "description": str(raw.get("description") or "")[:120],
-            "status": str(raw.get("status") or "unknown")[:40],
-            "kind": str(raw.get("kind") or "")[:40],
-        }
-        try:
-            report = reports / f"{task_id}.md"
-            if report.is_file():
-                entry["report_path"] = str(report)
-        except OSError:
-            pass
-        if entry["status"] in KIMI_TASK_TERMINAL_STATUSES:
-            result["finished"].append(entry)
-        else:
-            result["pending"].append(entry)
-    return result
+        text = str(row.get("text") or "").strip()
+        if text:
+            messages.append((role, text))
+    return _cap_forge_message_tail(messages[-limit:], max_bytes)
 
 
 class AutoForgeClaimStore:
@@ -4694,6 +4819,26 @@ class ServerState:
         # 仅内存态（与 Kimi 相同）。
         self.kiro_chat_queue: deque[dict[str, Any]] = deque()
         self.kiro_chat_queue_worker_running = False
+        # kiro 自动 forge (2026-10-08)：上下文使用率超过阈值时自动 forge
+        # （默认 80，对齐 codex_auto_forge_threshold_percent / Kimi 的 0.8）。
+        # 用量来源是 ACP `_kiro.dev/metadata` 通知里的
+        # contextUsagePercentage（kiro_acp 缓存最新值，kiro 状态栏同款）；
+        # 还没有任何用量读数（None）时不触发。自动 forge 挂在 Kiro 聊天路径
+        # 上，且与 POST /kiro/forge 走同一套移交管线（任务盘点 + handoff
+        # 登记 + seed 注入 + 用户通知），绝不做无声 forge。显式设为 false
+        # 禁用；阈值越界回落 80。Kiro 正忙或 forge 失败时沿用旧会话，绝不
+        # 影响本条消息发送。
+        self.kiro_auto_forge_enabled: bool = bool(
+            server_cfg.get("kiro_auto_forge_enabled", True)
+        )
+        self.kiro_auto_forge_threshold_percent = _parse_kiro_auto_forge_threshold(
+            server_cfg.get("kiro_auto_forge_threshold_percent", 80.0)
+        )
+        # seed 原文 tail 条数：默认 80（对齐 Kairos/Kimi），钳位 [0,160]，
+        # 0 关闭原文 tail；读取历史失败时降级为纯摘要，绝不让 forge 失败。
+        self.kiro_auto_forge_retain_messages: int = _clamp_kimi_forge_seed_retain(
+            server_cfg.get("kiro_auto_forge_retain_messages", KIMI_FORGE_SEED_RETAIN_DEFAULT)
+        )
         self.kimi_web = KimiWebClient(
             command=server_cfg.get("kimi_bin", "/root/.kimi-code/bin/kimi"),
             port=int(server_cfg.get("kimi_web_port", 58627)),
@@ -14759,6 +14904,15 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         prepare_ms = int((time.monotonic() - prepare_started) * 1000)
 
+        # kiro 自动 forge (2026-10-08)：上下文阈值自动 forge（默认 80%），与
+        # POST /kiro/forge 同一套移交管线，换的是 ACP 常驻会话指针。此时仍
+        # 持有 prepare 预约，管线不会另行加锁。失败或 Kiro 正忙时沿用旧会
+        # 话，绝不影响本条消息发送。
+        try:
+            session_id, _forged = self._maybe_forge_kiro_session(session_id)
+        except Exception:
+            logger.warning("Kiro auto-forge failed, continuing with existing session", exc_info=True)
+
         with self.state.kiro_turn_lock:
             if self.state.kiro_prepare_token != prepare_token or self.state.kiro_active_turn:
                 self._release_kiro_prepare(prepare_token)
@@ -15320,6 +15474,372 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception:
             logger.exception("Kiro new-session notice append failed")
         self._send_json(200, {"ok": True, "session_id": session_id})
+
+    # ---------- kiro 自动 forge (2026-10-08) — 受控 forge 移交管线 ----------
+    # 与 Kimi 同款（_kimi_forge_*）两段式：swap + finish，阈值自动 forge 与
+    # POST /kiro/forge 共用。差异：Kiro 的唯一通道是 ACP，swap 由
+    # kiro_acp.forge_new_session 完成（总结旧会话 + session/new + 钉选重放 +
+    # 指针提交，全程 _prepare_lock）；任务盘点走 _scan_kiro_session_tasks
+    # （kiro-cli 目前无后台任务模型，盘点恒为空，但管线与登记格式已就位）；
+    # seed 的原文 tail 读服务端 chat_history_kiro.jsonl 而非会话存档。
+
+    def _handle_kiro_forge(self, body: dict[str, Any]) -> None:
+        """POST /kiro/forge — 显式受控 forge（常驻会话的逃生门）。
+
+        与阈值自动 forge 共用同一套移交管线
+        （``_kiro_forge_swap_session`` + ``_kiro_forge_finish_handoff``）：
+        换会话前总结旧会话，交接材料（摘要 + 重要状态 + 最近对话原文 +
+        handoff 登记）注入新会话的 seed prompt。绝不做无声 forge。
+        """
+        with self.state.kiro_turn_lock:
+            if self.state.kiro_active_turn or self.state.kiro_prepare_token:
+                self._send_json(409, {
+                    "ok": False,
+                    "error": "kiro_turn_active",
+                    "reason": "Kiro 正在回复，等当前回复结束后再 forge。",
+                })
+                return
+            prepare_token = secrets.token_hex(16)
+            self.state.kiro_prepare_token = prepare_token
+        try:
+            # 与聊天发送同款：TUI 与 ACP 绝不同时写会话，先让空闲 TUI 交还。
+            handed_off = self._handoff_kiro_terminal_to_writer(prepare_token)
+        except KiroTerminalBusy:
+            self._release_kiro_prepare(prepare_token)
+            self._send_json(409, {
+                "ok": False,
+                "error": "kiro_terminal_busy",
+                "reason": "Kiro 终端正在使用中，等它空闲后再 forge。",
+            })
+            return
+        if not handed_off:
+            self._release_kiro_prepare(prepare_token)
+            self._send_json(503, {
+                "ok": False,
+                "error": "kiro_terminal_handoff_failed",
+                "reason": "Kiro 终端未能安全交还聊天，本次 forge 未执行。",
+            })
+            return
+        try:
+            error, ctx = self._kiro_forge_swap_session()
+        finally:
+            self._release_kiro_prepare(prepare_token)
+        if error is not None:
+            self._send_json(self._kiro_forge_error_status(error), error)
+            return
+        self._send_json(200, self._kiro_forge_finish_handoff(ctx, trigger="manual"))
+
+    @staticmethod
+    def _kiro_forge_error_status(error: dict[str, Any]) -> int:
+        if error.get("error") in {"no_active_kiro_session", "kiro_busy", "kiro_session_changed", "kiro_turn_active", "kiro_terminal_busy"}:
+            return 409
+        return 503
+
+    def _kiro_context_usage_percent(self) -> float | None:
+        """Latest ACP-reported contextUsagePercentage, None when never seen."""
+        acp = getattr(self.state, "kiro_acp", None)
+        getter = getattr(acp, "context_usage_percent", None)
+        if not callable(getter):
+            return None
+        try:
+            value = getter()
+        except Exception:
+            return None
+        if isinstance(value, bool):
+            return None
+        try:
+            percent = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return percent if 0.0 <= percent <= 100.0 else None
+
+    def _maybe_forge_kiro_session(self, session_id: str) -> tuple[str, bool]:
+        """Threshold auto-forge on the live ACP channel.
+
+        Runs the exact same handoff pipeline as POST /kiro/forge
+        (``_kiro_forge_swap_session`` + ``_kiro_forge_finish_handoff``).
+        Returns ``(session_id, forged)``; any failure — including a busy
+        Kiro — keeps the current session so the in-flight send just proceeds
+        and the next turn can retry the forge.  用量读数缺失（ACP 还没上报
+        过 contextUsagePercentage）时绝不触发。
+        """
+        if not getattr(self.state, "kiro_auto_forge_enabled", True):
+            return session_id, False
+        threshold = float(getattr(self.state, "kiro_auto_forge_threshold_percent", 80.0))
+        usage = self._kiro_context_usage_percent()
+        if usage is None or usage < threshold:
+            return session_id, False
+        logger.info(
+            "Kiro context usage %.2f%% exceeds threshold %.2f%%; forging new session",
+            usage,
+            threshold,
+        )
+        error, ctx = self._kiro_forge_swap_session(expected_old_session_id=session_id)
+        if error is not None:
+            if error.get("error") == "kiro_busy":
+                logger.info("Kiro is busy; auto-forge skipped this round")
+            else:
+                logger.warning("Kiro auto-forge skipped: %s", error.get("error"))
+            return session_id, False
+        try:
+            result = self._kiro_forge_finish_handoff(ctx, trigger="auto")
+        except Exception:
+            # 指针已提交新会话，本条消息必须跟着指针走，否则 prompt_existing
+            # 会因 session 不匹配失败、丢掉这一轮。
+            logger.exception("Kiro auto-forge handoff failed after pointer swap")
+            return str(ctx["new_session_id"]), True
+        new_session_id = str(result.get("active_session_id") or "")
+        if not new_session_id:
+            return session_id, False
+        logger.info("Kiro auto-forged new session %s", new_session_id)
+        return new_session_id, True
+
+    def _kiro_forge_swap_session(
+        self,
+        *,
+        expected_old_session_id: str = "",
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Shared first half of the forge pipeline on the ACP channel.
+
+        The caller must already hold the Kiro concurrency guard (a chat-send
+        prepare token or the /kiro/forge reservation).  Returns
+        ``(None, ctx)`` once the durable session pointer has moved to a
+        freshly forged session, or ``(error_payload, None)`` when nothing
+        was forged; ``error_payload["error"]`` maps to an HTTP status
+        through ``_kiro_forge_error_status``.  A busy ACP turn is a
+        ``kiro_busy`` error — automatic callers treat it as "skip this
+        round", never as a reason to interrupt an in-flight reply.
+        """
+        try:
+            acp = self.state.kiro_acp
+            old_session_id = str(acp.load_session_id() or "")
+            if not old_session_id:
+                return {"ok": False, "error": "no_active_kiro_session"}, None
+            if expected_old_session_id and old_session_id != expected_old_session_id:
+                # The pointer changed since the caller measured context usage;
+                # forging now would swap a session nobody evaluated.
+                return {"ok": False, "error": "kiro_session_changed"}, None
+            if getattr(acp, "busy", False):
+                return {"ok": False, "error": "kiro_busy",
+                        "reason": "Kiro 正在回复中，等这一轮结束后再 forge。"}, None
+            tasks = _scan_kiro_session_tasks(old_session_id)
+            usage_percent = self._kiro_context_usage_percent()
+            model = self._kiro_model_selection()
+            effort = self._kiro_effort_selection() or None
+            new_session_id, summary = acp.forge_new_session(model=model, effort=effort)
+        except Exception:
+            logger.warning("Kiro forge session swap failed", exc_info=True)
+            return {"ok": False, "error": "kiro_unavailable"}, None
+        return None, {
+            "old_session_id": old_session_id,
+            "new_session_id": new_session_id,
+            "summary": summary,
+            "tasks": tasks,
+            "usage_percent": usage_percent,
+            "model": model,
+            "effort": effort,
+        }
+
+    def _kiro_forge_finish_handoff(self, ctx: dict[str, Any], *, trigger: str) -> dict[str, Any]:
+        """Shared second half: handoff record, seed prompt, user notice.
+
+        Runs after the pointer has moved, so a failure here only degrades
+        the handoff, never the forge itself.  ``trigger`` is ``"manual"``
+        (POST /kiro/forge) or ``"auto"`` (context threshold) and only
+        changes the user-facing wording.
+        """
+        old_session_id = ctx["old_session_id"]
+        new_session_id = ctx["new_session_id"]
+        tasks = ctx["tasks"]
+        handoff_path = self._write_kiro_forge_handoff(ctx)
+        seed_ok, retained_messages = self._seed_kiro_forged_session(ctx, handoff_path)
+        notice = self._kiro_forge_notice_text(old_session_id, new_session_id, tasks, seed_ok, trigger=trigger)
+        try:
+            # role=assistant（而非 system）：Android 的 RealtimeNotificationService
+            # 只对 assistant 消息弹通知（isNotifiableAssistant），system 消息只会
+            # 静静躺在聊天记录里。source 保留 system:kiro-forge 作为出处标记。
+            # 对齐 Kimi/Kairos forge 通知。
+            self._chat_for_contact("kiro").append(
+                role="assistant",
+                text=notice,
+                source="system:kiro-forge",
+            )
+        except Exception:
+            logger.exception("Kiro forge notice history append failed")
+        title = (
+            "Kiro 上下文将满，已自动切换新会话" if trigger == "auto"
+            else "Kiro 已按你的要求切换新会话"
+        )
+        try:
+            self._send_chat_notification(title, notice[:80])
+        except Exception:
+            logger.warning("Kiro forge notification failed", exc_info=True)
+        return {
+            "ok": True,
+            "previous_session_id": old_session_id,
+            "active_session_id": new_session_id,
+            "model": ctx["model"],
+            "effort": ctx["effort"] or "",
+            "finished_tasks": len(tasks["finished"]),
+            "pending_tasks": len(tasks["pending"]),
+            "handoff_record": handoff_path,
+            "seed_submitted": seed_ok,
+            "retained_messages": retained_messages,
+        }
+
+    def _write_kiro_forge_handoff(self, ctx: dict[str, Any]) -> str:
+        """Persist the unfinished-task registry for one controlled forge."""
+        payload = {
+            "version": 1,
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "old_session_id": ctx["old_session_id"],
+            "new_session_id": ctx["new_session_id"],
+            "usage_percent": ctx.get("usage_percent"),
+            "model": str(ctx.get("model") or ""),
+            "effort": str(ctx.get("effort") or ""),
+            "summary": str(ctx.get("summary") or "")[:4000],
+            "pending_tasks": ctx["tasks"]["pending"],
+            "finished_tasks": ctx["tasks"]["finished"],
+        }
+        path = Path(self.state.token_store_path).expanduser().parent / "kiro_forge_handoff.json"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+            return str(path)
+        except Exception:
+            logger.exception("Kiro forge handoff record could not be written")
+            return ""
+
+    def _kiro_forge_notice_text(
+        self,
+        old_session_id: str,
+        new_session_id: str,
+        tasks: dict[str, list[dict[str, Any]]],
+        seed_ok: bool,
+        *,
+        trigger: str = "manual",
+    ) -> str:
+        if trigger == "auto":
+            lines = [
+                f"上下文使用率超过自动 forge 阈值，已自动 forge 新会话"
+                f"（旧 {old_session_id} → 新 {new_session_id}）。"
+                "旧会话历史仍完整保留。",
+            ]
+        else:
+            lines = [
+                f"已按你的要求 forge 新会话（旧 {old_session_id} → 新 {new_session_id}）。"
+                "旧会话历史仍完整保留。",
+            ]
+        finished = tasks["finished"]
+        if finished:
+            lines.append(f"旧会话有 {len(finished)} 个已结束的后台任务：")
+            for entry in finished[:KIMI_FORGE_TASK_LIST_LIMIT]:
+                report = entry.get("report_path")
+                suffix = f"，报告：{report}" if report else ""
+                lines.append(f"· [{entry['status']}] {entry['description'] or entry['task_id']}{suffix}")
+            if len(finished) > KIMI_FORGE_TASK_LIST_LIMIT:
+                lines.append(f"· ……另有 {len(finished) - KIMI_FORGE_TASK_LIST_LIMIT} 个，详见 handoff 登记。")
+        pending = tasks["pending"]
+        if pending:
+            lines.append(f"仍有 {len(pending)} 个任务未结束，已登记跟踪并交代给新会话：")
+            for entry in pending[:KIMI_FORGE_TASK_LIST_LIMIT]:
+                lines.append(f"· [{entry['status']}] {entry['description'] or entry['task_id']}")
+        if not seed_ok:
+            lines.append("注意：新会话的交接 seed 未能提交，以上任务信息仅以本条消息为准。")
+        return "\n".join(lines)
+
+    def _seed_kiro_forged_session(
+        self,
+        ctx: dict[str, Any],
+        handoff_path: str,
+    ) -> tuple[bool, int]:
+        """Submit the task-handoff seed prompt into the freshly forged session.
+
+        Returns ``(submitted, retained_messages)`` — the second element is
+        the number of verbatim old-conversation messages actually injected
+        (0 when the tail is disabled or the history read degraded to a pure
+        summary).  Seed 失败只降级不阻断：指针已提交，交接信息以通知与
+        handoff 登记为准。
+        """
+        old_session_id = ctx["old_session_id"]
+        new_session_id = ctx["new_session_id"]
+        tasks = ctx["tasks"]
+        lines = [
+            "【CcCompanion 受控 forge · 上下文交接】这是一条系统交接消息，不是用户指令。",
+            f"你从旧会话 {old_session_id} 切换而来；服务端聊天记录完整保留，"
+            "旧会话在 Kiro 本地存档中也仍在（同名 session id），需要细节时可以只读回查。",
+        ]
+        state_bits = [f"模型 {ctx.get('model') or '默认'}"]
+        if ctx.get("effort"):
+            state_bits.append(f"推理强度 {ctx['effort']}")
+        usage = ctx.get("usage_percent")
+        if isinstance(usage, (int, float)) and not isinstance(usage, bool):
+            state_bits.append(f"forge 前上下文使用率约 {float(usage):.0f}%")
+        lines.append("当前状态：" + "，".join(state_bits) + "。")
+        summary = str(ctx.get("summary") or "").strip()
+        if summary:
+            lines.append("旧会话摘要：\n" + summary)
+        pending = tasks["pending"]
+        if pending:
+            lines.append("旧会话还有以下后台任务未结束，它们的完成通知通道已随旧会话失效：")
+            for entry in pending[:KIMI_FORGE_TASK_LIST_LIMIT]:
+                lines.append(
+                    f"· {entry['task_id']}（{entry['status']}）：{entry['description']}"
+                )
+            lines.append("请跟踪这些任务的状态，完成后主动向用户汇报结果。")
+        finished_with_reports = [entry for entry in tasks["finished"] if entry.get("report_path")]
+        if finished_with_reports:
+            lines.append("以下后台任务已结束且有报告，若与用户当前诉求相关请提炼汇报：")
+            for entry in finished_with_reports[:KIMI_FORGE_TASK_LIST_LIMIT]:
+                lines.append(f"· {entry['task_id']}：{entry.get('report_path')}")
+        if handoff_path:
+            lines.append(f"本次交接的机器可读登记在 {handoff_path}。")
+        retained_messages = 0
+        retain = _clamp_kimi_forge_seed_retain(
+            getattr(self.state, "kiro_auto_forge_retain_messages", KIMI_FORGE_SEED_RETAIN_DEFAULT)
+        )
+        if retain > 0:
+            try:
+                tail = _load_kiro_recent_messages(
+                    self._chat_for_contact("kiro"),
+                    limit=retain,
+                )
+            except Exception:
+                tail = None
+            if tail is None:
+                logger.warning("Kiro forge seed tail degraded to summary: chat history unreadable")
+            elif tail["messages"]:
+                retained_messages = len(tail["messages"])
+                caveats = []
+                if tail["dropped"]:
+                    caveats.append(f"因总量上限丢弃了最老的 {tail['dropped']} 条")
+                if tail["truncated"]:
+                    caveats.append("最新一条因超长被截断")
+                suffix = f"（{'，'.join(caveats)}）" if caveats else ""
+                lines.append(
+                    f"以下为旧会话最近 {retained_messages} 条对话原文，供延续上下文{suffix}："
+                )
+                for role, text in tail["messages"]:
+                    speaker = "用户" if role == "user" else "助手"
+                    lines.append(f"[{speaker}] {text}")
+        try:
+            seed_turn_id = f"forge-seed-{int(time.time() * 1000)}"
+            self.state.kiro_acp.prompt_existing(
+                "\n".join(lines),
+                session_id=new_session_id,
+                turn_id=seed_turn_id,
+                on_update=lambda _delta: None,
+            )
+            return True, retained_messages
+        except Exception:
+            logger.warning("Kiro forge seed prompt failed", exc_info=True)
+            return False, 0
 
     # ---------- kiro 切模型 (2026-09-10) — /kiro/preferences ----------
     # 契约对照 /kimi/preferences（_kimi_preferences_payload），刻意更窄：模型

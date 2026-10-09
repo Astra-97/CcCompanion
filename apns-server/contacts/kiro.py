@@ -8,6 +8,9 @@ kiro 切模型 (2026-09-10): /kiro/preferences GET/POST — 模型目录查询�
 kiro 对齐 CC (2026-09-26): Stop（/chat/stop → ACP session/cancel，契约同
 Kimi：contact_id + user_ts）与附件（与 Kimi 同款，只接受 staged
 ``attachment_ids``）。旧式附件路径/URL、位置、语音与卡片形状仍在入口拒绝。
+
+kiro 自动 forge (2026-10-08): POST /kiro/forge — 显式受控 forge，与阈值
+自动 forge 共用同一套移交管线（对齐 POST /kimi/forge）。
 """
 from __future__ import annotations
 
@@ -70,4 +73,5 @@ GET_ROUTES = {
 POST_ROUTES = {
     "/kiro/new_session": "_handle_kiro_new_session",
     "/kiro/preferences": "_handle_kiro_preferences_post",
+    "/kiro/forge": "_handle_kiro_forge",
 }

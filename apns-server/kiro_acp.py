@@ -6,8 +6,18 @@ protocol away from the HTTP handler so Kiro has an independent session,
 lifecycle and cancellation boundary.
 
 Phase 1 scope: text chat + durable session continuity (session/new,
-session/load, session/prompt, session/cancel).  Image blocks, forge and
-quota bridges are later phases and intentionally absent here.
+session/load, session/prompt, session/cancel).  Image blocks and quota
+bridges are later phases and intentionally absent here.
+
+kiro 自动 forge (2026-10-08): ``forge_new_session`` mirrors
+kimi_acp.forge_new_session's atomicity — summarize the loaded session,
+session/new, re-apply the model/effort pins, then commit the durable
+pointer, all under ``_prepare_lock``.  Unlike Kimi it does not seed the
+fresh session: the seed content (task inventory, verbatim chat tail,
+handoff record path) is server-side data this module never sees, so the
+caller submits it as an ordinary follow-up prompt.  On any failure the
+durable pointer still names the old session and the next prepare
+session/load's it back.
 
 kiro 切模型 (2026-09-10): the client captures the ``models`` block from
 session/new and session/load responses (``availableModels`` /
@@ -1060,6 +1070,82 @@ class KiroACPClient:
                 self._active_update = None
                 self._active_activity = None
             self._turn_lock.release()
+
+    def _prompt_and_collect_text(
+        self,
+        text: str,
+        *,
+        session_id: str,
+        turn_id: str,
+        cancel_event: threading.Event | None = None,
+    ) -> str:
+        """Send a prompt and return the complete assistant text.
+
+        The ACP wire protocol delivers assistant text through
+        ``session/update`` chunks; this helper drains them into a single
+        string (same shape as kimi_acp's helper).
+        """
+        chunks: list[str] = []
+
+        def on_update(delta: str) -> None:
+            chunks.append(delta)
+
+        self.prompt_existing(
+            text,
+            session_id=session_id,
+            turn_id=turn_id,
+            on_update=on_update,
+            cancel_event=cancel_event,
+        )
+        return "".join(chunks)
+
+    def forge_new_session(
+        self,
+        *,
+        model: str | None = None,
+        effort: str | None = None,
+        summarize_prompt: str | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[str, str]:
+        """Summarize the current session and pin a fresh one seeded later.
+
+        Returns ``(new_session_id, summary_text)``.  The durable pointer
+        commits only after the summary landed and ACP confirmed the new
+        session id; on any earlier failure the old session stays active.
+        The handoff seed prompt is the caller's job (it carries
+        server-side data this module never sees).
+        """
+        with self._prepare_lock:
+            old_session_id = self.load_session_id()
+            if not old_session_id:
+                raise KiroACPError("No existing Kiro session to forge from")
+            self.prepare_session(model=model, effort=effort)
+            old_session_id = self._loaded_session_id
+            if not old_session_id:
+                raise KiroACPError("Kiro session not loaded")
+            prompt = summarize_prompt or (
+                "请用一段话总结我们当前会话的所有关键上下文：任务目标、已完成的工作、"
+                "未完成的决策、重要的文件路径或代码位置。要足够详细，让我能在新会话中"
+                "无缝继续。用中文。"
+            )
+            turn_id = f"forge-summarize-{int(time.time() * 1000)}"
+            summary = self._prompt_and_collect_text(
+                prompt,
+                session_id=old_session_id,
+                turn_id=turn_id,
+                cancel_event=cancel_event,
+            )
+            if not summary.strip():
+                raise KiroACPError("Kiro forge summary was empty")
+            new_session_id = self._new_session_id()
+            self._apply_pinned_model()
+            self._apply_pinned_effort()
+            self._save_session_id(new_session_id)
+            # The cached contextUsagePercentage belongs to the old session;
+            # the new one reports its own on the next metadata notification.
+            with self._catalog_lock:
+                self._context_usage_percent = None
+            return new_session_id, summary
 
     def cancel(self, turn_id: str, session_id: str) -> bool:
         expected_turn = str(turn_id or "").strip()

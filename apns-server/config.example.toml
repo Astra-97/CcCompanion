@@ -187,6 +187,20 @@ allowed_ips = []
 # should_skip。Stop 走 /chat/stop（contact_id+user_ts → ACP session/cancel），
 # 附件走 staged 上传（图片 → ACP image block，其余给本地路径）。
 # kiro_semantic_memory_recall_enabled = true
+# kiro 自动 forge (2026-10-08)：上下文使用率超过阈值时自动 forge 新会话
+# （默认 80，对齐 codex_auto_forge_threshold_percent / Kimi 的 0.8）。用量
+# 来源是 ACP `_kiro.dev/metadata` 通知里的 contextUsagePercentage（聊天
+# 状态栏同款）；还没有任何用量读数时不触发。自动 forge 与 POST
+# /kiro/forge 走同一套移交管线：旧会话摘要 + 重要状态 + 最近对话原文
+# tail + handoff 登记（tokens/kiro_forge_handoff.json）注入新会话 seed，
+# 并有聊天系统消息与推送通知，绝不做无声 forge。Kiro 正忙或 forge 失败
+# 时沿用旧会话发送本条消息，下一轮再触发。
+# kiro_auto_forge_enabled = true
+# kiro_auto_forge_threshold_percent = 80
+# forge seed 原文 tail：旧会话最近 N 条 user/assistant 对话原文（取自
+# 服务端聊天记录，跳过系统通知/记忆卡片/工具卡）。默认 80，钳位 0–160；
+# 0 表示关闭原文 tail、退回纯摘要 seed；读取失败同样降级，不让 forge 失败。
+# kiro_auto_forge_retain_messages = 80
 # Kairos App turns auto-forge after the completed reply has been persisted.
 # The old session is claimed at most once across service restarts.
 # codex_auto_forge_enabled = true
