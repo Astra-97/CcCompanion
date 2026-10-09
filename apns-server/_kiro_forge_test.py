@@ -503,11 +503,13 @@ class ForgeSeedRetainMessagesTest(unittest.TestCase):
 
 
 class ScanKiroSessionTasksTest(unittest.TestCase):
-    """kiro Delegate 任务盘点：<workspace>/.kiro/.subagents/<agent>.json。
+    """kiro Delegate 任务盘点（双来源）。
 
-    文件格式逆向自 kiro-cli 2.21.2 二进制（AgentExecution：
-    agent/task/status/launched_at/pid/exit_code/output/user_notified/
-    summary/cwd），status 取值 running/completed/failed。
+    2.21.2 实证落点：全局 ``<kiro-cli 数据目录>/.subagents/<agent>.json``；
+    ``<workspace>/.kiro/.subagents/`` 保留为第二来源。文件格式
+    （AgentExecution：agent/task/status/launched_at/pid/exit_code/output/
+    user_notified/summary/cwd，status∈running/completed/failed）与真实
+    任务样本逐字段吻合。所有用例都传独立 data_dir，绝不碰真实全局目录。
     """
 
     def _make_workspace(self, root: Path) -> Path:
@@ -538,6 +540,12 @@ class ScanKiroSessionTasksTest(unittest.TestCase):
         return workspace
 
     @staticmethod
+    def _make_data_dir(root: Path) -> Path:
+        data_dir = root / "kiro-cli-data"
+        data_dir.mkdir(parents=True)
+        return data_dir
+
+    @staticmethod
     def _dead_pid() -> int:
         for pid in range(40000, 4_000_000):
             if not Path(f"/proc/{pid}").exists():
@@ -547,7 +555,9 @@ class ScanKiroSessionTasksTest(unittest.TestCase):
     def test_classifies_terminal_and_pending_tasks(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = self._make_workspace(Path(tmp))
-            result = _scan_kiro_session_tasks("session_x", workspace=workspace)
+            result = _scan_kiro_session_tasks(
+                "session_x", workspace=workspace, data_dir=self._make_data_dir(Path(tmp)),
+            )
             self.assertEqual(["rust-agent"], [t["task_id"] for t in result["finished"]])
             self.assertEqual(["default_agent"], [t["task_id"] for t in result["pending"]])
             finished = result["finished"][0]
@@ -567,7 +577,9 @@ class ScanKiroSessionTasksTest(unittest.TestCase):
                 "status": "failed",
                 "exit_code": 1,
             }), encoding="utf-8")
-            result = _scan_kiro_session_tasks("session_x", workspace=workspace)
+            result = _scan_kiro_session_tasks(
+                "session_x", workspace=workspace, data_dir=self._make_data_dir(Path(tmp)),
+            )
             self.assertEqual(
                 ["default_agent", "rust-agent"],
                 sorted(t["task_id"] for t in result["finished"]),
@@ -584,7 +596,9 @@ class ScanKiroSessionTasksTest(unittest.TestCase):
                 "status": "running",
                 "pid": self._dead_pid(),
             }), encoding="utf-8")
-            result = _scan_kiro_session_tasks("session_x", workspace=workspace)
+            result = _scan_kiro_session_tasks(
+                "session_x", workspace=workspace, data_dir=self._make_data_dir(Path(tmp)),
+            )
             self.assertEqual([], result["pending"])
             self.assertEqual("failed", result["finished"][0]["status"])
             self.assertEqual("default_agent", result["finished"][0]["task_id"])
@@ -599,23 +613,28 @@ class ScanKiroSessionTasksTest(unittest.TestCase):
                 "status": "running",
                 "pid": os.getpid(),
             }), encoding="utf-8")
-            result = _scan_kiro_session_tasks("session_x", workspace=workspace)
+            result = _scan_kiro_session_tasks(
+                "session_x", workspace=workspace, data_dir=self._make_data_dir(Path(tmp)),
+            )
             self.assertEqual(["default_agent"], [t["task_id"] for t in result["pending"]])
 
     def test_rejects_foreign_or_empty_session_ids(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
+            data_dir = self._make_data_dir(Path(tmp))
             self.assertEqual(
                 {"finished": [], "pending": []},
-                _scan_kiro_session_tasks("", workspace=workspace),
+                _scan_kiro_session_tasks("", workspace=workspace, data_dir=data_dir),
             )
             self.assertEqual(
                 {"finished": [], "pending": []},
-                _scan_kiro_session_tasks("../escape", workspace=workspace),
+                _scan_kiro_session_tasks("../escape", workspace=workspace, data_dir=data_dir),
             )
             self.assertEqual(
                 {"finished": [], "pending": []},
-                _scan_kiro_session_tasks("session_x", workspace=workspace / "missing"),
+                _scan_kiro_session_tasks(
+                    "session_x", workspace=workspace / "missing", data_dir=data_dir / "missing",
+                ),
             )
 
     def test_drops_task_files_with_unsafe_task_ids(self):
@@ -627,7 +646,9 @@ class ScanKiroSessionTasksTest(unittest.TestCase):
                 "task": "逃逸",
                 "status": "completed",
             }), encoding="utf-8")
-            result = _scan_kiro_session_tasks("session_x", workspace=workspace)
+            result = _scan_kiro_session_tasks(
+                "session_x", workspace=workspace, data_dir=self._make_data_dir(Path(tmp)),
+            )
             ids = [t["task_id"] for t in result["finished"] + result["pending"]]
             self.assertEqual(["default_agent", "rust-agent"], sorted(ids))
 
@@ -638,12 +659,131 @@ class ScanKiroSessionTasksTest(unittest.TestCase):
             # 格式漂移：顶层不是对象（未来 kiro 改版）也必须安全跳过。
             (subagents / "drifted.json").write_text(json.dumps(["not", "a", "dict"]), encoding="utf-8")
             with self.assertLogs("cc-apns-server", level="WARNING") as caught:
-                result = _scan_kiro_session_tasks("session_x", workspace=workspace)
+                result = _scan_kiro_session_tasks(
+                    "session_x", workspace=workspace, data_dir=self._make_data_dir(Path(tmp)),
+                )
             self.assertEqual(["rust-agent"], [t["task_id"] for t in result["finished"]])
             self.assertEqual(["default_agent"], [t["task_id"] for t in result["pending"]])
             warnings = "\n".join(caught.output)
             self.assertIn("broken.json", warnings)
             self.assertIn("drifted.json", warnings)
+
+    # ---------- 全局数据目录来源（2.21.2 实证落点） ----------
+
+    def _write_global_task(
+        self, data_dir: Path, agent: str, *, task: str, status: str,
+        cwd: str | None, mtime: float | None = None,
+    ) -> Path:
+        subagents = data_dir / ".subagents"
+        subagents.mkdir(parents=True, exist_ok=True)
+        path = subagents / f"{agent}.json"
+        payload = {
+            "agent": agent,
+            "task": task,
+            "status": status,
+            "launched_at": 1790000000,
+            "pid": 0,
+        }
+        if cwd is not None:
+            payload["cwd"] = cwd
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def test_global_data_dir_scanned_with_matching_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._make_workspace(Path(tmp))
+            data_dir = self._make_data_dir(Path(tmp))
+            self._write_global_task(
+                data_dir, "kiro_default", task="求和", status="completed",
+                cwd=str(workspace),
+            )
+            result = _scan_kiro_session_tasks(
+                "session_x", workspace=workspace, data_dir=data_dir,
+            )
+            by_id = {t["task_id"]: t for t in result["finished"] + result["pending"]}
+            self.assertEqual("求和", by_id["kiro_default"]["description"])
+            self.assertEqual("completed", by_id["kiro_default"]["status"])
+
+    def test_global_entry_with_foreign_cwd_kept_and_annotated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._make_workspace(Path(tmp))
+            data_dir = self._make_data_dir(Path(tmp))
+            self._write_global_task(
+                data_dir, "kiro_default", task="别处的活", status="completed",
+                cwd="/root/Somewhere-Else",
+            )
+            result = _scan_kiro_session_tasks(
+                "session_x", workspace=workspace, data_dir=data_dir,
+            )
+            by_id = {t["task_id"]: t for t in result["finished"] + result["pending"]}
+            self.assertEqual(
+                "[来自 /root/Somewhere-Else] 别处的活",
+                by_id["kiro_default"]["description"],
+            )
+
+    def test_global_entry_with_missing_or_unknown_cwd_not_annotated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._make_workspace(Path(tmp))
+            data_dir = self._make_data_dir(Path(tmp))
+            self._write_global_task(
+                data_dir, "kiro_default", task="无 cwd", status="completed", cwd=None,
+            )
+            self._write_global_task(
+                data_dir, "rust-agent-x", task="未知 cwd", status="completed", cwd="Unknown",
+            )
+            result = _scan_kiro_session_tasks(
+                "session_x", workspace=workspace, data_dir=data_dir,
+            )
+            by_id = {t["task_id"]: t for t in result["finished"] + result["pending"]}
+            self.assertEqual("无 cwd", by_id["kiro_default"]["description"])
+            self.assertEqual("未知 cwd", by_id["rust-agent-x"]["description"])
+
+    def test_duplicate_agent_newer_mtime_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._make_workspace(Path(tmp))
+            data_dir = self._make_data_dir(Path(tmp))
+            # 同一 agent 两处都有：全局更新 → 全局胜。
+            newer = self._write_global_task(
+                data_dir, "default_agent", task="全局新", status="completed",
+                cwd=str(workspace),
+            )
+            local = workspace / ".kiro" / ".subagents" / "default_agent.json"
+            old_ts = newer.stat().st_mtime - 100
+            os.utime(local, (old_ts, old_ts))
+            result = _scan_kiro_session_tasks(
+                "session_x", workspace=workspace, data_dir=data_dir,
+            )
+            entries = [
+                t for t in result["finished"] + result["pending"]
+                if t["task_id"] == "default_agent"
+            ]
+            self.assertEqual(1, len(entries))
+            self.assertEqual("全局新", entries[0]["description"])
+            self.assertEqual("completed", entries[0]["status"])
+
+    def test_duplicate_agent_local_newer_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._make_workspace(Path(tmp))
+            data_dir = self._make_data_dir(Path(tmp))
+            older = self._write_global_task(
+                data_dir, "default_agent", task="全局旧", status="completed",
+                cwd=str(workspace),
+            )
+            local = workspace / ".kiro" / ".subagents" / "default_agent.json"
+            new_ts = older.stat().st_mtime + 100
+            os.utime(local, (new_ts, new_ts))
+            result = _scan_kiro_session_tasks(
+                "session_x", workspace=workspace, data_dir=data_dir,
+            )
+            entries = [
+                t for t in result["finished"] + result["pending"]
+                if t["task_id"] == "default_agent"
+            ]
+            self.assertEqual(1, len(entries))
+            self.assertEqual("长跑", entries[0]["description"])
+            self.assertEqual("running", entries[0]["status"])
 
 
 class KiroAutoForgeConfigTest(unittest.TestCase):

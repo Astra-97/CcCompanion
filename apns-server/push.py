@@ -2794,21 +2794,45 @@ def _kiro_delegate_pid_alive(pid: Any) -> bool:
     return True
 
 
+def _kiro_cli_data_dir() -> Path:
+    """kiro-cli 的数据目录（与 dirs::data_dir 同款推断，不硬编码 /root）。
+
+    Linux 上 dirs crate 取 ``$XDG_DATA_HOME``，缺省 ``~/.local/share``；
+    kiro-cli 在其下建 ``kiro-cli`` 子目录（data.sqlite3、.subagents 等都在
+    这里）。与 kiro_acp.py 的 ``Path.home() / ".local" / "bin" / "kiro-cli"``
+    推断风格保持一致。
+    """
+    xdg = str(os.environ.get("XDG_DATA_HOME") or "").strip()
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "share"
+    return base / "kiro-cli"
+
+
 def _classify_kiro_delegate_files(
-    task_files: list[Path],
+    task_files: list[tuple[Path, bool]],
+    *,
+    workspace: Path,
 ) -> dict[str, list[dict[str, Any]]]:
     """Classify kiro delegate execution JSON files into finished/pending.
 
-    Same entry shape, whitelist, truncation and terminal statuses as
-    ``_classify_forge_task_files`` (Kimi), but kiro's ``AgentExecution``
-    field names (``agent``/``task``/``status``) instead of the Kimi task
-    model.  Unreadable or unrecognised files are skipped with a warning:
-    task bookkeeping must never block or break a forge.
+    ``task_files`` 是 ``(文件路径, 是否来自全局数据目录)`` 列表。entry 形状、
+    白名单、截断、终态分类与 ``_classify_forge_task_files``（Kimi）一致，
+    但字段名用 kiro 的 ``AgentExecution``（agent/task/status）。同名 agent
+    两处都有文件时按 mtime 新者为准去重；全局目录的条目按 JSON 里的
+    ``cwd`` 字段与当前 workspace 匹配，匹配不上保守保留并在 description
+    标注来源 cwd。坏文件跳过并告警：任务盘点绝不能阻塞或炸掉 forge。
     """
-    result: dict[str, list[dict[str, Any]]] = {"finished": [], "pending": []}
-    for task_file in task_files[:256]:
+    try:
+        workspace_resolved = workspace.resolve()
+    except OSError:
+        workspace_resolved = workspace
+    # 先按 agent 去重（mtime 新者胜），再统一分类，保证输出确定性。
+    records: dict[str, tuple[float, Path, bool, dict[str, Any]]] = {}
+    for task_file, is_global in task_files[:256]:
         try:
-            if not task_file.is_file() or task_file.stat().st_size > 256 * 1024:
+            if not task_file.is_file():
+                continue
+            stat = task_file.stat()
+            if stat.st_size > 256 * 1024:
                 continue
             raw = json.loads(task_file.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -2824,12 +2848,32 @@ def _classify_kiro_delegate_files(
             char.isalnum() or char in {"-", "_"} for char in task_id
         ):
             continue
+        existing = records.get(task_id)
+        if existing is not None and existing[0] >= stat.st_mtime:
+            continue
+        records[task_id] = (stat.st_mtime, task_file, is_global, raw)
+    result: dict[str, list[dict[str, Any]]] = {"finished": [], "pending": []}
+    for task_id in sorted(records):
+        _mtime, task_file, is_global, raw = records[task_id]
         status = str(raw.get("status") or "unknown").strip().lower()[:40]
         if status == "running" and not _kiro_delegate_pid_alive(raw.get("pid")):
             status = "failed"
+        description = str(raw.get("task") or "")
+        if is_global:
+            # 全局目录多工作区任务混放：cwd 与当前 workspace 匹配不上的保守
+            # 保留（宁多报不漏报），但标注来源工作区。
+            cwd = str(raw.get("cwd") or "").strip()
+            foreign = False
+            if cwd and cwd != "Unknown":
+                try:
+                    foreign = Path(cwd).expanduser().resolve() != workspace_resolved
+                except OSError:
+                    foreign = True
+            if foreign:
+                description = f"[来自 {cwd}] {description}"
         entry: dict[str, Any] = {
             "task_id": task_id[:120],
-            "description": str(raw.get("task") or "")[:120],
+            "description": description[:120],
             "status": status,
             "kind": "delegate",
         }
@@ -2844,28 +2888,39 @@ def _scan_kiro_session_tasks(
     session_id: str,
     *,
     workspace: str | Path | None = None,
+    data_dir: str | Path | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Inventory one Kiro session's background tasks before a controlled forge.
 
-    kiro-cli 2.21.x 的 Delegate 工具（chat.enableDelegate，2026-10-09 起启用）
-    把每个后台任务落盘为 ``<workspace>/.kiro/.subagents/<agent>.json``——
-    一个 agent 同时只跑一个任务，文件即执行记录（agent/task/status/
-    launched_at/pid/exit_code/output/summary 等，格式逆向自二进制并与
-    aws/amazon-q-developer-cli 的 delegate.rs 逐字段吻合）。任务按工作区
-    （会话 cwd）而不是 session id 归档，所以盘点以 workspace 为键；
-    ``session_id`` 仅保留作白名单校验与调用契约对齐。读不到或格式不认识
-    一律安全退回空名单，绝不让盘点失败炸掉 forge。
+    kiro-cli 2.21.x 的 Delegate 工具（chat.enableDelegate）把每个后台任务
+    落盘为 AgentExecution JSON（agent/task/status/launched_at/pid/
+    exit_code/output/summary/cwd，status∈running/completed/failed，一
+    agent 一任务）。2.21.2 实证（2026-10-09）落点是**全局数据目录**
+    ``<kiro-cli 数据目录>/.subagents/``（工具描述里写的
+    ``.kiro/.subagents/`` 与实际不符）；工作区本地
+    ``<workspace>/.kiro/.subagents/`` 保留为第二来源以防版本/配置差异。
+    两处去重（同名 agent 取 mtime 新者），全局条目按 ``cwd`` 字段与当前
+    workspace 匹配、匹配不上保守保留并标注来源。任务按工作区而不是
+    session id 归档，``session_id`` 仅保留作白名单校验与调用契约对齐。
+    读不到或格式不认识一律安全退回空名单，绝不让盘点失败炸掉 forge。
     """
     clean = str(session_id or "").strip()
     empty: dict[str, list[dict[str, Any]]] = {"finished": [], "pending": []}
     if not clean or not all(char.isalnum() or char in {"-", "_"} for char in clean):
         return empty
     root = Path(workspace).expanduser() if workspace else Path(DEFAULT_KIRO_CWD)
+    data = Path(data_dir).expanduser() if data_dir else _kiro_cli_data_dir()
     try:
-        candidates = sorted((root / ".kiro" / ".subagents").glob("*.json"))
+        candidates: list[tuple[Path, bool]] = [
+            (path, True) for path in sorted((data / ".subagents").glob("*.json"))
+        ]
+        candidates += [
+            (path, False)
+            for path in sorted((root / ".kiro" / ".subagents").glob("*.json"))
+        ]
     except OSError:
         return empty
-    return _classify_kiro_delegate_files(candidates)
+    return _classify_kiro_delegate_files(candidates, workspace=root)
 
 
 def _load_kiro_recent_messages(
