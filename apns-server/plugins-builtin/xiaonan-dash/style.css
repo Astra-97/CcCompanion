@@ -39,7 +39,7 @@ body {
 .bg-veil {
   position: fixed;
   inset: 0;
-  background: rgba(10, 8, 6, 0.42);
+  background: rgba(10, 10, 15, 0.72);
   z-index: -1;
 }
 
@@ -70,7 +70,7 @@ h1 { font-size: 20px; margin: 0; flex: 1; }
 
 /* ---- 板块 ---- */
 .panel {
-  background: var(--glass-bg);
+  background: rgba(14, 16, 22, 0.78);
   -webkit-backdrop-filter: blur(var(--glass-blur));
   backdrop-filter: blur(var(--glass-blur));
   border: 1px solid var(--glass-border);
