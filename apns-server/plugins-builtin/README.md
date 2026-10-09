@@ -29,8 +29,9 @@ plugins-builtin/
 ```
 
 保留路径：插件命名空间下的 `data/` 是 KV 接口（`/plugins/<id>/data/<doc>`），
-`appearance` / `appearance-asset` 是外观壁纸端点（见下表），都不要在插件里放同名
-真实文件/目录。
+`appearance` / `appearance-asset` 是外观壁纸端点（见下表），`panel-data` 是
+xiaonan-dash 专属的聚合数据端点（见下表，对其他插件 id 不生效、落到静态 404），
+都不要在插件里放同名真实文件/目录。
 
 ## 端点与鉴权
 
@@ -40,6 +41,7 @@ plugins-builtin/
 | `GET /plugins/<id>/...` 静态托管 | 同上 |
 | `GET /plugins/<id>/appearance` | 同上。→ `{"ok":true,"bg_url":"/plugins/<id>/appearance-asset" 或 null, "veil": {...如有}}`；bg_url 为 null 表示用户用 App 内置默认壁纸（bgUri 为空/文件缺失），页面回落纯色/渐变底 |
 | `GET /plugins/<id>/appearance-asset` | 同上。流式返回当前聊天壁纸图片（`no-cache`，换壁纸即生效）；无壁纸 → `404 {"ok":false,"error":"no_wallpaper"}` |
+| `GET /plugins/xiaonan-dash/panel-data` | 同上（`_require_auth`，scoped token 不放行）。xiaonan-dash 专属：服务端聚合记忆库 diary.health / Notion 账本 / 本机日程本，四板块各自带 `status`/`fetched_at`/`stale`，单源失败只降级该板块；token 不出服务端 |
 | `GET /plugins/<id>/data/<doc>` | fail-closed 三选一：X-Auth-Token / web session（仅 GET）/ scoped token |
 | `PUT /plugins/<id>/data/<doc>` | fail-closed 二选一：X-Auth-Token / scoped token（web session 不能写） |
 | `POST /plugins/<id>/token` 签发 scoped token | 仅 X-Auth-Token（native pairing 闸门，web session 无权） |

@@ -1,0 +1,7 @@
+{
+  "id": "xiaonan-dash",
+  "name": "小南面板",
+  "version": "1.0.0",
+  "description": "方小南的私人面板：饮食 / 睡眠心率体重 / 花钱账本 / 深空日活真打卡。服务端直读记忆库+Notion+日程本，只读。",
+  "entry": "index.html"
+}

@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>小南面板</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- 壁纸层: 用 <img> 而非 CSS background, 规避 CSP style-src 对动态内联样式的限制;
+       无壁纸时保持 hidden, 回落深色渐变底。 -->
+  <img id="bg-image" class="bg-image hidden" alt="" aria-hidden="true">
+  <div id="bg-veil" class="bg-veil hidden" aria-hidden="true"></div>
+  <main>
+    <header class="dash-header">
+      <div class="title-row">
+        <span class="pig" aria-hidden="true">🐷</span>
+        <h1>小南面板</h1>
+        <button id="refresh-btn" type="button" class="ghost-btn" title="刷新">↻</button>
+      </div>
+      <p id="today-line" class="today-line">载入中…</p>
+      <p id="generated-line" class="generated-line"></p>
+    </header>
+
+    <section class="panel" id="panel-diet">
+      <h2>🍽️ 饮食 · 最近几天</h2>
+      <div class="panel-body" id="diet-body"></div>
+      <p class="panel-foot" id="diet-foot"></p>
+    </section>
+
+    <section class="panel" id="panel-sleep">
+      <h2>😴 睡眠 · 心率 · 体重</h2>
+      <div class="panel-body" id="sleep-body"></div>
+      <p class="panel-foot" id="sleep-foot"></p>
+    </section>
+
+    <section class="panel" id="panel-ledger">
+      <h2>💸 花钱账本</h2>
+      <div class="panel-body" id="ledger-body"></div>
+      <p class="panel-foot" id="ledger-foot"></p>
+    </section>
+
+    <section class="panel" id="panel-shenkong">
+      <h2>🌌 深空日活</h2>
+      <div class="panel-body" id="shenkong-body"></div>
+      <p class="panel-foot" id="shenkong-foot"></p>
+    </section>
+
+    <footer class="dash-footer">只给方小南看的私人面板 · 数据只读，不会改动任何源头</footer>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

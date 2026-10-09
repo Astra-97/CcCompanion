@@ -10867,6 +10867,13 @@ class PushHandler(BaseHTTPRequestHandler):
             else:
                 self._handle_plugin_appearance_asset_get(rel[0])
             return
+        # 保留子路径 (2026-10-09): 小南面板聚合数据, 只对 xiaonan-dash 生效
+        # (其他插件 id 落到静态托管自然 404)。鉴权与静态托管同级, scoped token 不放行。
+        if len(rel) == 2 and rel[1] == "panel-data" and rel[0] == self._DASH_PANEL_PLUGIN_ID:
+            if not self._require_auth():
+                return
+            self._handle_plugin_dash_data_get(rel[0])
+            return
         # 其余路径按静态托管: /plugins/<id>[/...] -> 插件目录下的文件 (默认 entry)。
         if not self._require_auth():
             return
@@ -11008,6 +11015,35 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         # 壁纸可换而 URL 不变, 插件端点不缓存, 保证总是当前壁纸。
         self._serve_appearance_asset_file(target, cache_control="no-cache")
+
+    # ------------------------------------------------------------------
+    # 小南面板聚合端点 (2026-10-09, 方案 B: 服务端直读数据源, 不代理原站)
+    # 记忆库/Notion token 只在服务端内存, 页面拿聚合好的 JSON;
+    # App 插件 WebView 对 /plugins/ 同源请求自动代加 X-Auth-Token, 零 App 改动。
+    # ------------------------------------------------------------------
+
+    _DASH_PANEL_PLUGIN_ID = "xiaonan-dash"
+    _dash_panel_service = None
+
+    @classmethod
+    def _dash_panel(cls):
+        if cls._dash_panel_service is None:
+            from dash_panel import DashPanelService
+            cls._dash_panel_service = DashPanelService()
+        return cls._dash_panel_service
+
+    def _handle_plugin_dash_data_get(self, plugin_id: str) -> None:
+        """GET /plugins/xiaonan-dash/panel-data — 四板块聚合 JSON, 全程只读。"""
+        if self._plugin_store().load_manifest(plugin_id) is None:
+            self._send_json(404, {"ok": False, "error": "not_found"})
+            return
+        try:
+            payload = self._dash_panel().aggregate()
+        except Exception:
+            logger.exception("dash panel aggregate fail")
+            self._send_json(500, {"ok": False, "error": "dash panel unavailable"})
+            return
+        self._send_json(200, payload)
 
     def _serve_web_chat(self, auth_token=None):
         html = WEB_CHAT_HTML
