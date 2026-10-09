@@ -2774,36 +2774,98 @@ def _parse_kiro_auto_forge_threshold(value: Any) -> float:
     return threshold if 1.0 <= threshold <= 100.0 else 80.0
 
 
+def _kiro_delegate_pid_alive(pid: Any) -> bool:
+    """Best-effort liveness check for a delegate task's recorded pid.
+
+    kiro's own status operation reconciles ``running`` executions whose pid
+    is gone into ``failed``; the scanner mirrors that read-only (it never
+    rewrites kiro's files).  Unknown answer (non-int pid, os error,
+    permission denied) keeps the task "alive" — a false pending entry is
+    harmless, a false finished one would drop a live task from the handoff.
+    """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        pass
+    return True
+
+
+def _classify_kiro_delegate_files(
+    task_files: list[Path],
+) -> dict[str, list[dict[str, Any]]]:
+    """Classify kiro delegate execution JSON files into finished/pending.
+
+    Same entry shape, whitelist, truncation and terminal statuses as
+    ``_classify_forge_task_files`` (Kimi), but kiro's ``AgentExecution``
+    field names (``agent``/``task``/``status``) instead of the Kimi task
+    model.  Unreadable or unrecognised files are skipped with a warning:
+    task bookkeeping must never block or break a forge.
+    """
+    result: dict[str, list[dict[str, Any]]] = {"finished": [], "pending": []}
+    for task_file in task_files[:256]:
+        try:
+            if not task_file.is_file() or task_file.stat().st_size > 256 * 1024:
+                continue
+            raw = json.loads(task_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            logger.warning("Kiro delegate task file unreadable, skipped: %s", task_file)
+            continue
+        if not isinstance(raw, dict):
+            logger.warning("Kiro delegate task file has unknown format, skipped: %s", task_file)
+            continue
+        # kiro keys executions by agent name (one task per agent); the id is
+        # echoed into prompts, so it gets the same whitelist as Kimi task ids.
+        task_id = str(raw.get("agent") or task_file.stem).strip()
+        if not task_id or not all(
+            char.isalnum() or char in {"-", "_"} for char in task_id
+        ):
+            continue
+        status = str(raw.get("status") or "unknown").strip().lower()[:40]
+        if status == "running" and not _kiro_delegate_pid_alive(raw.get("pid")):
+            status = "failed"
+        entry: dict[str, Any] = {
+            "task_id": task_id[:120],
+            "description": str(raw.get("task") or "")[:120],
+            "status": status,
+            "kind": "delegate",
+        }
+        if entry["status"] in KIMI_TASK_TERMINAL_STATUSES:
+            result["finished"].append(entry)
+        else:
+            result["pending"].append(entry)
+    return result
+
+
 def _scan_kiro_session_tasks(
     session_id: str,
     *,
-    sessions_root: str | Path | None = None,
+    workspace: str | Path | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Inventory one Kiro session's background tasks before a controlled forge.
 
-    kiro-cli 2.21.x exposes no background-task store on the wire or on disk
-    (sessions live under ~/.kiro/sessions with no tasks model), so today this
-    always returns empty lists.  The scanner keeps Kimi's exact contract —
-    same entry shape, same whitelist, same terminal statuses — so a future
-    Kiro task store in the same layout is picked up without touching the
-    forge pipeline.
+    kiro-cli 2.21.x 的 Delegate 工具（chat.enableDelegate，2026-10-09 起启用）
+    把每个后台任务落盘为 ``<workspace>/.kiro/.subagents/<agent>.json``——
+    一个 agent 同时只跑一个任务，文件即执行记录（agent/task/status/
+    launched_at/pid/exit_code/output/summary 等，格式逆向自二进制并与
+    aws/amazon-q-developer-cli 的 delegate.rs 逐字段吻合）。任务按工作区
+    （会话 cwd）而不是 session id 归档，所以盘点以 workspace 为键；
+    ``session_id`` 仅保留作白名单校验与调用契约对齐。读不到或格式不认识
+    一律安全退回空名单，绝不让盘点失败炸掉 forge。
     """
-    root = (
-        Path(sessions_root).expanduser()
-        if sessions_root
-        else Path.home() / ".kiro" / "sessions"
-    )
     clean = str(session_id or "").strip()
     empty: dict[str, list[dict[str, Any]]] = {"finished": [], "pending": []}
     if not clean or not all(char.isalnum() or char in {"-", "_"} for char in clean):
         return empty
+    root = Path(workspace).expanduser() if workspace else Path(DEFAULT_KIRO_CWD)
     try:
-        candidates = sorted(root.glob(f"*/{clean}/agents/*/tasks/*.json"))
-        candidates += sorted(root.glob(f"{clean}/agents/*/tasks/*.json"))
+        candidates = sorted((root / ".kiro" / ".subagents").glob("*.json"))
     except OSError:
         return empty
-    # No Kiro task-report directory exists; report paths stay absent.
-    return _classify_forge_task_files(candidates, reports_dir=None)
+    return _classify_kiro_delegate_files(candidates)
 
 
 def _load_kiro_recent_messages(
@@ -15480,7 +15542,8 @@ class PushHandler(BaseHTTPRequestHandler):
     # POST /kiro/forge 共用。差异：Kiro 的唯一通道是 ACP，swap 由
     # kiro_acp.forge_new_session 完成（总结旧会话 + session/new + 钉选重放 +
     # 指针提交，全程 _prepare_lock）；任务盘点走 _scan_kiro_session_tasks
-    # （kiro-cli 目前无后台任务模型，盘点恒为空，但管线与登记格式已就位）；
+    # （读 kiro Delegate 落盘的 <workspace>/.kiro/.subagents/*.json，
+    # best-effort，读不到/格式漂移安全退回空名单）；
     # seed 的原文 tail 读服务端 chat_history_kiro.jsonl 而非会话存档。
 
     def _handle_kiro_forge(self, body: dict[str, Any]) -> None:
@@ -15622,7 +15685,7 @@ class PushHandler(BaseHTTPRequestHandler):
             if getattr(acp, "busy", False):
                 return {"ok": False, "error": "kiro_busy",
                         "reason": "Kiro 正在回复中，等这一轮结束后再 forge。"}, None
-            tasks = _scan_kiro_session_tasks(old_session_id)
+            tasks = _scan_kiro_session_tasks(old_session_id, workspace=getattr(acp, "cwd", None))
             usage_percent = self._kiro_context_usage_percent()
             model = self._kiro_model_selection()
             effort = self._kiro_effort_selection() or None
