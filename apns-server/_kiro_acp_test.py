@@ -500,6 +500,130 @@ class KiroACPProtocolTest(unittest.TestCase):
         self.assertIsNone(_activity_from_update(chunk("agent_message_chunk", "hi")))
 
 
+class KiroSessionLoadFallbackTest(unittest.TestCase):
+    """换号/会话失效自愈 (2026-10-09)：session/load 白名单错误回退 session/new。
+
+    复现的生产事故：换账号后旧会话指针 session/load 恒 -32603，fail-closed
+    让 kiro 对用户永久沉默。白名单（-32603/-32002）回退开新会话并提交新
+    指针；AuthRequired/额度/拿不准的错误码一律保守原样抛、不动旧指针。
+    """
+
+    OLD_SESSION = "old-account-session"
+    NEW_SESSION = "fresh-session"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state_path = str(Path(self.tmp.name) / "kiro_acp_session.json")
+        Path(self.state_path).write_text(
+            json.dumps({
+                "version": 2,
+                "session_id": self.OLD_SESSION,
+                "cwd": str(Path(self.tmp.name).resolve()),
+            }),
+            encoding="utf-8",
+        )
+
+    def _client(self, factory):
+        return KiroACPClient(
+            command="/fake/kiro-cli",
+            cwd=self.tmp.name,
+            state_path=self.state_path,
+            request_timeout=5,
+            prompt_timeout=10,
+            popen_factory=factory,
+        )
+
+    def _handler_failing_load(self, code, *, new_ok=True, new_error=None):
+        def handle(_process, message):
+            method = message.get("method")
+            if method == "initialize":
+                return [{"jsonrpc": "2.0", "id": message["id"], "result": {"protocolVersion": 1}}]
+            if method == "session/load":
+                return [{
+                    "jsonrpc": "2.0", "id": message["id"],
+                    "error": {"code": code, "message": "load blew up"},
+                }]
+            if method == "session/new":
+                if not new_ok:
+                    return [{
+                        "jsonrpc": "2.0", "id": message["id"],
+                        "error": {"code": new_error or -32603, "message": "new blew up"},
+                    }]
+                return [{"jsonrpc": "2.0", "id": message["id"], "result": {"sessionId": self.NEW_SESSION}}]
+            raise AssertionError(f"unexpected method {method}")
+        return handle
+
+    def _methods(self, process):
+        return [req.get("method") for req in process.requests]
+
+    def test_load_internal_error_falls_back_to_new_session(self):
+        process = FakeKiroACPProcess(self._handler_failing_load(-32603))
+        client = self._client(_scripted_factory([process]))
+        with self.assertLogs("kiro_acp", level="WARNING") as caught:
+            session_id = client.prepare_session()
+        self.assertEqual(self.NEW_SESSION, session_id)
+        self.assertEqual(["initialize", "session/load", "session/new"], self._methods(process))
+        # 新指针已提交，旧指针被替换。
+        self.assertEqual(self.NEW_SESSION, client.load_session_id())
+        warnings = "\n".join(caught.output)
+        self.assertIn("-32603", warnings)
+        self.assertIn(self.OLD_SESSION, warnings)
+
+    def test_load_resource_not_found_falls_back(self):
+        process = FakeKiroACPProcess(self._handler_failing_load(-32002))
+        client = self._client(_scripted_factory([process]))
+        with self.assertLogs("kiro_acp", level="WARNING"):
+            session_id = client.prepare_session()
+        self.assertEqual(self.NEW_SESSION, session_id)
+        self.assertEqual(["initialize", "session/load", "session/new"], self._methods(process))
+        self.assertEqual(self.NEW_SESSION, client.load_session_id())
+
+    def test_auth_required_never_falls_back(self):
+        def handle(_process, message):
+            method = message.get("method")
+            if method == "initialize":
+                return [{"jsonrpc": "2.0", "id": message["id"], "result": {"protocolVersion": 1}}]
+            if method == "session/load":
+                return [{
+                    "jsonrpc": "2.0", "id": message["id"],
+                    "error": {"code": -32000, "message": "Authentication required"},
+                }]
+            raise AssertionError(f"unexpected method {method}")
+        process = FakeKiroACPProcess(handle)
+        client = self._client(_scripted_factory([process]))
+        with self.assertRaises(KiroACPAuthRequired):
+            client.prepare_session()
+        self.assertEqual(["initialize", "session/load"], self._methods(process))
+        # 旧指针原地保留。
+        self.assertEqual(self.OLD_SESSION, client.load_session_id())
+
+    def test_unknown_load_error_never_falls_back(self):
+        process = FakeKiroACPProcess(self._handler_failing_load(-32602))
+        client = self._client(_scripted_factory([process]))
+        with self.assertRaises(KiroACPError):
+            client.prepare_session()
+        self.assertEqual(["initialize", "session/load"], self._methods(process))
+        self.assertEqual(self.OLD_SESSION, client.load_session_id())
+
+    def test_successful_load_does_not_fall_back(self):
+        process = FakeKiroACPProcess(_basic_handler())
+        client = self._client(_scripted_factory([process]))
+        self.assertEqual(self.OLD_SESSION, client.prepare_session())
+        self.assertEqual(["initialize", "session/load"], self._methods(process))
+        self.assertEqual(self.OLD_SESSION, client.load_session_id())
+
+    def test_fallback_keeps_old_pointer_when_session_new_fails(self):
+        process = FakeKiroACPProcess(self._handler_failing_load(-32603, new_ok=False))
+        client = self._client(_scripted_factory([process]))
+        with self.assertLogs("kiro_acp", level="WARNING"):
+            with self.assertRaises(KiroACPError):
+                client.prepare_session()
+        self.assertEqual(["initialize", "session/load", "session/new"], self._methods(process))
+        # session/new 没成功，旧指针原地保留，下次 prepare 再试。
+        self.assertEqual(self.OLD_SESSION, client.load_session_id())
+
+
 # ---------------------------------------------------------------------------
 # Handler-level tests
 # ---------------------------------------------------------------------------

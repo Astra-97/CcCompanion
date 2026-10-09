@@ -19,6 +19,14 @@ caller submits it as an ordinary follow-up prompt.  On any failure the
 durable pointer still names the old session and the next prepare
 session/load's it back.
 
+kiro 会话失效自愈 (2026-10-09): 换账号后旧会话指针的 session/load 恒返回
+-32603（会话不可达），fail-closed 会让 kiro 对用户永久沉默。
+``_new_or_load_session`` 对白名单错误码（-32603 internal error、-32002
+resource_not_found）回退 session/new 并提交新指针（仅 session/new 成功后
+原子提交，失败时旧指针原地保留）；未登录、额度、超时及一切拿不准的错误
+一律保守原样抛，绝不拿新会话掩盖问题。回退会无感丢上下文，logger.warning
+留痕；显式逃生门仍是 POST /kiro/new_session。
+
 kiro 切模型 (2026-09-10): the client captures the ``models`` block from
 session/new and session/load responses (``availableModels`` /
 ``currentModelId``), persists a sanitized catalog cache next to the session
@@ -73,7 +81,11 @@ KIRO_PROMPT_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "im
 
 
 class KiroACPError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, code: int | None = None) -> None:
+        super().__init__(message)
+        # JSON-RPC error code when the failure came from an RPC error object;
+        # None for client-side failures (timeout, invalid id, ...).
+        self.code = code
 
 
 class KiroACPBusy(KiroACPError):
@@ -274,6 +286,14 @@ def _metadata_context_percent(params: Any) -> float | None:
     return None
 
 
+# 换号/会话失效自愈 (2026-10-09)：session/load 只有返回这两个 RPC 错误码才
+# 允许回退开新会话——-32603 internal error（换账号后旧会话不可达的实测表现）
+# 与 -32002 resource_not_found（kiro-cli 二进制的 Resource not found 映射）。
+# 未登录(-32000)、额度、超时、参数错及一切拿不准的错误一律保守原样抛：
+# 绝不拿新会话掩盖问题，也绝不在不确定时丢掉旧指针。
+KIRO_SESSION_LOAD_FALLBACK_CODES = frozenset({-32603, -32002})
+
+
 def _classified_rpc_error(method: str, error: Any) -> KiroACPError:
     """Map one JSON-RPC error object to a typed, payload-free failure."""
     code = error.get("code") if isinstance(error, dict) else None
@@ -283,7 +303,10 @@ def _classified_rpc_error(method: str, error: Any) -> KiroACPError:
     if _QUOTA_MESSAGE_RE.search(message):
         return KiroACPQuotaExceeded("Kiro credits or quota are exhausted")
     suffix = f" ({code})" if code else ""
-    return KiroACPError(f"Kiro ACP {method} failed{suffix}")
+    return KiroACPError(
+        f"Kiro ACP {method} failed{suffix}",
+        code=code if isinstance(code, int) else None,
+    )
 
 
 class KiroACPClient:
@@ -926,11 +949,25 @@ class KiroACPClient:
         if previous and previous == self._loaded_session_id and self._process_alive():
             return previous
         if previous:
-            # Fail closed instead of silently replacing a conversation after
-            # restart. A transient/load/auth failure must not make the next
-            # user message start in an unrelated context; POST /kiro/new_session
-            # is the explicit recovery path.
-            return self._load_existing_session(previous)
+            try:
+                return self._load_existing_session(previous)
+            except KiroACPError as exc:
+                # 换号/会话失效自愈 (2026-10-09)：旧指针已死（换账号后
+                # session/load 恒 -32603）时，fail-closed 会让 kiro 对用户
+                # 永久沉默，比无感丢上下文更糟。白名单内的 load 失败回退
+                # session/new 并提交新指针；新指针只在 session/new 成功后
+                # 提交（tmp+os.replace 原子写），失败时旧指针原地保留、
+                # 下次 prepare 再试。回退是无感丢上下文行为，必须留痕。
+                if exc.code not in KIRO_SESSION_LOAD_FALLBACK_CODES:
+                    raise
+                self.logger.warning(
+                    "Kiro session/load failed (%s); abandoning stale pointer %s and starting a fresh session",
+                    exc,
+                    previous,
+                )
+                session_id = self._new_session_id()
+                self._save_session_id(session_id)
+                return session_id
         session_id = self._new_session_id()
         # The new pointer commits only after ACP confirmed a valid session id.
         self._save_session_id(session_id)
