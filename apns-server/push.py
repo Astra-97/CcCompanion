@@ -6026,6 +6026,51 @@ class PushHandler(BaseHTTPRequestHandler):
                 return dict(self.state.typing_state)
         return self.state.contact_typing_states.setdefault(contact_id, {"is_typing": False, "since": None})
 
+    def _expire_chat_typing_if_stale(
+        self, contact_id: str, ts: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Apply the /chat/typing expiry rule and return the state to report.
+
+        Exact XiaoKe tmux turns end through their correlated Stop hook or
+        explicit Stop state machine; the generic 120s cosmetic typing TTL
+        would hide Stop during long tool runs.  When such a turn does expire
+        via the stale-completion grace, report it as a terminal payload that
+        keeps the turn identity: the Android client only releases its Stop
+        target when ``completed`` names the exact tracked since/session, so a
+        bare ``{"is_typing": false}`` left Stop pinned in the composer.
+        """
+        if not (ts.get("is_typing") and ts.get("since")):
+            return ts
+        try:
+            since_dt = datetime.fromisoformat(ts["since"])
+            age = (datetime.now(timezone.utc).astimezone() - since_dt).total_seconds()
+            if not _should_expire_chat_typing(contact_id, ts, age):
+                return ts
+        except Exception:
+            return ts
+        token = str(ts.get("turn_token") or "").strip().lower()
+        if contact_id == "xiaoke" and re.fullmatch(r"[0-9a-f]{32}", token):
+            with self.state.xiaoke_stop_lock:
+                current = dict(self.state.typing_state or {})
+                if (
+                    current.get("is_typing")
+                    and str(current.get("turn_token") or "").lower() == token
+                    and not self.state.xiaoke_stopping_claim
+                ):
+                    value = {
+                        "is_typing": False,
+                        "since": str(current.get("since") or ""),
+                        "session": str(current.get("session") or ""),
+                        "transport": "tmux",
+                        "turn_token": token,
+                        "completed": True,
+                    }
+                    self.state.typing_state = value
+                    self.state.contact_typing_states["xiaoke"] = value
+            return self._typing_for_contact(contact_id)
+        self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
+        return self._typing_for_contact(contact_id)
+
     def _set_typing_for_contact(self, contact_id: str, value: dict[str, Any]) -> None:
         if contact_id == "xiaoke":
             lock = getattr(self.state, "xiaoke_stop_lock", None)
@@ -7669,19 +7714,9 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/chat/typing"):
             contact_id = self._contact_id_from_query()
-            ts = self._typing_for_contact(contact_id)
-            if ts.get("is_typing") and ts.get("since"):
-                try:
-                    since_dt = datetime.fromisoformat(ts["since"])
-                    age = (datetime.now(timezone.utc).astimezone() - since_dt).total_seconds()
-                    # Exact XiaoKe tmux turns end through their correlated Stop
-                    # hook or explicit Stop state machine.  The generic 120s
-                    # cosmetic typing TTL would hide Stop during long tool runs.
-                    if _should_expire_chat_typing(contact_id, ts, age):
-                        self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
-                        ts = self._typing_for_contact(contact_id)
-                except Exception:
-                    pass
+            ts = self._expire_chat_typing_if_stale(
+                contact_id, self._typing_for_contact(contact_id)
+            )
             if contact_id == "apples" and ts.get("is_typing") and not ts.get("member_id"):
                 pending = []
                 with self.state.group_reply_lock:

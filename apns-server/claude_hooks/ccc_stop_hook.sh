@@ -124,6 +124,14 @@ def resolve(lines):
         if kind == "user":
             if tool_result_only(content):
                 continue
+            # Claude Code writes CLI-generated companion rows (isMeta, e.g.
+            # "[Image: source: ...]" after a pasted App image, or the
+            # "[Image: original WxH ...]" note after Read on an image) as
+            # separate user rows inside the same prompt.  They never start a
+            # turn; treating them as one reset the marker and downgraded every
+            # image turn to a beacon, pinning the App on Stop (2026-10-10).
+            if obj.get("isMeta"):
+                continue
             # Ctrl-C can restore an interrupted prompt into the CLI input, so
             # the next injection submits one row carrying several markers.
             # The last marker is the newest injected turn — the identity the

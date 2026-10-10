@@ -1445,6 +1445,62 @@ class XiaokeStopTest(unittest.TestCase):
         self.assertEqual(payload["turn_token"], "")
         self.assertEqual(payload["session_id"], "cctg")
 
+    def test_image_turn_meta_rows_keep_exact_marker_identity(self) -> None:
+        # 2026-10-10 incident: an App image turn is written as the marker row
+        # plus an isMeta "[Image: source: ...]" companion row, and a Read on an
+        # image adds another isMeta row mid-turn.  Neither may reset the marker.
+        token = "c" * 32
+        meta = lambda text: {**self.user_record(text), "isMeta": True, "turnCompanion": True}
+        payload = self.run_repository_stop_hook([
+            self.user_record(f"[Image #10]\n\n[CCC_APP_TURN:{token}:cctg]\nlook"),
+            meta("[Image: source: /tmp/attachments/x.jpg]"),
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {}},
+            ]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": []},
+            ]}},
+            meta("[Image: original 1536x2048, displayed at 1500x2000.]"),
+            self.assistant_record("image answer"),
+        ], "image answer")
+        self.assertEqual(payload["turn_token"], token)
+        self.assertEqual(payload["session_id"], "cctg")
+
+    def test_stale_grace_expiry_reports_exact_completed_payload(self) -> None:
+        handler = self.handler(user_ts="2026-10-10T03:10:23.486+00:00")
+        handler.state.typing_state["stale_completion_at"] = time.time() - 121.0
+        handler.state.contact_typing_states["xiaoke"] = handler.state.typing_state
+
+        reported = handler._expire_chat_typing_if_stale("xiaoke", dict(handler.state.typing_state))
+
+        self.assertFalse(reported["is_typing"])
+        self.assertTrue(reported["completed"])
+        self.assertEqual(reported["since"], "2026-10-10T03:10:23.486+00:00")
+        self.assertEqual(reported["session"], "cctg")
+        self.assertEqual(reported["transport"], "tmux")
+        self.assertEqual(reported["turn_token"], "a" * 32)
+        self.assertEqual(handler.state.contact_typing_states["xiaoke"], reported)
+
+    def test_stale_grace_expiry_never_completes_a_newer_turn(self) -> None:
+        handler = self.handler(user_ts="2026-10-10T03:10:23.486+00:00")
+        stale = {**handler.state.typing_state, "stale_completion_at": time.time() - 121.0}
+        # A newer send replaced the turn between the read and the expiry.
+        handler.state.typing_state = {**handler.state.typing_state, "turn_token": "b" * 32}
+
+        reported = handler._expire_chat_typing_if_stale("xiaoke", stale)
+
+        self.assertTrue(reported["is_typing"])
+        self.assertEqual(reported["turn_token"], "b" * 32)
+
+    def test_stale_grace_inside_window_keeps_turn_active(self) -> None:
+        handler = self.handler(user_ts="2026-10-10T03:10:23.486+00:00")
+        handler.state.typing_state["stale_completion_at"] = time.time()
+
+        reported = handler._expire_chat_typing_if_stale("xiaoke", dict(handler.state.typing_state))
+
+        self.assertTrue(reported["is_typing"])
+        self.assertNotIn("completed", reported)
+
     def test_terminal_turn_after_app_turn_emits_sessionful_beacon(self) -> None:
         # 02:53 incident, phase two: the user switched to typing in the
         # terminal (no marker), so the resolver sees current=None for the
