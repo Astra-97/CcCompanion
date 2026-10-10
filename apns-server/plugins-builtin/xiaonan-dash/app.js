@@ -42,17 +42,38 @@ function fmtMoney(n) {
 }
 
 /* ---- 外观: 复用 App 壁纸 + 玻璃风 (与 packing 插件同款) ---- */
+/* 真机观察 (2026-10-10): App 插件 WebView 的代取通道偶发把单个请求吞掉
+   (连服务器访问日志都没有), 壁纸请求被吞就永远黑底。加有限重试自愈。 */
+async function fetchWithRetry(url, attempts) {
+  let lastErr = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(url, { cache: "no-store" });
+      if (res.ok) return res;
+      lastErr = new Error("http " + res.status);
+    } catch (e) { lastErr = e; }
+    await new Promise((r) => setTimeout(r, 1500 * (i + 1)));
+  }
+  throw lastErr || new Error("fetch failed");
+}
+
 async function applyAppearance() {
   try {
-    const res = await fetch(`/plugins/${PLUGIN_ID}/appearance`, { cache: "no-store" });
-    if (!res.ok) return;
+    const res = await fetchWithRetry(`/plugins/${PLUGIN_ID}/appearance`, 3);
     const data = await res.json().catch(() => null);
     const bgUrl = data && data.ok && typeof data.bg_url === "string" ? data.bg_url : "";
     if (!bgUrl) return;
     const img = document.getElementById("bg-image");
+    let imgAttempts = 0;
     img.addEventListener("error", () => {
       img.classList.add("hidden");
       document.body.classList.remove("has-wallpaper");
+      // 图片请求被通道吞掉时 error 即触发, 退避重试 (换 query 防任何中间缓存)
+      if (imgAttempts < 3) {
+        imgAttempts++;
+        const sep = bgUrl.indexOf("?") >= 0 ? "&" : "?";
+        setTimeout(() => { img.src = bgUrl + sep + "r=" + imgAttempts; }, 2000 * imgAttempts);
+      }
     });
     img.addEventListener("load", () => {
       img.classList.remove("hidden");
@@ -64,8 +85,7 @@ async function applyAppearance() {
 
 /* ---- 数据 ---- */
 async function loadPanelData() {
-  const res = await fetch(`/plugins/${PLUGIN_ID}/panel-data`, { cache: "no-store" });
-  if (!res.ok) throw new Error("panel-data http " + res.status);
+  const res = await fetchWithRetry(`/plugins/${PLUGIN_ID}/panel-data`, 3);
   const data = await res.json();
   if (!data || !data.ok || !data.panels) throw new Error("panel-data 格式异常");
   return data;
