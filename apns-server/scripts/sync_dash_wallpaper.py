@@ -47,13 +47,16 @@ def main() -> int:
         return 0
     if TARGET.exists() and TARGET.stat().st_mtime >= src.stat().st_mtime:
         return 0  # 已是最新
-    from PIL import Image
+    from PIL import Image, ImageEnhance
     img = Image.open(src)
     img.load()  # 截断文件在这里抛错, 不会写出半个图
     img = img.convert("RGB")
     if max(img.size) > MAX_DIM:
         scale = MAX_DIM / max(img.size)
         img = img.resize((round(img.width * scale), round(img.height * scale)))
+    # 预压暗: 插件页全屏显示壁纸, 真机上遮罩层渲染不可靠 (2026-10-10 Astra 反馈
+    # 壁纸太亮太抢), 把「最终观感」直接烘进图片, CSS 遮罩降级为辅助。
+    img = ImageEnhance.Brightness(img).enhance(0.32)
     tmp = TARGET.with_suffix(".tmp")
     img.save(tmp, "JPEG", quality=JPEG_QUALITY, optimize=True, progressive=True)
     os.replace(tmp, TARGET)

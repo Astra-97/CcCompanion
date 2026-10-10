@@ -45,7 +45,9 @@ body {
 .bg-veil {
   position: fixed;
   inset: 0;
-  background: rgba(10, 10, 15, 0.72);
+  /* 主压暗已烘进内置壁纸 (sync_dash_wallpaper.py 0.32), 这里只留轻度辅助;
+     真机上本层渲染不可靠, 不能再承担主要遮罩职责 (2026-10-10) */
+  background: rgba(10, 10, 15, 0.25);
   z-index: 1;
 }
 
