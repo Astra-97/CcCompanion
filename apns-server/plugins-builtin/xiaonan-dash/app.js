@@ -57,29 +57,38 @@ async function fetchWithRetry(url, attempts) {
   throw lastErr || new Error("fetch failed");
 }
 
-async function applyAppearance() {
+/* 壁纸两阶段 (2026-10-10 Astra 要求「一点开就是」):
+   1) 立即挂插件目录内置 wallpaper.jpg —— 与 app.js/style.css 同批静态请求,
+      不等任何异步 fetch, 打开即有。cron 每分钟把它与当前聊天壁纸同步压缩。
+   2) 内置加载失败才回落 appearance-asset 端点 (壁纸刚换、同步还没跑的场景)。 */
+function mountWallpaper() {
+  const img = document.getElementById("bg-image");
+  let attempts = 0;
+  let fellBack = false;
+  img.addEventListener("load", () => {
+    img.classList.remove("hidden");
+    document.body.classList.add("has-wallpaper");
+  });
+  img.addEventListener("error", () => {
+    img.classList.add("hidden");
+    document.body.classList.remove("has-wallpaper");
+    if (attempts < 2) {
+      attempts++;
+      setTimeout(() => { img.src = "wallpaper.jpg?r=" + attempts; }, 1500 * attempts);
+    } else if (!fellBack) {
+      fellBack = true;
+      applyAppearanceFallback(img);
+    }
+  });
+  img.src = "wallpaper.jpg";
+}
+
+async function applyAppearanceFallback(img) {
   try {
     const res = await fetchWithRetry(`/plugins/${PLUGIN_ID}/appearance`, 3);
     const data = await res.json().catch(() => null);
     const bgUrl = data && data.ok && typeof data.bg_url === "string" ? data.bg_url : "";
-    if (!bgUrl) return;
-    const img = document.getElementById("bg-image");
-    let imgAttempts = 0;
-    img.addEventListener("error", () => {
-      img.classList.add("hidden");
-      document.body.classList.remove("has-wallpaper");
-      // 图片请求被通道吞掉时 error 即触发, 退避重试 (换 query 防任何中间缓存)
-      if (imgAttempts < 3) {
-        imgAttempts++;
-        const sep = bgUrl.indexOf("?") >= 0 ? "&" : "?";
-        setTimeout(() => { img.src = bgUrl + sep + "r=" + imgAttempts; }, 2000 * imgAttempts);
-      }
-    });
-    img.addEventListener("load", () => {
-      img.classList.remove("hidden");
-      document.body.classList.add("has-wallpaper");
-    });
-    img.src = bgUrl;
+    if (bgUrl) img.src = bgUrl;
   } catch (e) { /* 静默回落: 无壁纸不代表页面坏了 */ }
 }
 
@@ -288,7 +297,7 @@ async function refresh() {
   }
 }
 
-applyAppearance();
+mountWallpaper();
 document.getElementById("refresh-btn").addEventListener("click", refresh);
 refresh();
 setInterval(refresh, AUTO_REFRESH_MS);
