@@ -6170,6 +6170,46 @@ class PushHandler(BaseHTTPRequestHandler):
         self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
         return True
 
+    def _apples_typing_payload(self, ts: dict[str, Any]) -> dict[str, Any]:
+        """Enrich the apples typing state for GET /chat/typing.
+
+        - member_id 兜底：先查 group_reply_pending 最后一条（xiaoke 派发路径
+          会登记）；kimi 派发路径从不写 pending，再查 kimi_active_turn 里
+          登记的群轮（user_ts == typing.since 才认领，绝不错配私聊轮）。
+        - turn_user_ts：群轮触发消息的 ts，App 端终止键按它做 exact-turn
+          Stop（/chat/stop 的 user_ts 精确匹配 kimi_active_turn）。
+        """
+        if not isinstance(ts, dict) or not ts.get("is_typing"):
+            return ts
+        member_id = str(ts.get("member_id") or "")
+        if not member_id:
+            with self.state.group_reply_lock:
+                pending = list(self.state.group_reply_pending)
+            if pending:
+                member_id = str(pending[-1].get("member_id") or "")
+        if not member_id:
+            active: dict[str, Any] = {}
+            lock = getattr(self.state, "kimi_turn_lock", None)
+            active_turn = getattr(self.state, "kimi_active_turn", None)
+            try:
+                if lock is not None:
+                    with lock:
+                        active = dict(active_turn or {})
+                elif isinstance(active_turn, dict):
+                    active = dict(active_turn)
+            except Exception:
+                active = {}
+            active_ts = str(active.get("user_ts") or "")
+            if active.get("group") and active_ts and active_ts == str(ts.get("since") or ""):
+                member_id = "kimi"
+        if not member_id:
+            return ts
+        enriched = {**ts, "member_id": member_id}
+        since = str(ts.get("since") or "")
+        if since:
+            enriched["turn_user_ts"] = since
+        return enriched
+
     def _schedule_kimi_web_abort_settlement(
         self,
         *,
@@ -7791,12 +7831,8 @@ class PushHandler(BaseHTTPRequestHandler):
             ts = self._expire_chat_typing_if_stale(
                 contact_id, self._typing_for_contact(contact_id)
             )
-            if contact_id == "apples" and ts.get("is_typing") and not ts.get("member_id"):
-                pending = []
-                with self.state.group_reply_lock:
-                    pending = list(self.state.group_reply_pending)
-                if pending:
-                    ts = {**ts, "member_id": str(pending[-1].get("member_id") or "")}
+            if contact_id == "apples":
+                ts = self._apples_typing_payload(ts)
             self._send_json(200, {"ok": True, **ts})
             return
         if self.path == "/chat/status" or self.path.startswith("/chat/status?"):
@@ -21186,8 +21222,12 @@ class PushHandler(BaseHTTPRequestHandler):
                 return "started"
             self.state.kimi_prepare_token = ""
             self.state.kimi_active_turn = {"user_ts": user_ts, "session_id": session_id, "prompt_id": "", "cancel_event": cancel_event, "transport": "kimi-web", "group": True}
+            # 2026-10-10 群聊「…」气泡头像修复：必须带 member_id。派发时
+            # （_dispatch_apples_mentions）写入的 member_id="kimi" 会被这里
+            # 整体覆盖丢掉，App 端拿不到成员只能回落成群头像。
             self._set_typing_for_contact("apples", {
                 "is_typing": True, "since": user_ts, "transport": "kimi-web",
+                "member_id": "kimi",
             })
         self._mark_kimi_group_turn_inflight(session_id, user_ts)
         # First Web use may happen from a group mention.  Seed only the
@@ -22211,6 +22251,8 @@ class PushHandler(BaseHTTPRequestHandler):
             typing_target = "xiaoke"
         elif "kairos" in targets:
             typing_target = "kairos"
+        elif "kimi" in targets:
+            typing_target = "kimi"
         typing_state = {"is_typing": True, "since": rec["ts"]}
         if typing_target:
             typing_state["member_id"] = typing_target
