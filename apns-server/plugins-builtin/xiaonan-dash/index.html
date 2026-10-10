@@ -8,9 +8,9 @@
 </head>
 <body>
   <!-- 壁纸层: 用 <img> 而非 CSS background, 规避 CSP style-src 对动态内联样式的限制;
-       无壁纸时保持 hidden, 回落深色渐变底。 -->
+       无壁纸时 img 保持 hidden, 回落深色渐变底; 遮罩常驻, 不随 img 状态显隐。 -->
   <img id="bg-image" class="bg-image hidden" alt="" aria-hidden="true">
-  <div id="bg-veil" class="bg-veil hidden" aria-hidden="true"></div>
+  <div id="bg-veil" class="bg-veil" aria-hidden="true"></div>
   <main>
     <header class="dash-header">
       <div class="title-row">

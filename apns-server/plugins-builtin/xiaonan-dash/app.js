@@ -50,15 +50,12 @@ async function applyAppearance() {
     const bgUrl = data && data.ok && typeof data.bg_url === "string" ? data.bg_url : "";
     if (!bgUrl) return;
     const img = document.getElementById("bg-image");
-    const veil = document.getElementById("bg-veil");
     img.addEventListener("error", () => {
       img.classList.add("hidden");
-      veil.classList.add("hidden");
       document.body.classList.remove("has-wallpaper");
     });
     img.addEventListener("load", () => {
       img.classList.remove("hidden");
-      veil.classList.remove("hidden");
       document.body.classList.add("has-wallpaper");
     });
     img.src = bgUrl;
