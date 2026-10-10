@@ -297,7 +297,13 @@ async function refresh() {
   }
 }
 
-mountWallpaper();
+/* 在 App 插件 WebView 内 (原生注入了 CCBridge shim): 页面变透明,
+   壁纸由 App 原生层按功能页同款绘制 (2026-10-10 Astra 反馈壁纸断层/打架);
+   浏览器/PWA 里保持内置壁纸。 */
+const IN_APP = typeof window.CCBridge !== "undefined";
+if (IN_APP) document.documentElement.classList.add("in-app");
+
+if (!IN_APP) mountWallpaper();
 document.getElementById("refresh-btn").addEventListener("click", refresh);
 refresh();
 setInterval(refresh, AUTO_REFRESH_MS);

@@ -258,3 +258,7 @@ h1 { font-size: 20px; margin: 0; flex: 1; }
 }
 
 .hidden { display: none; }
+
+/* ---- App 插件 WebView 内: 透明化, 透出原生壁纸层 ---- */
+html.in-app, html.in-app body { background: transparent; }
+html.in-app .bg-image, html.in-app .bg-veil { display: none; }
