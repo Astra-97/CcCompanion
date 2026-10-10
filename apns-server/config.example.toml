@@ -163,6 +163,14 @@ allowed_ips = []
 # 新会话 seed 注入 + 聊天系统消息与推送通知，绝不做无声 forge。显式设为
 # 0 可禁用；(0,1) 区间生效。Kimi 正忙时自动 forge 跳过本轮，下一轮再触发。
 # kimi_auto_forge_context_threshold = 0.8
+# forge 预警线（2026-10-10）：使用率达到该值、但尚未到 forge 阈值时，服务端
+# 在投递给 Kimi 的 prompt（私聊与群聊入口都评估）里附一次性系统提示——同一
+# 会话同一档位只注入一次，usage 回落或 forge 后重置。Kimi 任务未完结可在
+# 回复末尾单独一行输出 [[CCC_KIMI_FORGE_DEFER]] 自助延期（服务端剥离标记，
+# 不展示给用户）；延期不是无限期的——usage 到达 0.92 硬上限仍照常 forge，
+# forge 系统消息会注明「延期后到达硬上限」。默认 0.75；显式设为 0 禁用；
+# (0,1) 区间生效；≥ forge 阈值时预警带为空、自动不生效。
+# kimi_auto_forge_warn_threshold = 0.75
 # forge seed 混合模式：新会话的交接 seed 在任务盘点/移交登记等摘要内容之后，
 # 追加旧会话最近 N 条对话原文 verbatim（只取 user/assistant 文本，跳过系统
 # 消息、工具调用、工具结果等噪音）。默认 80（对齐 Kairos 的
