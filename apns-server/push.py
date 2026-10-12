@@ -177,6 +177,7 @@ from device_activity import (
 from device_notice import (
     NOTICE_KIND_APP,
     NOTICE_KIND_BATTERY,
+    NOTICE_KIND_SUN,
     XiaokeLowKeyNotifier,
     build_device_notice,
 )
@@ -8324,6 +8325,34 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         # 手机/应用使用上报（2026-09-27 v4）：与 /kimi/ 同一道 native pairing
         # 闸门，fail-closed；体积极小，超界直接拒。
+        # 北京日出日落（2026-10-12）：只给本机 sun-bubble timer 用——shared_secret
+        # fail-closed + 真实来源必须是本机（经 cloudflared/nginx 转发的公网请求
+        # 按 CF-Connecting-IP/X-Real-IP 判为非本机，拒）。体积极小，超界直接拒。
+        if request_path == "/sun-event":
+            try:
+                local_peer = ipaddress.ip_address(self._trusted_client_ip()).is_loopback
+            except ValueError:
+                local_peer = False
+            if not local_peer or not self._native_pairing_auth_matches():
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except (TypeError, ValueError):
+                length = -1
+            if length <= 0 or length > 4 * 1024:
+                self.close_connection = True
+                self._send_json(413, {"ok": False, "error": "request_too_large"})
+                return
+            try:
+                body = self._read_body()
+                if not isinstance(body, dict):
+                    raise ValueError("JSON object required")
+            except Exception as exc:
+                self._send_json(400, {"ok": False, "error": f"bad json: {exc}"})
+                return
+            self._handle_sun_event(body)
+            return
         if request_path in ("/device/battery", "/device/app-event", "/device/activity"):
             if not self._native_pairing_auth_matches():
                 self._send_json(401, {"ok": False, "error": "unauthorized"})
@@ -9099,21 +9128,27 @@ class PushHandler(BaseHTTPRequestHandler):
         notice_kind: str = NOTICE_KIND_BATTERY,
         severity: str = "info",
         change: str = "",
+        device: str = "手机",
+        source: str = "device-event",
     ) -> None:
-        """设备事件落成小克会话的事件胶囊并低调注入 cctg；失败只记日志不炸上报。"""
+        """设备事件落成小克会话的事件胶囊并低调注入 cctg；失败只记日志不炸上报。
+
+        ``device``/``source`` 默认是手机感知（电量/应用开关）；日出日落等本机
+        定时事件复用同一胶囊+低调注入，只换胶囊 items 的 device 与 source。
+        """
         try:
             chat = self._chat_for_contact("xiaoke")
             chat.append(
                 role="assistant",
                 text=text,
-                source="device-event",
+                source=source,
                 metadata={
                     # mihome_event + severity + 非空 items 是 Android 端
                     # MihomeEventPill 的渲染开关（同 roborock-watch）。
                     "mihome_event": True,
                     "severity": "warn" if severity == "warn" else "info",
                     "items": [{
-                        "device": "手机",
+                        "device": device,
                         "change": change or str(event_meta.get("kind") or ""),
                         "human": text,
                     }],
@@ -9128,6 +9163,44 @@ class PushHandler(BaseHTTPRequestHandler):
                 notifier.enqueue(build_device_notice(notice_kind, text))
         except Exception:
             logger.warning("device event notice enqueue failed", exc_info=True)
+
+    _SUN_EVENT_KINDS = ("sunrise", "sunset")
+    _SUN_EVENT_TEXT_MAX = 200
+
+    def _handle_sun_event(self, body: dict[str, Any]) -> None:
+        """POST /sun-event — 本机 sun-bubble timer 的北京日出/日落胶囊。
+
+        与电量/应用开关同一条路：小克会话 mihome 胶囊（device=北京）+ cctg
+        低调注入（【🌅 日出日落·自动触发】）。文案由 timer 算好传入，这里只校验。
+        """
+        kind = body.get("kind")
+        text = body.get("text")
+        if (
+            kind not in self._SUN_EVENT_KINDS
+            or not isinstance(text, str)
+            or not text.strip()
+            or len(text) > self._SUN_EVENT_TEXT_MAX
+            or "\n" in text or "\r" in text
+        ):
+            self._send_json(400, {
+                "ok": False,
+                "error": "kind (sunrise|sunset) and single-line text (<=200 chars) required",
+            })
+            return
+        text = text.strip()
+        event_meta: dict[str, Any] = {"kind": kind}
+        date = body.get("date")
+        if isinstance(date, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+            event_meta["date"] = date
+        if body.get("test") is True:
+            event_meta["test"] = True
+        self._append_device_event_bubble(
+            text, event_meta,
+            notice_kind=NOTICE_KIND_SUN, change=kind,
+            device="北京", source="sun-event",
+        )
+        logger.info("sun event %s bubbled", kind)
+        self._send_json(200, {"ok": True, "kind": kind})
 
     def _maybe_record_device_activity(self, body: dict[str, Any]) -> None:
         """电池/应用事件上报可捎带 activity 快照；非法快照不拖垮主上报。"""

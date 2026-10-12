@@ -649,6 +649,53 @@ class ChatSendDeviceScrubTest(unittest.TestCase):
         self.assertNotIn("device", (body.get("metadata") or {}))
 
 
+class SunEventHandlerTest(DeviceHandlerTestBase):
+    """POST /sun-event（2026-10-12）：复用电量胶囊 + cctg 低调注入，只换 device/source。"""
+
+    def post(self, body):
+        self.handler._handle_sun_event(body)
+        return self.handler.responses[-1]
+
+    def test_sunset_pill_and_notice(self):
+        text = "🌇 北京日落 17:40 · 明天日出 06:22"
+        status, payload = self.post({"kind": "sunset", "text": text, "date": "2026-10-12"})
+        self.assertEqual(200, status)
+        self.assertTrue(payload["ok"])
+        rec = self.handler.chat.appended[0]
+        self.assertEqual("assistant", rec["role"])
+        self.assertEqual("sun-event", rec["source"])
+        meta = rec["metadata"]
+        self.assertTrue(meta["mihome_event"])
+        self.assertEqual("info", meta["severity"])
+        self.assertEqual([{"device": "北京", "change": "sunset", "human": text}], meta["items"])
+        self.assertEqual({"kind": "sunset", "date": "2026-10-12"}, meta["device_event"])
+        self.assertNotIn("no_model_context", meta)
+        notices = self.notices()
+        self.assertEqual(1, len(notices))
+        self.assertTrue(notices[0].startswith("【🌅 日出日落·自动触发】"))
+        self.assertIn(text, notices[0])
+        self.assertTrue(notices[0].endswith(SILENT_SUFFIX))
+
+    def test_bad_bodies_rejected(self):
+        for body in (
+            {"kind": "noon", "text": "x"},
+            {"kind": "sunrise", "text": ""},
+            {"kind": "sunrise", "text": "a\nb"},
+            {"kind": "sunrise", "text": "x" * 201},
+            {"kind": "sunrise"},
+        ):
+            status, _payload = self.post(body)
+            self.assertEqual(400, status)
+        self.assertEqual([], self.bubbles())
+        self.assertEqual([], self.notices())
+
+    def test_battery_pill_unchanged_defaults(self):
+        self.handler._append_device_event_bubble("🔋x", {"kind": "charging_started"})
+        rec = self.handler.chat.appended[0]
+        self.assertEqual("device-event", rec["source"])
+        self.assertEqual("手机", rec["metadata"]["items"][0]["device"])
+
+
 class NativePairingGateTest(unittest.TestCase):
     """/device/* 走与 /kimi/ 相同的 fail-closed native pairing 闸门。"""
 
