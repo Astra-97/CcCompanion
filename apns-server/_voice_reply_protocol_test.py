@@ -182,7 +182,7 @@ class _FakeChat:
         self.appended.append(saved)
         return saved
 
-    def merge_thinking_to_last_assistant(self, *_args) -> bool:
+    def merge_thinking_to_last_assistant(self, *_args, **_kwargs) -> bool:
         return False
 
 

@@ -23658,9 +23658,14 @@ class PushHandler(BaseHTTPRequestHandler):
         # 思考链自动预翻译 (2026-09-08): 小克英文思考链入库前同步翻成中文
         # (30s 上限 + sha256 磁盘缓存), 英文原文留 metadata.thinking_original,
         # 显示文本存译文; 非英文/失败/超时静默存原文, 绝不因翻译丢消息或久等。
+        # 缩水质检 (2026-10-16): 长原文译文两次都缩水时 suspect=True,
+        # 随 metadata.thinking_translation_suspect 落库 (App 暂不消费)。
         thinking_original = None
+        thinking_translation_suspect = False
         if thinking and role == "assistant":
-            thinking, thinking_original = translate_api.translate_thinking_auto(thinking)
+            thinking, thinking_original, thinking_translation_suspect = (
+                translate_api.translate_thinking_auto(thinking)
+            )
         tools = body.get("tools") or ""
         if isinstance(tools, str) and len(tools) > 5000:
             tools = tools[:5000]
@@ -23710,7 +23715,10 @@ class PushHandler(BaseHTTPRequestHandler):
         if not text and not attachment_url and (thinking or tools):
             # 思考链自动预翻译 (2026-09-08): 译文合入上一条 assistant, 原文随行
             ok = chat.merge_thinking_to_last_assistant(
-                thinking, tools, thinking_original=thinking_original
+                thinking,
+                tools,
+                thinking_original=thinking_original,
+                thinking_translation_suspect=thinking_translation_suspect,
             )
             if ok:
                 self._send_json(200, {"ok": True, "merged": True})
@@ -23787,6 +23795,9 @@ class PushHandler(BaseHTTPRequestHandler):
         # thinking 字段本身已是中文译文 (上面的 translate_thinking_auto)。
         if thinking_original:
             metadata = {**(metadata or {}), "thinking_original": thinking_original}
+        # 缩水质检 (2026-10-16): 两次翻译都缩水时落标记, App 侧暂不消费先落数据。
+        if thinking_translation_suspect:
+            metadata = {**(metadata or {}), "thinking_translation_suspect": True}
         # 2026-07-18 互动卡片: metadata.card_title (可选字符串) 标记这条附件是
         # 互动卡片, app 端据此渲染卡片样式并在点开时用 WebView 打开 attachment_url。
         # metadata 本身走 chat_history 原样入库 + /chat/poll /chat/history 原样下发

@@ -99,8 +99,12 @@ def openrouter_api_key() -> str:
     return ""
 
 
-def _cache_key(text: str) -> str:
-    return hashlib.sha256(f"{PROMPT_VERSION}\n{text}".encode("utf-8")).hexdigest()
+def _cache_key(text: str, salt: str = "") -> str:
+    # salt 仅在有值时参与键派生，保证既有缓存条目（无 salt）键值不变。
+    base = f"{PROMPT_VERSION}\n{text}"
+    if salt:
+        base = f"{salt}\n{base}"
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 
 def _cache_read(cache_dir: Path, key: str, model: str) -> str:
@@ -142,6 +146,7 @@ def translate_text(
     url: str = OPENROUTER_CHAT_URL,
     model: str = TRANSLATE_MODEL,
     max_chars: int = MAX_TEXT_CHARS,
+    cache_salt: str = "",
 ) -> dict[str, Any]:
     """Translate one thinking chain to Simplified Chinese.
 
@@ -151,6 +156,8 @@ def translate_text(
     中文为主的输入恒等短路、直接原样返回（见 :func:`_is_chinese_dominant`）。
     同一文本已有翻译在途（如语音后台预热）时搭车等待其结果，不重复发起
     OpenRouter 请求（2026-10-02 在途合并）。
+    ``cache_salt`` 非空时参与缓存键派生，用于缩水质检重试与首次翻译
+    使用不同缓存条目（见 :func:`translate_thinking_auto`）。
     """
 
     source = str(text or "")
@@ -167,7 +174,7 @@ def translate_text(
     if _is_chinese_dominant(source):
         return {"translated": source, "cached": False, "truncated": truncated, "usage": {}}
 
-    key = _cache_key(source)
+    key = _cache_key(source, cache_salt)
     cache_path = Path(cache_dir) if cache_dir is not None else DEFAULT_CACHE_DIR
     with _cache_lock:
         hit = _cache_read(cache_path, key, model)
@@ -324,17 +331,42 @@ def _is_chinese_dominant(text: str) -> bool:
     return cjk > 0 and cjk >= other_letters
 
 
+# 译文缩水质检 (2026-10-16)：模型偶发"摸鱼"——5 句英文长段只翻出一句俏皮话
+# （tokens/chat_history.jsonl ts=2026-10-16T08:11:00.199Z 实例，后半段整体没翻，
+# 管线无检出直接入库）。判定启发式：原文较长 + 译文字符数不足原文 ~45%。
+# EN→ZH 本身有字符压缩（正常译文常见 40%-70%），阈值偏宽，误报代价只是多一次
+# 重试并取较长版，不会改坏正常译文。
+ABRIDGED_MIN_SOURCE_CHARS = 200
+ABRIDGED_MIN_RATIO = 0.45
+# 重试走独立缓存键（salt），而不是绕开缓存：首次的缩水译文已占正常键，重试
+# 必须换键才可能拿到新结果；重试结果缓存在 salt 键下，同一文本再次入库时
+# 正常键 + salt 键两次查找全部命中、零 API。不覆盖正常键——/chat/translate
+# 手动入口与语音预热共用正常键，语义保持不变。
+ABRIDGED_RETRY_CACHE_SALT = "abridged-retry-v1"
+
+
+def _looks_abridged(source: str, translated: str) -> bool:
+    """长原文 + 译文字符数不足原文 ~45% → 疑似缩水。"""
+
+    if len(source) < ABRIDGED_MIN_SOURCE_CHARS:
+        return False
+    return len(translated) < len(source) * ABRIDGED_MIN_RATIO
+
+
 def translate_thinking_auto(
     text: str,
     *,
     timeout: float = AUTO_TIMEOUT_SEC,
     **kwargs: Any,
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, bool]:
     """Auto-translate one thinking chain before it lands in chat history.
 
-    Returns ``(display_text, original_or_None)``: 译成中文时给出原文让调用方
-    存进 metadata.thinking_original；失败 / 超时一律静默返回 ``(原文, None)``，
-    消息绝不因翻译丢失或久等。重复内容走磁盘缓存零成本。
+    Returns ``(display_text, original_or_None, translation_suspect)``:
+    译成中文时给出原文让调用方存进 metadata.thinking_original；失败 / 超时
+    一律静默返回 ``(原文, None, False)``，消息绝不因翻译丢失或久等。
+    重复内容走磁盘缓存零成本。``translation_suspect`` 为缩水质检标记：
+    长原文两次翻译都缩水（或重试失败仍只有缩水版）时为 True，调用方写进
+    metadata.thinking_translation_suspect 落数据，App 侧暂不消费。
 
     中文为主的输入直接原样返回（见 :func:`_is_chinese_dominant`）；其余输入
     不设语言预判门控、全部走模型翻译（Astra 2026-09-08 拍板）。
@@ -344,15 +376,34 @@ def translate_thinking_auto(
 
     source = str(text or "")
     if not source.strip():
-        return text, None
+        return text, None, False
     if _is_chinese_dominant(source):
-        return text, None
+        return text, None, False
     try:
         result = translate_text(source, timeout=timeout, **kwargs)
     except Exception as exc:
         logger.warning("thinking auto-translate failed, keeping original: %s", exc)
-        return text, None
+        return text, None, False
     translated = str(result.get("translated") or "").strip()
     if not translated or translated == source.strip():
-        return text, None
-    return translated, text
+        return text, None, False
+    suspect = False
+    if _looks_abridged(source, translated):
+        # 疑似缩水：同一 prompt 重试一次（temperature=0 但模型采样仍有方差），
+        # 两版取较长；重试失败保留首版，仍按疑似缩水标记落库。
+        retry_kwargs = dict(kwargs)
+        retry_kwargs["cache_salt"] = ABRIDGED_RETRY_CACHE_SALT
+        retry_translated = ""
+        try:
+            retry = translate_text(source, timeout=timeout, **retry_kwargs)
+            retry_translated = str(retry.get("translated") or "").strip()
+        except Exception as exc:
+            logger.warning("thinking abridged-retry failed, keeping first pass: %s", exc)
+        if (
+            retry_translated
+            and retry_translated != source.strip()
+            and len(retry_translated) > len(translated)
+        ):
+            translated = retry_translated
+        suspect = _looks_abridged(source, translated)
+    return translated, text, suspect

@@ -331,11 +331,14 @@ class ChatHistory:
         thinking: str,
         tools: str = "",
         thinking_original: str | None = None,
+        thinking_translation_suspect: bool = False,
     ) -> bool:
         """Merge thinking/tools into the most recent assistant record.
 
         思考链自动预翻译 (2026-09-08): ``thinking_original`` 非空时把英文原文
         留进该条记录的 metadata.thinking_original，显示文本 thinking 存译文。
+        缩水质检 (2026-10-16): ``thinking_translation_suspect`` 为 True 时同条
+        metadata 落 thinking_translation_suspect 标记（App 暂不消费）。
         """
         if not self.path.exists():
             return False
@@ -356,11 +359,16 @@ class ChatHistory:
                 rec = json.loads(lines[target_idx])
                 if thinking:
                     rec["thinking"] = thinking
+                    meta_updates = {}
                     if thinking_original:
+                        meta_updates["thinking_original"] = thinking_original
+                    if thinking_translation_suspect:
+                        meta_updates["thinking_translation_suspect"] = True
+                    if meta_updates:
                         meta = rec.get("metadata")
                         if not isinstance(meta, dict):
                             meta = {}
-                        rec["metadata"] = {**meta, "thinking_original": thinking_original}
+                        rec["metadata"] = {**meta, **meta_updates}
                 if tools:
                     rec["tools"] = tools
                 lines[target_idx] = json.dumps(rec, ensure_ascii=False)

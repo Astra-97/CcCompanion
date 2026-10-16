@@ -386,5 +386,66 @@ class InflightCoalescingTest(unittest.TestCase):
         self.assertEqual(str(ctx.exception), "translate_inflight_timeout")
 
 
+class AbridgedRetryCacheSaltTest(unittest.TestCase):
+    """缩水质检 (2026-10-16) 重试的缓存键语义：salt 键与正常键互相独立，
+    无 salt 的既有键派生保持不变。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cache_dir = Path(self.tmp.name) / "cache"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _call(self, text: str = SAMPLE_THINKING, **kwargs):
+        kwargs.setdefault("cache_dir", self.cache_dir)
+        kwargs.setdefault("api_key", "sk-test")
+        return translate_api.translate_text(text, **kwargs)
+
+    def test_unsalted_cache_key_unchanged(self) -> None:
+        # 无 salt 时键派生与修复前一致：既有磁盘缓存条目全部继续有效
+        expected = hashlib.sha256(
+            f"{translate_api.PROMPT_VERSION}\n{SAMPLE_THINKING}".encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(translate_api._cache_key(SAMPLE_THINKING), expected)
+        self.assertEqual(translate_api._cache_key(SAMPLE_THINKING, ""), expected)
+
+    def test_salt_produces_distinct_key(self) -> None:
+        salted = translate_api._cache_key(
+            SAMPLE_THINKING, translate_api.ABRIDGED_RETRY_CACHE_SALT
+        )
+        self.assertNotEqual(salted, translate_api._cache_key(SAMPLE_THINKING))
+
+    def test_salted_and_unsalted_cache_entries_are_independent(self) -> None:
+        # 同一文本：正常键与 salt 键各自缓存，互不命中——重试才不会吃到首次的缩水缓存
+        with patch.object(translate_api.httpx, "post", return_value=_ok_response()) as post:
+            first = self._call()
+            retry = self._call(cache_salt=translate_api.ABRIDGED_RETRY_CACHE_SALT)
+        self.assertEqual(post.call_count, 2)
+        self.assertFalse(first["cached"])
+        self.assertFalse(retry["cached"])
+        # 两个键都落盘后再调，全部缓存命中、零 API
+        with patch.object(translate_api.httpx, "post") as post:
+            again = self._call()
+            again_retry = self._call(cache_salt=translate_api.ABRIDGED_RETRY_CACHE_SALT)
+        post.assert_not_called()
+        self.assertTrue(again["cached"])
+        self.assertTrue(again_retry["cached"])
+
+    def test_looks_abridged_thresholds(self) -> None:
+        long_source = "x" * translate_api.ABRIDGED_MIN_SOURCE_CHARS
+        # 原文刚好到阈值 + 译文不足 45% → 疑似缩水
+        self.assertTrue(
+            translate_api._looks_abridged(long_source, "y" * int(len(long_source) * 0.44))
+        )
+        # 译文达到 45% → 正常
+        self.assertFalse(
+            translate_api._looks_abridged(long_source, "y" * int(len(long_source) * 0.45))
+        )
+        # 原文不足阈值 → 永不判定（短原文不触发）
+        short_source = "x" * (translate_api.ABRIDGED_MIN_SOURCE_CHARS - 1)
+        self.assertFalse(translate_api._looks_abridged(short_source, "y"))
+
+
 if __name__ == "__main__":
     unittest.main()
