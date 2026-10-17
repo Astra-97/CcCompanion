@@ -354,6 +354,12 @@ body[data-appearance='compact'] .composer{padding-block:11px}
 .chat-card-face .contact-led{position:absolute;right:-3px;bottom:0;margin-left:0}
 .chat-list .chat-card>strong{font-size:11.5px;font-weight:600}
 .chat-list .chat-card:hover .avatar{filter:brightness(1.12)}
+
+/* Tablet and wider: dashboard cards flow in two columns, contacts span the row. */
+@media (min-width:768px){
+  .dash-stack{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .dash-contacts-card{grid-column:1 / -1}
+}
 .terminal-page-list{display:grid;gap:12px;margin-top:16px}
 .terminal-page-card .terminal-events{max-height:220px;margin-top:10px}
 .terminal-page-card .terminal-status{margin:8px 0 0}
@@ -402,8 +408,8 @@ body[data-appearance='compact'] .composer{padding-block:11px}
   .terminal-events{max-height:min(32dvh,230px)}
 }
 
-/* Phone: wallpaper-first single column, floating glass composer + bottom tab bar. */
-@media (max-width:720px){
+/* Phone (<768px): wallpaper-first single column, floating glass composer + bottom tab bar. */
+@media (max-width:767px){
   body{overflow:hidden}
   .desk-shell{display:block;height:100vh;height:100dvh;padding:0}
   .rail{display:none}

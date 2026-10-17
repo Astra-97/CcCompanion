@@ -1,5 +1,5 @@
-const CACHE = 'cccompanion-desk-v20';
-const ASSETS = ['./', './index.html', './manifest.webmanifest', './src/styles.css?v=20', './src/api.js?v=20', './src/bootstrap.js?v=20', './src/composer-state.js?v=20', './src/data.js?v=20', './src/pairing-code.js?v=20', './src/live-messages.js?v=20', './src/clipboard-images.js?v=20', './src/sticker-protocol.js?v=20', './src/markdown.js?v=20', './src/unread.js?v=20', './src/notifications.js?v=20', './src/memory-calendar.js?v=20', './src/home-dashboard.js?v=20', './src/app.js?v=20', './assets/cc-mark.svg', './assets/icon-192.png', './assets/icon-512.png'];
+const CACHE = 'cccompanion-desk-v21';
+const ASSETS = ['./', './index.html', './manifest.webmanifest', './src/styles.css?v=21', './src/api.js?v=21', './src/bootstrap.js?v=21', './src/composer-state.js?v=21', './src/data.js?v=21', './src/pairing-code.js?v=21', './src/live-messages.js?v=21', './src/clipboard-images.js?v=21', './src/sticker-protocol.js?v=21', './src/markdown.js?v=21', './src/unread.js?v=21', './src/notifications.js?v=21', './src/memory-calendar.js?v=21', './src/home-dashboard.js?v=21', './src/app.js?v=21', './assets/cc-mark.svg', './assets/icon-192.png', './assets/icon-512.png'];
 self.addEventListener('activate', (event) => event.waitUntil(
   caches.keys()
     .then((keys) => Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key))))

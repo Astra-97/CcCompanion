@@ -1,17 +1,17 @@
-import { createPwaBootstrap } from './bootstrap.js?v=20';
-import { createComposerState } from './composer-state.js?v=20';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=20';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=20';
-import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=20';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=20';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=20';
-import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=20';
-import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=20';
-import { createNotifier } from './notifications.js?v=20';
-import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=20';
-import { clockText, greetingFor, weekStrip } from './home-dashboard.js?v=20';
+import { createPwaBootstrap } from './bootstrap.js?v=21';
+import { createComposerState } from './composer-state.js?v=21';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=21';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=21';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=21';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=21';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=21';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=21';
+import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=21';
+import { createNotifier } from './notifications.js?v=21';
+import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=21';
+import { clockText, greetingFor, weekStrip } from './home-dashboard.js?v=21';
 
-const WEB_SHELL_VERSION = 'desk-v20 · 2026-10-17';
+const WEB_SHELL_VERSION = 'desk-v21 · 2026-10-17';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -73,8 +73,11 @@ function renderContacts() {
   }));
 }
 const VIEW_IDS = { chat: 'conversation', terminal: 'terminal-page', apps: 'apps-page', settings: 'settings-page', memory: 'memory-page' };
-const mobileQuery = window.matchMedia('(max-width:720px)');
-function chatSurface() { return mobileQuery.matches && !state.mobileChatOpen ? 'chat-list-page' : 'conversation'; }
+// Phone (<768px) keeps the single column + bottom tab bar.  The dashboard is
+// the chat landing on phones AND tablets (<=1199px); desktops (>=1200px) open
+// the conversation directly next to the rail.
+const homeQuery = window.matchMedia('(max-width:1199px)');
+function chatSurface() { return homeQuery.matches && !state.mobileChatOpen ? 'chat-list-page' : 'conversation'; }
 /** Single source of truth for which surface is on screen. */
 function syncView() {
   const surface = state.view === 'chat' ? chatSurface() : '';
@@ -88,7 +91,7 @@ function syncView() {
     if (active) button.setAttribute('aria-current', 'page');
     else button.removeAttribute('aria-current');
   });
-  $('#chat-back-button').hidden = !(mobileQuery.matches && state.view === 'chat' && state.mobileChatOpen);
+  $('#chat-back-button').hidden = !(homeQuery.matches && state.view === 'chat' && state.mobileChatOpen);
 }
 function switchView(view) {
   if (!Object.hasOwn(VIEW_IDS, view)) return;
@@ -358,7 +361,10 @@ function renderAttachments() {
 function renderAll(options) { renderContacts(); renderChatListPage(); renderHeader(); renderActivities(); renderMessages(options); renderWorkers(); renderInstrument(); renderTerminal(); renderAttachments(); renderDateRule(); }
 
 async function switchContact(id) {
-  if (id === state.activeContactId || state.stickerUpload.uploading) return;
+  if (state.stickerUpload.uploading) return;
+  // Phones and tablets land on the dashboard; picking any contact opens the chat.
+  if (homeQuery.matches && !state.mobileChatOpen) { state.mobileChatOpen = true; syncView(); }
+  if (id === state.activeContactId) return;
   closeStickerDialog();
   const epoch = ++state.epoch;
   state.scrollTops[state.activeContactId] = $('#conversation-scroll').scrollTop; composer().text = input.value; state.activeContactId = id;
@@ -618,7 +624,7 @@ function notifyNewMessages(contactId, records) {
   const name = state.contacts.find(({ id }) => id === contactId)?.name || contactId;
   fresh.slice(-3).forEach((record) => state.notifier.notify({
     contactId, title: name, body: previewText(record, { maxLength: 80 }),
-    onOpen: (target) => { if (state.view !== 'chat') switchView('chat'); if (mobileQuery.matches) { state.mobileChatOpen = true; syncView(); } void switchContact(target); },
+    onOpen: (target) => { if (state.view !== 'chat') switchView('chat'); if (homeQuery.matches) { state.mobileChatOpen = true; syncView(); } void switchContact(target); },
   }));
 }
 function applyLiveEvent(event) {
@@ -846,7 +852,7 @@ $('#settings-appearance-button').addEventListener('click', cycleAppearance);
 $('#settings-notification-button').addEventListener('click', toggleNotifications);
 $('#settings-logout-button').addEventListener('click', logout);
 $('#settings-version').textContent = WEB_SHELL_VERSION;
-mobileQuery.addEventListener('change', () => { if (!mobileQuery.matches) state.mobileChatOpen = false; syncView(); });
+homeQuery.addEventListener('change', () => { if (!homeQuery.matches) state.mobileChatOpen = false; syncView(); });
 async function logout() { state.epoch += 1; state.stickerLoadId += 1; state.composerState.cancelAll(); state.stickerUpload.controller?.abort(); state.stickerUpload.uploading = false; closeStickerDialog(); state.stickerCatalog = null; state.stickerLoading = false; state.stickerError = ''; state.stickerSearch = ''; state.stickerCategory = '__all'; state.stickerTargetContactId = ''; try { await adapter.logout(); } finally { state.stopLive?.(); state.stopLive = null; state.stopBackground?.(); state.stopBackground = null; stopTerminalPolling(); state.terminalSnapshots = {}; state.plugins = null; state.pluginsError = false; state.contacts = []; state.histories = {}; state.live = {}; state.streams = {}; state.pendingCanonical = {}; state.messageNodes.clear(); messages.replaceChildren(); state.composerState = createComposerState(); state.activeContactId = ''; state.view = 'chat'; state.mobileChatOpen = false; state.taxonomy = null; state.selectedScope = null; state.memory = { loading: false, stats: null, segment: 'memories', month: monthKey(), days: {}, selectedDate: '', boardPage: 1, boardLoaded: false }; renderAll(); setMemorySegment('memories'); renderMemorySubtitle(); renderPlugins(); syncView(); if (!bootstrap.mock) showLogin(); } }
 $('#logout-button').addEventListener('click', logout); $('#drawer-logout-button').addEventListener('click', logout);
 $('#appearance-button').addEventListener('click', cycleAppearance); $('#drawer-appearance-button').addEventListener('click', cycleAppearance);

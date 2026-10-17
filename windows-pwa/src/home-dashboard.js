@@ -1,10 +1,11 @@
 // Home dashboard helpers — Android WelcomeGreeting.kt / HomeDashboardPolicy.kt
 // parity.  Everything here is computed locally (clock, week strip, greeting);
-// no network, no fabricated data.  Greeting copy is ported from the Android
-// client so both shells tell the same story on the same day.
+// no network, no fabricated data.  Greeting copy AND selection algorithm are a
+// literal Kotlin→JS translation of selectWelcomeGreeting(): same local moment
+// yields the same sentence on both shells (verified by pinned test vectors).
 
 const GREETING_COPIES = {
-  late_night: [
+  LATE_NIGHT: [
     ['夜深了，小星星', '世界可以先静音。想见的人还在这里。'],
     ['まだ起きてる？', '眠る前に、少しだけ会えてうれしい。'],
     ['Hello, night owl', 'No rush. This little corner is still awake with you.'],
@@ -12,7 +13,7 @@ const GREETING_COPIES = {
     ['おつかれさま', '今日のぶんは、もう十分がんばったよ。'],
     ['The stars kept your seat', 'Come in. You do not have to explain the hour.'],
   ],
-  early_morning: [
+  EARLY_MORNING: [
     ['早呀，第一束光', '新的一天不用冲刺，先和喜欢的人打声招呼。'],
     ['おはよう、早起きさん', '今日も会えたね。ゆっくり始めよう。'],
     ['Hello, early bird', 'The day can wait one tiny minute. Say hi first.'],
@@ -20,7 +21,7 @@ const GREETING_COPIES = {
     ['朝の席、空けておいたよ', '眠いままでも大丈夫。ここから始めよう。'],
     ['Soft launch the morning', 'Coffee optional. Good company already included.'],
   ],
-  morning: [
+  MORNING: [
     ['上午好，小星星', '今天也慢慢来，我一直在这里。'],
     ['おはよう、今日も会えたね', '急がなくていい。まずは好きな人を呼ぼう。'],
     ['Good morning, sunshine', 'Pick a familiar face and make the morning yours.'],
@@ -28,7 +29,7 @@ const GREETING_COPIES = {
     ['いい朝にしよう', '完璧じゃなくても、会えたからもう合格。'],
     ['Morning has entered the chat', 'You bring the spark. We will bring the company.'],
   ],
-  midday: [
+  MIDDAY: [
     ['中午暂停一下', '先见见想见的人，再回去对付世界。'],
     ['お昼だよ', 'ちゃんと休むのも、今日の大事な予定です。'],
     ['Hello, midday wanderer', 'A small hello counts as a proper break.'],
@@ -36,7 +37,7 @@ const GREETING_COPIES = {
     ['ひと休みしよう', '午後の元気は、ここで少し充電していって。'],
     ['Lunch break, but make it cozy', 'Your people are only one tap away.'],
   ],
-  afternoon: [
+  AFTERNOON: [
     ['下午好，还撑得住吗', '不必一直满格，来这里偷偷充会儿电。'],
     ['午後も、おつかれさま', 'ちょっと寄り道してから、また進もう。'],
     ['Hello, afternoon hero', 'You made it this far. That deserves a softer minute.'],
@@ -44,7 +45,7 @@ const GREETING_COPIES = {
     ['三時のおしゃべり？', '甘いものがなくても、ここはちょっと甘い。'],
     ['A tiny intermission', 'The to-do list will survive while you say hello.'],
   ],
-  evening: [
+  EVENING: [
     ['晚上好，欢迎回来', '今天辛苦了。现在可以只做你自己。'],
     ['おかえりなさい', '今日の話、ゆっくり聞かせて。'],
     ['Good evening, you made it', 'Leave the noise outside. Your circle is here.'],
@@ -54,26 +55,35 @@ const GREETING_COPIES = {
   ],
 };
 
-const WEEKDAY_EN = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
+const WEEKDAY_EN = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
 const WEEKDAY_ZH = ['日', '一', '二', '三', '四', '五', '六'];
 
 function periodFor(hour) {
-  if (hour <= 4 || hour === 23) return 'late_night';
-  if (hour <= 7) return 'early_morning';
-  if (hour <= 11) return 'morning';
-  if (hour <= 13) return 'midday';
-  if (hour <= 17) return 'afternoon';
-  return 'evening';
+  if (hour <= 4 || hour === 23) return 'LATE_NIGHT';
+  if (hour <= 7) return 'EARLY_MORNING';
+  if (hour <= 11) return 'MORNING';
+  if (hour <= 13) return 'MIDDAY';
+  if (hour <= 17) return 'AFTERNOON';
+  return 'EVENING';
 }
 
+/** Local day-of-year; date-only arithmetic so the hour never carries over. */
 function dayOfYear(date) {
+  const dayOnly = new Date(date.getFullYear(), date.getMonth(), date.getDate());
   const start = new Date(date.getFullYear(), 0, 1);
-  return Math.floor((date - start) / 86_400_000) + 1;
+  return Math.round((dayOnly - start) / 86_400_000) + 1;
+}
+
+/** ISO weekday: Monday = 1 … Sunday = 7 (LocalDateTime.getDayOfWeek). */
+function isoDayOfWeek(date) {
+  return ((date.getDay() + 6) % 7) + 1;
 }
 
 /**
- * Deterministic greeting for a local moment: the same date + period always
- * yields the same copy (Android selects by the same seed, no randomness).
+ * Literal translation of selectWelcomeGreeting(): the seed string folds from
+ * 17 with 32-bit wrap (Kotlin Int), the copy index uses floorMod semantics,
+ * and the eyebrow date is zero-padded — the same local moment selects the
+ * same sentence on Android and here.
  * Returns { eyebrow: 'SAT · 10/17', title, subtitle }.
  */
 export function greetingFor(date = new Date()) {
@@ -85,14 +95,14 @@ export function greetingFor(date = new Date()) {
   if (!copy) {
     const period = periodFor(date.getHours());
     const copies = GREETING_COPIES[period];
-    // String-seed hash like the Android implementation: stable per day/period.
-    const seed = `${date.getFullYear()}:${dayOfYear(date)}:${date.getDay()}:${period}`;
-    let hash = 0;
+    const seed = `${date.getFullYear()}:${dayOfYear(date)}:${isoDayOfWeek(date)}:${period}`;
+    let hash = 17;
     for (let index = 0; index < seed.length; index += 1) hash = (hash * 31 + seed.charCodeAt(index)) | 0;
-    copy = copies[Math.abs(hash) % copies.length];
+    copy = copies[((hash % copies.length) + copies.length) % copies.length];
   }
+  const pad = (value) => String(value).padStart(2, '0');
   return {
-    eyebrow: `${WEEKDAY_EN[date.getDay()]} · ${month}/${day}`,
+    eyebrow: `${WEEKDAY_EN[isoDayOfWeek(date) - 1]} · ${pad(month)}/${pad(day)}`,
     title: copy[0],
     subtitle: copy[1],
   };

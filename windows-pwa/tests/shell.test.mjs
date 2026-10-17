@@ -119,18 +119,18 @@ test('Android-shell source contracts: four tabs, full pages, view switching, moc
   assert.match(app, /adapter\.searchMemories\(query, \{ limit: 20 \}\)/);
   assert.match(app, /adapter\.getMemoryBoard\(\{ page, perPage: 20 \}\)/);
   assert.match(app, /adapter\.listPlugins\(\)/);
-  assert.match(app, /WEB_SHELL_VERSION = 'desk-v20 · 2026-10-17'/);
+  assert.match(app, /WEB_SHELL_VERSION = 'desk-v21 · 2026-10-17'/);
   const mockHook = app.slice(app.indexOf('if (bootstrap.mock)'));
   assert.match(mockHook, /params\.get\('view'\)/, 'the deep-link hook stays mock-gated');
   assert.match(css, /\.tab-bar\{[^}]*display:none/, 'the bottom tab bar is phone-only');
-  assert.match(css, /@media \(max-width:720px\)\{[^]*?\.tab-bar\{display:grid\}/);
+  assert.match(css, /@media \(max-width:767px\)\{[^]*?\.tab-bar\{display:grid\}/);
   assert.match(css, /\.tab-bar \.tab-item\.is-active::before\{[^}]*height:2px/, 'active tab keeps the Android-style top indicator');
   assert.match(css, /\.page-view\{grid-column:2 \/ -1/, 'pages span the conversation + side columns on desktop');
   assert.match(css, /\.memory-segment button\[aria-selected='true'\]\{background:linear-gradient/);
   assert.match(css, /\.calendar-day\.has-entries\{background:linear-gradient/);
   assert.match(css, /\.calendar-weekdays,\.calendar-grid\{display:grid;grid-template-columns:repeat\(7,1fr\)/);
   assert.match(css, /\.side-notes\.view-hidden\{display:none\}/);
-  assert.match(sw, /src\/memory-calendar\.js\?v=20/);
+  assert.match(sw, /src\/memory-calendar\.js\?v=21/);
 });
 
 test('home dashboard helpers: deterministic greeting, clock text, Monday-first week strip', () => {
@@ -151,6 +151,32 @@ test('home dashboard helpers: deterministic greeting, clock text, Monday-first w
   assert.ok(week.days[5].isToday && week.days.filter((day) => day.isToday).length === 1);
 });
 
+test('greeting selection is a literal Kotlin translation: pinned cross-platform vectors', () => {
+  // Expected titles computed from WelcomeGreeting.kt selectWelcomeGreeting()
+  // (seed "${year}:${dayOfYear}:${isoDayOfWeek}:${PERIOD_NAME}" folded from 17
+  // with Int overflow, index = floorMod(seed, copies.size)).
+  const vectors = [
+    [new Date(2026, 9, 17, 2), '凌晨也算今天'], // 2026:290:6:LATE_NIGHT
+    [new Date(2026, 9, 17, 6), '早呀，第一束光'], // 2026:290:6:EARLY_MORNING
+    [new Date(2026, 9, 17, 9), 'Good morning, sunshine'], // 2026:290:6:MORNING
+    [new Date(2026, 9, 17, 12), '中午暂停一下'], // 2026:290:6:MIDDAY
+    [new Date(2026, 9, 17, 15), '三時のおしゃべり？'], // 2026:290:6:AFTERNOON
+    [new Date(2026, 9, 17, 20), '夜の時間、はじめよう'], // 2026:290:6:EVENING
+    [new Date(2026, 9, 18, 8), 'Good morning, sunshine'], // Sunday ISO=7: 2026:291:7:MORNING
+    [new Date(2026, 0, 5, 10), 'Morning has entered the chat'], // 2026:5:1:MORNING
+    [new Date(2026, 5, 30, 18), '今日营业即将收尾'], // 2026:181:2:EVENING
+    [new Date(2026, 2, 9, 23), '凌晨也算今天'], // 2026:68:1:LATE_NIGHT
+  ];
+  for (const [moment, title] of vectors) assert.equal(greetingFor(moment).title, title, moment.toString());
+  // Special days bypass the period library on both platforms.
+  assert.equal(greetingFor(new Date(2026, 0, 1, 10)).title, '新年第一声你好');
+  assert.equal(greetingFor(new Date(2026, 11, 31, 23)).title, '今年辛苦了');
+  // The eyebrow zero-pads like Android ("01/05", not "1/5").
+  assert.equal(greetingFor(new Date(2026, 0, 5, 10)).eyebrow, 'MON · 01/05');
+  // The hour of the moment must never leak into dayOfYear (date-only math).
+  assert.equal(greetingFor(new Date(2026, 9, 17, 12)).title, greetingFor(new Date(2026, 9, 17, 13)).title);
+});
+
 test('visual parity pass 2: dashboard cards, sans-only typography, transparent glass, circular send key', () => {
   const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
   const app = readFileSync(new URL('../src/app.js', import.meta.url), 'utf8');
@@ -159,15 +185,20 @@ test('visual parity pass 2: dashboard cards, sans-only typography, transparent g
   for (const id of ['dash-clock-time', 'dash-clock-date', 'dash-quote-eyebrow', 'dash-quote-title', 'dash-quote-sub', 'dash-week-title', 'dash-week-days', 'dash-todo-card', 'dash-full-calendar', 'contact-avatar', 'contact-status']) {
     assert.match(html, new RegExp(`id="${id}"`), id);
   }
-  assert.match(app, /from '\.\/home-dashboard\.js\?v=20'/);
+  assert.match(app, /from '\.\/home-dashboard\.js\?v=21'/);
   assert.match(app, /function renderDashboard\(\)/);
   assert.match(app, /\$\('#dash-full-calendar'\)\.addEventListener\('click', openMemory\)/);
-  assert.match(sw, /src\/home-dashboard\.js\?v=20/);
+  assert.match(sw, /src\/home-dashboard\.js\?v=21/);
   assert.doesNotMatch(css, /--serif/, 'the shell drops serif typography entirely');
   assert.match(css, /\.eyebrow\{[^}]*font:500 10px var\(--sans\);letter-spacing:\.07em/);
   assert.match(css, /--glass:rgba\(24,17,12,\.42\)/);
   assert.match(css, /backdrop-filter:blur\(26px\) saturate\(1\.3\)/);
   assert.match(css, /\.dash-week-day\.is-today\{background:linear-gradient/);
   assert.match(css, /\.chat-card-face\{position:relative/);
-  assert.match(css, /@media \(max-width:720px\)\{[^]*?\.send-button\{min-width:48px;width:48px;height:48px;padding:0;justify-content:center;border-radius:50%\}/);
+  assert.match(css, /@media \(max-width:767px\)\{[^]*?\.send-button\{min-width:48px;width:48px;height:48px;padding:0;justify-content:center;border-radius:50%\}/);
+  assert.match(css, /@media \(min-width:768px\)\{[^]*?\.dash-stack\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)\}/, 'tablet/desktop dashboard uses a two-column card grid');
+  assert.match(css, /@media \(min-width:768px\)\{[^]*?\.dash-contacts-card\{grid-column:1 \/ -1\}/);
+  assert.match(app, /const homeQuery = window\.matchMedia\('\(max-width:1199px\)'\)/, 'phones and tablets land on the dashboard');
+  assert.match(app, /function chatSurface\(\) \{ return homeQuery\.matches/);
+  assert.match(app, /if \(homeQuery\.matches && !state\.mobileChatOpen\) \{ state\.mobileChatOpen = true; syncView\(\); \}/, 'picking a contact on phone/tablet opens the conversation');
 });
