@@ -211,6 +211,24 @@ export function historyCursor(records = []) {
   }, '');
 }
 
+/**
+ * Optimistic busy projection applied locally the moment POST /chat/send
+ * succeeds.  The next authoritative /chat/status snapshot or SSE draft
+ * replaces it; until then the UI must not look idle.  The old turn's stop
+ * fence is never reused: a fresh turn starts without a stop request.
+ */
+export function optimisticBusyState(live = {}) {
+  const base = live && typeof live === 'object' ? live : {};
+  return { ...base, busy: true, replyState: 'generating', statusText: base.busy || ['generating', 'queued'].includes(base.replyState) ? (base.statusText || '正在处理') : '正在启动…', stopRequest: { supported: false, body: null } };
+}
+
+/** Header stop control: visible while busy, armed only with a server fence. */
+export function stopControlState(live = {}) {
+  const busy = Boolean(live?.busy || ['generating', 'queued'].includes(live?.replyState));
+  const canStop = busy && live?.stopRequest?.supported === true;
+  return { visible: busy, enabled: canStop, label: canStop ? '停止' : '正在启动…' };
+}
+
 export function normalizeSendRecord(result) {
   const record = result && typeof result === 'object' ? (result.record || result.message) : null;
   if (!record || typeof record !== 'object' || Array.isArray(record)) return null;

@@ -73,3 +73,36 @@ body[data-appearance='reading']{--sans:ui-rounded,'Noto Sans SC',system-ui,sans-
 .message{position:relative}.message-actions{display:flex;justify-content:flex-end;gap:6px;margin-top:5px;opacity:0;transition:opacity .15s}.message:hover .message-actions,.message:focus-within .message-actions{opacity:1}.message-action{min-height:28px;border:1px solid var(--line);border-radius:3px;padding:2px 9px;background:var(--surface);color:var(--muted);font:10px var(--mono)}.message-action:hover{border-color:var(--brass);color:var(--brass)}
 .contact-preview{display:block}.unread-badge{display:grid;place-items:center;min-width:19px;height:19px;margin-left:auto;border-radius:999px;padding:0 5px;background:var(--oxide);color:var(--paper);font:600 10px var(--mono)}.unread-badge+.contact-led{margin-left:6px}
 @media (prefers-reduced-motion:reduce){.message-actions{transition:none}}
+
+/* 2026-10-17 polish pass: real surfaces for assistant content, calmer code
+   blocks, unified control radii.  Palette and information architecture stay. */
+.stop-button:disabled{opacity:.6;cursor:not-allowed}
+#notification-button[aria-pressed='true']{border-color:var(--brass);color:var(--brass);background:var(--accent-wash)}
+.messages{gap:28px}
+.message-meta{letter-spacing:.09em;margin-bottom:7px}
+.from-assistant .message-body:not(.sticker-only-message){padding:12px 16px;border:1px solid var(--line);border-radius:2px 14px 14px;background:rgba(255,252,247,.72);box-shadow:0 1px 3px rgba(92,56,35,.06)}
+.from-user .message-body{border-radius:14px 2px 14px 14px;box-shadow:0 1px 3px rgba(92,56,35,.1)}
+.message.has-sticker-only .message-body{box-shadow:none}
+.message-md .message-md-paragraph{margin:0 0 12px}.message-md .message-md-paragraph:last-child,.message-md .message-md-list:last-child,.message-md .code-block:last-child{margin-bottom:0}
+.message-md .message-md-list{margin:2px 0 12px;padding-left:24px}.message-md .message-md-list li::marker{color:var(--brass)}
+.inline-code{border-radius:4px;padding:1px 6px;background:var(--accent-wash);color:var(--oxide);font-size:12.5px}
+.code-block{border-radius:8px;border-color:rgba(242,233,220,.16);background:#33241a;box-shadow:0 4px 14px rgba(42,23,15,.16)}
+.code-block-head{padding:6px 12px;background:rgba(255,246,236,.05)}
+.code-block pre{padding:13px 16px;font-size:12.5px;max-height:min(46dvh,420px)}
+.from-user .code-block{background:rgba(42,23,15,.22)}
+.thinking-bubble{border:1px solid var(--line);border-radius:8px;padding:9px 12px;background:var(--accent-wash)}
+.thinking-bubble summary{min-height:30px}
+.thinking-text{font-size:12.5px}
+.message-actions{margin-top:6px}
+.message-action{border-radius:6px;background:rgba(255,252,247,.9)}
+.contact-button{min-height:56px;gap:12px;border-radius:8px}
+.contact-preview{line-height:1.5}
+.unread-badge{box-shadow:0 0 0 2px var(--paper)}
+.composer{gap:12px;padding-top:18px}
+textarea{padding:9px 2px;line-height:1.65}
+.send-button,.stop-button{border-radius:8px;padding:9px 16px}
+.send-button{letter-spacing:.04em}
+.attach-button,.sticker-button,.icon-button{transition:border-color .18s,color .18s,background .18s}
+.latest-button{border-radius:999px;padding:9px 16px}
+.activity-strip{border-radius:0 6px 6px 0}
+@media (max-width:720px){.messages{gap:22px}.from-assistant .message-body:not(.sticker-only-message){padding:10px 13px}.code-block pre{font-size:11.5px;padding:11px 12px}.composer{gap:9px;padding-top:12px}.send-button,.stop-button{padding:9px 13px}.contact-button{min-height:52px}}

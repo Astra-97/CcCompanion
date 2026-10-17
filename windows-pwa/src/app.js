@@ -2,7 +2,7 @@ import { createPwaBootstrap } from './bootstrap.js?v=13';
 import { createComposerState } from './composer-state.js?v=13';
 import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=13';
 import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=13';
-import { normalizeLiveState, normalizeSendRecord, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=13';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=13';
 import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=13';
 import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=13';
 import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=13';
@@ -71,7 +71,16 @@ function renderHeader() {
   const sending = Boolean(sendOperation(current.id));
   $('#contact-name').textContent = current.name; $('#contact-mode').textContent = current.channel;
   input.placeholder = `写给${current.name}…`; $('#connection-state').textContent = isBusy() ? (live.statusText || '正在处理') : '已连接';
-  $('#signal-dot').classList.toggle('is-busy', isBusy()); $('#stop-button').hidden = !(isBusy() && live.stopRequest?.supported);
+  $('#signal-dot').classList.toggle('is-busy', isBusy());
+  // The stop key tracks the busy turn itself: visible the moment a send goes
+  // optimistic-busy, armed only once the server provides its stop fence.
+  const stopControl = stopControlState(live);
+  const stopButton = $('#stop-button');
+  stopButton.hidden = !stopControl.visible;
+  stopButton.disabled = !stopControl.enabled;
+  stopButton.textContent = stopControl.label;
+  stopButton.setAttribute('aria-disabled', String(!stopControl.enabled));
+  stopButton.title = stopControl.enabled ? '停止本轮回复' : '正在启动，等待服务端确认本轮后可停止';
   input.disabled = sending; $('#attachment-input').disabled = sending; $('.attach-button').classList.toggle('is-disabled', sending); $('.attach-button').setAttribute('aria-disabled', String(sending));
   $('#sticker-button').disabled = sending || !current.id || Boolean(current.readOnly);
   $('#send-button').disabled = sending || !current.id || Boolean(current.readOnly) || (!composer().text.trim() && !composer().attachments.length);
@@ -323,7 +332,11 @@ async function send(event) {
     state.pendingCanonical[contactId] = [...new Set([...(state.pendingCanonical[contactId] || []), record.id])];
     const merged = upsertHistoryRecord(state.histories[contactId] || [], record);
     state.histories[contactId] = merged.history;
-    if (contactId === state.activeContactId && state.composerState.isCurrent(contactId, operation)) renderMessages({ forceLatest: true });
+    // Enter optimistic busy the instant the server accepts the send.  The
+    // next /chat/status snapshot or SSE draft overwrites this projection;
+    // mergeHistoryDelta only touches history and can never wipe it.
+    state.live[contactId] = optimisticBusyState(state.live[contactId]);
+    if (contactId === state.activeContactId && state.composerState.isCurrent(contactId, operation)) { renderMessages({ forceLatest: true }); renderHeader(); }
     if (state.composerState.isCurrent(contactId, operation)) draft.attachments = [];
   } catch (error) {
     if (staged.length) await adapter.cancelUploads(staged).catch(() => {});
