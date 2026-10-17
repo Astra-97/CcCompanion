@@ -1,10 +1,13 @@
-import { createPwaBootstrap } from './bootstrap.js?v=12';
-import { createComposerState } from './composer-state.js?v=12';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=12';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=12';
-import { normalizeLiveState, normalizeSendRecord, reconcileHistorySnapshot, upsertHistoryRecord } from './api.js?v=12';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=12';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=12';
+import { createPwaBootstrap } from './bootstrap.js?v=13';
+import { createComposerState } from './composer-state.js?v=13';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=13';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=13';
+import { normalizeLiveState, normalizeSendRecord, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=13';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=13';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=13';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=13';
+import { createUnreadStore, previewText, unseenAssistant } from './unread.js?v=13';
+import { createNotifier } from './notifications.js?v=13';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -26,6 +29,7 @@ const state = {
   composerState: createComposerState(), appearance: 'default', followLatest: {}, scrollTops: {},
   stickerCatalog: null, stickerLoading: false, stickerLoadId: 0, stickerError: '', stickerCategory: '__all', stickerSearch: '', stickerTargetContactId: '', stickerSelection: { start: 0, end: 0 }, pendingCanonical: {},
   stickerUpload: { file: null, previewUrl: '', uploading: false, controller: null },
+  unread: createUnreadStore(), notifier: createNotifier(), messageNodes: new Map(), stopBackground: null, backgroundPollInFlight: false,
 };
 const contactList = $('#contact-list'); const messages = $('#message-list'); const input = $('#message-input');
 
@@ -51,9 +55,14 @@ function renderDateRule() {
 function renderContacts() {
   contactList.replaceChildren(...state.contacts.map((item) => {
     const busy = isBusy(item.id);
+    const history = state.histories[item.id] || [];
+    const unread = item.id === state.activeContactId ? 0 : state.unread.unreadFor(item.id, history);
+    const preview = previewText(history.at(-1)) || item.note;
     const button = el('button', { class: `contact-button ${item.id === state.activeContactId ? 'is-active' : ''}`, type: 'button', 'aria-current': item.id === state.activeContactId ? 'page' : 'false' });
     const accent = item.id === 'kairos' ? 'brass' : 'oxide';
-    button.append(el('span', { class: `avatar ${accent}`, text: item.name.slice(0, 1) }), el('span', { class: 'contact-copy' }, [el('strong', { text: item.name }), el('small', { text: item.note })]), el('span', { class: `contact-led ${busy ? 'is-busy' : ''}`, 'aria-label': busy ? '正在处理' : '待命' }));
+    button.append(el('span', { class: `avatar ${accent}`, text: item.name.slice(0, 1) }), el('span', { class: 'contact-copy' }, [el('strong', { text: item.name }), el('small', { class: 'contact-preview', text: preview })]));
+    if (unread > 0) button.append(el('span', { class: 'unread-badge', text: unread > 99 ? '99+' : String(unread), 'aria-label': `${unread} 条未读消息` }));
+    button.append(el('span', { class: `contact-led ${busy ? 'is-busy' : ''}`, 'aria-label': busy ? '正在处理' : '待命' }));
     button.addEventListener('click', () => switchContact(item.id)); return button;
   }));
 }
@@ -117,8 +126,22 @@ function renderActivities() {
 function nearBottom() { const scroll = $('#conversation-scroll'); return scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 88; }
 function updateLatestControl() { const follow = state.followLatest[state.activeContactId] !== false; $('#latest-button').hidden = follow; }
 function scrollLatest() { const scroll = $('#conversation-scroll'); scroll.scrollTop = scroll.scrollHeight; state.followLatest[state.activeContactId] = true; updateLatestControl(); }
+function stickerTextNodes(value) {
+  return parseStickerParts(value, state.stickerCatalog).map((part) => part.type === 'text'
+    ? document.createTextNode(part.value)
+    : el('img', { class: 'message-sticker-inline', src: part.sticker.url, alt: part.sticker.label, loading: 'lazy', decoding: 'async' }));
+}
 function renderMessageBody(message) {
-  const source = message.body || '…'; const parts = parseStickerParts(source, state.stickerCatalog);
+  const source = message.body || '…';
+  // Assistant text goes through the safe Markdown subset (DOM-built, escaped
+  // by construction); user drafts keep the plain pre-wrap rendering.
+  if (message.role === 'assistant') {
+    const body = el('div', { class: 'message-body message-md' });
+    appendMarkdown(body, parseMarkdown(source), { mapText: stickerTextNodes });
+    if (message.streaming) body.classList.add('is-streaming');
+    return { body, standalone: false };
+  }
+  const parts = parseStickerParts(source, state.stickerCatalog);
   const stickers = parts.filter(({ type }) => type === 'sticker'); const standalone = stickers.length > 0 && parts.every((part) => part.type === 'sticker' || !part.value.trim());
   const body = el(standalone ? 'div' : 'p', { class: `message-body ${standalone ? 'sticker-only-message' : stickers.length ? 'sticker-mixed-message' : ''}` });
   parts.forEach((part) => {
@@ -126,6 +149,73 @@ function renderMessageBody(message) {
     else body.append(el('img', { class: standalone ? 'message-sticker-large' : 'message-sticker-inline', src: part.sticker.url, alt: part.sticker.label, loading: 'lazy', decoding: 'async' }));
   });
   if (message.streaming) body.classList.add('is-streaming'); return { body, standalone };
+}
+/** Collapsible thinking chain: translation by default, toggle to the original. */
+function renderThinking(message) {
+  const hasTranslation = Boolean(message.thinking); const hasOriginal = Boolean(message.thinkingOriginal);
+  const details = el('details', { class: 'thinking-bubble' });
+  details.append(el('summary', { text: '思考过程' }));
+  const text = el('div', { class: 'thinking-text' });
+  const view = hasTranslation ? 'translation' : 'original';
+  details.dataset.view = view;
+  text.textContent = view === 'translation' ? message.thinking : message.thinkingOriginal;
+  details.append(text);
+  if (hasTranslation && hasOriginal) {
+    // The toggle label names the side currently on screen, not the action.
+    const toggle = el('button', { type: 'button', class: 'thinking-toggle', text: '译文', 'aria-label': '切换思考过程语言，当前显示译文' });
+    toggle.addEventListener('click', () => {
+      const next = details.dataset.view === 'translation' ? 'original' : 'translation';
+      details.dataset.view = next;
+      text.textContent = next === 'translation' ? message.thinking : message.thinkingOriginal;
+      toggle.textContent = next === 'translation' ? '译文' : '原文';
+      toggle.setAttribute('aria-label', `切换思考过程语言，当前显示${next === 'translation' ? '译文' : '原文'}`);
+    });
+    details.append(toggle);
+  }
+  return details;
+}
+function renderMessageActions(message) {
+  const actions = el('div', { class: 'message-actions' });
+  const copy = el('button', { type: 'button', class: 'message-action', text: '复制', 'aria-label': '复制消息内容' });
+  copy.addEventListener('click', async () => {
+    const ok = await copyText(message.body || '');
+    copy.textContent = ok ? '已复制' : '复制失败';
+    setTimeout(() => { copy.textContent = '复制'; }, 1600);
+  });
+  actions.append(copy);
+  return actions;
+}
+function messageSignature(message) {
+  return [message.role, message.time, message.body, message.thinking, message.thinkingOriginal, message.streaming, message.attachments?.length || 0].map((part) => String(part ?? '').length + ':' + String(part ?? '')).join('|');
+}
+function buildMessageNode(item, message) {
+  item.className = `message ${message.role === 'user' ? 'from-user' : 'from-assistant'}`;
+  const meta = el('div', { class: 'message-meta' }, [el('span', { text: message.role === 'user' ? 'ASTRA' : contact().name.toUpperCase() }), el('time', { text: message.time || '刚刚' })]);
+  const rendered = renderMessageBody(message); item.classList.toggle('has-sticker-only', rendered.standalone);
+  const children = [meta];
+  if (message.role === 'assistant' && (message.thinking || message.thinkingOriginal)) children.push(renderThinking(message));
+  children.push(rendered.body);
+  if (message.attachments?.length) children.push(el('div', { class: 'message-files', role: 'list', 'aria-label': '消息附件' }, message.attachments.map(renderAttachment)));
+  children.push(renderMessageActions(message));
+  item.replaceChildren(...children);
+  return item;
+}
+/** Reuse one <li> per message id; rebuild content only when the record changed. */
+function messageNode(message) {
+  const key = `${state.activeContactId}:${message.id || `transient-${message.role}-${message.time}`}`;
+  const signature = messageSignature(message);
+  const cached = state.messageNodes.get(key);
+  if (cached && cached.signature === signature) return cached.node;
+  const node = buildMessageNode(cached?.node || el('li'), message);
+  node.dataset.messageId = key;
+  state.messageNodes.set(key, { signature, node });
+  return node;
+}
+/** Order-preserving child sync: remove strays, then move/append in place. */
+function reconcileChildren(parent, desired) {
+  const keep = new Set(desired);
+  [...parent.children].forEach((child) => { if (!keep.has(child)) child.remove(); });
+  desired.forEach((node) => parent.append(node));
 }
 function renderMessages({ forceLatest = false } = {}) {
   const shouldFollow = forceLatest || (state.followLatest[state.activeContactId] !== false && nearBottom());
@@ -138,15 +228,12 @@ function renderMessages({ forceLatest = false } = {}) {
     typingStatus.setAttribute('aria-hidden', String(!showTyping));
     typingStatus.textContent = showTyping ? '正在输入…' : '';
   }
-  const existingTyping = messages.querySelector(`.typing-bubble[data-contact-id="${state.activeContactId}"]`);
-  const typingBubble = showTyping ? (existingTyping || createTypingBubble()) : null;
-  messages.replaceChildren(...history.filter((message) => !(message.role === 'assistant' && message.streaming && !String(message.body || '').trim())).map((message) => {
-    const item = el('li', { class: `message ${message.role === 'user' ? 'from-user' : 'from-assistant'}` });
-    const meta = el('div', { class: 'message-meta' }, [el('span', { text: message.role === 'user' ? 'ASTRA' : contact().name.toUpperCase() }), el('time', { text: message.time || '刚刚' })]);
-    const rendered = renderMessageBody(message); item.classList.toggle('has-sticker-only', rendered.standalone); item.append(meta, rendered.body);
-    if (message.attachments?.length) item.append(el('div', { class: 'message-files', role: 'list', 'aria-label': '消息附件' }, message.attachments.map(renderAttachment)));
-    return item;
-  }), ...(typingBubble ? [typingBubble] : []));
+  const desired = history.filter((message) => !(message.role === 'assistant' && message.streaming && !String(message.body || '').trim())).map(messageNode);
+  if (showTyping) {
+    const existingTyping = [...messages.children].find((node) => node.classList?.contains('typing-bubble'));
+    desired.push(existingTyping || createTypingBubble());
+  }
+  reconcileChildren(messages, desired);
   requestAnimationFrame(() => { if (shouldFollow) scrollLatest(); else updateLatestControl(); });
 }
 function createTypingBubble() {
@@ -188,9 +275,18 @@ async function switchContact(id) {
   closeStickerDialog();
   const epoch = ++state.epoch;
   state.scrollTops[state.activeContactId] = $('#conversation-scroll').scrollTop; composer().text = input.value; state.activeContactId = id;
+  // Message nodes are keyed per contact; a switch starts with a clean list.
+  state.messageNodes.clear(); messages.replaceChildren();
   input.value = composer(id).text; state.followLatest[id] ??= true; autoResize(); syncWorkerPanel(); renderAll({ forceLatest: !Object.hasOwn(state.scrollTops, id) });
   if (Object.hasOwn(state.scrollTops, id)) requestAnimationFrame(() => { $('#conversation-scroll').scrollTop = state.scrollTops[id]; updateLatestControl(); });
-  if (await refreshContact(id, { epoch }) && epoch === state.epoch && id === state.activeContactId) watchLive(id, epoch);
+  markActiveSeen();
+  if (await refreshContact(id, { epoch }) && epoch === state.epoch && id === state.activeContactId) { markActiveSeen(); watchLive(id, epoch); }
+}
+/** Reading the active conversation advances its persistent read cursor. */
+function markActiveSeen() {
+  if (document.visibilityState === 'hidden') return;
+  const cursor = historyCursor(state.histories[state.activeContactId] || []);
+  if (cursor && cursor > state.unread.lastSeen(state.activeContactId)) { state.unread.markSeen(state.activeContactId, cursor); renderContacts(); }
 }
 async function refreshContact(id, { epoch = state.epoch } = {}) {
   try { const [history, live] = await Promise.all([adapter.getHistory(id), adapter.getLiveState(id)]); if (epoch !== state.epoch) return false; const reconciled = reconcileHistorySnapshot(state.histories[id] || [], history, state.pendingCanonical[id] || []); state.histories[id] = reconciled.history; state.pendingCanonical[id] = reconciled.pendingIds; state.live[id] = live; if (id === state.activeContactId) renderAll(); else renderContacts(); }
@@ -250,8 +346,29 @@ function renderTaxonomy() {
   }));
 }
 async function selectMemory(scope) { state.selectedScope = scope; renderTaxonomy(); const result = $('#memory-results'); result.replaceChildren(el('p', { class: 'loading', text: '正在读取记忆…' })); try { const entries = await adapter.listMemories(scope); result.replaceChildren(...entries.map((entry) => el('article', { class: 'memory-card' }, [el('small', { text: entry.timestamp || entry.created_at || '记忆条目' }), el('h3', { text: entry.title || entry.content?.slice(0, 40) || '无标题' }), el('p', { text: entry.body || entry.content || '' })]))); } catch { result.replaceChildren(el('p', { class: 'error', text: '这个分类暂时无法读取。' })); } }
+function notifyNewMessages(contactId, records) {
+  const fresh = unseenAssistant(records, state.unread.lastSeen(contactId));
+  if (!fresh.length) return;
+  const name = state.contacts.find(({ id }) => id === contactId)?.name || contactId;
+  fresh.slice(-3).forEach((record) => state.notifier.notify({
+    contactId, title: name, body: previewText(record, { maxLength: 80 }),
+    onOpen: (target) => { void switchContact(target); },
+  }));
+}
 function applyLiveEvent(event) {
-  if (event.type === 'message') updateMessage(event.contactId, event.message); if (event.type === 'state') state.live[event.contactId] = event.state; if (event.type === 'snapshot') { const reconciled = reconcileHistorySnapshot(state.histories[event.contactId] || [], event.history, state.pendingCanonical[event.contactId] || []); state.histories[event.contactId] = reconciled.history; state.pendingCanonical[event.contactId] = reconciled.pendingIds; state.live[event.contactId] = event.state; state.streams[event.contactId] = reconcileSnapshotStream(state.streams[event.contactId], event.state); }
+  if (event.type === 'message') { updateMessage(event.contactId, event.message); if (event.message?.role === 'assistant') notifyNewMessages(event.contactId, [event.message]); }
+  if (event.type === 'state') state.live[event.contactId] = event.state;
+  if (event.type === 'snapshot') {
+    if (event.incremental) {
+      const merged = mergeHistoryDelta(state.histories[event.contactId] || [], event.history, state.pendingCanonical[event.contactId] || []);
+      state.histories[event.contactId] = merged.history; state.pendingCanonical[event.contactId] = merged.pendingIds;
+      notifyNewMessages(event.contactId, event.history);
+    } else {
+      const reconciled = reconcileHistorySnapshot(state.histories[event.contactId] || [], event.history, state.pendingCanonical[event.contactId] || []);
+      state.histories[event.contactId] = reconciled.history; state.pendingCanonical[event.contactId] = reconciled.pendingIds;
+    }
+    state.live[event.contactId] = event.state; state.streams[event.contactId] = reconcileSnapshotStream(state.streams[event.contactId], event.state);
+  }
   if (event.type === 'stream') {
     const next = reduceStreamDraft(state.streams[event.contactId], event.payload);
     state.streams[event.contactId] = next;
@@ -264,9 +381,58 @@ function applyLiveEvent(event) {
     });
     if (next?.terminal && event.payload?.refresh_history) void refreshContact(event.contactId, { epoch: state.epoch });
   }
-  if (event.type === 'connection' && event.contactId === state.activeContactId && !event.online) $('#connection-state').textContent = '正在重连'; if (event.contactId === state.activeContactId) renderAll(); else renderContacts();
+  if (event.type === 'connection' && event.contactId === state.activeContactId && !event.online) $('#connection-state').textContent = '正在重连'; if (event.contactId === state.activeContactId) { markActiveSeen(); renderAll(); } else renderContacts();
 }
 function watchLive(contactId, epoch = state.epoch) { state.stopLive?.(); state.stopLive = adapter.subscribe((event) => { if (epoch === state.epoch && contactId === state.activeContactId) applyLiveEvent(event); }, { contactId }); }
+/**
+ * Inactive contacts have no SSE subscription; a slow incremental poll keeps
+ * their previews, unread badges and (hidden-page) notifications up to date.
+ */
+const BACKGROUND_POLL_MS = 20_000;
+async function pollInactiveContacts() {
+  if (state.backgroundPollInFlight || navigator.onLine === false) return;
+  state.backgroundPollInFlight = true;
+  try {
+    for (const item of state.contacts) {
+      if (item.id === state.activeContactId) continue;
+      const known = state.histories[item.id] || [];
+      const since = historyCursor(known);
+      try {
+        const delta = await adapter.getHistory(item.id, since ? { since, limit: 50 } : { limit: 1 });
+        if (!delta.length) continue;
+        // Notify only for records newer than everything already known; a
+        // misbehaving adapter returning a full window cannot re-notify.
+        const fresh = since ? delta.filter((record) => String(record.ts || '') > since) : [];
+        const merged = mergeHistoryDelta(known, delta, state.pendingCanonical[item.id] || []);
+        state.histories[item.id] = merged.history; state.pendingCanonical[item.id] = merged.pendingIds;
+        // The first fetch only seeds the preview: backlog is not "new".
+        if (known.length && fresh.length) notifyNewMessages(item.id, fresh);
+      } catch { /* one contact failing must not starve the others */ }
+    }
+  } finally { state.backgroundPollInFlight = false; }
+  renderContacts();
+}
+function startBackgroundPolling() {
+  const timer = setInterval(() => { void pollInactiveContacts(); }, BACKGROUND_POLL_MS);
+  return () => clearInterval(timer);
+}
+function syncNotificationButton() {
+  const button = $('#notification-button');
+  if (!button) return;
+  const supported = state.notifier.supported();
+  const on = state.notifier.isEnabled();
+  button.hidden = !supported;
+  button.textContent = on ? '🔔' : '🔕';
+  button.title = on ? '桌面通知：开（点击关闭）' : '桌面通知：关（点击开启）';
+  button.setAttribute('aria-label', on ? '关闭桌面通知，当前已开启' : '开启桌面通知，当前已关闭');
+  button.setAttribute('aria-pressed', String(on));
+}
+async function toggleNotifications() {
+  const wantsOn = !state.notifier.isEnabled();
+  const live = await state.notifier.setEnabled(wantsOn);
+  syncNotificationButton();
+  if (wantsOn && !live) $('#connection-state').textContent = '通知权限未授予，请在浏览器设置中允许';
+}
 const workerDrawerQuery = window.matchMedia('(max-width:1199px)');
 function syncWorkerPanel() {
   const panel = $('#side-notes'); const drawer = workerDrawerQuery.matches;
@@ -393,15 +559,17 @@ $('#sticker-upload-open').addEventListener('click', showStickerUpload); $('#stic
 $('#sticker-upload-file').addEventListener('change', (event) => setStickerUploadFile(event.target.files?.[0])); $('#sticker-upload-form').addEventListener('change', (event) => { if (event.target.name === 'sticker-category-mode') renderStickerCategoryFields(); }); $('#sticker-upload-form').addEventListener('submit', uploadSticker);
 $('#upload-cancel-button').addEventListener('click', () => state.composerState.cancel(state.activeContactId)); $('#stop-button').addEventListener('click', () => adapter.stop(state.activeContactId, state.live[state.activeContactId]?.stopRequest).catch(() => { $('#connection-state').textContent = '停止请求失效'; }));
 $('#memory-button').addEventListener('click', openMemory); $('#memory-close').addEventListener('click', () => $('#memory-dialog').close()); $('#worker-toggle').addEventListener('click', () => setWorkers(!document.body.classList.contains('workers-open'))); $('#worker-close').addEventListener('click', closeWorkers);
-async function logout() { state.epoch += 1; state.stickerLoadId += 1; state.composerState.cancelAll(); state.stickerUpload.controller?.abort(); state.stickerUpload.uploading = false; closeStickerDialog(); state.stickerCatalog = null; state.stickerLoading = false; state.stickerError = ''; state.stickerSearch = ''; state.stickerCategory = '__all'; state.stickerTargetContactId = ''; try { await adapter.logout(); } finally { state.stopLive?.(); state.stopLive = null; state.contacts = []; state.histories = {}; state.live = {}; state.streams = {}; state.pendingCanonical = {}; state.composerState = createComposerState(); state.activeContactId = ''; renderAll(); if (!bootstrap.mock) showLogin(); } }
+async function logout() { state.epoch += 1; state.stickerLoadId += 1; state.composerState.cancelAll(); state.stickerUpload.controller?.abort(); state.stickerUpload.uploading = false; closeStickerDialog(); state.stickerCatalog = null; state.stickerLoading = false; state.stickerError = ''; state.stickerSearch = ''; state.stickerCategory = '__all'; state.stickerTargetContactId = ''; try { await adapter.logout(); } finally { state.stopLive?.(); state.stopLive = null; state.stopBackground?.(); state.stopBackground = null; state.contacts = []; state.histories = {}; state.live = {}; state.streams = {}; state.pendingCanonical = {}; state.messageNodes.clear(); messages.replaceChildren(); state.composerState = createComposerState(); state.activeContactId = ''; renderAll(); if (!bootstrap.mock) showLogin(); } }
 $('#logout-button').addEventListener('click', logout); $('#drawer-logout-button').addEventListener('click', logout);
 $('#appearance-button').addEventListener('click', cycleAppearance); $('#drawer-appearance-button').addEventListener('click', cycleAppearance);
+$('#notification-button').addEventListener('click', toggleNotifications);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState !== 'hidden') markActiveSeen(); });
 window.addEventListener('keydown', (event) => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); input.focus(); } if (event.altKey && /^[1-9]$/.test(event.key)) { const target = state.contacts[Number(event.key) - 1]; if (target) switchContact(target.id); } if (event.key === 'Escape') { if ($('#sticker-dialog').open) closeStickerDialog({ returnFocus: true }); if ($('#memory-dialog').open) $('#memory-dialog').close(); if (document.body.classList.contains('workers-open')) closeWorkers(); } });
 window.addEventListener('beforeinstallprompt', (event) => { event.preventDefault(); state.deferredInstall = event; $('#install-button').hidden = false; }); $('#install-button').addEventListener('click', async () => { await state.deferredInstall?.prompt(); state.deferredInstall = null; $('#install-button').hidden = true; });
 workerDrawerQuery.addEventListener('change', syncWorkerPanel); syncWorkerPanel(); document.body.append($('#svg-defs').content.cloneNode(true)); if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js'));
 async function start() {
   try { await bootstrap.checkSession(); } catch (error) { if (!bootstrap.mock) { showLogin(); return; } }
-  try { state.contacts = await adapter.contacts(); if (!state.contacts.length) throw new Error('没有可用联系人'); state.activeContactId = state.contacts.find(({ id }) => id === 'xiaoke')?.id || state.contacts[0].id; state.contacts.forEach(({ id }) => { state.histories[id] = []; state.live[id] = { replyState: 'idle', statusText: '待命', workers: [] }; composer(id); state.followLatest[id] = true; }); await Promise.all(state.contacts.map(({ id }) => refreshContact(id))); watchLive(state.activeContactId); renderAll({ forceLatest: true }); void loadStickerCatalog(); }
+  try { state.contacts = await adapter.contacts(); if (!state.contacts.length) throw new Error('没有可用联系人'); state.activeContactId = state.contacts.find(({ id }) => id === 'xiaoke')?.id || state.contacts[0].id; state.contacts.forEach(({ id }) => { state.histories[id] = []; state.live[id] = { replyState: 'idle', statusText: '待命', workers: [] }; composer(id); state.followLatest[id] = true; }); await Promise.all(state.contacts.map(({ id }) => refreshContact(id))); markActiveSeen(); watchLive(state.activeContactId); state.stopBackground?.(); state.stopBackground = startBackgroundPolling(); syncNotificationButton(); renderAll({ forceLatest: true }); void loadStickerCatalog(); }
   catch (error) { $('#connection-state').textContent = '连接不可用'; console.warn('PWA bootstrap failed', error); }
 }
 function pairingError(error) {

@@ -1,6 +1,6 @@
-import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY } from './data.js?v=12';
-import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=12';
-import { normalizeStickerCatalog } from './sticker-protocol.js?v=12';
+import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY } from './data.js?v=13';
+import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=13';
+import { normalizeStickerCatalog } from './sticker-protocol.js?v=13';
 
 const clone = (value) => structuredClone(value);
 const now = () => new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
@@ -121,6 +121,13 @@ export function normalizeRecord(record = {}) {
     role: record.role === 'user' ? 'user' : 'assistant',
     body: String(record.text ?? record.content ?? record.body ?? ''),
     time,
+    // Raw server timestamp drives incremental `since` polling and unread
+    // cursors; keep the exact string so string comparison matches the server.
+    ts: validStamp ? stamp : '',
+    // Thinking chain: `thinking` carries the Chinese translation while
+    // metadata.thinking_original keeps the English source for the toggle.
+    thinking: typeof record.thinking === 'string' ? record.thinking.slice(0, 100_000) : '',
+    thinkingOriginal: typeof record.metadata?.thinking_original === 'string' ? record.metadata.thinking_original.slice(0, 100_000) : '',
     attachments,
   };
 }
@@ -176,6 +183,32 @@ export function reconcileHistorySnapshot(currentHistory = [], snapshot = [], pen
     if (retained && !snapshotIds.has(id)) next.push(retained);
   });
   return { history: dedupeHistory(next), pendingIds: [...pending] };
+}
+
+/**
+ * Merge an incremental `since` delta into the retained history.  Unlike a
+ * full snapshot, absent records are not dropped; pending canonical sends stay
+ * pending until the delta explicitly contains them.
+ */
+export function mergeHistoryDelta(currentHistory = [], delta = [], pendingIds = []) {
+  const next = dedupeHistory(currentHistory);
+  const positions = new Map();
+  next.forEach((record, index) => { if (record?.id) positions.set(record.id, index); });
+  (Array.isArray(delta) ? delta : []).forEach((record) => {
+    if (!record || typeof record !== 'object' || !record.id) return;
+    if (positions.has(record.id)) next[positions.get(record.id)] = record;
+    else { positions.set(record.id, next.length); next.push(record); }
+  });
+  const seen = new Set((Array.isArray(delta) ? delta : []).map(({ id }) => id).filter(Boolean));
+  return { history: next, pendingIds: pendingIds.filter((id) => !seen.has(id)) };
+}
+
+/** Latest server timestamp in a normalized history ('' when unknown). */
+export function historyCursor(records = []) {
+  return (Array.isArray(records) ? records : []).reduce((latest, record) => {
+    const ts = String(record?.ts || '');
+    return ts > latest ? ts : latest;
+  }, '');
 }
 
 export function normalizeSendRecord(result) {
@@ -256,8 +289,13 @@ export function createHttpAdapter({ baseUrl = '', request = defaultRequest, uplo
       const result = await call(url('/chat/contacts'));
       return (Array.isArray(result) ? result : result.contacts || []).map(normalizeContact).filter(({ id }) => id);
     },
-    async getHistory(contactId, { signal } = {}) {
-      const result = await call(url(`/chat/history?contact_id=${encodeURIComponent(contactId)}`), { signal });
+    async getHistory(contactId, { signal, since, limit } = {}) {
+      const query = new URLSearchParams({ contact_id: contactId });
+      // Incremental sync: the server already accepts since/limit and answers
+      // with only the records newer than the cursor (strict ts comparison).
+      if (since) query.set('since', String(since));
+      if (limit) query.set('limit', String(Math.min(Math.max(Number(limit) || 0, 1), 10_000)));
+      const result = await call(url(`/chat/history?${query}`), { signal });
       const records = Array.isArray(result) ? result : (result.records || result.messages || []);
       return normalizeHistory(records);
     },
@@ -325,7 +363,7 @@ export function createHttpAdapter({ baseUrl = '', request = defaultRequest, uplo
     subscribe(listener, { contactId } = {}) {
       if (!contactId) throw new Error('contactId is required for a production live subscription');
       const VISIBLE_POLL_MS = 4_000; const BUSY_POLL_MS = 1_000; const HIDDEN_POLL_MS = 15_000;
-      let stopped = false; let pollTimer = null; let reconnectTimer = null; let stream = null; let controller = null; let pollInFlight = false; let failureDelay = 1_000;
+      let stopped = false; let pollTimer = null; let reconnectTimer = null; let stream = null; let controller = null; let pollInFlight = false; let failureDelay = 1_000; let cursor = '';
       const isHidden = () => visibility?.visibilityState === 'hidden';
       const closeStream = () => { if (stream) { stream.close?.(); stream = null; } };
       const schedulePoll = (delay) => {
@@ -341,10 +379,15 @@ export function createHttpAdapter({ baseUrl = '', request = defaultRequest, uplo
         if (stopped || pollInFlight) return;
         if (network?.navigator?.onLine === false) { schedulePoll(HIDDEN_POLL_MS); return; }
         pollInFlight = true; const requestController = new AbortController(); controller = requestController;
+        // First poll is a full snapshot; later polls fetch only the delta
+        // after the newest record seen so far (server `since` is exclusive).
+        const since = cursor;
         try {
-          const [history, state] = await Promise.all([this.getHistory(contactId, { signal: requestController.signal }), this.getLiveState(contactId, { signal: requestController.signal })]);
+          const [history, state] = await Promise.all([this.getHistory(contactId, { signal: requestController.signal, ...(since ? { since, limit: 500 } : {}) }), this.getLiveState(contactId, { signal: requestController.signal })]);
           if (stopped) return;
-          listener({ type: 'snapshot', contactId, history, state });
+          const nextCursor = historyCursor(history);
+          if (nextCursor > cursor) cursor = nextCursor;
+          listener({ type: 'snapshot', contactId, history, state, incremental: Boolean(since) });
           failureDelay = 1_000;
           schedulePoll(isHidden() ? HIDDEN_POLL_MS : (state.busy ? BUSY_POLL_MS : VISIBLE_POLL_MS));
         } catch (error) {

@@ -8,7 +8,7 @@
     <meta name="description" content="CcCompanion private operations desk" />
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" href="./assets/cc-mark.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="./src/styles.css?v=12" />
+    <link rel="stylesheet" href="./src/styles.css?v=13" />
     <title>CcCompanion · Desk</title>
   </head>
   <body>
@@ -46,6 +46,7 @@
         <nav id="contact-list" class="contact-list" aria-label="切换联系人"></nav>
         <div class="rail-footer">
           <button class="icon-button" id="install-button" type="button" title="安装到 Windows" aria-label="安装到 Windows" hidden>↓</button>
+          <button class="icon-button" id="notification-button" type="button" title="桌面通知：关（点击开启）" aria-label="开启桌面通知，当前已关闭" aria-pressed="false" hidden>🔕</button>
           <button class="icon-button" id="appearance-button" type="button" title="切换显示模式" aria-label="切换显示模式：默认">◒</button>
           <span class="sr-only" id="appearance-status" aria-live="polite">显示模式：默认</span>
         </div>
@@ -149,6 +150,6 @@
     </dialog>
 
     <template id="svg-defs"><svg class="svg-defs" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><symbol id="cc-mark" viewBox="0 0 24 24"><path d="M3 12 12 3l9 9-9 9-9 9Zm4.2 0L12 7.2l4.8 4.8L12 16.8 7.2 12Z" fill="currentColor"/></symbol></svg></template>
-    <script type="module" src="./src/app.js?v=12"></script>
+    <script type="module" src="./src/app.js?v=13"></script>
   </body>
 </html>
