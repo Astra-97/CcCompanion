@@ -1,17 +1,17 @@
-import { createPwaBootstrap } from './bootstrap.js?v=23';
-import { createComposerState } from './composer-state.js?v=23';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=23';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=23';
-import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=23';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=23';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=23';
-import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=23';
-import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=23';
-import { createNotifier } from './notifications.js?v=23';
-import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=23';
-import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=23';
+import { createPwaBootstrap } from './bootstrap.js?v=24';
+import { createComposerState } from './composer-state.js?v=24';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=24';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=24';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=24';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=24';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=24';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=24';
+import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=24';
+import { createNotifier } from './notifications.js?v=24';
+import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=24';
+import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=24';
 
-const WEB_SHELL_VERSION = 'desk-v23 · 2026-10-17';
+const WEB_SHELL_VERSION = 'desk-v24 · 2026-10-17';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -91,11 +91,11 @@ function renderContacts() {
   }));
 }
 const VIEW_IDS = { chat: 'conversation', terminal: 'terminal-page', apps: 'apps-page', settings: 'settings-page', memory: 'memory-page' };
-// Phone (<768px) keeps the single column + bottom tab bar.  The dashboard is
-// the chat landing on phones AND tablets (<=1199px); desktops (>=1200px) open
-// the conversation directly next to the rail.
+// The dashboard is the chat landing on every shell size (phone, tablet and
+// desktop).  Phones/tablets (<=1199px) swap the whole surface; desktop keeps
+// the contacts column beside whichever surface is active.
 const homeQuery = window.matchMedia('(max-width:1199px)');
-function chatSurface() { return homeQuery.matches && !state.mobileChatOpen ? 'chat-list-page' : 'conversation'; }
+function chatSurface() { return state.mobileChatOpen ? 'conversation' : 'chat-list-page'; }
 /** Single source of truth for which surface is on screen. */
 function syncView() {
   const surface = state.view === 'chat' ? chatSurface() : '';
@@ -103,6 +103,11 @@ function syncView() {
   $('#chat-list-page').hidden = surface !== 'chat-list-page';
   ['terminal', 'apps', 'settings', 'memory'].forEach((name) => { $(`#${VIEW_IDS[name]}`).hidden = state.view !== name; });
   $('#side-notes').classList.toggle('view-hidden', state.view !== 'chat');
+  // Desktop layout keys off these two dataset flags (dashboard hides the
+  // instrument panel; non-chat views collapse the rail to its nav column).
+  const shell = $('.desk-shell');
+  shell.dataset.view = state.view;
+  shell.dataset.surface = state.view === 'chat' ? (state.mobileChatOpen ? 'conversation' : 'dashboard') : '';
   document.querySelectorAll('.tab-item').forEach((button) => {
     const active = button.dataset.view === state.view;
     button.classList.toggle('is-active', active);
@@ -122,7 +127,7 @@ function switchView(view) {
   if (view === 'memory') void refreshMemoryPage();
   syncView();
 }
-/** Phone-only second level: chat list -> conversation. */
+/** Second level of the chat tab (all shell sizes): dashboard -> conversation. */
 function openMobileChat(id) {
   state.mobileChatOpen = true;
   syncView();
@@ -414,8 +419,8 @@ function renderAll(options) { renderContacts(); renderChatListPage(); renderHead
 
 async function switchContact(id) {
   if (state.stickerUpload.uploading) return;
-  // Phones and tablets land on the dashboard; picking any contact opens the chat.
-  if (homeQuery.matches && !state.mobileChatOpen) { state.mobileChatOpen = true; syncView(); }
+  // Every shell size lands on the dashboard; picking any contact opens the chat.
+  if (!state.mobileChatOpen) { state.mobileChatOpen = true; syncView(); }
   if (id === state.activeContactId) return;
   closeStickerDialog();
   const epoch = ++state.epoch;
@@ -908,7 +913,7 @@ $('#settings-appearance-button').addEventListener('click', cycleAppearance);
 $('#settings-notification-button').addEventListener('click', toggleNotifications);
 $('#settings-logout-button').addEventListener('click', logout);
 $('#settings-version').textContent = WEB_SHELL_VERSION;
-homeQuery.addEventListener('change', () => { if (!homeQuery.matches) state.mobileChatOpen = false; syncView(); });
+homeQuery.addEventListener('change', syncView);
 async function logout() { state.epoch += 1; state.stickerLoadId += 1; state.composerState.cancelAll(); state.stickerUpload.controller?.abort(); state.stickerUpload.uploading = false; closeStickerDialog(); state.stickerCatalog = null; state.stickerLoading = false; state.stickerError = ''; state.stickerSearch = ''; state.stickerCategory = '__all'; state.stickerTargetContactId = ''; try { await adapter.logout(); } finally { state.stopLive?.(); state.stopLive = null; state.stopBackground?.(); state.stopBackground = null; stopTerminalPolling(); state.terminalSnapshots = {}; state.plugins = null; state.pluginsError = false; state.contacts = []; state.histories = {}; state.live = {}; state.streams = {}; state.pendingCanonical = {}; state.messageNodes.clear(); messages.replaceChildren(); state.composerState = createComposerState(); state.activeContactId = ''; state.view = 'chat'; state.mobileChatOpen = false; state.taxonomy = null; state.selectedScope = null; state.memory = { loading: false, stats: null, segment: 'memories', month: monthKey(), days: {}, selectedDate: '', boardPage: 1, boardLoaded: false }; state.dash = { appearance: { nicknames: {}, avatars: {} }, todos: null, weather: null, weatherFailed: false }; renderAll(); setMemorySegment('memories'); renderMemorySubtitle(); renderPlugins(); syncView(); if (!bootstrap.mock) showLogin(); } }
 $('#logout-button').addEventListener('click', logout); $('#drawer-logout-button').addEventListener('click', logout);
 $('#appearance-button').addEventListener('click', cycleAppearance); $('#drawer-appearance-button').addEventListener('click', cycleAppearance);

@@ -483,3 +483,35 @@ body[data-appearance='compact'] .composer{padding-block:11px}
   .attachment-chip{max-width:calc(100vw - 26px)}
 }
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}.typing-bubble{animation:none;opacity:1;transform:none}.typing-dots i{animation:none;opacity:.7}.message-actions{transition:none}}
+
+/* Desktop (>=1200px) reskin: the same glass language as the phone, laid out
+   for width — a nav rail visually split from a contacts column, the chat tab
+   landing on the two-column dashboard, and the instrument panel beside an
+   open conversation.  Tablet (768-1199) rules above are untouched. */
+.rail-contacts-head{display:none}
+@media (min-width:1200px){
+  .desk-shell{grid-template-columns:208px 272px minmax(0,1fr) 312px;gap:16px;padding:16px}
+  .rail{display:grid;grid-column:1 / 3;grid-template-rows:auto auto minmax(0,1fr) auto;grid-template-columns:208px minmax(0,1fr);padding:0;overflow:hidden}
+  .rail-brand{grid-column:1;padding:22px 14px 18px}
+  .rail-tabs{grid-column:1;padding:0 10px}
+  .rail-footer{grid-column:1;align-self:end;margin-top:0;padding:14px 12px}
+  .rail-contacts-head{display:block;grid-column:2;grid-row:1;align-self:end;margin:0 0 8px;padding:18px 16px 0}
+  .contact-list{grid-column:2;grid-row:2 / -1;align-content:start;min-height:0;padding:0 10px 14px;border-left:1px solid var(--line)}
+  .rail-tabs .tab-item.is-active{color:var(--oxide);font-weight:600;background:linear-gradient(135deg,rgba(212,131,111,.16),rgba(212,131,111,.05))}
+  .desk-shell:not([data-view='chat']) .rail-contacts-head{display:none}
+  .conversation{grid-column:3}
+  #chat-list-page{grid-column:3}
+  .desk-shell[data-view='chat'][data-surface='dashboard']{grid-template-columns:208px 272px minmax(0,1fr)}
+  .desk-shell[data-view='chat'][data-surface='dashboard'] .side-notes{display:none}
+  .desk-shell:not([data-view='chat']){grid-template-columns:208px minmax(0,1fr)}
+  .desk-shell:not([data-view='chat']) .rail{grid-column:1;grid-template-columns:208px}
+  .desk-shell:not([data-view='chat']) .contact-list{display:none}
+  .contact-heading .avatar.contact-avatar{display:grid;width:44px;height:44px;font-size:16px}
+  .contact-sub{display:flex;align-items:center;gap:6px;margin:3px 0 0;color:var(--dim);font-size:11px}
+  .contact-sub .signal-dot{width:7px;height:7px}
+  .dash-stack{gap:16px}
+  .dash-clock-time{font-size:56px}
+  .terminal-page-list{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .settings-list{width:100%;margin-inline:auto}
+  #memory-browse,#memory-board{max-width:880px;margin-inline:auto}
+}

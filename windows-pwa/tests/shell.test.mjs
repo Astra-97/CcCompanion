@@ -119,7 +119,7 @@ test('Android-shell source contracts: four tabs, full pages, view switching, moc
   assert.match(app, /adapter\.searchMemories\(query, \{ limit: 20 \}\)/);
   assert.match(app, /adapter\.getMemoryBoard\(\{ page, perPage: 20 \}\)/);
   assert.match(app, /adapter\.listPlugins\(\)/);
-  assert.match(app, /WEB_SHELL_VERSION = 'desk-v23 · 2026-10-17'/);
+  assert.match(app, /WEB_SHELL_VERSION = 'desk-v24 · 2026-10-17'/);
   const mockHook = app.slice(app.indexOf('if (bootstrap.mock)'));
   assert.match(mockHook, /params\.get\('view'\)/, 'the deep-link hook stays mock-gated');
   assert.match(css, /\.tab-bar\{[^}]*display:none/, 'the bottom tab bar is phone-only');
@@ -130,7 +130,7 @@ test('Android-shell source contracts: four tabs, full pages, view switching, moc
   assert.match(css, /\.calendar-day\.has-entries\{background:linear-gradient/);
   assert.match(css, /\.calendar-weekdays,\.calendar-grid\{display:grid;grid-template-columns:repeat\(7,1fr\)/);
   assert.match(css, /\.side-notes\.view-hidden\{display:none\}/);
-  assert.match(sw, /src\/memory-calendar\.js\?v=23/);
+  assert.match(sw, /src\/memory-calendar\.js\?v=24/);
 });
 
 test('home dashboard helpers: deterministic greeting, clock text, Monday-first week strip', () => {
@@ -185,10 +185,10 @@ test('visual parity pass 2: dashboard cards, sans-only typography, transparent g
   for (const id of ['dash-clock-time', 'dash-clock-date', 'dash-quote-eyebrow', 'dash-quote-title', 'dash-quote-sub', 'dash-week-title', 'dash-week-days', 'dash-todo-card', 'dash-full-calendar', 'contact-avatar', 'contact-status']) {
     assert.match(html, new RegExp(`id="${id}"`), id);
   }
-  assert.match(app, /from '\.\/home-dashboard\.js\?v=23'/);
+  assert.match(app, /from '\.\/home-dashboard\.js\?v=24'/);
   assert.match(app, /function renderDashboard\(\)/);
   assert.match(app, /\$\('#dash-full-calendar'\)\.addEventListener\('click', openMemory\)/);
-  assert.match(sw, /src\/home-dashboard\.js\?v=23/);
+  assert.match(sw, /src\/home-dashboard\.js\?v=24/);
   assert.doesNotMatch(css, /--serif/, 'the shell drops serif typography entirely');
   assert.match(css, /\.eyebrow\{[^}]*font:500 10px var\(--sans\);letter-spacing:\.07em/);
   assert.match(css, /--glass:rgba\(24,17,12,\.42\)/);
@@ -198,9 +198,33 @@ test('visual parity pass 2: dashboard cards, sans-only typography, transparent g
   assert.match(css, /@media \(max-width:767px\)\{[^]*?\.send-button\{min-width:48px;width:48px;height:48px;padding:0;justify-content:center;border-radius:50%\}/);
   assert.match(css, /@media \(min-width:768px\)\{[^]*?\.dash-stack\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)\}/, 'tablet/desktop dashboard uses a two-column card grid');
   assert.match(css, /@media \(min-width:768px\)\{[^]*?\.dash-contacts-card\{grid-column:1 \/ -1\}/);
-  assert.match(app, /const homeQuery = window\.matchMedia\('\(max-width:1199px\)'\)/, 'phones and tablets land on the dashboard');
-  assert.match(app, /function chatSurface\(\) \{ return homeQuery\.matches/);
-  assert.match(app, /if \(homeQuery\.matches && !state\.mobileChatOpen\) \{ state\.mobileChatOpen = true; syncView\(\); \}/, 'picking a contact on phone/tablet opens the conversation');
+  assert.match(app, /const homeQuery = window\.matchMedia\('\(max-width:1199px\)'\)/, 'the narrow-shell media query still gates the drawer and back key');
+  assert.match(app, /function chatSurface\(\) \{ return state\.mobileChatOpen \? 'conversation' : 'chat-list-page'; \}/, 'the dashboard is the chat landing on every shell size');
+  assert.match(app, /if \(!state\.mobileChatOpen\) \{ state\.mobileChatOpen = true; syncView\(\); \}/, 'picking a contact opens the conversation on any shell');
+});
+
+test('desktop reskin (>=1200px): nav rail + contacts column + dashboard landing, instrument beside conversation', () => {
+  const app = readFileSync(new URL('../src/app.js', import.meta.url), 'utf8');
+  const css = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  assert.match(html, /class="eyebrow rail-contacts-head"/, 'the contacts column gets its own header');
+  assert.match(app, /shell\.dataset\.view = state\.view;/);
+  assert.match(app, /shell\.dataset\.surface = state\.view === 'chat' \? \(state\.mobileChatOpen \? 'conversation' : 'dashboard'\) : '';/);
+  assert.match(css, /@media \(min-width:1200px\)\{/);
+  const desktop = css.slice(css.indexOf('@media (min-width:1200px)'));
+  assert.match(desktop, /\.desk-shell\{grid-template-columns:208px 272px minmax\(0,1fr\) 312px/, 'rail + contacts + main + instrument');
+  assert.match(desktop, /\.rail\{display:grid;grid-column:1 \/ 3/, 'the rail splits into nav and contacts columns');
+  assert.match(desktop, /\.rail-contacts-head\{display:block;grid-column:2;grid-row:1/, 'contacts header sits atop the contacts column');
+  assert.match(desktop, /\.contact-list\{grid-column:2;grid-row:2 \/ -1/, 'contacts occupy their own column below the header');
+  assert.match(desktop, /\.rail-contacts-head\{display:block/, 'contacts column header is desktop-only');
+  assert.match(desktop, /\.desk-shell\[data-view='chat'\]\[data-surface='dashboard'\] \.side-notes\{display:none\}/, 'dashboard hides the instrument panel');
+  assert.match(desktop, /#chat-list-page\{grid-column:3\}/, 'dashboard sits beside the contacts column');
+  assert.match(desktop, /\.desk-shell:not\(\[data-view='chat'\]\) \.contact-list\{display:none\}/, 'non-chat views collapse the rail to nav only');
+  assert.match(desktop, /\.contact-heading \.avatar\.contact-avatar\{display:grid/, 'desktop header shows the round avatar like the phone');
+  assert.match(desktop, /\.contact-sub\{display:flex/, 'desktop header shows the orange status line');
+  assert.match(desktop, /\.terminal-page-list\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)\}/, 'terminal cards go two-column on wide screens');
+  assert.match(desktop, /#memory-browse,#memory-board\{max-width:880px;margin-inline:auto\}/, 'memory page content is width-capped and centered');
+  assert.match(css, /body\{[^]*?url\('\/plugins\/xiaonan-dash\/appearance-asset'\)/, 'the wallpaper channel backs the desktop glass too');
 });
 
 test('todoFeed is a literal homeTodoFeed() port: schedule-only, today-only, done/time/text order', () => {
@@ -242,7 +266,7 @@ test('dashboard real-data wiring: weather chip/line, todo list, icon-keyed head 
   assert.match(html, /id="worker-toggle"[^>]*aria-controls="side-notes"[^>]*aria-expanded="false"[^>]*><svg class="icon"[^>]*><use href="#icon-panel"/, 'worker toggle is an icon button but keeps its drawer contract');
   assert.match(html, /id="memory-button"[^>]*><svg class="icon"[^>]*><use href="#icon-atlas"/);
   assert.doesNotMatch(html, /现场 <span aria-hidden="true">↗/, 'text buttons with arrows are gone from the head');
-  assert.match(app, /import \{ clockText, greetingFor, todoFeed, weekStrip \} from '\.\/home-dashboard\.js\?v=23'/);
+  assert.match(app, /import \{ clockText, greetingFor, todoFeed, weekStrip \} from '\.\/home-dashboard\.js\?v=24'/);
   assert.match(app, /state\.dash = \{ appearance: \{ nicknames: \{\}, avatars: \{\} \}, todos: null, weather: null, weatherFailed: false \}/, 'logout resets the dashboard channel');
   assert.match(app, /adapter\.getTodos\(\)/);
   assert.match(app, /adapter\.getDashAppearance\(\)/);
