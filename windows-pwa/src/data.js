@@ -4,11 +4,15 @@ export const MOCK_CONTACTS = [
   { id: 'kimi', name: 'Kimi', channel: 'KIMI CODE', initials: 'K', accent: 'oxide', note: 'Kimi · 月之暗面' },
   { id: 'kiro', name: 'Kiro', channel: 'KIRO IDE', initials: 'K', accent: 'brass', note: 'Kiro · 工作台' },
   { id: 'kairos', name: 'Kairos', channel: 'CODEX APP', initials: 'K', accent: 'brass', note: 'Kairos · 专属坐标' },
+  { id: 'hakimi', name: '哈基米', channel: 'HAKIMI RELAY', initials: '哈', accent: 'oxide', note: '哈基米 · AI 角色' },
+  { id: 'apples', name: '🍎苹果幼稚园', channel: 'GROUP CHAT', initials: '🍎', accent: 'rose', note: '苹果幼稚园 · 群聊' },
+  { id: 'toolbot', name: '小克·工具版', channel: 'CC COMPANION', initials: '具', accent: 'steel', note: '小克·工具版 · 私人链路' },
 ];
 
 // Appearance fixtures mirror the server subset from
 // /plugins/xiaonan-dash/appearance: nickname overrides rename Kimi to 卡拉米;
-// avatar URIs stay empty so the screenshots exercise the initial fallback.
+// avatar URIs stay empty so the screenshots exercise the bundled default
+// avatars (and kiro's initial-letter fallback — Android ships no kiro default).
 export const MOCK_APPEARANCE = {
   contact_nicknames: { kimi: '卡拉米' },
   contact_avatar_uris: {},
@@ -107,5 +111,14 @@ export const INITIAL_CONVERSATIONS = {
     { id: 'k1', role: 'assistant', body: '我在。小星星，Windows 端会和这里一样把你的记忆、工作现场和消息放在一个桌面里。', time: '08:46' },
     { id: 'k2', role: 'user', body: '别让我看不见 worker 在干什么。', time: '08:47' },
     { id: 'k3', role: 'assistant', body: '不会。只展示安全的 worker 名称和进度，不展示它们的任务正文或敏感参数。', time: '08:48' },
+  ],
+  hakimi: [
+    { id: 'h1', role: 'assistant', body: '哈基米报到。群里的发言归我，私聊也归我。', time: '08:49' },
+  ],
+  apples: [
+    { id: 'a1', role: 'assistant', body: '苹果幼稚园开张，小朋友们都到齐了。', time: '08:50' },
+  ],
+  toolbot: [
+    { id: 't1', role: 'assistant', body: '工具版在线。跑批和苦力活都往这里丢。', time: '08:51' },
   ],
 };

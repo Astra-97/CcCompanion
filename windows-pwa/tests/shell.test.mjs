@@ -119,7 +119,7 @@ test('Android-shell source contracts: four tabs, full pages, view switching, moc
   assert.match(app, /adapter\.searchMemories\(query, \{ limit: 20 \}\)/);
   assert.match(app, /adapter\.getMemoryBoard\(\{ page, perPage: 20 \}\)/);
   assert.match(app, /adapter\.listPlugins\(\)/);
-  assert.match(app, /WEB_SHELL_VERSION = 'desk-v25 · 2026-10-17'/);
+  assert.match(app, /WEB_SHELL_VERSION = 'desk-v26 · 2026-10-17'/);
   const mockHook = app.slice(app.indexOf('if (bootstrap.mock)'));
   assert.match(mockHook, /params\.get\('view'\)/, 'the deep-link hook stays mock-gated');
   assert.match(css, /\.tab-bar\{[^}]*display:none/, 'the bottom tab bar is phone-only');
@@ -130,7 +130,7 @@ test('Android-shell source contracts: four tabs, full pages, view switching, moc
   assert.match(css, /\.calendar-day\.has-entries\{background:linear-gradient/);
   assert.match(css, /\.calendar-weekdays,\.calendar-grid\{display:grid;grid-template-columns:repeat\(7,1fr\)/);
   assert.match(css, /\.side-notes\.view-hidden\{display:none\}/);
-  assert.match(sw, /src\/memory-calendar\.js\?v=25/);
+  assert.match(sw, /src\/memory-calendar\.js\?v=26/);
 });
 
 test('home dashboard helpers: deterministic greeting, clock text, Monday-first week strip', () => {
@@ -185,10 +185,10 @@ test('visual parity pass 2: dashboard cards, sans-only typography, transparent g
   for (const id of ['dash-clock-time', 'dash-clock-date', 'dash-quote-eyebrow', 'dash-quote-title', 'dash-quote-sub', 'dash-week-title', 'dash-week-days', 'dash-todo-card', 'dash-full-calendar', 'contact-avatar', 'contact-status']) {
     assert.match(html, new RegExp(`id="${id}"`), id);
   }
-  assert.match(app, /from '\.\/home-dashboard\.js\?v=25'/);
+  assert.match(app, /from '\.\/home-dashboard\.js\?v=26'/);
   assert.match(app, /function renderDashboard\(\)/);
   assert.match(app, /\$\('#dash-full-calendar'\)\.addEventListener\('click', openMemory\)/);
-  assert.match(sw, /src\/home-dashboard\.js\?v=25/);
+  assert.match(sw, /src\/home-dashboard\.js\?v=26/);
   assert.doesNotMatch(css, /--serif/, 'the shell drops serif typography entirely');
   assert.match(css, /\.eyebrow\{[^}]*font:500 10px var\(--sans\);letter-spacing:\.07em/);
   assert.match(css, /--glass:rgba\(24,17,12,\.42\)/);
@@ -266,7 +266,7 @@ test('dashboard real-data wiring: weather chip/line, todo list, icon-keyed head 
   assert.match(html, /id="worker-toggle"[^>]*aria-controls="side-notes"[^>]*aria-expanded="false"[^>]*><svg class="icon"[^>]*><use href="#icon-panel"/, 'worker toggle is an icon button but keeps its drawer contract');
   assert.match(html, /id="memory-button"[^>]*><svg class="icon"[^>]*><use href="#icon-atlas"/);
   assert.doesNotMatch(html, /现场 <span aria-hidden="true">↗/, 'text buttons with arrows are gone from the head');
-  assert.match(app, /import \{ clockText, greetingFor, todoFeed, weekStrip \} from '\.\/home-dashboard\.js\?v=25'/);
+  assert.match(app, /import \{ clockText, greetingFor, todoFeed, weekStrip \} from '\.\/home-dashboard\.js\?v=26'/);
   assert.match(app, /state\.dash = \{ appearance: \{ nicknames: \{\}, avatars: \{\} \}, todos: null, weather: null, weatherFailed: false \}/, 'logout resets the dashboard channel');
   assert.match(app, /adapter\.getTodos\(\)/);
   assert.match(app, /adapter\.getDashAppearance\(\)/);
@@ -288,7 +288,21 @@ test('dashboard real-data wiring: weather chip/line, todo list, icon-keyed head 
   assert.match(app, /Math\.imul\(hash, 31\) \+ text\.charCodeAt\(i\)\) \| 0/, 'Java String.hashCode parity');
   assert.match(app, /\(javaStringHash\(id\) & 0x7fffffff\) % AVATAR_ACCENT_PALETTE\.length/);
   assert.doesNotMatch(app, /=== 'kairos' \? 'brass' : 'oxide'/, 'the single-color fallback ternary is gone');
+  assert.match(app, /function avatarUriOf\(id\) \{ return state\.dash\.appearance\.avatars\[id\] \|\| DEFAULT_AVATAR_URIS\[id\] \|\| ''; \}/, 'server custom avatars win, bundled defaults are the fallback');
+  for (const [id, file] of [['xiaoke', 'default_avatar_xiaoke.webp'], ['kairos', 'default_avatar_kairos.jpg'], ['kimi', 'default_avatar_ai.jpg'], ['apples', 'default_avatar_group.jpg'], ['toolbot', 'default_avatar_toolbot.jpg']]) {
+    assert.match(app, new RegExp(`${id}: '\\./assets/${file}'`), `bundled default avatar for ${id}`);
+  }
+  assert.match(app, /hakimi: '\.\/assets\/default_avatar_hakimi\.jpg',\n  hajimi: '\.\/assets\/default_avatar_hakimi\.jpg',\n  hajiki: '\.\/assets\/default_avatar_hakimi\.jpg',/, 'hakimi aliases mirror Android ContactDisplay');
+  assert.doesNotMatch(app, /kiro: '\.\/assets\/default_avatar/, 'Android ships no kiro default avatar, so the PWA must not invent one');
+  const swAssets = readFileSync(new URL('../sw.js', import.meta.url), 'utf8');
+  for (const file of ['default_avatar_xiaoke.webp', 'default_avatar_kairos.jpg', 'default_avatar_ai.jpg', 'default_avatar_hakimi.jpg', 'default_avatar_group.jpg', 'default_avatar_toolbot.jpg']) {
+    assert.match(swAssets, new RegExp(`'\\./assets/${file}'`), `${file} is precached`);
+  }
+  const fixtures = readFileSync(new URL('../src/data.js', import.meta.url), 'utf8');
+  for (const id of ['hakimi', 'apples', 'toolbot']) assert.match(fixtures, new RegExp(`\\{ id: '${id}'`), `mock contact ${id}`);
   assert.match(css, /#contact-status\{color:var\(--oxide\)\}/, 'the header status line is oxide orange');
   assert.match(css, /\.chat-list\{display:flex;flex-wrap:nowrap;gap:8px;margin-top:13px;overflow-x:auto/, 'the avatar row scrolls sideways instead of clipping');
+  assert.match(css, /\.chat-list\{[^}]*min-width:0/, 'a long avatar row never stretches the mobile dashboard');
+  assert.match(css, /\.dash-contacts-card\{min-width:0\}/, 'the contacts grid item yields its track on narrow shells');
   assert.match(css, /\.chat-list \.chat-card\{display:grid;flex:0 0 auto/, 'cards keep their width while scrolling');
 });

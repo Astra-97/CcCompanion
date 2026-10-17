@@ -1,17 +1,17 @@
-import { createPwaBootstrap } from './bootstrap.js?v=25';
-import { createComposerState } from './composer-state.js?v=25';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=25';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=25';
-import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=25';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=25';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=25';
-import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=25';
-import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=25';
-import { createNotifier } from './notifications.js?v=25';
-import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=25';
-import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=25';
+import { createPwaBootstrap } from './bootstrap.js?v=26';
+import { createComposerState } from './composer-state.js?v=26';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=26';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=26';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=26';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=26';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=26';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=26';
+import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=26';
+import { createNotifier } from './notifications.js?v=26';
+import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=26';
+import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=26';
 
-const WEB_SHELL_VERSION = 'desk-v25 · 2026-10-17';
+const WEB_SHELL_VERSION = 'desk-v26 · 2026-10-17';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -45,7 +45,21 @@ const DASH_DATA_INTERVAL_MS = 15 * 60_000;
 function contact() { return state.contacts.find(({ id }) => id === state.activeContactId) || { id: '', name: '连接中', channel: 'PRIVATE CHANNEL', note: '', capabilities: [] }; }
 /** Server nickname overrides win over the contacts payload (App parity). */
 function displayNameOf(item) { return state.dash.appearance.nicknames[item?.id] || item?.name || ''; }
-function avatarUriOf(id) { return state.dash.appearance.avatars[id] || ''; }
+// Bundled default avatars mirror Android ContactDisplay.defaultContactAvatarUri()
+// (including the hakimi/hajimi/hajiki aliases): server-side custom avatars from
+// the appearance payload win; these bundled images are the fallback before the
+// initial-letter disc.
+const DEFAULT_AVATAR_URIS = {
+  xiaoke: './assets/default_avatar_xiaoke.webp',
+  kairos: './assets/default_avatar_kairos.jpg',
+  kimi: './assets/default_avatar_ai.jpg',
+  hakimi: './assets/default_avatar_hakimi.jpg',
+  hajimi: './assets/default_avatar_hakimi.jpg',
+  hajiki: './assets/default_avatar_hakimi.jpg',
+  apples: './assets/default_avatar_group.jpg',
+  toolbot: './assets/default_avatar_toolbot.jpg',
+};
+function avatarUriOf(id) { return state.dash.appearance.avatars[id] || DEFAULT_AVATAR_URIS[id] || ''; }
 // Fallback accent colors mirror Android ChatListScreen.toChatContact(): fixed
 // brand hues for known contacts; everyone else picks from the same six-color
 // palette via Java String.hashCode() (Android dynamicContactColor).

@@ -220,7 +220,7 @@ test('first-batch UX source contracts: no innerHTML, markdown renderer, thinking
   assert.match(app, /state\.notifier\.notify/);
   assert.match(app, /startBackgroundPolling\(\)/);
   assert.match(html, /id="notification-button"[^>]*aria-pressed="false"/);
-  assert.match(sw, /src\/markdown\.js\?v=25/);
-  assert.match(sw, /src\/unread\.js\?v=25/);
-  assert.match(sw, /src\/notifications\.js\?v=25/);
+  assert.match(sw, /src\/markdown\.js\?v=26/);
+  assert.match(sw, /src\/unread\.js\?v=26/);
+  assert.match(sw, /src\/notifications\.js\?v=26/);
 });
