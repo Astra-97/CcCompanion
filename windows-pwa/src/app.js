@@ -1,16 +1,16 @@
-import { createPwaBootstrap } from './bootstrap.js?v=17';
-import { createComposerState } from './composer-state.js?v=17';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=17';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=17';
-import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=17';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=17';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=17';
-import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=17';
-import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=17';
-import { createNotifier } from './notifications.js?v=17';
-import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=17';
+import { createPwaBootstrap } from './bootstrap.js?v=18';
+import { createComposerState } from './composer-state.js?v=18';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=18';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=18';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=18';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=18';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=18';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=18';
+import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=18';
+import { createNotifier } from './notifications.js?v=18';
+import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=18';
 
-const WEB_SHELL_VERSION = 'desk-v17 · 2026-10-17';
+const WEB_SHELL_VERSION = 'desk-v18 · 2026-10-17';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -533,12 +533,16 @@ async function loadMemoryBoard(page = 1) {
 }
 function stopTerminalPolling() { state.stopTerminalPoll?.(); state.stopTerminalPoll = null; }
 async function pollTerminalPage() {
-  const results = await Promise.all(state.contacts.map(async (item) => {
-    try { return [item.id, await adapter.getLiveState(item.id)]; } catch { return [item.id, null]; }
-  }));
-  if (state.view !== 'terminal') return;
-  results.forEach(([id, live]) => { state.terminalSnapshots[id] = live; });
-  renderTerminalPage();
+  if (state.terminalPollInFlight) return;
+  state.terminalPollInFlight = true;
+  try {
+    const results = await Promise.all(state.contacts.map(async (item) => {
+      try { return [item.id, await adapter.getLiveState(item.id)]; } catch { return [item.id, null]; }
+    }));
+    if (state.view !== 'terminal') return;
+    results.forEach(([id, live]) => { state.terminalSnapshots[id] = live; });
+    renderTerminalPage();
+  } finally { state.terminalPollInFlight = false; }
 }
 function startTerminalPolling() {
   stopTerminalPolling();
