@@ -1,17 +1,17 @@
-import { createPwaBootstrap } from './bootstrap.js?v=21';
-import { createComposerState } from './composer-state.js?v=21';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=21';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=21';
-import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=21';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=21';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=21';
-import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=21';
-import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=21';
-import { createNotifier } from './notifications.js?v=21';
-import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=21';
-import { clockText, greetingFor, weekStrip } from './home-dashboard.js?v=21';
+import { createPwaBootstrap } from './bootstrap.js?v=22';
+import { createComposerState } from './composer-state.js?v=22';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=22';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=22';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=22';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=22';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=22';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=22';
+import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=22';
+import { createNotifier } from './notifications.js?v=22';
+import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=22';
+import { clockText, greetingFor, weekStrip } from './home-dashboard.js?v=22';
 
-const WEB_SHELL_VERSION = 'desk-v21 · 2026-10-17';
+const WEB_SHELL_VERSION = 'desk-v22 · 2026-10-17';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -860,7 +860,7 @@ $('#notification-button').addEventListener('click', toggleNotifications);
 document.addEventListener('visibilitychange', () => { if (document.visibilityState !== 'hidden') markActiveSeen(); });
 window.addEventListener('keydown', (event) => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); input.focus(); } if (event.altKey && /^[1-9]$/.test(event.key)) { const target = state.contacts[Number(event.key) - 1]; if (target) switchContact(target.id); } if (event.key === 'Escape') { if ($('#sticker-dialog').open) closeStickerDialog({ returnFocus: true }); else if (state.view === 'memory') switchView('chat'); if (document.body.classList.contains('workers-open')) closeWorkers(); } });
 window.addEventListener('beforeinstallprompt', (event) => { event.preventDefault(); state.deferredInstall = event; $('#install-button').hidden = false; }); $('#install-button').addEventListener('click', async () => { await state.deferredInstall?.prompt(); state.deferredInstall = null; $('#install-button').hidden = true; });
-workerDrawerQuery.addEventListener('change', syncWorkerPanel); syncWorkerPanel(); document.body.append($('#svg-defs').content.cloneNode(true)); if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js'));
+workerDrawerQuery.addEventListener('change', syncWorkerPanel); syncWorkerPanel(); document.body.append($('#svg-defs').content.cloneNode(true)); if ('serviceWorker' in navigator) { let swReloaded = false; navigator.serviceWorker.addEventListener('controllerchange', () => { if (swReloaded) return; swReloaded = true; location.reload(); }); window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js')); }
 async function start() {
   try { await bootstrap.checkSession(); } catch (error) { if (!bootstrap.mock) { showLogin(); return; } }
   try { state.contacts = await adapter.contacts(); if (!state.contacts.length) throw new Error('没有可用联系人'); state.activeContactId = state.contacts.find(({ id }) => id === 'xiaoke')?.id || state.contacts[0].id; state.contacts.forEach(({ id }) => { state.histories[id] = []; state.live[id] = { replyState: 'idle', statusText: '待命', workers: [] }; composer(id); state.followLatest[id] = true; }); await Promise.all(state.contacts.map(({ id }) => refreshContact(id))); seedUnreadCursors(state.unread, state.histories); markActiveSeen(); watchLive(state.activeContactId); state.stopBackground?.(); state.stopBackground = startBackgroundPolling(); syncNotificationButton(); renderAll({ forceLatest: true }); syncView(); void loadStickerCatalog(); }

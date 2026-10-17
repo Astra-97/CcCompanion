@@ -520,11 +520,11 @@ test('PWA shell declares installability and has no secret persistence', async ()
   assert.match(manifest, /icon-192\.png/);
   assert.match(manifest, /icon-512\.png/);
   assert.match(serviceWorker, /addEventListener\('fetch'/);
-  assert.match(serviceWorker, /cccompanion-desk-v21/);
-  assert.match(serviceWorker, /src\/styles\.css\?v=21/);
-  assert.match(serviceWorker, /src\/app\.js\?v=21/);
-  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=21/);
-  assert.match(serviceWorker, /src\/sticker-protocol\.js\?v=21/);
+  assert.match(serviceWorker, /cccompanion-desk-v22/);
+  assert.match(serviceWorker, /src\/styles\.css\?v=22/);
+  assert.match(serviceWorker, /src\/app\.js\?v=22/);
+  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=22/);
+  assert.match(serviceWorker, /src\/sticker-protocol\.js\?v=22/);
   assert.match(serviceWorker, /src\/live-messages\.js/);
   assert.match(serviceWorker, /src\/pairing-code\.js/);
   assert.doesNotMatch(source, /shared_secret|localStorage\.setItem|sessionStorage\.setItem|credentials:\s*'include'/);
@@ -541,8 +541,8 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   ]);
   assert.match(html, /id="latest-button"/);
   assert.match(html, /id="pairing-code"/);
-  assert.match(html, /href="\.\/src\/styles\.css\?v=21"/);
-  assert.match(html, /src="\.\/src\/app\.js\?v=21"/);
+  assert.match(html, /href="\.\/src\/styles\.css\?v=22"/);
+  assert.match(html, /src="\.\/src\/app\.js\?v=22"/);
   assert.match(html, /autocomplete="one-time-code"/);
   assert.match(html, /id="pairing-form"/);
   assert.match(html, /<details class="password-fallback">/);
