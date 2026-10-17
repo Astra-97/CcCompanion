@@ -1,13 +1,13 @@
-import { createPwaBootstrap } from './bootstrap.js?v=13';
-import { createComposerState } from './composer-state.js?v=13';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=13';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=13';
-import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=13';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=13';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=13';
-import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=13';
-import { createUnreadStore, previewText, unseenAssistant } from './unread.js?v=13';
-import { createNotifier } from './notifications.js?v=13';
+import { createPwaBootstrap } from './bootstrap.js?v=14';
+import { createComposerState } from './composer-state.js?v=14';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=14';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=14';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=14';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=14';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=14';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=14';
+import { createUnreadStore, previewText, unseenAssistant } from './unread.js?v=14';
+import { createNotifier } from './notifications.js?v=14';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
