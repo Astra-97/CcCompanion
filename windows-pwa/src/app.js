@@ -1,16 +1,17 @@
-import { createPwaBootstrap } from './bootstrap.js?v=19';
-import { createComposerState } from './composer-state.js?v=19';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=19';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=19';
-import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=19';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=19';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=19';
-import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=19';
-import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=19';
-import { createNotifier } from './notifications.js?v=19';
-import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=19';
+import { createPwaBootstrap } from './bootstrap.js?v=20';
+import { createComposerState } from './composer-state.js?v=20';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=20';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=20';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=20';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=20';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=20';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=20';
+import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=20';
+import { createNotifier } from './notifications.js?v=20';
+import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=20';
+import { clockText, greetingFor, weekStrip } from './home-dashboard.js?v=20';
 
-const WEB_SHELL_VERSION = 'desk-v19 · 2026-10-17';
+const WEB_SHELL_VERSION = 'desk-v20 · 2026-10-17';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -106,18 +107,35 @@ function openMobileChat(id) {
   syncView();
   void switchContact(id);
 }
+function renderDashboard() {
+  const now = new Date();
+  const clock = clockText(now);
+  $('#dash-clock-time').textContent = clock.time;
+  $('#dash-clock-date').textContent = clock.date;
+  const greeting = greetingFor(now);
+  $('#dash-quote-eyebrow').textContent = greeting.eyebrow;
+  $('#dash-quote-title').textContent = greeting.title;
+  $('#dash-quote-sub').textContent = greeting.subtitle;
+  const week = weekStrip(now);
+  $('#dash-week-title').textContent = week.title;
+  $('#dash-week-days').replaceChildren(...week.days.map((day) => el('div', { class: 'dash-week-col' }, [
+    el('small', { text: day.weekday }),
+    el('span', { class: `dash-week-day${day.isToday ? ' is-today' : ''}`, text: String(day.day) }),
+  ])));
+}
 function renderChatListPage() {
+  renderDashboard();
   const list = $('#chat-list');
   list.replaceChildren(...state.contacts.map((item) => {
     const busy = isBusy(item.id);
     const history = state.histories[item.id] || [];
     const unread = state.unread.unreadFor(item.id, history);
-    const preview = previewText(history.at(-1)) || item.note;
     const accent = item.id === 'kairos' ? 'brass' : 'oxide';
     const button = el('button', { type: 'button', class: 'chat-card', 'aria-label': `打开与 ${item.name} 的对话` });
-    button.append(el('span', { class: `avatar ${accent}`, text: item.name.slice(0, 1) }), el('span', { class: 'chat-card-copy' }, [el('strong', { text: item.name }), el('small', { text: preview })]));
-    if (unread > 0) button.append(el('span', { class: 'unread-badge', text: unread > 99 ? '99+' : String(unread), 'aria-label': `${unread} 条未读消息` }));
-    button.append(el('span', { class: `contact-led ${busy ? 'is-busy' : ''}`, 'aria-label': busy ? '正在处理' : '待命' }));
+    const face = el('span', { class: 'chat-card-face' }, [el('span', { class: `avatar ${accent}`, text: item.name.slice(0, 1) })]);
+    if (unread > 0) face.append(el('span', { class: 'unread-badge', text: unread > 99 ? '99+' : String(unread), 'aria-label': `${unread} 条未读消息` }));
+    face.append(el('span', { class: `contact-led ${busy ? 'is-busy' : ''}`, 'aria-label': busy ? '正在处理' : '待命' }));
+    button.append(face, el('strong', { text: item.name }));
     button.addEventListener('click', () => openMobileChat(item.id));
     return button;
   }));
@@ -126,6 +144,10 @@ function renderHeader() {
   const current = contact(); const live = state.live[current.id] || { replyState: 'idle', statusText: '待命', workers: [] };
   const sending = Boolean(sendOperation(current.id));
   $('#contact-name').textContent = current.name; $('#contact-mode').textContent = current.channel;
+  const headerAvatar = $('#contact-avatar');
+  headerAvatar.textContent = (current.name || '克').slice(0, 1);
+  headerAvatar.className = `avatar contact-avatar ${current.id === 'kairos' ? 'brass' : 'oxide'}`;
+  $('#contact-status').textContent = live.statusText || '待命';
   input.placeholder = `写给${current.name}…`; $('#connection-state').textContent = isBusy() ? (live.statusText || '正在处理') : '已连接';
   $('#signal-dot').classList.toggle('is-busy', isBusy());
   // The stop key tracks the busy turn itself: visible the moment a send goes
@@ -819,6 +841,7 @@ $('#calendar-today').addEventListener('click', () => void loadCalendarMonth(mont
 $('#board-prev').addEventListener('click', () => void loadMemoryBoard(state.memory.boardPage - 1));
 $('#board-next').addEventListener('click', () => void loadMemoryBoard(state.memory.boardPage + 1));
 $('#open-memory-card').addEventListener('click', openMemory);
+$('#dash-full-calendar').addEventListener('click', openMemory);
 $('#settings-appearance-button').addEventListener('click', cycleAppearance);
 $('#settings-notification-button').addEventListener('click', toggleNotifications);
 $('#settings-logout-button').addEventListener('click', logout);
@@ -866,4 +889,4 @@ function showLogin() {
   });
   $('#login-form').addEventListener('submit', async (event) => { event.preventDefault(); const submit = $('#login-submit'); const error = $('#login-error'); submit.disabled = true; error.textContent = ''; try { await bootstrap.establishSession({ username: $('#login-username').value, password: $('#login-password').value }); panel.hidden = true; await start(); } catch { error.textContent = '登录未通过，请检查账号或连接。'; } finally { $('#login-password').value = ''; submit.disabled = false; } });
 }
-renderAll(); syncView(); start();
+renderAll(); syncView(); start(); setInterval(renderDashboard, 30_000);

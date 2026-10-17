@@ -495,7 +495,7 @@ test('dark glass palette preserves AA text, wallpaper layering, and glass struct
   assert.match(css, /url\('\/plugins\/xiaonan-dash\/appearance-asset'\) center\/cover no-repeat fixed/);
   assert.match(css, /background-color:var\(--bg\)/);
   assert.doesNotMatch(css, /#fff6ec|fonts\.googleapis|fonts\.gstatic/);
-  assert.match(css, /backdrop-filter:blur\(20px\) saturate\(1\.35\)/);
+  assert.match(css, /backdrop-filter:blur\(26px\) saturate\(1\.3\)/);
   assert.match(css, /\.avatar\{[^}]*color:var\(--avatar-ink\)/);
   assert.match(css, /\.login-card input\{[^}]*border:1px solid var\(--control-border\)/);
   assert.match(css, /input::placeholder\{color:var\(--placeholder\);opacity:1\}/);
@@ -520,11 +520,11 @@ test('PWA shell declares installability and has no secret persistence', async ()
   assert.match(manifest, /icon-192\.png/);
   assert.match(manifest, /icon-512\.png/);
   assert.match(serviceWorker, /addEventListener\('fetch'/);
-  assert.match(serviceWorker, /cccompanion-desk-v19/);
-  assert.match(serviceWorker, /src\/styles\.css\?v=19/);
-  assert.match(serviceWorker, /src\/app\.js\?v=19/);
-  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=19/);
-  assert.match(serviceWorker, /src\/sticker-protocol\.js\?v=19/);
+  assert.match(serviceWorker, /cccompanion-desk-v20/);
+  assert.match(serviceWorker, /src\/styles\.css\?v=20/);
+  assert.match(serviceWorker, /src\/app\.js\?v=20/);
+  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=20/);
+  assert.match(serviceWorker, /src\/sticker-protocol\.js\?v=20/);
   assert.match(serviceWorker, /src\/live-messages\.js/);
   assert.match(serviceWorker, /src\/pairing-code\.js/);
   assert.doesNotMatch(source, /shared_secret|localStorage\.setItem|sessionStorage\.setItem|credentials:\s*'include'/);
@@ -541,8 +541,8 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   ]);
   assert.match(html, /id="latest-button"/);
   assert.match(html, /id="pairing-code"/);
-  assert.match(html, /href="\.\/src\/styles\.css\?v=19"/);
-  assert.match(html, /src="\.\/src\/app\.js\?v=19"/);
+  assert.match(html, /href="\.\/src\/styles\.css\?v=20"/);
+  assert.match(html, /src="\.\/src\/app\.js\?v=20"/);
   assert.match(html, /autocomplete="one-time-code"/);
   assert.match(html, /id="pairing-form"/);
   assert.match(html, /<details class="password-fallback">/);
@@ -616,7 +616,7 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   assert.match(html, /name="theme-color" content="#17100b"/);
   assert.match(css, /color-scheme:dark/);
   assert.match(css, /--bg:#17100b/);
-  assert.match(css, /--glass:rgba\(28,20,14,\.55\)/);
+  assert.match(css, /--glass:rgba\(24,17,12,\.42\)/);
   assert.match(css, /--ink:#f7efe4/);
   assert.match(css, /--oxide:#d4836f/);
   assert.match(css, /--dim:#c2a98e/);

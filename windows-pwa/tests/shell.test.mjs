@@ -3,6 +3,7 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { createHttpAdapter, createMockAdapter, normalizeBoardMessage, normalizeMemoryItem, normalizePlugin } from '../src/api.js';
 import { buildMonthGrid, monthKey, shiftMonth, todayKey } from '../src/memory-calendar.js';
+import { clockText, greetingFor, weekStrip } from '../src/home-dashboard.js';
 
 test('month keys and shifting follow the YYYY-MM contract across year edges', () => {
   assert.match(monthKey(new Date(2026, 9, 17)), /^2026-10$/);
@@ -118,7 +119,7 @@ test('Android-shell source contracts: four tabs, full pages, view switching, moc
   assert.match(app, /adapter\.searchMemories\(query, \{ limit: 20 \}\)/);
   assert.match(app, /adapter\.getMemoryBoard\(\{ page, perPage: 20 \}\)/);
   assert.match(app, /adapter\.listPlugins\(\)/);
-  assert.match(app, /WEB_SHELL_VERSION = 'desk-v19 · 2026-10-17'/);
+  assert.match(app, /WEB_SHELL_VERSION = 'desk-v20 · 2026-10-17'/);
   const mockHook = app.slice(app.indexOf('if (bootstrap.mock)'));
   assert.match(mockHook, /params\.get\('view'\)/, 'the deep-link hook stays mock-gated');
   assert.match(css, /\.tab-bar\{[^}]*display:none/, 'the bottom tab bar is phone-only');
@@ -129,5 +130,44 @@ test('Android-shell source contracts: four tabs, full pages, view switching, moc
   assert.match(css, /\.calendar-day\.has-entries\{background:linear-gradient/);
   assert.match(css, /\.calendar-weekdays,\.calendar-grid\{display:grid;grid-template-columns:repeat\(7,1fr\)/);
   assert.match(css, /\.side-notes\.view-hidden\{display:none\}/);
-  assert.match(sw, /src\/memory-calendar\.js\?v=19/);
+  assert.match(sw, /src\/memory-calendar\.js\?v=20/);
+});
+
+test('home dashboard helpers: deterministic greeting, clock text, Monday-first week strip', () => {
+  const saturday = new Date(2026, 9, 17, 14, 15); // 2026-10-17 is a Saturday.
+  const greeting = greetingFor(saturday);
+  assert.equal(greeting.eyebrow, 'SAT · 10/17');
+  assert.ok(greeting.title.length > 0 && greeting.subtitle.length > 0);
+  assert.deepEqual(greetingFor(saturday), greeting, 'the same moment always yields the same copy');
+  for (const hour of [0, 5, 9, 12, 15, 19, 23]) assert.ok(greetingFor(new Date(2026, 9, 17, hour)).title.length > 0, `hour ${hour}`);
+  const clock = clockText(saturday);
+  assert.equal(clock.time, '14:15');
+  assert.equal(clock.date, '10月17日 · 星期六');
+  const week = weekStrip(saturday);
+  assert.equal(week.title, '2026年10月');
+  assert.equal(week.days.length, 7);
+  assert.equal(week.days[0].date, '2026-10-12', 'the strip starts on the Monday of the current week');
+  assert.equal(week.days[5].date, '2026-10-17');
+  assert.ok(week.days[5].isToday && week.days.filter((day) => day.isToday).length === 1);
+});
+
+test('visual parity pass 2: dashboard cards, sans-only typography, transparent glass, circular send key', () => {
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  const app = readFileSync(new URL('../src/app.js', import.meta.url), 'utf8');
+  const css = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
+  const sw = readFileSync(new URL('../sw.js', import.meta.url), 'utf8');
+  for (const id of ['dash-clock-time', 'dash-clock-date', 'dash-quote-eyebrow', 'dash-quote-title', 'dash-quote-sub', 'dash-week-title', 'dash-week-days', 'dash-todo-card', 'dash-full-calendar', 'contact-avatar', 'contact-status']) {
+    assert.match(html, new RegExp(`id="${id}"`), id);
+  }
+  assert.match(app, /from '\.\/home-dashboard\.js\?v=20'/);
+  assert.match(app, /function renderDashboard\(\)/);
+  assert.match(app, /\$\('#dash-full-calendar'\)\.addEventListener\('click', openMemory\)/);
+  assert.match(sw, /src\/home-dashboard\.js\?v=20/);
+  assert.doesNotMatch(css, /--serif/, 'the shell drops serif typography entirely');
+  assert.match(css, /\.eyebrow\{[^}]*font:500 10px var\(--sans\);letter-spacing:\.07em/);
+  assert.match(css, /--glass:rgba\(24,17,12,\.42\)/);
+  assert.match(css, /backdrop-filter:blur\(26px\) saturate\(1\.3\)/);
+  assert.match(css, /\.dash-week-day\.is-today\{background:linear-gradient/);
+  assert.match(css, /\.chat-card-face\{position:relative/);
+  assert.match(css, /@media \(max-width:720px\)\{[^]*?\.send-button\{min-width:48px;width:48px;height:48px;padding:0;justify-content:center;border-radius:50%\}/);
 });
