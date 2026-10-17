@@ -1,13 +1,13 @@
-import { createPwaBootstrap } from './bootstrap.js?v=15';
-import { createComposerState } from './composer-state.js?v=15';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=15';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=15';
-import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=15';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=15';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=15';
-import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=15';
-import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=15';
-import { createNotifier } from './notifications.js?v=15';
+import { createPwaBootstrap } from './bootstrap.js?v=16';
+import { createComposerState } from './composer-state.js?v=16';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=16';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=16';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=16';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=16';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=16';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=16';
+import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=16';
+import { createNotifier } from './notifications.js?v=16';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {

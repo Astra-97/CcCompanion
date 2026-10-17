@@ -1,6 +1,6 @@
-import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY } from './data.js?v=15';
-import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=15';
-import { normalizeStickerCatalog } from './sticker-protocol.js?v=15';
+import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY } from './data.js?v=16';
+import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=16';
+import { normalizeStickerCatalog } from './sticker-protocol.js?v=16';
 
 const clone = (value) => structuredClone(value);
 const now = () => new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
