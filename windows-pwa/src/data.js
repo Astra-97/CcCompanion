@@ -21,6 +21,37 @@ export const MOCK_MEMORIES = {
   'xiayizhou.qiqi_game_copy': [{ title: '七七整理的游戏文案', body: '已迁移为受控二级分类。', timestamp: '1520 条' }],
 };
 
+// Memory page fixtures: stats mirror the upstream { total, byCategory } shape;
+// calendar entries get stitched onto fixed days of whatever month is asked.
+export const MOCK_MEMORY_STATS = {
+  total: 2290,
+  byCategory: { chat: 119, deep: 177, daily: 11, diary: 304, worklog: 31, health: 3 },
+};
+
+export const MOCK_MEMORY_CALENDAR_ENTRIES = [
+  { offsetDay: 2, mood: 'calm', entries: [{ id: 'mock-cal-1', content: '把 Windows 端的记忆页做成了整页，不再是弹窗。', category: 'diary', subcategory: 'diary.worklog', tags: ['pwa'], createdAt: '2026-10-02T09:30:00+00:00' }] },
+  { offsetDay: 9, mood: 'happy', entries: [{ id: 'mock-cal-2', content: 'Astra 验收了深色玻璃主题。', category: 'daily', subcategory: '', tags: [], createdAt: '2026-10-09T13:05:00+00:00' }] },
+  { offsetDay: 16, mood: 'calm', entries: [{ id: 'mock-cal-3', content: 'Android 壳对齐：聊天 / 终端 / App / 设置四个 tab。', category: 'diary', subcategory: 'diary.worklog', tags: ['android'], createdAt: '2026-10-16T11:20:00+00:00' }] },
+];
+
+export const MOCK_MEMORY_BOARD = {
+  messages: [
+    { id: 'board-1', from: '小克-cc-session01', content: '记忆页月历已对齐 Android：周一开头、有内容的日期高亮。', createdAt: '2026-10-16T15:40:00+00:00' },
+    { id: 'board-2', from: '小克-cc-session02', content: '终端 tab 只做只读投影，交互终端仍归 Android。', createdAt: '2026-10-17T02:12:00+00:00' },
+  ],
+  pagination: { page: 1, perPage: 20, total: 2, totalPages: 1 },
+};
+
+export const MOCK_MEMORY_SEARCH = [
+  { id: 'search-1', content: '小南面板插件通过 /plugins/xiaonan-dash 提供壁纸。', category: 'deep', subcategory: '', tags: ['plugin'], createdAt: '2026-10-10T08:00:00+00:00', similarity: 0.83 },
+  { id: 'search-2', content: '记忆库留言板按页读取，每页 20 条。', category: 'chat', subcategory: '', tags: [], createdAt: '2026-10-11T08:00:00+00:00', similarity: 0.77 },
+];
+
+export const MOCK_PLUGINS = [
+  { id: 'xiaonan-dash', name: '小南仪表盘', version: '1.4.2', description: '壁纸与四板块聚合面板', entry: 'index.html', builtin: true },
+  { id: 'period-tracker', name: '经期记录', version: '0.9.1', description: '周期记录与预测', entry: 'index.html', builtin: false },
+];
+
 export const INITIAL_CONVERSATIONS = {
   xiaoke: [
     { id: 'x1', role: 'assistant', body: '早。今天先把最烦的那一件收掉，别让它一直占着你的脑子。', time: '08:41' },

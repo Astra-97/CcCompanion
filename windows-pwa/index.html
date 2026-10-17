@@ -8,7 +8,7 @@
     <meta name="description" content="CcCompanion private operations desk" />
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" href="./assets/cc-mark.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="./src/styles.css?v=16" />
+    <link rel="stylesheet" href="./src/styles.css?v=17" />
     <title>CcCompanion · Desk</title>
   </head>
   <body>
@@ -43,10 +43,16 @@
           <svg class="mark" aria-hidden="true"><use href="#cc-mark" /></svg>
           <span>Cc<span>Companion</span></span>
         </header>
+        <nav id="rail-tabs" class="rail-tabs" aria-label="主导航">
+          <button type="button" class="tab-item is-active" data-view="chat" aria-current="page"><svg class="icon" aria-hidden="true"><use href="#icon-chat" /></svg><span>聊天</span></button>
+          <button type="button" class="tab-item" data-view="terminal"><svg class="icon" aria-hidden="true"><use href="#icon-terminal" /></svg><span>终端</span></button>
+          <button type="button" class="tab-item" data-view="apps"><svg class="icon" aria-hidden="true"><use href="#icon-apps" /></svg><span>App</span></button>
+          <button type="button" class="tab-item" data-view="settings"><svg class="icon" aria-hidden="true"><use href="#icon-settings" /></svg><span>设置</span></button>
+        </nav>
         <nav id="contact-list" class="contact-list" aria-label="切换联系人"></nav>
         <div class="rail-footer">
           <button class="icon-button" id="install-button" type="button" title="安装到 Windows" aria-label="安装到 Windows" hidden>↓</button>
-          <button class="icon-button" id="notification-button" type="button" title="桌面通知：关（点击开启）" aria-label="开启桌面通知，当前已关闭" aria-pressed="false" hidden>🔕</button>
+          <button class="icon-button" id="notification-button" type="button" title="桌面通知：关（点击开启）" aria-label="开启桌面通知，当前已关闭" aria-pressed="false" hidden><svg class="icon" aria-hidden="true"><use href="#icon-bell-off" /></svg></button>
           <button class="icon-button" id="appearance-button" type="button" title="切换显示模式" aria-label="切换显示模式：默认">◒</button>
           <span class="sr-only" id="appearance-status" aria-live="polite">显示模式：默认</span>
         </div>
@@ -55,6 +61,7 @@
       <section class="conversation" id="conversation" aria-label="当前对话">
         <header class="conversation-head">
           <div class="contact-heading">
+            <button class="icon-button" id="chat-back-button" type="button" aria-label="返回聊天列表" hidden><svg class="icon" aria-hidden="true"><use href="#icon-back" /></svg></button>
             <span class="signal-dot" id="signal-dot" aria-hidden="true"></span>
             <div><p class="eyebrow" id="contact-mode">PRIVATE CHANNEL</p><h1 id="contact-name">小克</h1></div>
           </div>
@@ -121,14 +128,86 @@
           <button class="text-button logout-button" id="drawer-logout-button" type="button">退出工作台</button>
         </div>
       </aside>
+
+      <section class="page-view" id="chat-list-page" aria-label="聊天列表" hidden>
+        <header class="page-head"><div><p class="eyebrow">CHANNELS</p><h2>聊天</h2><p class="page-sub">选择一个联系人进入对话</p></div></header>
+        <div class="home-cards">
+          <article class="glass-card empty-card"><p class="eyebrow">WEATHER</p><h3>天气</h3><p class="empty-note">天气服务在 Android 上直连第三方，网页端 CSP 不开放外连；需要服务端代理后才会启用。</p></article>
+          <article class="glass-card empty-card"><p class="eyebrow">TODOS</p><h3>待办</h3><p class="empty-note">待办接口（GET /todos）尚未对网页会话放行，放行前这里保持占位。</p></article>
+        </div>
+        <nav id="chat-list" class="chat-list" aria-label="选择联系人"></nav>
+      </section>
+
+      <section class="page-view" id="terminal-page" aria-label="终端" hidden>
+        <header class="page-head"><div><p class="eyebrow">READ-ONLY OBSERVER</p><h2>终端</h2><p class="page-sub" id="terminal-page-sub">各联系人的安全观察投影 · 每 4 秒刷新</p></div></header>
+        <div id="terminal-page-list" class="terminal-page-list"></div>
+      </section>
+
+      <section class="page-view" id="apps-page" aria-label="应用" hidden>
+        <header class="page-head"><div><p class="eyebrow">APPS</p><h2>App</h2><p class="page-sub">记忆库与已安装插件</p></div></header>
+        <div class="apps-grid">
+          <button class="glass-card app-card" id="open-memory-card" type="button">
+            <p class="eyebrow">MEMORY ATLAS</p><h3>记忆库</h3><p class="app-card-note">语义搜索、分类、月历与留言板</p>
+          </button>
+          <article class="glass-card empty-card"><p class="eyebrow">WEATHER</p><h3>天气</h3><p class="empty-note">需要服务端代理第三方天气接口后启用。</p></article>
+          <article class="glass-card empty-card"><p class="eyebrow">TODOS</p><h3>待办</h3><p class="empty-note">等待服务端放行 GET /todos。</p></article>
+        </div>
+        <div class="panel-heading plugin-heading"><div><p class="eyebrow">PLUGINS</p><h3 class="plugin-title">插件</h3></div></div>
+        <div id="plugin-list" class="plugin-list" aria-live="polite"></div>
+      </section>
+
+      <section class="page-view" id="settings-page" aria-label="设置" hidden>
+        <header class="page-head"><div><p class="eyebrow">SETTINGS</p><h2>设置</h2></div></header>
+        <div class="settings-list">
+          <div class="glass-card setting-row"><div class="setting-copy"><strong>显示模式</strong><small id="settings-appearance-label">默认</small></div><button class="text-button" id="settings-appearance-button" type="button">切换</button></div>
+          <div class="glass-card setting-row"><div class="setting-copy"><strong>桌面通知</strong><small id="settings-notification-label">已关闭</small></div><button class="text-button" id="settings-notification-button" type="button">开启</button></div>
+          <div class="glass-card setting-row"><div class="setting-copy"><strong>关于</strong><small id="settings-version">—</small></div></div>
+          <div class="glass-card setting-row"><div class="setting-copy"><strong>会话</strong><small>退出当前浏览器会话</small></div><button class="text-button logout-button" id="settings-logout-button" type="button">退出</button></div>
+        </div>
+      </section>
+
+      <section class="page-view memory-page" id="memory-page" aria-labelledby="memory-title" hidden>
+        <header class="page-head memory-page-head">
+          <button class="icon-button" id="memory-back" type="button" aria-label="返回"><svg class="icon" aria-hidden="true"><use href="#icon-back" /></svg></button>
+          <div class="memory-heading"><h2 id="memory-title">记忆库</h2><p class="page-sub" id="memory-subtitle">正在统计…</p></div>
+          <button class="icon-button" id="memory-refresh" type="button" aria-label="刷新记忆库"><svg class="icon" aria-hidden="true"><use href="#icon-refresh" /></svg></button>
+        </header>
+        <div class="memory-segment" role="tablist" aria-label="记忆或留言板">
+          <button id="memory-tab-memories" type="button" role="tab" aria-selected="true">记忆</button>
+          <button id="memory-tab-board" type="button" role="tab" aria-selected="false">留言板</button>
+        </div>
+        <div id="memory-browse">
+          <label class="memory-search"><span class="sr-only">语义搜索记忆</span><input id="memory-search" type="search" placeholder="语义搜索记忆（回车检索）" autocomplete="off" /></label>
+          <div class="taxonomy memory-chips" id="taxonomy" aria-live="polite"></div>
+          <section class="calendar-card" aria-label="时间档案">
+            <div class="calendar-head">
+              <button class="icon-button calendar-nav" id="calendar-prev" type="button" aria-label="上个月">‹</button>
+              <strong id="calendar-title">时间档案</strong>
+              <button class="icon-button calendar-nav" id="calendar-next" type="button" aria-label="下个月">›</button>
+              <button class="text-button" id="calendar-today" type="button">回到今天</button>
+            </div>
+            <div class="calendar-weekdays" aria-hidden="true"><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span></div>
+            <div class="calendar-grid" id="calendar-grid"></div>
+          </section>
+          <div class="memory-results" id="memory-results"><p>选择一个分类、搜索，或点月历上高亮的日期。</p></div>
+        </div>
+        <div id="memory-board" hidden>
+          <div class="memory-results" id="board-results"></div>
+          <div class="board-pager">
+            <button class="text-button" id="board-prev" type="button">上一页</button>
+            <span id="board-page-label">第 1 页</span>
+            <button class="text-button" id="board-next" type="button">下一页</button>
+          </div>
+        </div>
+      </section>
     </main>
 
-    <dialog class="memory-dialog" id="memory-dialog" aria-labelledby="memory-title">
-      <div class="memory-head"><div><p class="eyebrow">MEMORY ATLAS</p><h2 id="memory-title">记忆库</h2></div><button class="icon-button" id="memory-close" type="button" aria-label="关闭记忆库">×</button></div>
-      <p class="memory-intro">分类从后端 taxonomy 自动读取；新增分类无需更新 Windows App。</p>
-      <div class="taxonomy" id="taxonomy" aria-live="polite"></div>
-      <div class="memory-results" id="memory-results"><p>选择一个分类查看记忆。</p></div>
-    </dialog>
+    <nav class="tab-bar" id="tab-bar" aria-label="主导航">
+      <button type="button" class="tab-item is-active" data-view="chat" aria-current="page"><svg class="icon" aria-hidden="true"><use href="#icon-chat" /></svg><span>聊天</span></button>
+      <button type="button" class="tab-item" data-view="terminal"><svg class="icon" aria-hidden="true"><use href="#icon-terminal" /></svg><span>终端</span></button>
+      <button type="button" class="tab-item" data-view="apps"><svg class="icon" aria-hidden="true"><use href="#icon-apps" /></svg><span>App</span></button>
+      <button type="button" class="tab-item" data-view="settings"><svg class="icon" aria-hidden="true"><use href="#icon-settings" /></svg><span>设置</span></button>
+    </nav>
 
     <dialog class="sticker-dialog" id="sticker-dialog" aria-labelledby="sticker-title">
       <header class="sticker-head"><div><p class="eyebrow">BQB CATALOG</p><h2 id="sticker-title">表情包</h2></div><button class="icon-button" id="sticker-close" type="button" aria-label="关闭表情包">×</button></header>
@@ -149,7 +228,7 @@
       </form>
     </dialog>
 
-    <template id="svg-defs"><svg class="svg-defs" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><symbol id="cc-mark" viewBox="0 0 24 24"><path d="M3 12 12 3l9 9-9 9-9 9Zm4.2 0L12 7.2l4.8 4.8L12 16.8 7.2 12Z" fill="currentColor"/></symbol></svg></template>
-    <script type="module" src="./src/app.js?v=16"></script>
+    <template id="svg-defs"><svg class="svg-defs" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><symbol id="cc-mark" viewBox="0 0 24 24"><path d="M3 12 12 3l9 9-9 9-9 9Zm4.2 0L12 7.2l4.8 4.8L12 16.8 7.2 12Z" fill="currentColor"/></symbol><symbol id="icon-chat" viewBox="0 0 24 24"><path d="M4.5 5.5h15v10.5H9.5l-5 4v-14.5Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol><symbol id="icon-terminal" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="m7.5 9.5 3 2.7-3 2.7M12.5 15h4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="icon-apps" viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="13" y="4" width="7" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="4" y="13" width="7" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="13" y="13" width="7" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.7"/></symbol><symbol id="icon-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.1" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 3.6v2.5M12 17.9v2.5M3.6 12h2.5M17.9 12h2.5M6.1 6.1l1.8 1.8M16.1 16.1l1.8 1.8M17.9 6.1l-1.8 1.8M7.9 16.1l-1.8 1.8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol><symbol id="icon-bell" viewBox="0 0 24 24"><path d="M6 10a6 6 0 0 1 12 0c0 3.8 1.5 5.3 1.5 5.3h-15S6 13.8 6 10Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M10 18.4a2.2 2.2 0 0 0 4 0" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol><symbol id="icon-bell-off" viewBox="0 0 24 24"><path d="M6 10a6 6 0 0 1 12 0c0 3.8 1.5 5.3 1.5 5.3h-15S6 13.8 6 10Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M10 18.4a2.2 2.2 0 0 0 4 0" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="m4.5 4.5 15 15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol><symbol id="icon-back" viewBox="0 0 24 24"><path d="m14 6-6 6 6 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M19.2 12a7.2 7.2 0 1 1-2.1-5.1M19.2 4.2v4h-4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol></svg></template>
+    <script type="module" src="./src/app.js?v=17"></script>
   </body>
 </html>

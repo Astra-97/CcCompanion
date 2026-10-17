@@ -1,6 +1,6 @@
-import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY } from './data.js?v=16';
-import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=16';
-import { normalizeStickerCatalog } from './sticker-protocol.js?v=16';
+import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY, MOCK_MEMORY_STATS, MOCK_MEMORY_CALENDAR_ENTRIES, MOCK_MEMORY_BOARD, MOCK_MEMORY_SEARCH, MOCK_PLUGINS } from './data.js?v=17';
+import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=17';
+import { normalizeStickerCatalog } from './sticker-protocol.js?v=17';
 
 const clone = (value) => structuredClone(value);
 const now = () => new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
@@ -263,6 +263,50 @@ function safeAttachmentUrl(value) {
   } catch { return ''; }
 }
 
+/** Memory items cross a trust boundary: bound every field, never trust HTML. */
+export function normalizeMemoryItem(raw = {}) {
+  if (!raw || typeof raw !== 'object') return null;
+  const content = String(raw.display_markdown || raw.content || raw.body || raw.title || '').slice(0, 20_000);
+  const id = String(raw.id || '').slice(0, 128);
+  if (!content && !id) return null;
+  return {
+    id,
+    content,
+    category: String(raw.category || '').slice(0, 64),
+    subcategory: String(raw.subcategory || '').slice(0, 96),
+    tags: (Array.isArray(raw.tags) ? raw.tags : []).map((tag) => String(tag).slice(0, 40)).slice(0, 12),
+    createdAt: String(raw.createdAt || raw.created_at || raw.timestamp || '').slice(0, 40),
+    similarity: typeof raw.similarity === 'number' && Number.isFinite(raw.similarity) ? Math.round(raw.similarity * 1000) / 1000 : null,
+  };
+}
+
+/** Board messages are plain guest-book entries: id/from/content/createdAt. */
+export function normalizeBoardMessage(raw = {}) {
+  if (!raw || typeof raw !== 'object') return null;
+  const content = String(raw.content || '').slice(0, 4_000);
+  if (!content) return null;
+  return {
+    id: String(raw.id || '').slice(0, 128),
+    from: String(raw.from || '小克').slice(0, 60),
+    content,
+    createdAt: String(raw.createdAt || raw.created_at || '').slice(0, 40),
+  };
+}
+
+/** Plugin ids become URL path segments, so accept only flat slug ids. */
+export function normalizePlugin(raw = {}) {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = String(raw.id || '');
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(id)) return null;
+  return {
+    id,
+    name: String(raw.name || id).slice(0, 60),
+    version: String(raw.version || '').slice(0, 24),
+    description: String(raw.description || '').slice(0, 200),
+    builtin: raw.builtin === true,
+  };
+}
+
 export function normalizeContact(contact = {}) {
   const capabilities = Array.isArray(contact.capabilities) ? contact.capabilities : [];
   return {
@@ -340,7 +384,60 @@ export function createHttpAdapter({ baseUrl = '', request = defaultRequest, uplo
     async listMemories({ category, subcategory }) {
       const query = new URLSearchParams({ category, ...(subcategory ? { subcategory } : {}) });
       const result = await call(url(`/memory/list?${query}`));
-      return Array.isArray(result) ? result : (result.memories || []);
+      const items = Array.isArray(result) ? result : (result.memories || result.items || []);
+      return items.map(normalizeMemoryItem).filter(Boolean);
+    },
+    async getMemoryStats() {
+      const result = await call(url('/memory/stats'));
+      const source = result && typeof result === 'object' ? result : {};
+      const rawCategories = (source.byCategory || source.by_category) && typeof (source.byCategory || source.by_category) === 'object' ? (source.byCategory || source.by_category) : {};
+      const byCategory = {};
+      Object.entries(rawCategories).forEach(([key, value]) => {
+        const count = Number(value);
+        if (/^[A-Za-z0-9_.-]{1,64}$/.test(key) && Number.isInteger(count) && count >= 0) byCategory[key] = count;
+      });
+      const total = Number(source.total ?? source.total_count);
+      return { total: Number.isInteger(total) && total >= 0 ? total : Object.values(byCategory).reduce((sum, count) => sum + count, 0), byCategory };
+    },
+    async getMemoryCalendar(month) {
+      if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(String(month || ''))) throw new Error('month must use YYYY-MM');
+      const result = await call(url(`/memory/calendar?${new URLSearchParams({ month })}`));
+      // The upstream answers either { days: {date: {entries, mood}} } or the
+      // bare date map; both normalize to the same { days } projection.
+      const rawDays = result?.days && typeof result.days === 'object' ? result.days : (result && typeof result === 'object' && !Array.isArray(result) ? result : {});
+      const days = {};
+      Object.entries(rawDays).forEach(([date, value]) => {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !value || typeof value !== 'object') return;
+        const entries = (Array.isArray(value.entries) ? value.entries : []).map(normalizeMemoryItem).filter(Boolean);
+        if (!entries.length) return;
+        days[date] = { entries, mood: typeof value.mood === 'string' ? value.mood.slice(0, 24) : '' };
+      });
+      return { days };
+    },
+    async searchMemories(query, { limit = 20 } = {}) {
+      const bounded = Math.min(Math.max(Number(limit) || 20, 1), 200);
+      const result = await call(url(`/memory/semantic-search?${new URLSearchParams({ query: String(query || '').slice(0, 200), limit: String(bounded) })}`));
+      const items = Array.isArray(result) ? result : (result?.memories || result?.results || result?.items || []);
+      return items.map(normalizeMemoryItem).filter(Boolean);
+    },
+    async getMemoryBoard({ page = 1, perPage = 20 } = {}) {
+      const safePage = Math.min(Math.max(Number(page) || 1, 1), 1_000_000);
+      const safePerPage = [20, 50, 100].includes(Number(perPage)) ? Number(perPage) : 20;
+      const result = await call(url(`/memory/board?${new URLSearchParams({ page: String(safePage), per_page: String(safePerPage) })}`));
+      const rawMessages = Array.isArray(result) ? result : (result?.messages || []);
+      const rawPagination = result?.pagination && typeof result.pagination === 'object' ? result.pagination : {};
+      const totalPages = Number(rawPagination.totalPages ?? rawPagination.total_pages);
+      return {
+        messages: rawMessages.map(normalizeBoardMessage).filter(Boolean),
+        pagination: {
+          page: Number.isInteger(Number(rawPagination.page)) ? Number(rawPagination.page) : safePage,
+          totalPages: Number.isInteger(totalPages) && totalPages >= 1 ? totalPages : 1,
+        },
+      };
+    },
+    async listPlugins() {
+      const result = await call(url('/plugins'));
+      return (Array.isArray(result?.plugins) ? result.plugins : []).map(normalizePlugin).filter(Boolean);
     },
     async uploadAttachments(contactId, files, { signal, onProgress } = {}) {
       if (files.length > uploadLimits.max_pending_files) throw new Error(`一次最多上传 ${uploadLimits.max_pending_files} 个文件`);
@@ -519,6 +616,24 @@ export function createMockAdapter() {
     async getStickerCatalog() { return normalizeStickerCatalog({ version: 'mock', categories: [{ id: 'common', name: '常用' }], stickers: [{ name: '爱', label: '爱', category_id: 'common', url: 'https://test.xiaonancaleb.xyz/stickers/%E7%88%B1.gif' }], upload: { supported: true, max_file_bytes: 8388608, content_types: ['image/png', 'image/jpeg', 'image/gif', 'image/webp'], max_name_chars: 80 } }); },
     async uploadSticker() { throw new Error('mock upload unavailable'); },
     async listMemories({ category, subcategory }) { return clone(MOCK_MEMORIES[subcategory || category] || [{ title: '暂时没有可展示的条目', body: '此分类已从 taxonomy 读取。', timestamp: '—' }]); },
+    async getMemoryStats() { return clone(MOCK_MEMORY_STATS); },
+    async getMemoryCalendar(month) {
+      if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(String(month || ''))) throw new Error('month must use YYYY-MM');
+      const days = {};
+      MOCK_MEMORY_CALENDAR_ENTRIES.forEach(({ offsetDay, mood, entries }) => {
+        const date = `${month}-${String(offsetDay).padStart(2, '0')}`;
+        days[date] = { entries: clone(entries), mood };
+      });
+      return { days };
+    },
+    async searchMemories(query) {
+      const needle = String(query || '').trim();
+      if (!needle) return [];
+      const matched = MOCK_MEMORY_SEARCH.filter((item) => item.content.includes(needle));
+      return clone(matched.length ? matched : MOCK_MEMORY_SEARCH);
+    },
+    async getMemoryBoard({ page = 1 } = {}) { const result = clone(MOCK_MEMORY_BOARD); result.pagination.page = Math.max(1, Number(page) || 1); return result; },
+    async listPlugins() { return clone(MOCK_PLUGINS); },
     async uploadAttachments(_contactId, files, { onProgress } = {}) { return files.map((file, index) => { onProgress?.({ index, totalFiles: files.length, loaded: file.size, total: file.size, file }); return { attachment_id: `mock-${crypto.randomUUID()}`, filename: file.name, type: file.type || 'file', size: file.size }; }); },
     async cancelUploads() { return { ok: true, canceled: 0 }; },
     subscribe(listener, { contactId } = {}) {

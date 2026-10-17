@@ -502,6 +502,10 @@ test('dark glass palette preserves AA text, wallpaper layering, and glass struct
   assert.match(css, /\.contact-button\.is-active\{border-color:var\(--line-strong\)/);
   assert.match(css, /\.contact-button\.is-active \.contact-copy strong\{font-weight:700/);
   assert.match(css, /\.send-button:disabled\{opacity:\.55;box-shadow:none;cursor:not-allowed\}/);
+  const userBubble = css.match(/\.from-user \.message-body\{[^}]*color:(#[0-9a-fA-F]{6})/);
+  assert.ok(userBubble, 'the user bubble keeps an explicit text color');
+  assert.ok(contrastRatio(userBubble[1], '#8e4437') >= 4.5, 'user bubble text stays AA on the darkest gradient stop');
+  assert.match(css, /@supports \(backdrop-filter:blur\(2px\)\)/, 'solid-by-default glass lowers alpha only where blur exists');
 });
 
 test('PWA shell declares installability and has no secret persistence', async () => {
@@ -516,11 +520,11 @@ test('PWA shell declares installability and has no secret persistence', async ()
   assert.match(manifest, /icon-192\.png/);
   assert.match(manifest, /icon-512\.png/);
   assert.match(serviceWorker, /addEventListener\('fetch'/);
-  assert.match(serviceWorker, /cccompanion-desk-v16/);
-  assert.match(serviceWorker, /src\/styles\.css\?v=16/);
-  assert.match(serviceWorker, /src\/app\.js\?v=16/);
-  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=16/);
-  assert.match(serviceWorker, /src\/sticker-protocol\.js\?v=16/);
+  assert.match(serviceWorker, /cccompanion-desk-v17/);
+  assert.match(serviceWorker, /src\/styles\.css\?v=17/);
+  assert.match(serviceWorker, /src\/app\.js\?v=17/);
+  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=17/);
+  assert.match(serviceWorker, /src\/sticker-protocol\.js\?v=17/);
   assert.match(serviceWorker, /src\/live-messages\.js/);
   assert.match(serviceWorker, /src\/pairing-code\.js/);
   assert.doesNotMatch(source, /shared_secret|localStorage\.setItem|sessionStorage\.setItem|credentials:\s*'include'/);
@@ -537,8 +541,8 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   ]);
   assert.match(html, /id="latest-button"/);
   assert.match(html, /id="pairing-code"/);
-  assert.match(html, /href="\.\/src\/styles\.css\?v=16"/);
-  assert.match(html, /src="\.\/src\/app\.js\?v=16"/);
+  assert.match(html, /href="\.\/src\/styles\.css\?v=17"/);
+  assert.match(html, /src="\.\/src\/app\.js\?v=17"/);
   assert.match(html, /autocomplete="one-time-code"/);
   assert.match(html, /id="pairing-form"/);
   assert.match(html, /<details class="password-fallback">/);
@@ -598,6 +602,9 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   assert.match(app, /function closeWorkers\(\) \{ setWorkers\(false, \{ returnFocus: true \}\); \}/);
   assert.match(app, /Intl\.DateTimeFormat\('zh-CN'/);
   assert.match(app, /if \(!subs\.length\)/);
+  assert.match(html, /id="tab-bar"/);
+  assert.match(html, /id="memory-page"/);
+  assert.doesNotMatch(html, /memory-dialog/, 'the memory dialog is replaced by the full memory page');
   assert.match(app, /state\.followLatest\[state\.activeContactId\] !== false && nearBottom\(\)/);
   assert.match(app, /body\.dataset\.appearance = state\.appearance/);
   assert.match(app, /appearance-status'\)\.textContent/);

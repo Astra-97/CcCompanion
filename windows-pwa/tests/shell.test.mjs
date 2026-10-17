@@ -1,0 +1,133 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { readFileSync } from 'node:fs';
+import { createHttpAdapter, createMockAdapter, normalizeBoardMessage, normalizeMemoryItem, normalizePlugin } from '../src/api.js';
+import { buildMonthGrid, monthKey, shiftMonth, todayKey } from '../src/memory-calendar.js';
+
+test('month keys and shifting follow the YYYY-MM contract across year edges', () => {
+  assert.match(monthKey(new Date(2026, 9, 17)), /^2026-10$/);
+  assert.match(todayKey(new Date(2026, 9, 7)), /^2026-10-07$/);
+  assert.equal(shiftMonth('2026-10', 1), '2026-11');
+  assert.equal(shiftMonth('2026-01', -1), '2025-12');
+  assert.equal(shiftMonth('2026-12', 2), '2027-02');
+  assert.match(shiftMonth('not-a-month', 1), /^\d{4}-(0[1-9]|1[0-2])$/, 'bad input falls back to the current month');
+});
+
+test('month grids start on Monday and pad with marked out-of-month cells', () => {
+  const grid = buildMonthGrid('2026-10'); // 2026-10-01 is a Thursday.
+  assert.equal(grid.weeks[0][0].date, '2026-09-28', 'the first cell is the Monday of the first week');
+  assert.equal(grid.weeks[0][0].inMonth, false);
+  assert.equal(grid.weeks[0][3].date, '2026-10-01');
+  assert.equal(grid.weeks[0][3].inMonth, true);
+  assert.equal(grid.weeks.flat().filter((cell) => cell.inMonth).length, 31);
+  assert.ok(grid.weeks.length >= 4 && grid.weeks.length <= 6);
+  assert.equal(grid.weeks.at(-1).length, 7);
+  assert.equal(buildMonthGrid('bogus').weeks.length, 0, 'invalid keys render nothing rather than a wrong month');
+});
+
+test('memory item normalization bounds fields and accepts upstream aliases', () => {
+  const item = normalizeMemoryItem({ id: 'm1', display_markdown: '**正文**', category: 'diary', subcategory: 'diary.worklog', tags: ['a', 'b'], created_at: '2026-10-16T11:20:00+00:00', similarity: 0.8333 });
+  assert.deepEqual(item, { id: 'm1', content: '**正文**', category: 'diary', subcategory: 'diary.worklog', tags: ['a', 'b'], createdAt: '2026-10-16T11:20:00+00:00', similarity: 0.833 });
+  assert.equal(normalizeMemoryItem({}), null);
+  assert.equal(normalizeMemoryItem('nope'), null);
+  assert.equal(normalizeBoardMessage({ id: 'b1', from: '小克', content: '留言', created_at: '2026-10-17T02:12:00+00:00' }).createdAt, '2026-10-17T02:12:00+00:00');
+  assert.equal(normalizeBoardMessage({ id: 'b2' }), null);
+});
+
+test('plugin ids must be flat slugs before they become URL path segments', () => {
+  assert.equal(normalizePlugin({ id: 'xiaonan-dash', name: '小南仪表盘', version: '1.4.2', builtin: true }).id, 'xiaonan-dash');
+  for (const bad of ['../etc', 'a/b', 'UPPER', '', 'a b', 'x'.repeat(70)]) {
+    assert.equal(normalizePlugin({ id: bad }), null, bad);
+  }
+});
+
+test('memory and plugin adapters build only allowlisted GET query strings', async () => {
+  const calls = [];
+  const adapter = createHttpAdapter({ request: async (path) => { calls.push(path); return { ok: true }; } });
+  await adapter.getMemoryStats();
+  await adapter.getMemoryCalendar('2026-10');
+  await adapter.searchMemories('壁纸', { limit: 20 });
+  await adapter.searchMemories('壁纸', { limit: 9999 });
+  await adapter.getMemoryBoard({ page: 2, perPage: 20 });
+  await adapter.listPlugins();
+  assert.equal(calls[0], '/memory/stats');
+  assert.equal(calls[1], '/memory/calendar?month=2026-10');
+  assert.equal(calls[2], `/memory/semantic-search?query=${encodeURIComponent('壁纸')}&limit=20`);
+  assert.equal(calls[3], `/memory/semantic-search?query=${encodeURIComponent('壁纸')}&limit=200`, 'limit is capped at the server contract');
+  assert.equal(calls[4], '/memory/board?page=2&per_page=20');
+  assert.equal(calls[5], '/plugins');
+  await assert.rejects(() => adapter.getMemoryCalendar('2026-13'), /YYYY-MM/);
+  await assert.rejects(() => adapter.getMemoryCalendar('2026-10-01'), /YYYY-MM/);
+});
+
+test('calendar accepts both the wrapped days shape and the bare date map', async () => {
+  const wrapped = createHttpAdapter({ request: async () => ({ days: { '2026-10-09': { entries: [{ id: 'a', content: '一条' }], mood: 'happy' }, 'bad-date': { entries: [{ id: 'x', content: '丢' }] } } }) });
+  assert.deepEqual(Object.keys(await wrapped.getMemoryCalendar('2026-10').then(({ days }) => days)), ['2026-10-09']);
+  const bare = createHttpAdapter({ request: async () => ({ '2026-10-02': { entries: [{ id: 'b', content: '裸表' }] } }) });
+  const { days } = await bare.getMemoryCalendar('2026-10');
+  assert.equal(days['2026-10-02'].entries[0].content, '裸表');
+  const arraySearch = createHttpAdapter({ request: async () => [{ id: 's1', content: '搜索结果', similarity: 0.9 }] });
+  assert.equal((await arraySearch.searchMemories('搜索'))[0].id, 's1');
+  const bareBoard = createHttpAdapter({ request: async () => [{ id: 'm1', from: '小克', content: '裸数组留言' }] });
+  const board = await bareBoard.getMemoryBoard({ page: 3 });
+  assert.equal(board.messages[0].content, '裸数组留言');
+  assert.deepEqual(board.pagination, { page: 3, totalPages: 1 });
+});
+
+test('mock adapter serves memory stats, calendar, board, search, and plugins', async () => {
+  const adapter = createMockAdapter();
+  const stats = await adapter.getMemoryStats();
+  assert.ok(stats.total > 0 && Object.keys(stats.byCategory).length > 0);
+  const { days } = await adapter.getMemoryCalendar('2026-10');
+  assert.deepEqual(Object.keys(days), ['2026-10-02', '2026-10-09', '2026-10-16']);
+  assert.ok((await adapter.searchMemories('壁纸')).length > 0);
+  const board = await adapter.getMemoryBoard({ page: 1 });
+  assert.ok(board.messages.length > 0 && board.pagination.totalPages >= 1);
+  const plugins = await adapter.listPlugins();
+  assert.ok(plugins.some((plugin) => plugin.id === 'xiaonan-dash'));
+  await assert.rejects(() => adapter.getMemoryCalendar('2026-1'), /YYYY-MM/);
+});
+
+test('Android-shell source contracts: four tabs, full pages, view switching, mock-only deep links', () => {
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  const app = readFileSync(new URL('../src/app.js', import.meta.url), 'utf8');
+  const css = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
+  const sw = readFileSync(new URL('../sw.js', import.meta.url), 'utf8');
+  for (const view of ['chat', 'terminal', 'apps', 'settings']) {
+    assert.ok((html.match(new RegExp(`class="tab-item[^"]*" data-view="${view}"`, 'g')) || []).length === 2, `${view} appears in both the rail tabs and the bottom tab bar`);
+  }
+  for (const id of ['chat-list-page', 'terminal-page', 'apps-page', 'settings-page', 'memory-page']) {
+    assert.match(html, new RegExp(`class="page-view[^"]*" id="${id}"`), id);
+  }
+  assert.match(html, /id="chat-back-button"[^>]*hidden/);
+  assert.match(html, /id="memory-search"[^>]*placeholder="语义搜索记忆（回车检索）"/);
+  assert.match(html, /id="memory-tab-memories"[^>]*aria-selected="true"/);
+  assert.match(html, /id="calendar-prev"/);
+  assert.match(html, /id="calendar-today"[^>]*>回到今天/);
+  assert.match(html, /id="board-prev"/);
+  assert.match(html, /id="settings-version"/);
+  assert.match(html, /symbol id="icon-bell-off"/);
+  assert.doesNotMatch(html, /🔔|🔕/, 'the notification button uses SVG icons, not emoji');
+  assert.match(app, /const VIEW_IDS = \{ chat: 'conversation', terminal: 'terminal-page', apps: 'apps-page', settings: 'settings-page', memory: 'memory-page' \}/);
+  assert.match(app, /function switchView\(view\)/);
+  assert.match(app, /function syncView\(\)/);
+  assert.match(app, /startTerminalPolling\(\); else stopTerminalPolling\(\)/, 'terminal polling runs only while the terminal view is active');
+  assert.match(app, /setInterval\(\(\) => \{ void pollTerminalPage\(\); \}, 4_000\)/);
+  assert.match(app, /adapter\.getMemoryStats\(\)/);
+  assert.match(app, /adapter\.getMemoryCalendar\(month\)/);
+  assert.match(app, /adapter\.searchMemories\(query, \{ limit: 20 \}\)/);
+  assert.match(app, /adapter\.getMemoryBoard\(\{ page, perPage: 20 \}\)/);
+  assert.match(app, /adapter\.listPlugins\(\)/);
+  assert.match(app, /WEB_SHELL_VERSION = 'desk-v17 · 2026-10-17'/);
+  const mockHook = app.slice(app.indexOf('if (bootstrap.mock)'));
+  assert.match(mockHook, /params\.get\('view'\)/, 'the deep-link hook stays mock-gated');
+  assert.match(css, /\.tab-bar\{[^}]*display:none/, 'the bottom tab bar is phone-only');
+  assert.match(css, /@media \(max-width:720px\)\{[^]*?\.tab-bar\{display:grid\}/);
+  assert.match(css, /\.tab-bar \.tab-item\.is-active::before\{[^}]*height:2px/, 'active tab keeps the Android-style top indicator');
+  assert.match(css, /\.page-view\{grid-column:2 \/ -1/, 'pages span the conversation + side columns on desktop');
+  assert.match(css, /\.memory-segment button\[aria-selected='true'\]\{background:linear-gradient/);
+  assert.match(css, /\.calendar-day\.has-entries\{background:linear-gradient/);
+  assert.match(css, /\.calendar-weekdays,\.calendar-grid\{display:grid;grid-template-columns:repeat\(7,1fr\)/);
+  assert.match(css, /\.side-notes\.view-hidden\{display:none\}/);
+  assert.match(sw, /src\/memory-calendar\.js\?v=17/);
+});

@@ -1,13 +1,16 @@
-import { createPwaBootstrap } from './bootstrap.js?v=16';
-import { createComposerState } from './composer-state.js?v=16';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=16';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=16';
-import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=16';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=16';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=16';
-import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=16';
-import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=16';
-import { createNotifier } from './notifications.js?v=16';
+import { createPwaBootstrap } from './bootstrap.js?v=17';
+import { createComposerState } from './composer-state.js?v=17';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=17';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=17';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=17';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=17';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=17';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=17';
+import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=17';
+import { createNotifier } from './notifications.js?v=17';
+import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=17';
+
+const WEB_SHELL_VERSION = 'desk-v17 · 2026-10-17';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -30,6 +33,8 @@ const state = {
   stickerCatalog: null, stickerLoading: false, stickerLoadId: 0, stickerError: '', stickerCategory: '__all', stickerSearch: '', stickerTargetContactId: '', stickerSelection: { start: 0, end: 0 }, pendingCanonical: {},
   stickerUpload: { file: null, previewUrl: '', uploading: false, controller: null },
   unread: createUnreadStore(), notifier: createNotifier(), messageNodes: new Map(), stopBackground: null, backgroundPollInFlight: false,
+  view: 'chat', mobileChatOpen: false, stopTerminalPoll: null, terminalSnapshots: {}, plugins: null, pluginsError: false,
+  memory: { loading: false, stats: null, segment: 'memories', month: monthKey(), days: {}, selectedDate: '', boardPage: 1, boardLoaded: false },
 };
 const contactList = $('#contact-list'); const messages = $('#message-list'); const input = $('#message-input');
 
@@ -64,6 +69,57 @@ function renderContacts() {
     if (unread > 0) button.append(el('span', { class: 'unread-badge', text: unread > 99 ? '99+' : String(unread), 'aria-label': `${unread} 条未读消息` }));
     button.append(el('span', { class: `contact-led ${busy ? 'is-busy' : ''}`, 'aria-label': busy ? '正在处理' : '待命' }));
     button.addEventListener('click', () => switchContact(item.id)); return button;
+  }));
+}
+const VIEW_IDS = { chat: 'conversation', terminal: 'terminal-page', apps: 'apps-page', settings: 'settings-page', memory: 'memory-page' };
+const mobileQuery = window.matchMedia('(max-width:720px)');
+function chatSurface() { return mobileQuery.matches && !state.mobileChatOpen ? 'chat-list-page' : 'conversation'; }
+/** Single source of truth for which surface is on screen. */
+function syncView() {
+  const surface = state.view === 'chat' ? chatSurface() : '';
+  $('#conversation').hidden = surface !== 'conversation';
+  $('#chat-list-page').hidden = surface !== 'chat-list-page';
+  ['terminal', 'apps', 'settings', 'memory'].forEach((name) => { $(`#${VIEW_IDS[name]}`).hidden = state.view !== name; });
+  $('#side-notes').classList.toggle('view-hidden', state.view !== 'chat');
+  document.querySelectorAll('.tab-item').forEach((button) => {
+    const active = button.dataset.view === state.view;
+    button.classList.toggle('is-active', active);
+    if (active) button.setAttribute('aria-current', 'page');
+    else button.removeAttribute('aria-current');
+  });
+  $('#chat-back-button').hidden = !(mobileQuery.matches && state.view === 'chat' && state.mobileChatOpen);
+}
+function switchView(view) {
+  if (!Object.hasOwn(VIEW_IDS, view)) return;
+  if (view !== state.view) { closeStickerDialog(); setWorkers(false); }
+  state.view = view;
+  // The chat tab opens on its list on phones, like the Android home dashboard.
+  if (view === 'chat') state.mobileChatOpen = false;
+  if (view === 'terminal') startTerminalPolling(); else stopTerminalPolling();
+  if (view === 'apps') void loadPlugins();
+  if (view === 'memory') void refreshMemoryPage();
+  syncView();
+}
+/** Phone-only second level: chat list -> conversation. */
+function openMobileChat(id) {
+  state.mobileChatOpen = true;
+  syncView();
+  void switchContact(id);
+}
+function renderChatListPage() {
+  const list = $('#chat-list');
+  list.replaceChildren(...state.contacts.map((item) => {
+    const busy = isBusy(item.id);
+    const history = state.histories[item.id] || [];
+    const unread = state.unread.unreadFor(item.id, history);
+    const preview = previewText(history.at(-1)) || item.note;
+    const accent = item.id === 'kairos' ? 'brass' : 'oxide';
+    const button = el('button', { type: 'button', class: 'chat-card', 'aria-label': `打开与 ${item.name} 的对话` });
+    button.append(el('span', { class: `avatar ${accent}`, text: item.name.slice(0, 1) }), el('span', { class: 'chat-card-copy' }, [el('strong', { text: item.name }), el('small', { text: preview })]));
+    if (unread > 0) button.append(el('span', { class: 'unread-badge', text: unread > 99 ? '99+' : String(unread), 'aria-label': `${unread} 条未读消息` }));
+    button.append(el('span', { class: `contact-led ${busy ? 'is-busy' : ''}`, 'aria-label': busy ? '正在处理' : '待命' }));
+    button.addEventListener('click', () => openMobileChat(item.id));
+    return button;
   }));
 }
 function renderHeader() {
@@ -277,7 +333,7 @@ function renderAttachments() {
   });
   tray.replaceChildren(...chips);
 }
-function renderAll(options) { renderContacts(); renderHeader(); renderActivities(); renderMessages(options); renderWorkers(); renderInstrument(); renderTerminal(); renderAttachments(); renderDateRule(); }
+function renderAll(options) { renderContacts(); renderChatListPage(); renderHeader(); renderActivities(); renderMessages(options); renderWorkers(); renderInstrument(); renderTerminal(); renderAttachments(); renderDateRule(); }
 
 async function switchContact(id) {
   if (id === state.activeContactId || state.stickerUpload.uploading) return;
@@ -350,22 +406,193 @@ async function send(event) {
   }
 }
 function autoResize() { input.style.height = 'auto'; input.style.height = `${Math.min(input.scrollHeight, 160)}px`; }
-async function openMemory() { const dialog = $('#memory-dialog'); dialog.showModal(); if (state.taxonomy) return renderTaxonomy(); $('#taxonomy').replaceChildren(el('p', { class: 'loading', text: '正在读取 taxonomy…' })); try { state.taxonomy = await adapter.getTaxonomy(); renderTaxonomy(); } catch { $('#taxonomy').replaceChildren(el('p', { class: 'error', text: '记忆库暂不可用；不会使用硬编码分类替代。' })); } }
+async function openMemory() { switchView('memory'); }
+function renderMemorySubtitle() {
+  const stats = state.memory.stats;
+  const categories = state.taxonomy?.categories?.length || Object.keys(stats?.byCategory || {}).length;
+  $('#memory-subtitle').textContent = stats ? `${stats.total} 条记忆 · ${categories} 个分类` : '正在统计…';
+}
+async function refreshMemoryPage({ force = false } = {}) {
+  if (state.memory.loading) return;
+  state.memory.loading = true;
+  renderMemorySubtitle();
+  try {
+    const [stats, taxonomy] = await Promise.all([
+      adapter.getMemoryStats(),
+      state.taxonomy && !force ? Promise.resolve(state.taxonomy) : adapter.getTaxonomy(),
+    ]);
+    state.memory.stats = stats; state.taxonomy = taxonomy;
+    renderMemorySubtitle(); renderTaxonomy();
+  } catch {
+    $('#memory-subtitle').textContent = '记忆库暂不可用；不会使用硬编码分类替代。';
+    $('#taxonomy').replaceChildren(el('p', { class: 'error', text: '分类读取失败；可点右上角刷新重试。' }));
+  } finally { state.memory.loading = false; }
+  await loadCalendarMonth(state.memory.month, { keepSelection: true });
+}
+function memoryChip(scope, label) {
+  const selected = state.selectedScope?.category === scope.category && (state.selectedScope?.subcategory || '') === (scope.subcategory || '');
+  const button = el('button', { type: 'button', class: selected ? 'is-selected' : '', text: label });
+  button.addEventListener('click', () => selectMemory(scope));
+  return button;
+}
 function renderTaxonomy() {
-  const area = $('#taxonomy'); const categories = state.taxonomy?.categories || []; area.replaceChildren(...categories.map((category) => {
-    const group = el('section', { class: 'taxonomy-group' }); group.append(el('h3', { text: category.label })); const choices = el('div', { class: 'taxonomy-choices', role: 'list' }); const subs = category.subcategories || [];
-    if (!subs.length) { const button = el('button', { type: 'button', class: state.selectedScope?.category === category.key && !state.selectedScope?.subcategory ? 'is-selected' : '', text: `${category.label} · ${category.count ?? 0}` }); button.addEventListener('click', () => selectMemory({ category: category.key })); choices.append(button); }
-    subs.forEach((sub) => { const button = el('button', { type: 'button', class: state.selectedScope?.category === category.key && state.selectedScope?.subcategory === sub.key ? 'is-selected' : '', text: `${sub.label} · ${sub.count ?? 0}` }); button.addEventListener('click', () => selectMemory({ category: category.key, subcategory: sub.key })); choices.append(button); }); group.append(choices); return group;
+  const area = $('#taxonomy'); const categories = state.taxonomy?.categories || [];
+  const choices = el('div', { class: 'taxonomy-choices', role: 'list' });
+  categories.forEach((category) => {
+    const subs = category.subcategories || [];
+    if (!subs.length) { choices.append(memoryChip({ category: category.key }, `${category.label} · ${category.count ?? 0}`)); return; }
+    const total = category.count ?? subs.reduce((sum, sub) => sum + (Number(sub.count) || 0), 0);
+    choices.append(memoryChip({ category: category.key }, `${category.label} · ${total}`));
+    subs.forEach((sub) => choices.append(memoryChip({ category: category.key, subcategory: sub.key }, `${sub.label} · ${sub.count ?? 0}`)));
+  });
+  area.replaceChildren(choices);
+}
+function formatMemoryTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value || '');
+  return new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }).format(date);
+}
+/** Renders both normalized memory items and the legacy mock {title, body} shape. */
+function memoryEntryView(entry) {
+  const content = String(entry.body || entry.content || '');
+  const card = el('article', { class: 'memory-card' });
+  const meta = [entry.createdAt ? formatMemoryTime(entry.createdAt) : (entry.timestamp || ''), entry.category || '', entry.subcategory || '', entry.similarity != null ? `相似度 ${Math.round(entry.similarity * 100)}%` : ''].filter(Boolean).join(' · ');
+  card.append(el('small', { text: meta || '记忆条目' }));
+  if (entry.title) card.append(el('h3', { text: entry.title }));
+  card.append(el('p', { text: content.length > 260 ? `${content.slice(0, 260)}…` : content }));
+  if (entry.tags?.length) card.append(el('div', { class: 'memory-tags' }, entry.tags.map((tag) => el('span', { text: tag }))));
+  return card;
+}
+async function selectMemory(scope) {
+  state.selectedScope = scope; state.memory.selectedDate = ''; renderTaxonomy(); renderCalendar();
+  const result = $('#memory-results'); result.replaceChildren(el('p', { class: 'loading', text: '正在读取记忆…' }));
+  try {
+    const entries = await adapter.listMemories(scope);
+    result.replaceChildren(...(entries.length ? entries.map(memoryEntryView) : [el('p', { text: '这个分类暂时没有记忆。' })]));
+  } catch { result.replaceChildren(el('p', { class: 'error', text: '这个分类暂时无法读取。' })); }
+}
+function renderCalendar() {
+  const grid = buildMonthGrid(state.memory.month);
+  const today = todayKey();
+  $('#calendar-title').textContent = `时间档案 · ${grid.year}年${grid.month}月`;
+  $('#calendar-grid').replaceChildren(...grid.weeks.flat().map((cell) => {
+    const hasEntries = Boolean(state.memory.days[cell.date]?.entries?.length);
+    const classes = ['calendar-day', cell.inMonth ? '' : 'is-outside', cell.date === today ? 'is-today' : '', hasEntries ? 'has-entries' : '', state.memory.selectedDate === cell.date ? 'is-selected' : ''].filter(Boolean).join(' ');
+    const button = el('button', { type: 'button', class: classes, text: String(cell.day), 'aria-label': `${cell.date}${hasEntries ? '，有记忆' : ''}` });
+    button.addEventListener('click', () => selectCalendarDate(cell.date));
+    return button;
   }));
 }
-async function selectMemory(scope) { state.selectedScope = scope; renderTaxonomy(); const result = $('#memory-results'); result.replaceChildren(el('p', { class: 'loading', text: '正在读取记忆…' })); try { const entries = await adapter.listMemories(scope); result.replaceChildren(...entries.map((entry) => el('article', { class: 'memory-card' }, [el('small', { text: entry.timestamp || entry.created_at || '记忆条目' }), el('h3', { text: entry.title || entry.content?.slice(0, 40) || '无标题' }), el('p', { text: entry.body || entry.content || '' })]))); } catch { result.replaceChildren(el('p', { class: 'error', text: '这个分类暂时无法读取。' })); } }
+async function loadCalendarMonth(month, { keepSelection = false } = {}) {
+  state.memory.month = month;
+  if (!keepSelection) state.memory.selectedDate = '';
+  renderCalendar();
+  try {
+    const result = await adapter.getMemoryCalendar(month);
+    if (state.memory.month === month) { state.memory.days = result.days; renderCalendar(); }
+  } catch { if (state.memory.month === month) { state.memory.days = {}; renderCalendar(); } }
+}
+function selectCalendarDate(date) {
+  state.memory.selectedDate = date; state.selectedScope = null; renderTaxonomy(); renderCalendar();
+  const entries = state.memory.days[date]?.entries || [];
+  const result = $('#memory-results');
+  result.replaceChildren(...(entries.length ? entries.map(memoryEntryView) : [el('p', { text: `${date} 没有记忆条目。` })]));
+}
+async function runMemorySearch() {
+  const query = $('#memory-search').value.trim();
+  if (!query) return;
+  state.selectedScope = null; state.memory.selectedDate = ''; renderTaxonomy(); renderCalendar();
+  const result = $('#memory-results'); result.replaceChildren(el('p', { class: 'loading', text: '正在搜索…' }));
+  try {
+    const entries = await adapter.searchMemories(query, { limit: 20 });
+    result.replaceChildren(...(entries.length ? entries.map(memoryEntryView) : [el('p', { text: '没有语义相近的记忆。' })]));
+  } catch { result.replaceChildren(el('p', { class: 'error', text: '搜索暂时不可用。' })); }
+}
+function setMemorySegment(segment) {
+  state.memory.segment = segment;
+  $('#memory-tab-memories').setAttribute('aria-selected', String(segment === 'memories'));
+  $('#memory-tab-board').setAttribute('aria-selected', String(segment === 'board'));
+  $('#memory-browse').hidden = segment !== 'memories';
+  $('#memory-board').hidden = segment !== 'board';
+  if (segment === 'board' && !state.memory.boardLoaded) void loadMemoryBoard(1);
+}
+async function loadMemoryBoard(page = 1) {
+  const result = $('#board-results'); result.replaceChildren(el('p', { class: 'loading', text: '正在读取留言板…' }));
+  try {
+    const board = await adapter.getMemoryBoard({ page, perPage: 20 });
+    state.memory.boardPage = board.pagination.page; state.memory.boardLoaded = true;
+    result.replaceChildren(...(board.messages.length ? board.messages.map((message) => {
+      const card = el('article', { class: 'memory-card' });
+      card.append(el('small', { text: [message.from, formatMemoryTime(message.createdAt)].filter(Boolean).join(' · ') }), el('p', { text: message.content }));
+      return card;
+    }) : [el('p', { text: '留言板还是空的。' })]));
+    $('#board-page-label').textContent = `第 ${board.pagination.page} / ${board.pagination.totalPages} 页`;
+    $('#board-prev').disabled = board.pagination.page <= 1;
+    $('#board-next').disabled = board.pagination.page >= board.pagination.totalPages;
+  } catch { result.replaceChildren(el('p', { class: 'error', text: '留言板暂时无法读取。' })); }
+}
+function stopTerminalPolling() { state.stopTerminalPoll?.(); state.stopTerminalPoll = null; }
+async function pollTerminalPage() {
+  const results = await Promise.all(state.contacts.map(async (item) => {
+    try { return [item.id, await adapter.getLiveState(item.id)]; } catch { return [item.id, null]; }
+  }));
+  if (state.view !== 'terminal') return;
+  results.forEach(([id, live]) => { state.terminalSnapshots[id] = live; });
+  renderTerminalPage();
+}
+function startTerminalPolling() {
+  stopTerminalPolling();
+  void pollTerminalPage();
+  const timer = setInterval(() => { void pollTerminalPage(); }, 4_000);
+  state.stopTerminalPoll = () => clearInterval(timer);
+}
+/** Full-page read-only terminal projection for every contact (Android parity). */
+function renderTerminalPage() {
+  const list = $('#terminal-page-list');
+  if (!state.contacts.length) { list.replaceChildren(el('p', { class: 'empty-workers', text: '联系人尚未连接。' })); return; }
+  list.replaceChildren(...state.contacts.map((item) => {
+    const live = state.terminalSnapshots[item.id];
+    const terminal = live?.terminal || { available: false, busy: false, phase: 'unavailable', events: [] };
+    const status = !live ? '读取失败，下一次轮询重试' : !terminal.available ? '观察器暂不可用' : terminal.busy ? terminal.phase : '空闲 · 没有正在运行的安全事件';
+    const accent = item.id === 'kairos' ? 'brass' : 'oxide';
+    const card = el('article', { class: 'glass-card terminal-page-card' });
+    card.append(el('div', { class: 'terminal-page-head' }, [el('span', { class: `avatar ${accent}`, text: item.name.slice(0, 1) }), el('div', {}, [el('strong', { text: item.name }), el('small', { text: item.channel })])]));
+    card.append(el('p', { class: 'terminal-status', text: status }));
+    const events = el('ol', { class: 'terminal-events', 'aria-label': `${item.name} 的只读终端观察事件` });
+    terminal.events.forEach((event) => {
+      const row = el('li');
+      row.append(el('time', { text: `${String(Math.floor(event.elapsedSeconds / 60)).padStart(2, '0')}:${String(event.elapsedSeconds % 60).padStart(2, '0')}` }), el('span', { text: event.label }));
+      events.append(row);
+    });
+    card.append(events);
+    return card;
+  }));
+}
+async function loadPlugins({ force = false } = {}) {
+  if (state.plugins && !force) { renderPlugins(); return; }
+  try { state.plugins = await adapter.listPlugins(); state.pluginsError = false; }
+  catch { state.plugins = state.plugins || []; state.pluginsError = true; }
+  renderPlugins();
+}
+function renderPlugins() {
+  const list = $('#plugin-list');
+  if (state.pluginsError) { list.replaceChildren(el('p', { class: 'error', text: '插件列表暂时读取失败。' })); return; }
+  if (!state.plugins) { list.replaceChildren(el('p', { class: 'loading', text: '正在读取插件…' })); return; }
+  if (!state.plugins.length) { list.replaceChildren(el('p', { class: 'empty-workers', text: '还没有安装插件。' })); return; }
+  list.replaceChildren(...state.plugins.map((plugin) => {
+    const link = el('a', { class: 'glass-card plugin-card', href: `/plugins/${plugin.id}/`, target: '_blank', rel: 'noreferrer', 'aria-label': `打开插件 ${plugin.name}` });
+    link.append(el('div', { class: 'plugin-copy' }, [el('strong', { text: plugin.name }), el('small', { text: plugin.description || plugin.id })]));
+    if (plugin.version) link.append(el('span', { class: 'plugin-version', text: `v${plugin.version}` }));
+    return link;
+  }));
+}
 function notifyNewMessages(contactId, records) {
   const fresh = unseenAssistant(records, state.unread.lastSeen(contactId));
   if (!fresh.length) return;
   const name = state.contacts.find(({ id }) => id === contactId)?.name || contactId;
   fresh.slice(-3).forEach((record) => state.notifier.notify({
     contactId, title: name, body: previewText(record, { maxLength: 80 }),
-    onOpen: (target) => { void switchContact(target); },
+    onOpen: (target) => { if (state.view !== 'chat') switchView('chat'); if (mobileQuery.matches) { state.mobileChatOpen = true; syncView(); } void switchContact(target); },
   }));
 }
 function applyLiveEvent(event) {
@@ -430,15 +657,18 @@ function startBackgroundPolling() {
   return () => clearInterval(timer);
 }
 function syncNotificationButton() {
-  const button = $('#notification-button');
-  if (!button) return;
   const supported = state.notifier.supported();
   const on = state.notifier.isEnabled();
-  button.hidden = !supported;
-  button.textContent = on ? '🔔' : '🔕';
-  button.title = on ? '桌面通知：开（点击关闭）' : '桌面通知：关（点击开启）';
-  button.setAttribute('aria-label', on ? '关闭桌面通知，当前已开启' : '开启桌面通知，当前已关闭');
-  button.setAttribute('aria-pressed', String(on));
+  const button = $('#notification-button');
+  if (button) {
+    button.hidden = !supported;
+    button.querySelector('use')?.setAttribute('href', on ? '#icon-bell' : '#icon-bell-off');
+    button.title = on ? '桌面通知：开（点击关闭）' : '桌面通知：关（点击开启）';
+    button.setAttribute('aria-label', on ? '关闭桌面通知，当前已开启' : '开启桌面通知，当前已关闭');
+    button.setAttribute('aria-pressed', String(on));
+  }
+  const label = $('#settings-notification-label'); if (label) label.textContent = !supported ? '此浏览器不支持' : (on ? '已开启' : '已关闭');
+  const toggle = $('#settings-notification-button'); if (toggle) { toggle.textContent = on ? '关闭' : '开启'; toggle.disabled = !supported; }
 }
 async function toggleNotifications() {
   const wantsOn = !state.notifier.isEnabled();
@@ -454,7 +684,7 @@ function syncWorkerPanel() {
 }
 function setWorkers(open, { returnFocus = false } = {}) { if (!workerDrawerQuery.matches) return syncWorkerPanel(); document.body.classList.toggle('workers-open', open); syncWorkerPanel(); if (open) $('#worker-close').focus(); else if (returnFocus) $('#worker-toggle').focus(); }
 function closeWorkers() { setWorkers(false, { returnFocus: true }); }
-function cycleAppearance() { const modes = ['default', 'reading', 'compact']; state.appearance = modes[(modes.indexOf(state.appearance) + 1) % modes.length]; document.body.dataset.appearance = state.appearance; const names = { default: '默认', reading: '阅读', compact: '紧凑' }; $('#appearance-button').setAttribute('aria-label', `切换显示模式：${names[state.appearance]}`); $('#appearance-button').title = `显示模式：${names[state.appearance]}`; $('#drawer-appearance-button').textContent = `显示模式：${names[state.appearance]}`; $('#appearance-status').textContent = `显示模式：${names[state.appearance]}`; }
+function cycleAppearance() { const modes = ['default', 'reading', 'compact']; state.appearance = modes[(modes.indexOf(state.appearance) + 1) % modes.length]; document.body.dataset.appearance = state.appearance; const names = { default: '默认', reading: '阅读', compact: '紧凑' }; $('#appearance-button').setAttribute('aria-label', `切换显示模式：${names[state.appearance]}`); $('#appearance-button').title = `显示模式：${names[state.appearance]}`; $('#drawer-appearance-button').textContent = `显示模式：${names[state.appearance]}`; $('#appearance-status').textContent = `显示模式：${names[state.appearance]}`; $('#settings-appearance-label').textContent = names[state.appearance]; }
 
 function stickerSearchKey(value) { return String(value || '').normalize('NFC').toLocaleLowerCase('zh-CN'); }
 function clearStickerUploadFile({ clearInput = false } = {}) {
@@ -571,19 +801,45 @@ $('#sticker-search').addEventListener('input', (event) => { state.stickerSearch 
 $('#sticker-upload-open').addEventListener('click', showStickerUpload); $('#sticker-upload-cancel').addEventListener('click', () => { if (!state.stickerUpload.uploading) { resetStickerUpload(); renderStickerPicker(); $('#sticker-search').focus(); } });
 $('#sticker-upload-file').addEventListener('change', (event) => setStickerUploadFile(event.target.files?.[0])); $('#sticker-upload-form').addEventListener('change', (event) => { if (event.target.name === 'sticker-category-mode') renderStickerCategoryFields(); }); $('#sticker-upload-form').addEventListener('submit', uploadSticker);
 $('#upload-cancel-button').addEventListener('click', () => state.composerState.cancel(state.activeContactId)); $('#stop-button').addEventListener('click', () => adapter.stop(state.activeContactId, state.live[state.activeContactId]?.stopRequest).catch(() => { $('#connection-state').textContent = '停止请求失效'; }));
-$('#memory-button').addEventListener('click', openMemory); $('#memory-close').addEventListener('click', () => $('#memory-dialog').close()); $('#worker-toggle').addEventListener('click', () => setWorkers(!document.body.classList.contains('workers-open'))); $('#worker-close').addEventListener('click', closeWorkers);
-async function logout() { state.epoch += 1; state.stickerLoadId += 1; state.composerState.cancelAll(); state.stickerUpload.controller?.abort(); state.stickerUpload.uploading = false; closeStickerDialog(); state.stickerCatalog = null; state.stickerLoading = false; state.stickerError = ''; state.stickerSearch = ''; state.stickerCategory = '__all'; state.stickerTargetContactId = ''; try { await adapter.logout(); } finally { state.stopLive?.(); state.stopLive = null; state.stopBackground?.(); state.stopBackground = null; state.contacts = []; state.histories = {}; state.live = {}; state.streams = {}; state.pendingCanonical = {}; state.messageNodes.clear(); messages.replaceChildren(); state.composerState = createComposerState(); state.activeContactId = ''; renderAll(); if (!bootstrap.mock) showLogin(); } }
+$('#memory-button').addEventListener('click', openMemory); $('#worker-toggle').addEventListener('click', () => setWorkers(!document.body.classList.contains('workers-open'))); $('#worker-close').addEventListener('click', closeWorkers);
+document.querySelectorAll('.tab-item').forEach((button) => button.addEventListener('click', () => switchView(button.dataset.view)));
+$('#chat-back-button').addEventListener('click', () => { state.mobileChatOpen = false; syncView(); });
+$('#memory-back').addEventListener('click', () => switchView('chat'));
+$('#memory-refresh').addEventListener('click', () => { state.memory.stats = null; void refreshMemoryPage({ force: true }); });
+$('#memory-tab-memories').addEventListener('click', () => setMemorySegment('memories'));
+$('#memory-tab-board').addEventListener('click', () => setMemorySegment('board'));
+$('#memory-search').addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); void runMemorySearch(); } });
+$('#calendar-prev').addEventListener('click', () => void loadCalendarMonth(shiftMonth(state.memory.month, -1)));
+$('#calendar-next').addEventListener('click', () => void loadCalendarMonth(shiftMonth(state.memory.month, 1)));
+$('#calendar-today').addEventListener('click', () => void loadCalendarMonth(monthKey()));
+$('#board-prev').addEventListener('click', () => void loadMemoryBoard(state.memory.boardPage - 1));
+$('#board-next').addEventListener('click', () => void loadMemoryBoard(state.memory.boardPage + 1));
+$('#open-memory-card').addEventListener('click', openMemory);
+$('#settings-appearance-button').addEventListener('click', cycleAppearance);
+$('#settings-notification-button').addEventListener('click', toggleNotifications);
+$('#settings-logout-button').addEventListener('click', logout);
+$('#settings-version').textContent = WEB_SHELL_VERSION;
+mobileQuery.addEventListener('change', () => { if (!mobileQuery.matches) state.mobileChatOpen = false; syncView(); });
+async function logout() { state.epoch += 1; state.stickerLoadId += 1; state.composerState.cancelAll(); state.stickerUpload.controller?.abort(); state.stickerUpload.uploading = false; closeStickerDialog(); state.stickerCatalog = null; state.stickerLoading = false; state.stickerError = ''; state.stickerSearch = ''; state.stickerCategory = '__all'; state.stickerTargetContactId = ''; try { await adapter.logout(); } finally { state.stopLive?.(); state.stopLive = null; state.stopBackground?.(); state.stopBackground = null; stopTerminalPolling(); state.terminalSnapshots = {}; state.plugins = null; state.pluginsError = false; state.contacts = []; state.histories = {}; state.live = {}; state.streams = {}; state.pendingCanonical = {}; state.messageNodes.clear(); messages.replaceChildren(); state.composerState = createComposerState(); state.activeContactId = ''; state.view = 'chat'; state.mobileChatOpen = false; state.taxonomy = null; state.selectedScope = null; state.memory = { loading: false, stats: null, segment: 'memories', month: monthKey(), days: {}, selectedDate: '', boardPage: 1, boardLoaded: false }; renderAll(); setMemorySegment('memories'); renderMemorySubtitle(); renderPlugins(); syncView(); if (!bootstrap.mock) showLogin(); } }
 $('#logout-button').addEventListener('click', logout); $('#drawer-logout-button').addEventListener('click', logout);
 $('#appearance-button').addEventListener('click', cycleAppearance); $('#drawer-appearance-button').addEventListener('click', cycleAppearance);
 $('#notification-button').addEventListener('click', toggleNotifications);
 document.addEventListener('visibilitychange', () => { if (document.visibilityState !== 'hidden') markActiveSeen(); });
-window.addEventListener('keydown', (event) => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); input.focus(); } if (event.altKey && /^[1-9]$/.test(event.key)) { const target = state.contacts[Number(event.key) - 1]; if (target) switchContact(target.id); } if (event.key === 'Escape') { if ($('#sticker-dialog').open) closeStickerDialog({ returnFocus: true }); if ($('#memory-dialog').open) $('#memory-dialog').close(); if (document.body.classList.contains('workers-open')) closeWorkers(); } });
+window.addEventListener('keydown', (event) => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); input.focus(); } if (event.altKey && /^[1-9]$/.test(event.key)) { const target = state.contacts[Number(event.key) - 1]; if (target) switchContact(target.id); } if (event.key === 'Escape') { if ($('#sticker-dialog').open) closeStickerDialog({ returnFocus: true }); else if (state.view === 'memory') switchView('chat'); if (document.body.classList.contains('workers-open')) closeWorkers(); } });
 window.addEventListener('beforeinstallprompt', (event) => { event.preventDefault(); state.deferredInstall = event; $('#install-button').hidden = false; }); $('#install-button').addEventListener('click', async () => { await state.deferredInstall?.prompt(); state.deferredInstall = null; $('#install-button').hidden = true; });
 workerDrawerQuery.addEventListener('change', syncWorkerPanel); syncWorkerPanel(); document.body.append($('#svg-defs').content.cloneNode(true)); if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js'));
 async function start() {
   try { await bootstrap.checkSession(); } catch (error) { if (!bootstrap.mock) { showLogin(); return; } }
-  try { state.contacts = await adapter.contacts(); if (!state.contacts.length) throw new Error('没有可用联系人'); state.activeContactId = state.contacts.find(({ id }) => id === 'xiaoke')?.id || state.contacts[0].id; state.contacts.forEach(({ id }) => { state.histories[id] = []; state.live[id] = { replyState: 'idle', statusText: '待命', workers: [] }; composer(id); state.followLatest[id] = true; }); await Promise.all(state.contacts.map(({ id }) => refreshContact(id))); seedUnreadCursors(state.unread, state.histories); markActiveSeen(); watchLive(state.activeContactId); state.stopBackground?.(); state.stopBackground = startBackgroundPolling(); syncNotificationButton(); renderAll({ forceLatest: true }); void loadStickerCatalog(); }
+  try { state.contacts = await adapter.contacts(); if (!state.contacts.length) throw new Error('没有可用联系人'); state.activeContactId = state.contacts.find(({ id }) => id === 'xiaoke')?.id || state.contacts[0].id; state.contacts.forEach(({ id }) => { state.histories[id] = []; state.live[id] = { replyState: 'idle', statusText: '待命', workers: [] }; composer(id); state.followLatest[id] = true; }); await Promise.all(state.contacts.map(({ id }) => refreshContact(id))); seedUnreadCursors(state.unread, state.histories); markActiveSeen(); watchLive(state.activeContactId); state.stopBackground?.(); state.stopBackground = startBackgroundPolling(); syncNotificationButton(); renderAll({ forceLatest: true }); syncView(); void loadStickerCatalog(); }
   catch (error) { $('#connection-state').textContent = '连接不可用'; console.warn('PWA bootstrap failed', error); }
+  // Screenshot/dev hook, mock sessions only: ?view=terminal|apps|settings|memory
+  // lands directly on a page, and &chat=open pretends a conversation is open.
+  if (bootstrap.mock) {
+    const params = new URLSearchParams(globalThis.location?.search || '');
+    const target = params.get('view');
+    if (target && Object.hasOwn(VIEW_IDS, target)) switchView(target);
+    if (params.get('chat') === 'open') { state.mobileChatOpen = true; syncView(); }
+  }
 }
 function pairingError(error) {
   if (error?.status === 429) return '尝试次数过多，请稍后再生成新码。';
@@ -606,4 +862,4 @@ function showLogin() {
   });
   $('#login-form').addEventListener('submit', async (event) => { event.preventDefault(); const submit = $('#login-submit'); const error = $('#login-error'); submit.disabled = true; error.textContent = ''; try { await bootstrap.establishSession({ username: $('#login-username').value, password: $('#login-password').value }); panel.hidden = true; await start(); } catch { error.textContent = '登录未通过，请检查账号或连接。'; } finally { $('#login-password').value = ''; submit.disabled = false; } });
 }
-renderAll(); start();
+renderAll(); syncView(); start();
