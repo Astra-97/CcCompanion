@@ -55,10 +55,11 @@ test('app.js wires optimistic busy on send success and renders the stop key from
   assert.ok(sendSource.indexOf('normalizeSendRecord(response)') < sendSource.indexOf('optimisticBusyState('), 'optimistic busy applies only after the server accepted the send');
   assert.match(sendSource, /state\.live\[contactId\] = optimisticBusyState\(state\.live\[contactId\]\)/);
   assert.match(sendSource, /renderMessages\(\{ forceLatest: true \}\); renderHeader\(\)/, 'header re-renders in the same tick as the optimistic message');
-  const headerSource = app.slice(app.indexOf('function renderHeader'), app.indexOf('function formatTokens'));
+  const headerSource = app.slice(app.indexOf('function renderHeader'), app.indexOf('function controlEntry'));
   assert.match(headerSource, /const stopControl = stopControlState\(live\)/);
   assert.match(headerSource, /stopButton\.hidden = !stopControl\.visible/);
   assert.match(headerSource, /stopButton\.disabled = !stopControl\.enabled/);
-  assert.match(headerSource, /stopButton\.textContent = stopControl\.label/);
+  assert.match(headerSource, /stopButton\.setAttribute\('aria-label', stopControl\.label\)/);
+  assert.match(headerSource, /\$\('#send-button'\)\.hidden = stopControl\.visible/, 'busy swaps the send key for the stop circle like the App');
   assert.doesNotMatch(headerSource, /hidden = !\(isBusy\(\) && live\.stopRequest/, 'the old hide-without-fence logic is gone');
 });

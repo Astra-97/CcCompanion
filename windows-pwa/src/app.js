@@ -1,17 +1,17 @@
-import { createPwaBootstrap } from './bootstrap.js?v=26';
-import { createComposerState } from './composer-state.js?v=26';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=26';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=26';
-import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=26';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=26';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=26';
-import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=26';
-import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=26';
-import { createNotifier } from './notifications.js?v=26';
-import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=26';
-import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=26';
+import { createPwaBootstrap } from './bootstrap.js?v=27';
+import { createComposerState } from './composer-state.js?v=27';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=27';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=27';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord, controlPanelSupported } from './api.js?v=27';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=27';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=27';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=27';
+import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=27';
+import { createNotifier } from './notifications.js?v=27';
+import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=27';
+import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=27';
 
-const WEB_SHELL_VERSION = 'desk-v26 · 2026-10-17';
+const WEB_SHELL_VERSION = 'desk-v27 · 2026-10-17';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -19,7 +19,10 @@ const el = (tag, attrs = {}, children = []) => {
   Object.entries(attrs).forEach(([key, value]) => {
     if (key === 'class') node.className = value;
     else if (key === 'text') node.textContent = value;
-    else if (key.startsWith('data-')) node.dataset[key.slice(5)] = value;
+    // data-* goes through setAttribute, never dataset: DOMStringMap rejects
+    // hyphenated keys ('data-contact-id' → SyntaxError), which once crashed
+    // renderMessages mid-send and resurrected the cleared draft.  setAttribute
+    // takes the canonical dashed name and still feeds dataset readers.
     else node.setAttribute(key, value);
   });
   children.forEach((child) => node.append(child)); return node;
@@ -34,7 +37,7 @@ const state = {
   stickerCatalog: null, stickerLoading: false, stickerLoadId: 0, stickerError: '', stickerCategory: '__all', stickerSearch: '', stickerTargetContactId: '', stickerSelection: { start: 0, end: 0 }, pendingCanonical: {},
   stickerUpload: { file: null, previewUrl: '', uploading: false, controller: null },
   unread: createUnreadStore(), notifier: createNotifier(), messageNodes: new Map(), stopBackground: null, backgroundPollInFlight: false,
-  view: 'chat', mobileChatOpen: false, stopTerminalPoll: null, terminalSnapshots: {}, plugins: null, pluginsError: false,
+  view: 'chat', mobileChatOpen: false, stopTerminalPoll: null, terminalSnapshots: {}, plugins: null, pluginsError: false, control: {},
   memory: { loading: false, stats: null, segment: 'memories', month: monthKey(), days: {}, selectedDate: '', boardPage: 1, boardLoaded: false },
   dash: { appearance: { nicknames: {}, avatars: {} }, todos: null, weather: null, weatherFailed: false },
 };
@@ -218,7 +221,7 @@ function renderHeader() {
   const current = contact(); const live = state.live[current.id] || { replyState: 'idle', statusText: '待命', workers: [] };
   const sending = Boolean(sendOperation(current.id));
   const name = displayNameOf(current) || current.name;
-  $('#contact-name').textContent = name; $('#contact-mode').textContent = current.channel;
+  $('#contact-name').textContent = name;
   const headerAvatar = $('#contact-avatar');
   headerAvatar.className = `avatar contact-avatar ${avatarAccentOf(current.id)}`;
   headerAvatar.replaceChildren();
@@ -229,62 +232,167 @@ function renderHeader() {
     headerAvatar.append(img);
   } else headerAvatar.textContent = (name || '克').slice(0, 1);
   $('#contact-status').textContent = live.statusText || '待命';
-  input.placeholder = `写给${name}…`; $('#connection-state').textContent = isBusy() ? (live.statusText || '正在处理') : '已连接';
+  input.placeholder = `写给${name}…`;
+  // App parity: the single status line under the name carries the busy text;
+  // #connection-state stays the transport line ('已连接') between the
+  // transient error flashes written by send/paste/subscribe paths.
+  $('#connection-state').textContent = '已连接';
   $('#signal-dot').classList.toggle('is-busy', isBusy());
-  // The stop key tracks the busy turn itself: visible the moment a send goes
-  // optimistic-busy, armed only once the server provides its stop fence.
+  // The stop key tracks the busy turn itself: it replaces the send key the
+  // moment a send goes optimistic-busy, armed only with a server fence.
   const stopControl = stopControlState(live);
   const stopButton = $('#stop-button');
   stopButton.hidden = !stopControl.visible;
   stopButton.disabled = !stopControl.enabled;
-  stopButton.textContent = stopControl.label;
+  stopButton.setAttribute('aria-label', stopControl.label);
   stopButton.setAttribute('aria-disabled', String(!stopControl.enabled));
   stopButton.title = stopControl.enabled ? '停止本轮回复' : '正在启动，等待服务端确认本轮后可停止';
+  $('#send-button').hidden = stopControl.visible;
   input.disabled = sending; $('#attachment-input').disabled = sending; $('.attach-button').classList.toggle('is-disabled', sending); $('.attach-button').setAttribute('aria-disabled', String(sending));
   $('#sticker-button').disabled = sending || !current.id || Boolean(current.readOnly);
   $('#send-button').disabled = sending || !current.id || Boolean(current.readOnly) || (!composer().text.trim() && !composer().attachments.length);
   $('#upload-cancel-button').hidden = !(sending && sendOperation(current.id)?.uploading); $('#upload-cancel-button').disabled = !(sending && sendOperation(current.id)?.uploading);
 }
 
-function formatTokens(value) { return value >= 1_000_000 ? `${(value / 1_000_000).toFixed(1)}M` : value >= 1_000 ? `${(value / 1_000).toFixed(1)}k` : String(value); }
-function renderInstrument() {
-  const live = state.live[state.activeContactId] || {}; const instrument = live.instrument;
-  const supportsInstrument = ['kairos', 'xiaoke'].includes(state.activeContactId);
-  $('#instrument-contact').textContent = instrument?.provider || `${displayNameOf(contact()) || contact().name} / ${contact().channel === 'CODEX APP' ? 'Kairos' : 'CC'}`;
-  $('#instrument-status').textContent = live.statusText || '待命';
-  const model = supportsInstrument && instrument?.model ? instrument.model : '不可用';
-  const effort = supportsInstrument && instrument?.effort ? instrument.effort : '—';
-  $('#instrument-model').textContent = model; $('#instrument-effort').textContent = effort;
-  const context = supportsInstrument ? instrument?.context : null;
-  const contextDetail = $('#instrument-context-detail'); const contextBar = $('#instrument-context-bar');
-  if (context?.available) { const percent = context.usedPercent; contextDetail.textContent = context.usedTokens !== null && context.windowTokens !== null ? `${percent}% · ${formatTokens(context.usedTokens)} / ${formatTokens(context.windowTokens)}` : `${percent}% 已用`; contextBar.value = percent; contextBar.hidden = false; }
-  else { contextDetail.textContent = '暂无 token 记录'; contextBar.hidden = true; }
-  const quotas = $('#instrument-quota'); quotas.replaceChildren();
-  const windows = supportsInstrument ? (instrument?.quota?.windows || []) : [];
-  if (!windows.length) { quotas.append(el('p', { class: 'instrument-empty', text: supportsInstrument ? '额度信息暂不可用' : '此联系人没有工作仪表' })); return; }
-  const plan = instrument?.quota?.plan; if (plan) quotas.append(el('p', { class: 'quota-plan', text: plan }));
-  quotas.append(...windows.map((window) => el('div', { class: 'quota-window' }, [el('span', { text: window.label }), el('strong', { text: `${window.mode === 'used' ? '已用' : '剩余'} ${window.percent}%` }), el('small', { text: window.resetLabel })])));
+/**
+ * App control sheet parity (2026-10-17): the side rail is the same panel the
+ * Android chat header opens — one status card (provider, BUSY/READY, model,
+ * effort, session, context, quota) and one preference card (model + effort
+ * pickers applied through the web-session write gate).
+ */
+function controlEntry(id = state.activeContactId) {
+  return state.control[id] || { loading: true, status: null, preferences: null, error: '', saving: false, saveMessage: '', draftModel: '', draftEffort: '' };
+}
+async function refreshControlPanel(id = state.activeContactId) {
+  if (!controlPanelSupported(id)) { state.control[id] = null; if (id === state.activeContactId) renderControlPanel(); return; }
+  const epoch = state.epoch;
+  const previous = state.control[id];
+  state.control[id] = { ...(previous || { saving: false, saveMessage: '', draftModel: '', draftEffort: '' }), loading: true, error: '' };
+  if (id === state.activeContactId) renderControlPanel();
+  try {
+    const [status, preferences] = await Promise.all([adapter.getControlStatus(id), adapter.getControlPreferences(id)]);
+    if (epoch !== state.epoch) return;
+    const entry = state.control[id];
+    entry.status = status; entry.preferences = preferences; entry.loading = false; entry.error = '';
+    entry.draftModel = preferences.model || entry.draftModel;
+    entry.draftEffort = preferences.effort || entry.draftEffort;
+  } catch (error) {
+    if (epoch !== state.epoch) return;
+    const entry = state.control[id];
+    entry.loading = false; entry.error = error?.status === 401 ? '此浏览器会话没有控制面板权限' : '控制面板暂时读取失败';
+  }
+  if (id === state.activeContactId) renderControlPanel();
+}
+async function saveControlPreferences() {
+  const id = state.activeContactId; const entry = controlEntry(id);
+  if (!controlPanelSupported(id) || entry.saving || entry.loading || entry.error) return;
+  const model = entry.draftModel; const effort = entry.draftEffort;
+  entry.saving = true; entry.saveMessage = ''; renderControlPanel();
+  try {
+    await adapter.saveControlPreferences(id, { model, effort });
+    entry.saveMessage = '已应用，下一轮生效';
+  } catch (error) {
+    entry.saveMessage = error?.status === 403 ? '会话校验失效，请刷新页面后重试' : '保存失败，偏好未变更';
+  } finally {
+    entry.saving = false;
+  }
+  await refreshControlPanel(id);
+  const after = state.control[id];
+  if (after) after.saveMessage = entry.saveMessage;
+  if (id === state.activeContactId) renderControlPanel();
+}
+function controlRow(label, valueNodes) {
+  return el('div', { class: 'control-row' }, [el('dt', { text: label }), el('dd', {}, valueNodes)]);
+}
+function renderControlPanel() {
+  const panel = $('#control-panel');
+  if (!panel) return;
+  const id = state.activeContactId;
+  const current = contact();
+  if (!controlPanelSupported(id)) {
+    panel.replaceChildren(el('p', { class: 'control-empty', text: id ? `${displayNameOf(current) || current.name} 没有控制面板。` : '控制面板暂不可用。' }));
+    return;
+  }
+  const entry = controlEntry(id);
+  if (entry.loading && !entry.status && !entry.preferences) { panel.replaceChildren(el('p', { class: 'loading', text: '正在读取控制面板…' })); return; }
+  if (entry.error) {
+    const retry = el('button', { type: 'button', class: 'text-button', text: '重试' });
+    retry.addEventListener('click', () => refreshControlPanel(id));
+    panel.replaceChildren(el('p', { class: 'error', text: entry.error }), retry);
+    return;
+  }
+  const status = entry.status || {};
+  const preferences = entry.preferences || {};
+  const busy = isBusy(id) || status.busy === true;
+  const children = [];
+  const statusCard = el('section', { class: 'control-card', 'aria-label': '状态' });
+  const refresh = el('button', { type: 'button', class: 'control-refresh', 'aria-label': '刷新控制面板', title: '刷新', text: '⟳' });
+  refresh.addEventListener('click', () => refreshControlPanel(id));
+  statusCard.append(el('div', { class: 'control-card-head' }, [
+    el('strong', { text: status.provider || current.channel || '—' }),
+    el('span', { class: `control-pill ${busy ? 'is-busy' : 'is-ready'}`, text: busy ? 'BUSY' : 'READY' }),
+    refresh,
+  ]));
+  const rows = el('dl', { class: 'control-rows' });
+  rows.append(controlRow('模型', [document.createTextNode(status.model || preferences.model || '—')]));
+  rows.append(controlRow('强度', [document.createTextNode(status.effort || preferences.effort || '—')]));
+  rows.append(controlRow('会话', [document.createTextNode(status.sessionId ? `${status.sessionId.slice(0, 8)}…` : '—')]));
+  const contextNodes = [];
+  if (status.context?.available) {
+    const bar = el('progress', { max: '100', value: String(status.context.usedPercent ?? 0), 'aria-label': '上下文用量' });
+    contextNodes.push(bar, el('span', { text: status.context.text || `${status.context.usedPercent}% 已用` }));
+  } else contextNodes.push(document.createTextNode('暂无 token 记录'));
+  rows.append(controlRow('上下文', contextNodes));
+  statusCard.append(rows);
+  const quotaWindows = status.quotaWindows || [];
+  if (status.quotaText || quotaWindows.length) {
+    const quota = el('div', { class: 'control-quota', 'aria-label': '额度' });
+    if (status.quotaText) quota.append(el('p', { class: 'control-quota-plan', text: status.quotaText }));
+    quotaWindows.forEach((window) => quota.append(el('div', { class: 'quota-window' }, [
+      el('span', { text: window.label }), el('strong', { text: `已用 ${window.usedPercent}%` }), el('small', { text: window.resetText || window.text || '' }),
+    ])));
+    statusCard.append(quota);
+  }
+  children.push(statusCard);
+  if (preferences.available) {
+    const prefCard = el('section', { class: 'control-card', 'aria-label': '运行偏好' });
+    prefCard.append(el('div', { class: 'control-card-head' }, [el('strong', { text: '运行偏好' })]));
+    const models = preferences.models || [];
+    const modelSelect = el('select', { class: 'control-select', 'aria-label': '模型' });
+    modelSelect.replaceChildren(...models.map((model) => el('option', { value: model.id, text: model.label })));
+    const draftModel = models.some((model) => model.id === entry.draftModel) ? entry.draftModel : (preferences.model || models[0]?.id || '');
+    entry.draftModel = draftModel;
+    modelSelect.value = draftModel;
+    const effortOptionsFor = (modelId) => {
+      const perModel = models.find((model) => model.id === modelId)?.efforts || [];
+      return perModel.length ? perModel : (preferences.efforts || []);
+    };
+    const effortSelect = el('select', { class: 'control-select', 'aria-label': '推理强度' });
+    const syncEffortOptions = () => {
+      const options = effortOptionsFor(entry.draftModel);
+      effortSelect.replaceChildren(...options.map((effort) => el('option', { value: effort, text: effort })));
+      entry.draftEffort = options.includes(entry.draftEffort) ? entry.draftEffort : (options.includes(preferences.effort) ? preferences.effort : options[0] || '');
+      effortSelect.value = entry.draftEffort;
+      apply.disabled = entry.saving || (!entry.draftModel && !entry.draftEffort);
+    };
+    modelSelect.addEventListener('change', () => { entry.draftModel = modelSelect.value; syncEffortOptions(); });
+    effortSelect.addEventListener('change', () => { entry.draftEffort = effortSelect.value; });
+    const apply = el('button', { type: 'button', class: 'control-apply', text: '应用偏好' });
+    apply.addEventListener('click', saveControlPreferences);
+    syncEffortOptions();
+    prefCard.append(
+      el('label', { class: 'control-field' }, [el('span', { text: '模型' }), modelSelect]),
+      el('label', { class: 'control-field' }, [el('span', { text: '推理强度' }), effortSelect]),
+    );
+    if (preferences.appliesFrom) prefCard.append(el('p', { class: 'control-hint', text: preferences.appliesFrom === 'next_turn' ? '从下一轮开始生效' : '从下一次会话开始生效' }));
+    if (entry.saveMessage) prefCard.append(el('p', { class: 'control-hint', role: 'status', text: entry.saveMessage }));
+    apply.textContent = entry.saving ? '应用中…' : '应用偏好';
+    prefCard.append(apply);
+    children.push(prefCard);
+  }
+  panel.replaceChildren(...children);
 }
 
-function observerEventKey(event, occurrence) { return `${event.elapsedSeconds}:${event.label}:${occurrence}`; }
-function renderTerminal() {
-  const terminal = state.live[state.activeContactId]?.terminal || { available: false, busy: false, phase: 'unavailable', events: [] };
-  const status = $('#terminal-status'); const list = $('#terminal-events');
-  status.textContent = !terminal.available ? '观察器暂不可用' : terminal.busy ? terminal.phase : '空闲 · 没有正在运行的安全事件';
-  const nearEnd = list.scrollHeight - list.scrollTop - list.clientHeight < 28;
-  const seen = new Map(); const desired = [];
-  terminal.events.forEach((event) => { const base = `${event.elapsedSeconds}:${event.label}`; const count = seen.get(base) || 0; seen.set(base, count + 1); desired.push({ key: observerEventKey(event, count), event }); });
-  const existing = new Map([...list.children].map((node) => [node.dataset.key, node]));
-  const nodes = desired.map(({ key, event }) => {
-    let node = existing.get(key);
-    if (!node) { node = el('li', { 'data-key': key }); node.append(el('time'), el('span')); }
-    node.querySelector('time').textContent = `${String(Math.floor(event.elapsedSeconds / 60)).padStart(2, '0')}:${String(event.elapsedSeconds % 60).padStart(2, '0')}`;
-    node.querySelector('span').textContent = event.label;
-    return node;
-  });
-  list.replaceChildren(...nodes);
-  if (nearEnd) requestAnimationFrame(() => { list.scrollTop = list.scrollHeight; });
-}
 function renderActivities() {
   const live = state.live[state.activeContactId] || { replyState: 'idle' }; const strip = $('#activity-strip'); strip.replaceChildren();
   if (!isBusy()) return;
@@ -358,13 +466,14 @@ function messageSignature(message) {
 }
 function buildMessageNode(item, message) {
   item.className = `message ${message.role === 'user' ? 'from-user' : 'from-assistant'}`;
+  // App parity: the timestamp line sits under the bubble, 10.5px and faint.
   const meta = el('div', { class: 'message-meta' }, [el('span', { text: message.role === 'user' ? 'ASTRA' : (displayNameOf(contact()) || contact().name).toUpperCase() }), el('time', { text: message.time || '刚刚' })]);
   const rendered = renderMessageBody(message); item.classList.toggle('has-sticker-only', rendered.standalone);
-  const children = [meta];
+  const children = [];
   if (message.role === 'assistant' && (message.thinking || message.thinkingOriginal)) children.push(renderThinking(message));
   children.push(rendered.body);
   if (message.attachments?.length) children.push(el('div', { class: 'message-files', role: 'list', 'aria-label': '消息附件' }, message.attachments.map(renderAttachment)));
-  children.push(renderMessageActions(message));
+  children.push(meta, renderMessageActions(message));
   item.replaceChildren(...children);
   return item;
 }
@@ -409,7 +518,7 @@ function createTypingBubble() {
   const meta = el('div', { class: 'message-meta' }, [el('span', { text: (displayNameOf(contact()) || contact().name).toUpperCase() }), el('time', { text: '现在' })]);
   const body = el('p', { class: 'message-body typing-bubble-body' });
   body.append(el('span', { class: 'typing-dots', 'aria-hidden': 'true' }, [el('i'), el('i'), el('i')]));
-  item.append(meta, body);
+  item.append(body, meta);
   return item;
 }
 function renderAttachment(file) {
@@ -417,11 +526,6 @@ function renderAttachment(file) {
   const link = el('a', { href: file.url, target: '_blank', rel: 'noreferrer', class: file.type === 'image' ? 'attachment-image' : 'attachment-file', role: 'listitem', 'aria-label': label });
   if (file.type === 'image') { const image = el('img', { src: file.url, alt: file.name, loading: 'lazy' }); link.append(image, el('span', { text: file.name })); } else link.textContent = `⌁ ${file.name}`;
   return link;
-}
-function renderWorkers() {
-  const workers = state.live[state.activeContactId]?.workers || []; const list = $('#worker-list'); $('#worker-total').textContent = workers.length;
-  if (!workers.length) { list.replaceChildren(el('p', { class: 'empty-workers', text: '没有协作 worker 在场。' })); return; }
-  list.replaceChildren(...workers.map((worker) => { const labels = { running: '进行中', completed: '完成', interrupted: '中断', failed: '失败' }; const card = el('article', { class: `worker-card ${worker.state}` }); card.append(el('span', { class: 'worker-status', 'aria-hidden': 'true' }), el('div', { class: 'worker-copy' }, [el('strong', { text: worker.name }), el('small', { text: `${labels[worker.state]} · ${worker.count} 次` })])); return card; }));
 }
 function renderAttachments() {
   const tray = $('#attachment-tray'); const current = composer(); const operation = sendOperation(); const chips = current.attachments.map((file, index) => {
@@ -436,7 +540,7 @@ function renderAttachments() {
   });
   tray.replaceChildren(...chips);
 }
-function renderAll(options) { renderContacts(); renderChatListPage(); renderHeader(); renderActivities(); renderMessages(options); renderWorkers(); renderInstrument(); renderTerminal(); renderAttachments(); renderDateRule(); }
+function renderAll(options) { renderContacts(); renderChatListPage(); renderHeader(); renderActivities(); renderMessages(options); renderControlPanel(); renderAttachments(); renderDateRule(); }
 
 async function switchContact(id) {
   if (state.stickerUpload.uploading) return;
@@ -451,6 +555,7 @@ async function switchContact(id) {
   input.value = composer(id).text; state.followLatest[id] ??= true; autoResize(); syncWorkerPanel(); renderAll({ forceLatest: !Object.hasOwn(state.scrollTops, id) });
   if (Object.hasOwn(state.scrollTops, id)) requestAnimationFrame(() => { $('#conversation-scroll').scrollTop = state.scrollTops[id]; updateLatestControl(); });
   markActiveSeen();
+  void refreshControlPanel(id);
   if (await refreshContact(id, { epoch }) && epoch === state.epoch && id === state.activeContactId) { markActiveSeen(); watchLive(id, epoch); }
 }
 /** Reading the active conversation advances its persistent read cursor. */
@@ -501,6 +606,7 @@ async function send(event) {
     if (contactId === state.activeContactId && state.composerState.isCurrent(contactId, operation)) { renderMessages({ forceLatest: true }); renderHeader(); }
     if (state.composerState.isCurrent(contactId, operation)) draft.attachments = [];
   } catch (error) {
+    console.warn('send failed', error);
     if (staged.length) await adapter.cancelUploads(staged).catch(() => {});
     // This contact's composer is disabled while an operation is active. The
     // identity check prevents a stale completion from restoring over a newer one.
@@ -935,7 +1041,7 @@ $('#settings-notification-button').addEventListener('click', toggleNotifications
 $('#settings-logout-button').addEventListener('click', logout);
 $('#settings-version').textContent = WEB_SHELL_VERSION;
 homeQuery.addEventListener('change', syncView);
-async function logout() { state.epoch += 1; state.stickerLoadId += 1; state.composerState.cancelAll(); state.stickerUpload.controller?.abort(); state.stickerUpload.uploading = false; closeStickerDialog(); state.stickerCatalog = null; state.stickerLoading = false; state.stickerError = ''; state.stickerSearch = ''; state.stickerCategory = '__all'; state.stickerTargetContactId = ''; try { await adapter.logout(); } finally { state.stopLive?.(); state.stopLive = null; state.stopBackground?.(); state.stopBackground = null; stopTerminalPolling(); state.terminalSnapshots = {}; state.plugins = null; state.pluginsError = false; state.contacts = []; state.histories = {}; state.live = {}; state.streams = {}; state.pendingCanonical = {}; state.messageNodes.clear(); messages.replaceChildren(); state.composerState = createComposerState(); state.activeContactId = ''; state.view = 'chat'; state.mobileChatOpen = false; state.taxonomy = null; state.selectedScope = null; state.memory = { loading: false, stats: null, segment: 'memories', month: monthKey(), days: {}, selectedDate: '', boardPage: 1, boardLoaded: false }; state.dash = { appearance: { nicknames: {}, avatars: {} }, todos: null, weather: null, weatherFailed: false }; renderAll(); setMemorySegment('memories'); renderMemorySubtitle(); renderPlugins(); syncView(); if (!bootstrap.mock) showLogin(); } }
+async function logout() { state.epoch += 1; state.stickerLoadId += 1; state.composerState.cancelAll(); state.stickerUpload.controller?.abort(); state.stickerUpload.uploading = false; closeStickerDialog(); state.stickerCatalog = null; state.stickerLoading = false; state.stickerError = ''; state.stickerSearch = ''; state.stickerCategory = '__all'; state.stickerTargetContactId = ''; try { await adapter.logout(); } finally { state.stopLive?.(); state.stopLive = null; state.stopBackground?.(); state.stopBackground = null; stopTerminalPolling(); state.terminalSnapshots = {}; state.plugins = null; state.pluginsError = false; state.control = {}; state.contacts = []; state.histories = {}; state.live = {}; state.streams = {}; state.pendingCanonical = {}; state.messageNodes.clear(); messages.replaceChildren(); state.composerState = createComposerState(); state.activeContactId = ''; state.view = 'chat'; state.mobileChatOpen = false; state.taxonomy = null; state.selectedScope = null; state.memory = { loading: false, stats: null, segment: 'memories', month: monthKey(), days: {}, selectedDate: '', boardPage: 1, boardLoaded: false }; state.dash = { appearance: { nicknames: {}, avatars: {} }, todos: null, weather: null, weatherFailed: false }; renderAll(); setMemorySegment('memories'); renderMemorySubtitle(); renderPlugins(); syncView(); if (!bootstrap.mock) showLogin(); } }
 $('#logout-button').addEventListener('click', logout); $('#drawer-logout-button').addEventListener('click', logout);
 $('#appearance-button').addEventListener('click', cycleAppearance); $('#drawer-appearance-button').addEventListener('click', cycleAppearance);
 $('#notification-button').addEventListener('click', toggleNotifications);
@@ -945,7 +1051,7 @@ window.addEventListener('beforeinstallprompt', (event) => { event.preventDefault
 workerDrawerQuery.addEventListener('change', syncWorkerPanel); syncWorkerPanel(); document.body.append($('#svg-defs').content.cloneNode(true)); if ('serviceWorker' in navigator) { let swReloaded = false; navigator.serviceWorker.addEventListener('controllerchange', () => { if (swReloaded) return; swReloaded = true; location.reload(); }); window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js')); }
 async function start() {
   try { await bootstrap.checkSession(); } catch (error) { if (!bootstrap.mock) { showLogin(); return; } }
-  try { state.contacts = await adapter.contacts(); if (!state.contacts.length) throw new Error('没有可用联系人'); state.activeContactId = state.contacts.find(({ id }) => id === 'xiaoke')?.id || state.contacts[0].id; state.contacts.forEach(({ id }) => { state.histories[id] = []; state.live[id] = { replyState: 'idle', statusText: '待命', workers: [] }; composer(id); state.followLatest[id] = true; }); await Promise.all(state.contacts.map(({ id }) => refreshContact(id))); seedUnreadCursors(state.unread, state.histories); markActiveSeen(); watchLive(state.activeContactId); state.stopBackground?.(); state.stopBackground = startBackgroundPolling(); syncNotificationButton(); renderAll({ forceLatest: true }); syncView(); void loadStickerCatalog(); void loadDashAppearance(); void loadDashData(); }
+  try { state.contacts = await adapter.contacts(); if (!state.contacts.length) throw new Error('没有可用联系人'); state.activeContactId = state.contacts.find(({ id }) => id === 'xiaoke')?.id || state.contacts[0].id; state.contacts.forEach(({ id }) => { state.histories[id] = []; state.live[id] = { replyState: 'idle', statusText: '待命', workers: [] }; composer(id); state.followLatest[id] = true; }); await Promise.all(state.contacts.map(({ id }) => refreshContact(id))); seedUnreadCursors(state.unread, state.histories); markActiveSeen(); watchLive(state.activeContactId); void refreshControlPanel(state.activeContactId); state.stopBackground?.(); state.stopBackground = startBackgroundPolling(); syncNotificationButton(); renderAll({ forceLatest: true }); syncView(); void loadStickerCatalog(); void loadDashAppearance(); void loadDashData(); }
   catch (error) { $('#connection-state').textContent = '连接不可用'; console.warn('PWA bootstrap failed', error); }
   // Screenshot/dev hook, mock sessions only: ?view=terminal|apps|settings|memory
   // lands directly on a page, and &chat=open pretends a conversation is open.

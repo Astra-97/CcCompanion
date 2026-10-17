@@ -486,6 +486,22 @@ WEB_SESSION_CONTRACT_VERSION = "2026-08-09"
 WEB_PAIRING_MAX_BODY_BYTES = 1024
 WEB_PAIRING_BODY_TIMEOUT_SECONDS = 5
 
+# 2026-10-17 Astra 批准批次：PWA 聊天页控制面板的最小写门。
+# 网页 cookie 只触达这四个 provider 的 status/preferences 读取与 preferences
+# 写入（切模型 / effort），每个动作单独登记。会话操作（new/switch/forge/
+# abort）与其余 /kimi/ /kiro/ /xiaoke/ 控制面仍只对 native pairing 开放，
+# 绝不扩成通用写权限。
+WEB_CONTROL_GET_PATHS = frozenset({
+    "/xiaoke/status", "/xiaoke/preferences",
+    "/codex/status", "/codex/preferences",
+    "/kimi/status", "/kimi/preferences",
+    "/kiro/preferences",
+})
+WEB_CONTROL_POST_PATHS = frozenset({
+    "/xiaoke/preferences", "/codex/preferences",
+    "/kimi/preferences", "/kiro/preferences",
+})
+
 
 class WebSessionStore:
     """Small in-memory store for same-origin PWA sessions.
@@ -5830,6 +5846,9 @@ class PushHandler(BaseHTTPRequestHandler):
             # 2026-10-17 放行（Astra 批准网页版与 App 对齐）：今日待办只读投影；
             # 写操作 toggle/add/edit 仍不放行。
             "/todos",
+            # 2026-10-17 Astra 批准批次：控制面板只读投影（/kimi//kiro//xiaoke/
+            # 前缀闸与通用 auth 之前另有 WEB_CONTROL_* 逐路径登记）。
+            *WEB_CONTROL_GET_PATHS,
         }
         # /appearance-assets/<flat> 由 handler 自带扁平文件名+防穿越校验，
         # 与 /attachments/<flat> 同级；用于网页端联系人头像。
@@ -5837,6 +5856,8 @@ class PushHandler(BaseHTTPRequestHandler):
         post_exact = {
             "/web/session/logout", "/chat/send", "/chat/stop", "/chat/upload", "/chat/upload/cancel",
             "/stickers/upload",
+            # 控制面板写门：仅切模型/effort 的 preferences POST（逐个登记）。
+            *WEB_CONTROL_POST_PATHS,
         }
         if method in {"GET", "HEAD"}:
             return (
@@ -5936,6 +5957,25 @@ class PushHandler(BaseHTTPRequestHandler):
         csrf_matches = getattr(sessions, "csrf_matches", None)
         supplied = self.headers.get("X-CC-Web-CSRF", "") or ""
         return bool(callable(csrf_matches) and csrf_matches(self._web_session_token(), supplied))
+
+    def _web_control_gate_matches(self, path: str) -> bool:
+        """Let a PWA cookie through the native-only /kimi//kiro//xiaoke/ prefix
+        gate for exactly the registered control-panel paths (WEB_CONTROL_*).
+
+        Reads need only a valid session cookie; writes additionally pass the
+        origin+CSRF check in _require_write_auth before dispatch.  Every other
+        path under those prefixes stays native-pairing-only.
+        """
+        method = str(getattr(self, "command", "GET") or "GET").upper()
+        if method in {"GET", "HEAD"}:
+            if path not in WEB_CONTROL_GET_PATHS:
+                return False
+        elif method == "POST":
+            if path not in WEB_CONTROL_POST_PATHS:
+                return False
+        else:
+            return False
+        return self._web_session_matches(require_allowed_route=False)
 
     def _is_public_get(self) -> bool:
         from urllib.parse import urlparse
@@ -7624,7 +7664,13 @@ class PushHandler(BaseHTTPRequestHandler):
         # importantly, this happens before the generic cookie-aware auth.
         # kiro 切模型 (2026-09-10): /kiro/ 控制台走同一道 native pairing 闸门。
         # 小克控制台 (2026-09-15): /xiaoke/ 同闸。
-        if request_path.startswith(("/kimi/", "/kiro/", "/xiaoke/")) and not self._native_pairing_auth_matches():
+        # 2026-10-17：WEB_CONTROL_GET/POST_PATHS 里逐条登记的控制面板路径
+        # （status/preferences 读 + preferences 写）对网页 cookie 开口。
+        if (
+            request_path.startswith(("/kimi/", "/kiro/", "/xiaoke/"))
+            and not self._native_pairing_auth_matches()
+            and not self._web_control_gate_matches(request_path)
+        ):
             self._send_json(401, {"ok": False, "error": "unauthorized"})
             return
         # The Kimi interactive terminal is privileged even on a legacy
@@ -8298,7 +8344,13 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         # kiro 切模型 (2026-09-10): /kiro/ 与 /kimi/ 同一道 native pairing 闸门。
         # 小克控制台 (2026-09-15): /xiaoke/ 同闸。
-        if request_path.startswith(("/kimi/", "/kiro/", "/xiaoke/")) and not self._native_pairing_auth_matches():
+        # 2026-10-17：WEB_CONTROL_POST_PATHS 逐条登记的 preferences 写动作对
+        # 网页 cookie 开口（随后 _require_write_auth 仍强制 origin+CSRF）。
+        if (
+            request_path.startswith(("/kimi/", "/kiro/", "/xiaoke/"))
+            and not self._native_pairing_auth_matches()
+            and not self._web_control_gate_matches(request_path)
+        ):
             self._send_json(401, {"ok": False, "error": "unauthorized"})
             return
         # session/target lives in the JSON body for these routes. Fail closed

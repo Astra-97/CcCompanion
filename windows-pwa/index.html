@@ -8,7 +8,7 @@
     <meta name="description" content="CcCompanion private operations desk" />
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" href="./assets/cc-mark.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="./src/styles.css?v=26" />
+    <link rel="stylesheet" href="./src/styles.css?v=27" />
     <title>CcCompanion · Desk</title>
   </head>
   <body>
@@ -64,11 +64,11 @@
           <div class="contact-heading">
             <button class="icon-button" id="chat-back-button" type="button" aria-label="返回聊天列表" hidden><svg class="icon" aria-hidden="true"><use href="#icon-back" /></svg></button>
             <span class="avatar contact-avatar oxide" id="contact-avatar" aria-hidden="true">克</span>
-            <div><p class="eyebrow" id="contact-mode">PRIVATE CHANNEL</p><h1 id="contact-name">小克</h1><p class="contact-sub"><span class="signal-dot" id="signal-dot" aria-hidden="true"></span><span id="contact-status">待命</span></p></div>
+            <div><h1 id="contact-name">小克</h1><p class="contact-sub"><span class="signal-dot" id="signal-dot" aria-hidden="true"></span><span id="contact-status">待命</span></p></div>
           </div>
           <div class="head-actions">
             <span class="connection-state" id="connection-state" aria-live="polite">已连接</span>
-            <button class="icon-button worker-toggle" id="worker-toggle" type="button" aria-controls="side-notes" aria-expanded="false" aria-label="打开协作现场" title="协作现场"><svg class="icon" aria-hidden="true"><use href="#icon-panel" /></svg></button>
+            <button class="icon-button worker-toggle" id="worker-toggle" type="button" aria-controls="side-notes" aria-expanded="false" aria-label="打开控制面板" title="控制面板"><svg class="icon" aria-hidden="true"><use href="#icon-panel" /></svg></button>
             <button class="icon-button" id="memory-button" type="button" aria-label="打开记忆库" title="记忆库"><svg class="icon" aria-hidden="true"><use href="#icon-atlas" /></svg></button>
             <button class="text-button logout-button" id="logout-button" type="button">退出</button>
           </div>
@@ -88,41 +88,22 @@
             <span aria-hidden="true">＋</span><span class="sr-only">添加附件</span>
           </label>
           <input id="attachment-input" class="file-input" type="file" multiple tabindex="-1" />
-          <button class="sticker-button" id="sticker-button" type="button" aria-label="打开表情包" aria-haspopup="dialog" aria-controls="sticker-dialog" aria-expanded="false" title="表情包">☺</button>
-          <textarea id="message-input" rows="1" placeholder="写给小克…" aria-label="消息内容"></textarea>
+          <div class="composer-pill">
+            <textarea id="message-input" rows="1" placeholder="写给小克…" aria-label="消息内容"></textarea>
+            <button class="sticker-button" id="sticker-button" type="button" aria-label="打开表情包" aria-haspopup="dialog" aria-controls="sticker-dialog" aria-expanded="false" title="表情包">☺</button>
+          </div>
           <div class="composer-actions">
             <span class="shortcut-hint">Enter 发送 · ⇧Enter 换行</span>
             <button class="stop-button" id="upload-cancel-button" type="button" hidden>取消上传</button>
-            <button class="send-button" id="send-button" type="submit"><span>发送</span><span aria-hidden="true">↗</span></button>
-            <button class="stop-button" id="stop-button" type="button" hidden>停止</button>
+            <button class="send-button" id="send-button" type="submit" aria-label="发送"><svg class="icon" aria-hidden="true"><use href="#icon-send" /></svg></button>
+            <button class="send-button stop-circle" id="stop-button" type="button" aria-label="停止本轮回复" hidden><span class="stop-glyph" aria-hidden="true"></span></button>
           </div>
         </form>
       </section>
 
-      <aside class="side-notes" id="side-notes" aria-label="工作台状态" aria-hidden="false">
-        <div class="drawer-head"><p class="eyebrow">LIVE INSTRUMENT</p><button class="icon-button" id="worker-close" type="button" aria-label="关闭协作现场">×</button></div>
-        <section class="instrument" aria-labelledby="instrument-title">
-          <p class="eyebrow">LIVE INSTRUMENT</p><h2 id="instrument-title">本次工作</h2>
-          <dl class="instrument-grid instrument-identity">
-            <div><dt>通道</dt><dd id="instrument-contact">小克 / CC</dd></div>
-            <div><dt>状态</dt><dd id="instrument-status">待命</dd></div>
-          </dl>
-          <dl class="instrument-grid instrument-work" aria-label="本次工作的只读指标">
-            <div><dt>Model</dt><dd id="instrument-model">不可用</dd></div>
-            <div><dt>Context</dt><dd><progress id="instrument-context-bar" max="100" value="0" aria-label="上下文用量"></progress><span id="instrument-context-detail">暂无 token 记录</span></dd></div>
-            <div><dt>Effort</dt><dd id="instrument-effort">—</dd></div>
-          </dl>
-          <div class="instrument-quota" id="instrument-quota" aria-label="剩余额度"></div>
-        </section>
-        <section class="workers-panel" aria-labelledby="workers-title">
-          <div class="panel-heading"><div><p class="eyebrow">COLLABORATION</p><h2 id="workers-title">协作现场</h2></div><span id="worker-total" class="count-pill">0</span></div>
-          <div id="worker-list" class="worker-list" aria-live="polite"></div>
-          <section class="terminal-panel" aria-labelledby="terminal-title">
-            <div class="terminal-heading"><p class="eyebrow">READ-ONLY OBSERVER</p><h3 id="terminal-title">Terminal</h3></div>
-            <p id="terminal-status" class="terminal-status">观察器暂不可用</p>
-            <ol id="terminal-events" class="terminal-events" aria-label="只读终端观察事件"></ol>
-          </section>
-        </section>
+      <aside class="side-notes" id="side-notes" aria-label="控制面板" aria-hidden="false">
+        <div class="drawer-head"><p class="eyebrow">控制面板</p><button class="icon-button" id="worker-close" type="button" aria-label="关闭控制面板">×</button></div>
+        <section class="control-panel" id="control-panel" aria-label="当前联系人的状态与运行偏好"></section>
         <section class="quiet-note"><span aria-hidden="true">✦</span><p>联系人各自保留独立历史、草稿和忙碌状态。</p></section>
         <div class="drawer-tools" aria-label="工作台设置">
           <button class="text-button" id="drawer-appearance-button" type="button">显示模式</button>
@@ -256,7 +237,7 @@
       </form>
     </dialog>
 
-    <template id="svg-defs"><svg class="svg-defs" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><symbol id="cc-mark" viewBox="0 0 24 24"><path d="M3 12 12 3l9 9-9 9-9 9Zm4.2 0L12 7.2l4.8 4.8L12 16.8 7.2 12Z" fill="currentColor"/></symbol><symbol id="icon-chat" viewBox="0 0 24 24"><path d="M4.5 5.5h15v10.5H9.5l-5 4v-14.5Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol><symbol id="icon-terminal" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="m7.5 9.5 3 2.7-3 2.7M12.5 15h4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="icon-apps" viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="13" y="4" width="7" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="4" y="13" width="7" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="13" y="13" width="7" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.7"/></symbol><symbol id="icon-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.1" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 3.6v2.5M12 17.9v2.5M3.6 12h2.5M17.9 12h2.5M6.1 6.1l1.8 1.8M16.1 16.1l1.8 1.8M17.9 6.1l-1.8 1.8M7.9 16.1l-1.8 1.8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol><symbol id="icon-bell" viewBox="0 0 24 24"><path d="M6 10a6 6 0 0 1 12 0c0 3.8 1.5 5.3 1.5 5.3h-15S6 13.8 6 10Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M10 18.4a2.2 2.2 0 0 0 4 0" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol><symbol id="icon-bell-off" viewBox="0 0 24 24"><path d="M6 10a6 6 0 0 1 12 0c0 3.8 1.5 5.3 1.5 5.3h-15S6 13.8 6 10Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M10 18.4a2.2 2.2 0 0 0 4 0" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="m4.5 4.5 15 15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol><symbol id="icon-back" viewBox="0 0 24 24"><path d="m14 6-6 6 6 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M19.2 12a7.2 7.2 0 1 1-2.1-5.1M19.2 4.2v4h-4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="icon-panel" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M15 4.5v15" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M17.5 9h1.5M17.5 12h1.5M17.5 15h1.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol><symbol id="icon-atlas" viewBox="0 0 24 24"><path d="M5 5.5A2.5 2.5 0 0 1 7.5 3H19v15.5H7.5A2.5 2.5 0 0 0 5 21V5.5Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M5 18.5A2.5 2.5 0 0 1 7.5 16H19" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M9.5 7.5h5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol></svg></template>
-    <script type="module" src="./src/app.js?v=26"></script>
+    <template id="svg-defs"><svg class="svg-defs" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><symbol id="cc-mark" viewBox="0 0 24 24"><path d="M3 12 12 3l9 9-9 9-9 9Zm4.2 0L12 7.2l4.8 4.8L12 16.8 7.2 12Z" fill="currentColor"/></symbol><symbol id="icon-chat" viewBox="0 0 24 24"><path d="M4.5 5.5h15v10.5H9.5l-5 4v-14.5Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol><symbol id="icon-terminal" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="m7.5 9.5 3 2.7-3 2.7M12.5 15h4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="icon-apps" viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="13" y="4" width="7" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="4" y="13" width="7" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="13" y="13" width="7" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.7"/></symbol><symbol id="icon-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.1" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 3.6v2.5M12 17.9v2.5M3.6 12h2.5M17.9 12h2.5M6.1 6.1l1.8 1.8M16.1 16.1l1.8 1.8M17.9 6.1l-1.8 1.8M7.9 16.1l-1.8 1.8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol><symbol id="icon-bell" viewBox="0 0 24 24"><path d="M6 10a6 6 0 0 1 12 0c0 3.8 1.5 5.3 1.5 5.3h-15S6 13.8 6 10Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M10 18.4a2.2 2.2 0 0 0 4 0" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol><symbol id="icon-bell-off" viewBox="0 0 24 24"><path d="M6 10a6 6 0 0 1 12 0c0 3.8 1.5 5.3 1.5 5.3h-15S6 13.8 6 10Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M10 18.4a2.2 2.2 0 0 0 4 0" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="m4.5 4.5 15 15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol><symbol id="icon-back" viewBox="0 0 24 24"><path d="m14 6-6 6 6 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M19.2 12a7.2 7.2 0 1 1-2.1-5.1M19.2 4.2v4h-4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="icon-panel" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M15 4.5v15" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M17.5 9h1.5M17.5 12h1.5M17.5 15h1.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol><symbol id="icon-atlas" viewBox="0 0 24 24"><path d="M5 5.5A2.5 2.5 0 0 1 7.5 3H19v15.5H7.5A2.5 2.5 0 0 0 5 21V5.5Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M5 18.5A2.5 2.5 0 0 1 7.5 16H19" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M9.5 7.5h5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol><symbol id="icon-send" viewBox="0 0 24 24"><path d="M4.03 11.61 19.6 4.15a.7.7 0 0 1 .92.9l-7.04 16.04a.7.7 0 0 1-1.3-.1l-1.9-5.32a.7.7 0 0 0-.44-.44l-5.72-2.7a.7.7 0 0 1-.1-1.28Z" fill="currentColor"/></symbol></svg></template>
+    <script type="module" src="./src/app.js?v=27"></script>
   </body>
 </html>

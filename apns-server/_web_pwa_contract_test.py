@@ -491,7 +491,7 @@ class WebPwaContractTest(unittest.TestCase):
         handler.state = types.SimpleNamespace(web_session_enabled=True, web_sessions=store)
         self.assertFalse(handler._web_session_matches())
         for path in (
-            "/tmux/sessions", "/uploads/private.bin", "/codex/status",
+            "/tmux/sessions", "/uploads/private.bin",
             "/admin/rotate-secret", "/tokens",
         ):
             handler.path = path
@@ -501,6 +501,67 @@ class WebPwaContractTest(unittest.TestCase):
             handler.path = path
             handler.command = "POST"
             self.assertFalse(handler._web_session_matches(), path)
+
+    def test_web_cookie_control_gate_allows_only_registered_paths(self):
+        store = WebSessionStore(300)
+        token, _expires_at = store.create()
+        csrf = store.csrf_token(token)
+        handler = self.handler("/xiaoke/status")
+        handler.headers = {"Cookie": f"__Host-cccompanion={token}"}
+        handler.state = types.SimpleNamespace(
+            web_session_enabled=True,
+            web_sessions=store,
+            public_server_url="https://pwa.example",
+            shared_secret="native-only",
+            strict_auth=True,
+        )
+        for path in (
+            "/xiaoke/status", "/xiaoke/preferences",
+            "/codex/status", "/codex/preferences",
+            "/kimi/status", "/kimi/preferences",
+            "/kiro/preferences",
+        ):
+            handler.path = path
+            handler.command = "GET"
+            self.assertTrue(handler._web_control_gate_matches(path), path)
+            self.assertTrue(handler._web_session_matches(), path)
+        # Reads beyond the registered set stay rejected.
+        for path in ("/xiaoke/instrument", "/kimi/quota", "/kiro/status", "/codex/sessions"):
+            handler.path = path
+            handler.command = "GET"
+            self.assertFalse(handler._web_control_gate_matches(path), path)
+        # Writes: only the four preferences POSTs, and only with origin+CSRF.
+        handler.headers = {
+            "Cookie": f"__Host-cccompanion={token}",
+            "Origin": "https://pwa.example",
+            "X-CC-Web-CSRF": csrf,
+        }
+        for path in (
+            "/xiaoke/preferences", "/codex/preferences",
+            "/kimi/preferences", "/kiro/preferences",
+        ):
+            handler.path = path
+            handler.command = "POST"
+            self.assertTrue(handler._web_control_gate_matches(path), path)
+            self.assertTrue(handler._web_session_matches(), path)
+        for path in ("/xiaoke/forge", "/codex/switch", "/kimi/abort", "/kiro/session/new"):
+            handler.path = path
+            handler.command = "POST"
+            self.assertFalse(handler._web_control_gate_matches(path), path)
+            self.assertFalse(handler._web_session_matches(), path)
+        # No cookie at all: never through the gate.
+        handler.headers = {}
+        handler.path = "/xiaoke/status"
+        handler.command = "GET"
+        self.assertFalse(handler._web_control_gate_matches("/xiaoke/status"))
+        self.assertFalse(handler._web_session_matches())
+        # Cookie but no CSRF on POST: route gate passes, write auth refuses.
+        handler.headers = {"Cookie": f"__Host-cccompanion={token}", "Origin": "https://pwa.example"}
+        handler.path = "/xiaoke/preferences"
+        handler.command = "POST"
+        self.assertTrue(handler._web_control_gate_matches("/xiaoke/preferences"))
+        self.assertFalse(handler._require_write_auth())
+        self.assertEqual(handler.responses[-1][0], 403)
 
     def test_kairos_chat_status_has_only_bounded_read_only_panels_when_idle_or_busy(self):
         handler = self.handler("/chat/status?contact_id=kairos")

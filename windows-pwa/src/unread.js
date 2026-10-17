@@ -61,11 +61,41 @@ export function unseenAssistant(records = [], lastSeenTs = '') {
   return (Array.isArray(records) ? records : []).filter((record) => record?.role === 'assistant' && String(record?.ts || '') > lastSeenTs);
 }
 
+/**
+ * Drop lines that are raw structured events or log noise, never human words.
+ * Group relays sometimes persist Codex event streams verbatim
+ * (`{"type":"thread.started",…}` JSONL, `… ERROR codex_rmcp_client…` logs);
+ * a contact preview must never surface that raw meat (Astra 2026-10-17).
+ */
+function isStructuredEventLine(line) {
+  const trimmed = line.trim();
+  if (!trimmed) return true;
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?\s/.test(trimmed)) return true;
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return false;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed !== null && typeof parsed === 'object';
+  } catch {
+    return false;
+  }
+}
+
+/** Human-readable residue of a record body; '' when nothing but events/logs. */
+export function humanPreviewText(body) {
+  return String(body || '')
+    .split('\n')
+    .filter((line) => !isStructuredEventLine(line))
+    .join(' ')
+    .replace(/```[\s\S]*?```/g, '[代码]')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 /** One-line contact list preview for the latest record. */
 export function previewText(record, { maxLength = 42 } = {}) {
   if (!record) return '';
   const prefix = record.role === 'user' ? '我: ' : '';
-  const body = String(record.body || '').replace(/```[\s\S]*?```/g, '[代码]').replace(/\s+/g, ' ').trim();
+  const body = humanPreviewText(record.body);
   if (!body && record.attachments?.length) return `${prefix}[附件] ${record.attachments[0].name}`;
   if (!body) return '';
   const clipped = body.length > maxLength ? `${body.slice(0, maxLength)}…` : body;

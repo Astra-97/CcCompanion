@@ -95,6 +95,71 @@ export const MOCK_PLUGINS = [
   { id: 'period-tracker', name: '经期记录', version: '0.9.1', description: '周期记录与预测', entry: 'index.html', builtin: false },
 ];
 
+// Control panel fixtures mirror the four provider payload shapes the web
+// session gate serves (/xiaoke|codex|kimi|kiro /status + /preferences).
+// kairos/kimi use reasoning_effort; xiaoke/kiro use effort; kiro folds its
+// status snapshot into the preferences GET (no separate status path).
+export const MOCK_CONTROL = {
+  xiaoke: {
+    status: {
+      ok: true, provider: 'Claude Code', model: 'Fable 5', model_id: 'claude-fable-5', effort: 'high',
+      busy: false, active_session_id: 'c7f2a1d0-4b6e-4f1a-9c2d-1e0a5b8c9d7e',
+      context: { available: true, used_percent: 38 },
+      quota: { windows: [
+        { label: '5 小时窗口', used_percent: 41, text: '41% 已用', reset_text: '2 小时后重置' },
+        { label: '7 天窗口', used_percent: 12, text: '12% 已用', reset_text: '10 月 20 日重置' },
+      ] },
+    },
+    preferences: {
+      ok: true, provider: 'Claude Code', model: 'Fable 5', effort: 'high',
+      available_models: ['Fable 5', 'Opus 4.5', 'Sonnet 4.5'],
+      available_efforts: ['low', 'medium', 'high'],
+      busy: false, applies_from: { model: 'Fable 5', effort: 'high' },
+    },
+  },
+  kairos: {
+    status: {
+      ok: true, model: 'gpt-5.5', reasoning_effort: 'high', busy: true,
+      active_session_id: '01a06f90-dea6-76d3-b8e4-e6d800361d09',
+      account: { label: 'ChatGPT', email: '' },
+      quota: { plan: 'Plus', windows: [{ label: '5h', used_percent: 22, text: '22% 已用', reset_text: '3 小时后重置' }] },
+      context: { used_percent: 57 },
+    },
+    preferences: {
+      ok: true, models: [
+        { id: 'gpt-5.5', supported_reasoning_efforts: ['low', 'medium', 'high', 'xhigh'] },
+        { id: 'gpt-5.5-codex', supported_reasoning_efforts: ['medium', 'high', 'xhigh'] },
+      ],
+      selection: { model: 'gpt-5.5', reasoning_effort: 'high' },
+      busy: true, applies_from: 'next_turn',
+    },
+  },
+  kimi: {
+    status: {
+      ok: true, provider: 'Kimi Code', model: 'kimi-for-coding', reasoning_effort: 'high', busy: false,
+      active_session_id: 'km-session-42',
+      context: { available: true, used_percent: 24, input_tokens: 48200, window_tokens: 200000, text: '48.2k / 200k tokens' },
+      quota: { text: '额度充足', windows: [] },
+    },
+    preferences: {
+      ok: true, provider: 'Kimi Code',
+      models: ['kimi-for-coding', 'kimi-k2'], available_models: ['kimi-for-coding', 'kimi-k2'],
+      available_efforts: ['low', 'high', 'max'],
+      selection: { model: 'kimi-for-coding', reasoning_effort: 'high' },
+      model: 'kimi-for-coding', reasoning_effort: 'high', busy: false,
+    },
+  },
+  kiro: {
+    preferences: {
+      ok: true, provider: 'Kiro',
+      available_models: ['kiro-auto', 'kiro-claude-sonnet'], available_efforts: ['low', 'medium', 'high'],
+      selection: { model: 'kiro-auto', effort: 'medium' },
+      model: 'kiro-auto', effort: 'medium', current_effort: 'medium', current_model: 'kiro-auto',
+      busy: false, context_usage_percent: 31, header_display: 'kiro-auto · medium',
+    },
+  },
+};
+
 export const INITIAL_CONVERSATIONS = {
   xiaoke: [
     { id: 'x1', role: 'assistant', body: '早。今天先把最烦的那一件收掉，别让它一直占着你的脑子。', time: '08:41' },

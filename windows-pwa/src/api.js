@@ -1,6 +1,6 @@
-import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY, MOCK_MEMORY_STATS, MOCK_MEMORY_CALENDAR_ENTRIES, MOCK_MEMORY_BOARD, MOCK_MEMORY_SEARCH, MOCK_PLUGINS, MOCK_TODOS, MOCK_WEATHER, MOCK_APPEARANCE } from './data.js?v=26';
-import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=26';
-import { normalizeStickerCatalog } from './sticker-protocol.js?v=26';
+import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY, MOCK_MEMORY_STATS, MOCK_MEMORY_CALENDAR_ENTRIES, MOCK_MEMORY_BOARD, MOCK_MEMORY_SEARCH, MOCK_PLUGINS, MOCK_TODOS, MOCK_WEATHER, MOCK_APPEARANCE, MOCK_CONTROL } from './data.js?v=27';
+import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=27';
+import { normalizeStickerCatalog } from './sticker-protocol.js?v=27';
 
 const clone = (value) => structuredClone(value);
 const now = () => new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
@@ -93,6 +93,103 @@ export function normalizeTerminal(raw) {
     return elapsedSeconds === null || !SAFE_OBSERVER_LABELS.has(label) ? null : { elapsedSeconds, label };
   }).filter(Boolean) : [];
   return { available, busy, phase: busy ? phase : (available ? 'idle' : 'unavailable'), events };
+}
+
+/**
+ * Control panel contract (2026-10-17): the App's per-contact sheet projected
+ * onto the PWA side rail.  The server gates exactly these paths for the web
+ * session cookie (WEB_CONTROL_* in push.py); every other provider endpoint
+ * stays native-only.  kairos posts `reasoning_effort`, xiaoke/kiro `effort`.
+ */
+const CONTROL_PROVIDERS = { xiaoke: 'Claude Code', kairos: 'Codex', kimi: 'Kimi Code', kiro: 'Kiro' };
+const CONTROL_PATHS = {
+  xiaoke: { status: '/xiaoke/status', preferences: '/xiaoke/preferences', effortField: 'effort' },
+  kairos: { status: '/codex/status', preferences: '/codex/preferences', effortField: 'reasoning_effort' },
+  kimi: { status: '/kimi/status', preferences: '/kimi/preferences', effortField: 'reasoning_effort' },
+  kiro: { status: '', preferences: '/kiro/preferences', effortField: 'effort' },
+};
+export function controlPanelSupported(contactId) { return Boolean(CONTROL_PATHS[contactId]); }
+
+/** Bounded plain text for panel rendering (nodes only ever get textContent). */
+const controlText = (value, maximum = 120) => String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, maximum);
+const controlPercent = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100 ? Math.round(value * 10) / 10 : null;
+
+function normalizeControlQuotaWindows(raw) {
+  const windows = Array.isArray(raw) ? raw : [];
+  return windows.slice(0, 4).map((item) => {
+    if (!item || typeof item !== 'object') return null;
+    const usedPercent = controlPercent(item.used_percent ?? item.usedPercent);
+    const label = controlText(item.label, 40);
+    if (usedPercent === null || !label) return null;
+    return { label, usedPercent, text: controlText(item.text, 60), resetText: controlText(item.reset_text ?? item.resetText ?? item.reset_label, 60) };
+  }).filter(Boolean);
+}
+
+/** Unified status projection: provider/busy/model/effort/session/context/quota. */
+export function normalizeControlStatus(contactId, raw = {}) {
+  const provider = CONTROL_PROVIDERS[contactId] || '';
+  const empty = { available: false, provider, busy: false, model: '', effort: '', sessionId: '', context: { available: false, usedPercent: null, text: '' }, quotaText: '', quotaWindows: [] };
+  if (!raw || typeof raw !== 'object' || !provider) return empty;
+  const sourceContext = raw.context && typeof raw.context === 'object' ? raw.context : {};
+  const sourceQuota = raw.quota && typeof raw.quota === 'object' ? raw.quota : {};
+  let model = ''; let effort = ''; let sessionId = ''; let contextText = ''; let contextPercent = controlPercent(sourceContext.used_percent ?? sourceContext.usedPercent);
+  let contextAvailable = sourceContext.available === true && contextPercent !== null;
+  if (contactId === 'kiro') {
+    // Kiro folds its live snapshot into the preferences GET.
+    const selection = raw.selection && typeof raw.selection === 'object' ? raw.selection : {};
+    model = controlText(selection.model || raw.model || raw.current_model, 80);
+    effort = controlText(selection.effort || raw.effort || raw.current_effort, 24);
+    contextPercent = controlPercent(raw.context_usage_percent);
+    contextAvailable = contextPercent !== null;
+  } else {
+    model = controlText(raw.model, 80);
+    effort = controlText(contactId === 'xiaoke' ? raw.effort : raw.reasoning_effort, 24);
+    sessionId = controlText(raw.active_session_id, 80);
+    contextText = controlText(sourceContext.text, 120);
+    if (contactId === 'kairos') contextAvailable = contextPercent !== null;
+  }
+  const quotaWindows = normalizeControlQuotaWindows(sourceQuota.windows);
+  const quotaText = controlText(sourceQuota.text ?? sourceQuota.plan ?? '', 120);
+  return {
+    available: raw.ok === true,
+    provider: controlText(raw.provider, 40) || provider,
+    busy: raw.busy === true,
+    model, effort, sessionId,
+    context: { available: contextAvailable, usedPercent: contextAvailable ? contextPercent : null, text: contextText },
+    quotaText, quotaWindows,
+  };
+}
+
+/** Unified preferences projection: current selection plus pick-lists. */
+export function normalizeControlPreferences(contactId, raw = {}) {
+  const provider = CONTROL_PROVIDERS[contactId] || '';
+  const empty = { available: false, provider, busy: false, model: '', effort: '', models: [], efforts: [], appliesFrom: '' };
+  if (!raw || typeof raw !== 'object' || !provider) return empty;
+  const selection = raw.selection && typeof raw.selection === 'object' ? raw.selection : {};
+  const rawModels = Array.isArray(raw.models) ? raw.models : (Array.isArray(raw.available_models) ? raw.available_models : []);
+  const models = rawModels.slice(0, 24).map((item) => {
+    if (typeof item === 'string') {
+      const id = controlText(item, 80);
+      return id ? { id, label: id, efforts: [] } : null;
+    }
+    if (!item || typeof item !== 'object') return null;
+    const id = controlText(item.id, 80);
+    if (!id) return null;
+    const efforts = (Array.isArray(item.supported_reasoning_efforts) ? item.supported_reasoning_efforts : []).map((effort) => controlText(effort, 24)).filter(Boolean).slice(0, 8);
+    return { id, label: controlText(item.label, 80) || id, efforts };
+  }).filter(Boolean);
+  const efforts = (Array.isArray(raw.available_efforts) ? raw.available_efforts : []).map((effort) => controlText(effort, 24)).filter(Boolean).slice(0, 8);
+  let appliesFrom = '';
+  if (typeof raw.applies_from === 'string') appliesFrom = controlText(raw.applies_from, 40);
+  else if (raw.applies_from && typeof raw.applies_from === 'object') appliesFrom = 'next_session';
+  return {
+    available: raw.ok === true,
+    provider: controlText(raw.provider, 40) || provider,
+    busy: raw.busy === true,
+    model: controlText(selection.model || raw.model, 80),
+    effort: controlText(selection.reasoning_effort || selection.effort || raw.reasoning_effort || raw.effort, 24),
+    models, efforts, appliesFrom,
+  };
 }
 
 export function normalizeRecord(record = {}) {
@@ -429,6 +526,26 @@ export function createHttpAdapter({ baseUrl = '', request = defaultRequest, uplo
       return call(url('/chat/stop'), { method: 'POST', body });
     },
     async getStickerCatalog() { return normalizeStickerCatalog(await call(url('/stickers/catalog'))); },
+    // Control panel: only the per-provider paths the web cookie is gated to.
+    async getControlStatus(contactId) {
+      const paths = CONTROL_PATHS[contactId];
+      if (!paths) return normalizeControlStatus(contactId, null);
+      return normalizeControlStatus(contactId, await call(url(paths.status || paths.preferences)));
+    },
+    async getControlPreferences(contactId) {
+      const paths = CONTROL_PATHS[contactId];
+      if (!paths) return normalizeControlPreferences(contactId, null);
+      return normalizeControlPreferences(contactId, await call(url(paths.preferences)));
+    },
+    async saveControlPreferences(contactId, { model, effort } = {}) {
+      const paths = CONTROL_PATHS[contactId];
+      if (!paths) throw new Error('此联系人没有控制面板');
+      const body = {};
+      if (model) body.model = model;
+      if (effort) body[paths.effortField] = effort;
+      if (!Object.keys(body).length) throw new Error('没有要应用的偏好变更');
+      return call(url(paths.preferences), { method: 'POST', body });
+    },
     async uploadSticker(file, { name, categoryId, newCategoryName, signal, onProgress } = {}) {
       const query = new URLSearchParams({ name, filename: resolveAttachmentFilename(file, 0) || 'sticker.png', ...(categoryId ? { category_id: categoryId } : { new_category_name: newCategoryName }) });
       return upload(url(`/stickers/upload?${query}`), { body: file, signal, credentials: 'same-origin', cache: 'no-store', headers: { 'Content-Type': file.type, ...(csrfToken ? { 'X-CC-Web-CSRF': csrfToken } : {}) }, onProgress });
@@ -675,6 +792,29 @@ export function createMockAdapter() {
       states[contactId] = normalizeLiveState({ reply_state: 'idle', status_text: '已停止' }); emitState(contactId);
     },
     async getTaxonomy() { return clone(MOCK_TAXONOMY); },
+    async getControlStatus(contactId) {
+      const fixture = MOCK_CONTROL[contactId];
+      return normalizeControlStatus(contactId, fixture ? clone(fixture.status || fixture.preferences) : null);
+    },
+    async getControlPreferences(contactId) {
+      const fixture = MOCK_CONTROL[contactId];
+      return normalizeControlPreferences(contactId, fixture ? clone(fixture.preferences) : null);
+    },
+    async saveControlPreferences(contactId, { model, effort } = {}) {
+      const fixture = MOCK_CONTROL[contactId];
+      if (!fixture) throw new Error('此联系人没有控制面板');
+      if (!model && !effort) throw new Error('没有要应用的偏好变更');
+      const preferences = fixture.preferences;
+      const selection = preferences.selection && typeof preferences.selection === 'object' ? preferences.selection : null;
+      if (model) { if (selection) selection.model = model; preferences.model = model; if (fixture.status) fixture.status.model = model; }
+      if (effort) {
+        const field = contactId === 'kairos' || contactId === 'kimi' ? 'reasoning_effort' : 'effort';
+        if (selection) selection[field === 'effort' ? 'effort' : 'reasoning_effort'] = effort;
+        preferences[field] = effort;
+        if (fixture.status) fixture.status[field] = effort;
+      }
+      return { ok: true, mock: true };
+    },
     async getStickerCatalog() { return normalizeStickerCatalog({ version: 'mock', categories: [{ id: 'common', name: '常用' }], stickers: [{ name: '爱', label: '爱', category_id: 'common', url: 'https://test.xiaonancaleb.xyz/stickers/%E7%88%B1.gif' }], upload: { supported: true, max_file_bytes: 8388608, content_types: ['image/png', 'image/jpeg', 'image/gif', 'image/webp'], max_name_chars: 80 } }); },
     async uploadSticker() { throw new Error('mock upload unavailable'); },
     async listMemories({ category, subcategory }) { return clone(MOCK_MEMORIES[subcategory || category] || [{ title: '暂时没有可展示的条目', body: '此分类已从 taxonomy 读取。', timestamp: '—' }]); },
