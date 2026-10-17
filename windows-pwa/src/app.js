@@ -1,16 +1,16 @@
-import { createPwaBootstrap } from './bootstrap.js?v=18';
-import { createComposerState } from './composer-state.js?v=18';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=18';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=18';
-import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=18';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=18';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=18';
-import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=18';
-import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=18';
-import { createNotifier } from './notifications.js?v=18';
-import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=18';
+import { createPwaBootstrap } from './bootstrap.js?v=19';
+import { createComposerState } from './composer-state.js?v=19';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=19';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=19';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=19';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=19';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=19';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=19';
+import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=19';
+import { createNotifier } from './notifications.js?v=19';
+import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=19';
 
-const WEB_SHELL_VERSION = 'desk-v18 · 2026-10-17';
+const WEB_SHELL_VERSION = 'desk-v19 · 2026-10-17';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
