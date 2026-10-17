@@ -1,17 +1,17 @@
-import { createPwaBootstrap } from './bootstrap.js?v=22';
-import { createComposerState } from './composer-state.js?v=22';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=22';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=22';
-import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=22';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=22';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=22';
-import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=22';
-import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=22';
-import { createNotifier } from './notifications.js?v=22';
-import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=22';
-import { clockText, greetingFor, weekStrip } from './home-dashboard.js?v=22';
+import { createPwaBootstrap } from './bootstrap.js?v=23';
+import { createComposerState } from './composer-state.js?v=23';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=23';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=23';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=23';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=23';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=23';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=23';
+import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=23';
+import { createNotifier } from './notifications.js?v=23';
+import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=23';
+import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=23';
 
-const WEB_SHELL_VERSION = 'desk-v22 · 2026-10-17';
+const WEB_SHELL_VERSION = 'desk-v23 · 2026-10-17';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -36,10 +36,27 @@ const state = {
   unread: createUnreadStore(), notifier: createNotifier(), messageNodes: new Map(), stopBackground: null, backgroundPollInFlight: false,
   view: 'chat', mobileChatOpen: false, stopTerminalPoll: null, terminalSnapshots: {}, plugins: null, pluginsError: false,
   memory: { loading: false, stats: null, segment: 'memories', month: monthKey(), days: {}, selectedDate: '', boardPage: 1, boardLoaded: false },
+  dash: { appearance: { nicknames: {}, avatars: {} }, todos: null, weather: null, weatherFailed: false },
 };
 const contactList = $('#contact-list'); const messages = $('#message-list'); const input = $('#message-input');
+const HOME_DEFAULT_CITY = '北京'; // Android HomeDashboardPolicy.HOME_DEFAULT_CITY
+const DASH_DATA_INTERVAL_MS = 15 * 60_000;
 
 function contact() { return state.contacts.find(({ id }) => id === state.activeContactId) || { id: '', name: '连接中', channel: 'PRIVATE CHANNEL', note: '', capabilities: [] }; }
+/** Server nickname overrides win over the contacts payload (App parity). */
+function displayNameOf(item) { return state.dash.appearance.nicknames[item?.id] || item?.name || ''; }
+function avatarUriOf(id) { return state.dash.appearance.avatars[id] || ''; }
+/** Round avatar: server image when allowed, first-character fallback otherwise. */
+function avatarFace(item, accent) {
+  const face = el('span', { class: `avatar ${accent}` });
+  const uri = avatarUriOf(item.id);
+  if (uri) {
+    const img = el('img', { class: 'avatar-img', src: uri, alt: '', loading: 'lazy', decoding: 'async' });
+    img.addEventListener('error', () => { img.remove(); face.textContent = displayNameOf(item).slice(0, 1) || '·'; }, { once: true });
+    face.append(img);
+  } else face.textContent = displayNameOf(item).slice(0, 1) || '·';
+  return face;
+}
 function isBusy(id = state.activeContactId) { const live = state.live[id]; return Boolean(live?.busy || ['generating', 'queued'].includes(live?.replyState)); }
 function composer(id = state.activeContactId) { return state.composerState.get(id); }
 function sendOperation(id = state.activeContactId) { return state.composerState.current(id); }
@@ -64,9 +81,10 @@ function renderContacts() {
     const history = state.histories[item.id] || [];
     const unread = item.id === state.activeContactId ? 0 : state.unread.unreadFor(item.id, history);
     const preview = previewText(history.at(-1)) || item.note;
+    const name = displayNameOf(item);
     const button = el('button', { class: `contact-button ${item.id === state.activeContactId ? 'is-active' : ''}`, type: 'button', 'aria-current': item.id === state.activeContactId ? 'page' : 'false' });
     const accent = item.id === 'kairos' ? 'brass' : 'oxide';
-    button.append(el('span', { class: `avatar ${accent}`, text: item.name.slice(0, 1) }), el('span', { class: 'contact-copy' }, [el('strong', { text: item.name }), el('small', { class: 'contact-preview', text: preview })]));
+    button.append(avatarFace(item, accent), el('span', { class: 'contact-copy' }, [el('strong', { text: name }), el('small', { class: 'contact-preview', text: preview })]));
     if (unread > 0) button.append(el('span', { class: 'unread-badge', text: unread > 99 ? '99+' : String(unread), 'aria-label': `${unread} 条未读消息` }));
     button.append(el('span', { class: `contact-led ${busy ? 'is-busy' : ''}`, 'aria-label': busy ? '正在处理' : '待命' }));
     button.addEventListener('click', () => switchContact(item.id)); return button;
@@ -125,6 +143,32 @@ function renderDashboard() {
     el('small', { text: day.weekday }),
     el('span', { class: `dash-week-day${day.isToday ? ' is-today' : ''}`, text: String(day.day) }),
   ])));
+  const weather = state.dash.weather;
+  const placeChip = $('#dash-weather-place');
+  placeChip.hidden = !weather?.place;
+  placeChip.textContent = weather?.place || '';
+  $('#dash-weather').textContent = weather ? `${weather.temperatureC}° ${weather.label}`.trim() : (state.dash.weatherFailed ? '天气暂不可用' : '天气读取中…');
+  const feed = todoFeed(state.dash.todos || [], now);
+  $('#dash-todo-summary').textContent = feed.title;
+  const todoList = $('#dash-todo-list');
+  if (!feed.total) todoList.replaceChildren(el('li', { class: 'dash-todo-empty', text: state.dash.todos === null ? '待办读取中…' : '今天没有待办' }));
+  else todoList.replaceChildren(...feed.items.map((item) => el('li', { class: `dash-todo-item${item.done ? ' is-done' : ''}` }, [
+    el('span', { class: 'dash-todo-check', 'aria-hidden': 'true' }),
+    el('span', { class: 'dash-todo-text', text: item.text }),
+    el('span', { class: 'dash-todo-due', text: item.dueLabel }),
+  ])));
+}
+async function loadDashAppearance() {
+  try {
+    state.dash.appearance = await adapter.getDashAppearance();
+    renderContacts(); renderChatListPage(); renderHeader();
+  } catch { /* nickname/avatar overrides stay empty; contacts payload names remain */ }
+}
+async function loadDashData() {
+  try { state.dash.weather = await adapter.getWeather({ city: HOME_DEFAULT_CITY }); state.dash.weatherFailed = !state.dash.weather; }
+  catch { state.dash.weatherFailed = true; }
+  try { state.dash.todos = await adapter.getTodos(); } catch { state.dash.todos = state.dash.todos ?? []; }
+  renderDashboard();
 }
 function renderChatListPage() {
   renderDashboard();
@@ -134,11 +178,12 @@ function renderChatListPage() {
     const history = state.histories[item.id] || [];
     const unread = state.unread.unreadFor(item.id, history);
     const accent = item.id === 'kairos' ? 'brass' : 'oxide';
-    const button = el('button', { type: 'button', class: 'chat-card', 'aria-label': `打开与 ${item.name} 的对话` });
-    const face = el('span', { class: 'chat-card-face' }, [el('span', { class: `avatar ${accent}`, text: item.name.slice(0, 1) })]);
+    const name = displayNameOf(item);
+    const button = el('button', { type: 'button', class: 'chat-card', 'aria-label': `打开与 ${name} 的对话` });
+    const face = el('span', { class: 'chat-card-face' }, [avatarFace(item, accent)]);
     if (unread > 0) face.append(el('span', { class: 'unread-badge', text: unread > 99 ? '99+' : String(unread), 'aria-label': `${unread} 条未读消息` }));
     face.append(el('span', { class: `contact-led ${busy ? 'is-busy' : ''}`, 'aria-label': busy ? '正在处理' : '待命' }));
-    button.append(face, el('strong', { text: item.name }));
+    button.append(face, el('strong', { text: name }));
     button.addEventListener('click', () => openMobileChat(item.id));
     return button;
   }));
@@ -146,12 +191,19 @@ function renderChatListPage() {
 function renderHeader() {
   const current = contact(); const live = state.live[current.id] || { replyState: 'idle', statusText: '待命', workers: [] };
   const sending = Boolean(sendOperation(current.id));
-  $('#contact-name').textContent = current.name; $('#contact-mode').textContent = current.channel;
+  const name = displayNameOf(current) || current.name;
+  $('#contact-name').textContent = name; $('#contact-mode').textContent = current.channel;
   const headerAvatar = $('#contact-avatar');
-  headerAvatar.textContent = (current.name || '克').slice(0, 1);
   headerAvatar.className = `avatar contact-avatar ${current.id === 'kairos' ? 'brass' : 'oxide'}`;
+  headerAvatar.replaceChildren();
+  const headerAvatarUri = avatarUriOf(current.id);
+  if (headerAvatarUri) {
+    const img = el('img', { class: 'avatar-img', src: headerAvatarUri, alt: '', decoding: 'async' });
+    img.addEventListener('error', () => { img.remove(); headerAvatar.textContent = (name || '克').slice(0, 1); }, { once: true });
+    headerAvatar.append(img);
+  } else headerAvatar.textContent = (name || '克').slice(0, 1);
   $('#contact-status').textContent = live.statusText || '待命';
-  input.placeholder = `写给${current.name}…`; $('#connection-state').textContent = isBusy() ? (live.statusText || '正在处理') : '已连接';
+  input.placeholder = `写给${name}…`; $('#connection-state').textContent = isBusy() ? (live.statusText || '正在处理') : '已连接';
   $('#signal-dot').classList.toggle('is-busy', isBusy());
   // The stop key tracks the busy turn itself: visible the moment a send goes
   // optimistic-busy, armed only once the server provides its stop fence.
@@ -172,7 +224,7 @@ function formatTokens(value) { return value >= 1_000_000 ? `${(value / 1_000_000
 function renderInstrument() {
   const live = state.live[state.activeContactId] || {}; const instrument = live.instrument;
   const supportsInstrument = ['kairos', 'xiaoke'].includes(state.activeContactId);
-  $('#instrument-contact').textContent = instrument?.provider || `${contact().name} / ${contact().channel === 'CODEX APP' ? 'Kairos' : 'CC'}`;
+  $('#instrument-contact').textContent = instrument?.provider || `${displayNameOf(contact()) || contact().name} / ${contact().channel === 'CODEX APP' ? 'Kairos' : 'CC'}`;
   $('#instrument-status').textContent = live.statusText || '待命';
   const model = supportsInstrument && instrument?.model ? instrument.model : '不可用';
   const effort = supportsInstrument && instrument?.effort ? instrument.effort : '—';
@@ -280,7 +332,7 @@ function messageSignature(message) {
 }
 function buildMessageNode(item, message) {
   item.className = `message ${message.role === 'user' ? 'from-user' : 'from-assistant'}`;
-  const meta = el('div', { class: 'message-meta' }, [el('span', { text: message.role === 'user' ? 'ASTRA' : contact().name.toUpperCase() }), el('time', { text: message.time || '刚刚' })]);
+  const meta = el('div', { class: 'message-meta' }, [el('span', { text: message.role === 'user' ? 'ASTRA' : (displayNameOf(contact()) || contact().name).toUpperCase() }), el('time', { text: message.time || '刚刚' })]);
   const rendered = renderMessageBody(message); item.classList.toggle('has-sticker-only', rendered.standalone);
   const children = [meta];
   if (message.role === 'assistant' && (message.thinking || message.thinkingOriginal)) children.push(renderThinking(message));
@@ -328,7 +380,7 @@ function renderMessages({ forceLatest = false } = {}) {
 }
 function createTypingBubble() {
   const item = el('li', { class: 'message from-assistant typing-bubble', 'data-contact-id': state.activeContactId, 'aria-hidden': 'true' });
-  const meta = el('div', { class: 'message-meta' }, [el('span', { text: contact().name.toUpperCase() }), el('time', { text: '现在' })]);
+  const meta = el('div', { class: 'message-meta' }, [el('span', { text: (displayNameOf(contact()) || contact().name).toUpperCase() }), el('time', { text: '现在' })]);
   const body = el('p', { class: 'message-body typing-bubble-body' });
   body.append(el('span', { class: 'typing-dots', 'aria-hidden': 'true' }, [el('i'), el('i'), el('i')]));
   item.append(meta, body);
@@ -587,10 +639,11 @@ function renderTerminalPage() {
     const terminal = live?.terminal || { available: false, busy: false, phase: 'unavailable', events: [] };
     const status = !live ? '读取失败，下一次轮询重试' : !terminal.available ? '观察器暂不可用' : terminal.busy ? terminal.phase : '空闲 · 没有正在运行的安全事件';
     const accent = item.id === 'kairos' ? 'brass' : 'oxide';
+    const name = displayNameOf(item);
     const card = el('article', { class: 'glass-card terminal-page-card' });
-    card.append(el('div', { class: 'terminal-page-head' }, [el('span', { class: `avatar ${accent}`, text: item.name.slice(0, 1) }), el('div', {}, [el('strong', { text: item.name }), el('small', { text: item.channel })])]));
+    card.append(el('div', { class: 'terminal-page-head' }, [avatarFace(item, accent), el('div', {}, [el('strong', { text: name }), el('small', { text: item.channel })])]));
     card.append(el('p', { class: 'terminal-status', text: status }));
-    const events = el('ol', { class: 'terminal-events', 'aria-label': `${item.name} 的只读终端观察事件` });
+    const events = el('ol', { class: 'terminal-events', 'aria-label': `${name} 的只读终端观察事件` });
     terminal.events.forEach((event) => {
       const row = el('li');
       row.append(el('time', { text: `${String(Math.floor(event.elapsedSeconds / 60)).padStart(2, '0')}:${String(event.elapsedSeconds % 60).padStart(2, '0')}` }), el('span', { text: event.label }));
@@ -621,7 +674,7 @@ function renderPlugins() {
 function notifyNewMessages(contactId, records) {
   const fresh = unseenAssistant(records, state.unread.lastSeen(contactId));
   if (!fresh.length) return;
-  const name = state.contacts.find(({ id }) => id === contactId)?.name || contactId;
+  const name = displayNameOf(state.contacts.find(({ id }) => id === contactId)) || contactId;
   fresh.slice(-3).forEach((record) => state.notifier.notify({
     contactId, title: name, body: previewText(record, { maxLength: 80 }),
     onOpen: (target) => { if (state.view !== 'chat') switchView('chat'); if (homeQuery.matches) { state.mobileChatOpen = true; syncView(); } void switchContact(target); },
@@ -848,12 +901,15 @@ $('#board-prev').addEventListener('click', () => void loadMemoryBoard(state.memo
 $('#board-next').addEventListener('click', () => void loadMemoryBoard(state.memory.boardPage + 1));
 $('#open-memory-card').addEventListener('click', openMemory);
 $('#dash-full-calendar').addEventListener('click', openMemory);
+const goHomeDashboard = () => { state.mobileChatOpen = false; switchView('chat'); };
+$('#open-weather-card').addEventListener('click', goHomeDashboard);
+$('#open-todos-card').addEventListener('click', goHomeDashboard);
 $('#settings-appearance-button').addEventListener('click', cycleAppearance);
 $('#settings-notification-button').addEventListener('click', toggleNotifications);
 $('#settings-logout-button').addEventListener('click', logout);
 $('#settings-version').textContent = WEB_SHELL_VERSION;
 homeQuery.addEventListener('change', () => { if (!homeQuery.matches) state.mobileChatOpen = false; syncView(); });
-async function logout() { state.epoch += 1; state.stickerLoadId += 1; state.composerState.cancelAll(); state.stickerUpload.controller?.abort(); state.stickerUpload.uploading = false; closeStickerDialog(); state.stickerCatalog = null; state.stickerLoading = false; state.stickerError = ''; state.stickerSearch = ''; state.stickerCategory = '__all'; state.stickerTargetContactId = ''; try { await adapter.logout(); } finally { state.stopLive?.(); state.stopLive = null; state.stopBackground?.(); state.stopBackground = null; stopTerminalPolling(); state.terminalSnapshots = {}; state.plugins = null; state.pluginsError = false; state.contacts = []; state.histories = {}; state.live = {}; state.streams = {}; state.pendingCanonical = {}; state.messageNodes.clear(); messages.replaceChildren(); state.composerState = createComposerState(); state.activeContactId = ''; state.view = 'chat'; state.mobileChatOpen = false; state.taxonomy = null; state.selectedScope = null; state.memory = { loading: false, stats: null, segment: 'memories', month: monthKey(), days: {}, selectedDate: '', boardPage: 1, boardLoaded: false }; renderAll(); setMemorySegment('memories'); renderMemorySubtitle(); renderPlugins(); syncView(); if (!bootstrap.mock) showLogin(); } }
+async function logout() { state.epoch += 1; state.stickerLoadId += 1; state.composerState.cancelAll(); state.stickerUpload.controller?.abort(); state.stickerUpload.uploading = false; closeStickerDialog(); state.stickerCatalog = null; state.stickerLoading = false; state.stickerError = ''; state.stickerSearch = ''; state.stickerCategory = '__all'; state.stickerTargetContactId = ''; try { await adapter.logout(); } finally { state.stopLive?.(); state.stopLive = null; state.stopBackground?.(); state.stopBackground = null; stopTerminalPolling(); state.terminalSnapshots = {}; state.plugins = null; state.pluginsError = false; state.contacts = []; state.histories = {}; state.live = {}; state.streams = {}; state.pendingCanonical = {}; state.messageNodes.clear(); messages.replaceChildren(); state.composerState = createComposerState(); state.activeContactId = ''; state.view = 'chat'; state.mobileChatOpen = false; state.taxonomy = null; state.selectedScope = null; state.memory = { loading: false, stats: null, segment: 'memories', month: monthKey(), days: {}, selectedDate: '', boardPage: 1, boardLoaded: false }; state.dash = { appearance: { nicknames: {}, avatars: {} }, todos: null, weather: null, weatherFailed: false }; renderAll(); setMemorySegment('memories'); renderMemorySubtitle(); renderPlugins(); syncView(); if (!bootstrap.mock) showLogin(); } }
 $('#logout-button').addEventListener('click', logout); $('#drawer-logout-button').addEventListener('click', logout);
 $('#appearance-button').addEventListener('click', cycleAppearance); $('#drawer-appearance-button').addEventListener('click', cycleAppearance);
 $('#notification-button').addEventListener('click', toggleNotifications);
@@ -863,7 +919,7 @@ window.addEventListener('beforeinstallprompt', (event) => { event.preventDefault
 workerDrawerQuery.addEventListener('change', syncWorkerPanel); syncWorkerPanel(); document.body.append($('#svg-defs').content.cloneNode(true)); if ('serviceWorker' in navigator) { let swReloaded = false; navigator.serviceWorker.addEventListener('controllerchange', () => { if (swReloaded) return; swReloaded = true; location.reload(); }); window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js')); }
 async function start() {
   try { await bootstrap.checkSession(); } catch (error) { if (!bootstrap.mock) { showLogin(); return; } }
-  try { state.contacts = await adapter.contacts(); if (!state.contacts.length) throw new Error('没有可用联系人'); state.activeContactId = state.contacts.find(({ id }) => id === 'xiaoke')?.id || state.contacts[0].id; state.contacts.forEach(({ id }) => { state.histories[id] = []; state.live[id] = { replyState: 'idle', statusText: '待命', workers: [] }; composer(id); state.followLatest[id] = true; }); await Promise.all(state.contacts.map(({ id }) => refreshContact(id))); seedUnreadCursors(state.unread, state.histories); markActiveSeen(); watchLive(state.activeContactId); state.stopBackground?.(); state.stopBackground = startBackgroundPolling(); syncNotificationButton(); renderAll({ forceLatest: true }); syncView(); void loadStickerCatalog(); }
+  try { state.contacts = await adapter.contacts(); if (!state.contacts.length) throw new Error('没有可用联系人'); state.activeContactId = state.contacts.find(({ id }) => id === 'xiaoke')?.id || state.contacts[0].id; state.contacts.forEach(({ id }) => { state.histories[id] = []; state.live[id] = { replyState: 'idle', statusText: '待命', workers: [] }; composer(id); state.followLatest[id] = true; }); await Promise.all(state.contacts.map(({ id }) => refreshContact(id))); seedUnreadCursors(state.unread, state.histories); markActiveSeen(); watchLive(state.activeContactId); state.stopBackground?.(); state.stopBackground = startBackgroundPolling(); syncNotificationButton(); renderAll({ forceLatest: true }); syncView(); void loadStickerCatalog(); void loadDashAppearance(); void loadDashData(); }
   catch (error) { $('#connection-state').textContent = '连接不可用'; console.warn('PWA bootstrap failed', error); }
   // Screenshot/dev hook, mock sessions only: ?view=terminal|apps|settings|memory
   // lands directly on a page, and &chat=open pretends a conversation is open.
@@ -895,4 +951,4 @@ function showLogin() {
   });
   $('#login-form').addEventListener('submit', async (event) => { event.preventDefault(); const submit = $('#login-submit'); const error = $('#login-error'); submit.disabled = true; error.textContent = ''; try { await bootstrap.establishSession({ username: $('#login-username').value, password: $('#login-password').value }); panel.hidden = true; await start(); } catch { error.textContent = '登录未通过，请检查账号或连接。'; } finally { $('#login-password').value = ''; submit.disabled = false; } });
 }
-renderAll(); syncView(); start(); setInterval(renderDashboard, 30_000);
+renderAll(); syncView(); start(); setInterval(renderDashboard, 30_000); setInterval(() => void loadDashData(), DASH_DATA_INTERVAL_MS);

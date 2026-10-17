@@ -1,6 +1,6 @@
-import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY, MOCK_MEMORY_STATS, MOCK_MEMORY_CALENDAR_ENTRIES, MOCK_MEMORY_BOARD, MOCK_MEMORY_SEARCH, MOCK_PLUGINS } from './data.js?v=22';
-import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=22';
-import { normalizeStickerCatalog } from './sticker-protocol.js?v=22';
+import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY, MOCK_MEMORY_STATS, MOCK_MEMORY_CALENDAR_ENTRIES, MOCK_MEMORY_BOARD, MOCK_MEMORY_SEARCH, MOCK_PLUGINS, MOCK_TODOS, MOCK_WEATHER, MOCK_APPEARANCE } from './data.js?v=23';
+import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=23';
+import { normalizeStickerCatalog } from './sticker-protocol.js?v=23';
 
 const clone = (value) => structuredClone(value);
 const now = () => new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
@@ -320,6 +320,59 @@ export function normalizeContact(contact = {}) {
   };
 }
 
+/** /todos sections projection: keep only the fields the dashboard reads. */
+export function normalizeTodoSections(raw = {}) {
+  const sections = Array.isArray(raw?.sections) ? raw.sections : [];
+  return sections.map((section) => ({
+    section: String(section?.section || '').slice(0, 60),
+    source: String(section?.source || '').slice(0, 40),
+    items: (Array.isArray(section?.items) ? section.items : []).map((item) => ({
+      text: String(item?.text || '').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 300),
+      done: item?.done === true,
+      time: typeof item?.time === 'string' && /^([01]?\d|2[0-3]):[0-5]\d$/.test(item.time) ? item.time : '',
+      dueDate: typeof item?.dueDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(item.dueDate) ? item.dueDate : '',
+      eventId: String(item?.event_id || '').slice(0, 128),
+    })).filter((item) => item.text),
+  }));
+}
+
+/**
+ * Appearance subset from /plugins/xiaonan-dash/appearance: nickname overrides
+ * plus same-origin flat avatar URIs only — the server already sanitizes, this
+ * is defense-in-depth at the client boundary.
+ */
+export function normalizeDashAppearance(raw = {}) {
+  const cleanMap = (value) => (value && typeof value === 'object' && !Array.isArray(value) ? value : {});
+  const nicknames = {};
+  Object.entries(cleanMap(raw?.contact_nicknames)).forEach(([key, value]) => {
+    const id = String(key).slice(0, 64);
+    const name = String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 60);
+    if (id && name) nicknames[id] = name;
+  });
+  const avatars = {};
+  Object.entries(cleanMap(raw?.contact_avatar_uris)).forEach(([key, value]) => {
+    const id = String(key).slice(0, 64);
+    const uri = String(value ?? '');
+    const match = /^\/appearance-assets\/([^/\\]+)$/.exec(uri);
+    if (id && match && !match[1].startsWith('.') && !match[1].includes('..')) avatars[id] = uri;
+  });
+  return { nicknames, avatars };
+}
+
+/** Weather proxy payload → { place, temperatureC, weatherCode, label } | null. */
+export function normalizeWeather(raw = {}) {
+  const temperature = Number(raw?.temperature_c);
+  if (!Number.isFinite(temperature)) return null;
+  const code = Number(raw?.weather_code);
+  const place = raw?.place && typeof raw.place === 'object' ? raw.place : {};
+  return {
+    place: String(place.name || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 60),
+    temperatureC: Math.round(temperature),
+    weatherCode: Number.isInteger(code) ? code : -1,
+    label: String(raw?.label || '').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 24),
+  };
+}
+
 export function createHttpAdapter({ baseUrl = '', request = defaultRequest, upload = browserUpload, clock = globalThis, visibility = globalThis.document, eventSourceFactory = globalThis.EventSource ? (target) => new globalThis.EventSource(target) : null, network = globalThis } = {}) {
   const url = (path) => `${baseUrl.replace(/\/$/, '')}${path}`;
   let csrfToken = '';
@@ -438,6 +491,15 @@ export function createHttpAdapter({ baseUrl = '', request = defaultRequest, uplo
     async listPlugins() {
       const result = await call(url('/plugins'));
       return (Array.isArray(result?.plugins) ? result.plugins : []).map(normalizePlugin).filter(Boolean);
+    },
+    async getTodos() { return normalizeTodoSections(await call(url('/todos'))); },
+    async getDashAppearance() { return normalizeDashAppearance(await call(url('/plugins/xiaonan-dash/appearance'))); },
+    async getWeather({ city = '', lat = null, lon = null } = {}) {
+      const query = new URLSearchParams();
+      if (city) query.set('city', String(city).slice(0, 80));
+      else if (lat !== null && lat !== undefined && lon !== null && lon !== undefined) { query.set('lat', String(lat)); query.set('lon', String(lon)); }
+      else throw new Error('city or lat+lon required');
+      return normalizeWeather(await call(url(`/plugins/xiaonan-dash/weather?${query}`)));
     },
     async uploadAttachments(contactId, files, { signal, onProgress } = {}) {
       if (files.length > uploadLimits.max_pending_files) throw new Error(`一次最多上传 ${uploadLimits.max_pending_files} 个文件`);
@@ -634,6 +696,18 @@ export function createMockAdapter() {
     },
     async getMemoryBoard({ page = 1 } = {}) { const result = clone(MOCK_MEMORY_BOARD); result.pagination.page = Math.max(1, Number(page) || 1); return result; },
     async listPlugins() { return clone(MOCK_PLUGINS); },
+    async getTodos() {
+      const fixture = clone(MOCK_TODOS);
+      const pad = (value) => String(value).padStart(2, '0');
+      const dayKey = (offset) => { const d = new Date(); d.setDate(d.getDate() + offset); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
+      fixture.sections.forEach((section) => section.items.forEach((item) => {
+        if (item.dueDate === '__TODAY__') item.dueDate = dayKey(0);
+        if (item.dueDate === '__TOMORROW__') item.dueDate = dayKey(1);
+      }));
+      return normalizeTodoSections(fixture);
+    },
+    async getDashAppearance() { return normalizeDashAppearance(clone(MOCK_APPEARANCE)); },
+    async getWeather() { return normalizeWeather(clone(MOCK_WEATHER)); },
     async uploadAttachments(_contactId, files, { onProgress } = {}) { return files.map((file, index) => { onProgress?.({ index, totalFiles: files.length, loaded: file.size, total: file.size, file }); return { attachment_id: `mock-${crypto.randomUUID()}`, filename: file.name, type: file.type || 'file', size: file.size }; }); },
     async cancelUploads() { return { ok: true, canceled: 0 }; },
     subscribe(listener, { contactId } = {}) {

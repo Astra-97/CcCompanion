@@ -133,3 +133,42 @@ export function weekStrip(date = new Date()) {
   }
   return { title: `${monday.getFullYear()}年${monday.getMonth() + 1}月`, days };
 }
+
+/**
+ * Literal translation of the Android HomeDashboardPolicy.homeTodoFeed():
+ * keep schedule-sourced items due today, unfinished first, then by time
+ * (all-day last), then by text.  Returns { title, total, doneCount, items }
+ * where each item carries its dueLabel ('今天 周六 · 14:00' or '全天').
+ */
+export function todoFeed(sections = [], date = new Date()) {
+  const pad = (value) => String(value).padStart(2, '0');
+  const today = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  const items = [];
+  (Array.isArray(sections) ? sections : []).forEach((section) => {
+    const fromSchedule = section?.source === 'schedule';
+    (Array.isArray(section?.items) ? section.items : []).forEach((item) => {
+      if (!(fromSchedule || item?.eventId)) return;
+      if (String(item?.dueDate || '') !== today) return;
+      items.push({ text: String(item.text || ''), done: item.done === true, time: String(item.time || ''), eventId: String(item.eventId || '') });
+    });
+  });
+  items.sort((a, b) => {
+    if (a.done !== b.done) return a.done ? 1 : -1;
+    // Empty time (all-day) sorts after timed items, matching the Android
+    // comparator where a null time loses to any HH:MM.
+    const timeA = a.time || '99:99'; const timeB = b.time || '99:99';
+    if (timeA !== timeB) return timeA < timeB ? -1 : 1;
+    return a.text.localeCompare(b.text, 'zh-CN');
+  });
+  const doneCount = items.filter((item) => item.done).length;
+  const weekday = WEEKDAY_ZH[date.getDay()];
+  return {
+    title: items.length ? `今日待办 · ${doneCount}/${items.length} 已完成` : '今日待办',
+    total: items.length,
+    doneCount,
+    items: items.map((item) => ({
+      ...item,
+      dueLabel: `今天 周${weekday} · ${item.time || '全天'}`,
+    })),
+  };
+}

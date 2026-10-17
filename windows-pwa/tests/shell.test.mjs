@@ -3,7 +3,7 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { createHttpAdapter, createMockAdapter, normalizeBoardMessage, normalizeMemoryItem, normalizePlugin } from '../src/api.js';
 import { buildMonthGrid, monthKey, shiftMonth, todayKey } from '../src/memory-calendar.js';
-import { clockText, greetingFor, weekStrip } from '../src/home-dashboard.js';
+import { clockText, greetingFor, todoFeed, weekStrip } from '../src/home-dashboard.js';
 
 test('month keys and shifting follow the YYYY-MM contract across year edges', () => {
   assert.match(monthKey(new Date(2026, 9, 17)), /^2026-10$/);
@@ -119,7 +119,7 @@ test('Android-shell source contracts: four tabs, full pages, view switching, moc
   assert.match(app, /adapter\.searchMemories\(query, \{ limit: 20 \}\)/);
   assert.match(app, /adapter\.getMemoryBoard\(\{ page, perPage: 20 \}\)/);
   assert.match(app, /adapter\.listPlugins\(\)/);
-  assert.match(app, /WEB_SHELL_VERSION = 'desk-v22 · 2026-10-17'/);
+  assert.match(app, /WEB_SHELL_VERSION = 'desk-v23 · 2026-10-17'/);
   const mockHook = app.slice(app.indexOf('if (bootstrap.mock)'));
   assert.match(mockHook, /params\.get\('view'\)/, 'the deep-link hook stays mock-gated');
   assert.match(css, /\.tab-bar\{[^}]*display:none/, 'the bottom tab bar is phone-only');
@@ -130,7 +130,7 @@ test('Android-shell source contracts: four tabs, full pages, view switching, moc
   assert.match(css, /\.calendar-day\.has-entries\{background:linear-gradient/);
   assert.match(css, /\.calendar-weekdays,\.calendar-grid\{display:grid;grid-template-columns:repeat\(7,1fr\)/);
   assert.match(css, /\.side-notes\.view-hidden\{display:none\}/);
-  assert.match(sw, /src\/memory-calendar\.js\?v=22/);
+  assert.match(sw, /src\/memory-calendar\.js\?v=23/);
 });
 
 test('home dashboard helpers: deterministic greeting, clock text, Monday-first week strip', () => {
@@ -185,10 +185,10 @@ test('visual parity pass 2: dashboard cards, sans-only typography, transparent g
   for (const id of ['dash-clock-time', 'dash-clock-date', 'dash-quote-eyebrow', 'dash-quote-title', 'dash-quote-sub', 'dash-week-title', 'dash-week-days', 'dash-todo-card', 'dash-full-calendar', 'contact-avatar', 'contact-status']) {
     assert.match(html, new RegExp(`id="${id}"`), id);
   }
-  assert.match(app, /from '\.\/home-dashboard\.js\?v=22'/);
+  assert.match(app, /from '\.\/home-dashboard\.js\?v=23'/);
   assert.match(app, /function renderDashboard\(\)/);
   assert.match(app, /\$\('#dash-full-calendar'\)\.addEventListener\('click', openMemory\)/);
-  assert.match(sw, /src\/home-dashboard\.js\?v=22/);
+  assert.match(sw, /src\/home-dashboard\.js\?v=23/);
   assert.doesNotMatch(css, /--serif/, 'the shell drops serif typography entirely');
   assert.match(css, /\.eyebrow\{[^}]*font:500 10px var\(--sans\);letter-spacing:\.07em/);
   assert.match(css, /--glass:rgba\(24,17,12,\.42\)/);
@@ -201,4 +201,60 @@ test('visual parity pass 2: dashboard cards, sans-only typography, transparent g
   assert.match(app, /const homeQuery = window\.matchMedia\('\(max-width:1199px\)'\)/, 'phones and tablets land on the dashboard');
   assert.match(app, /function chatSurface\(\) \{ return homeQuery\.matches/);
   assert.match(app, /if \(homeQuery\.matches && !state\.mobileChatOpen\) \{ state\.mobileChatOpen = true; syncView\(\); \}/, 'picking a contact on phone/tablet opens the conversation');
+});
+
+test('todoFeed is a literal homeTodoFeed() port: schedule-only, today-only, done/time/text order', () => {
+  const saturday = new Date(2026, 9, 17, 14, 15); // 2026-10-17, Saturday.
+  const sections = [
+    { section: '日程', source: 'schedule', items: [
+      { text: '已完成的事', done: true, time: '08:00', dueDate: '2026-10-17', eventId: 'e1' },
+      { text: '下午的事', done: false, time: '14:00', dueDate: '2026-10-17', eventId: 'e2' },
+      { text: '全天的事', done: false, time: '', dueDate: '2026-10-17', eventId: 'e3' },
+      { text: '明天的事', done: false, time: '09:00', dueDate: '2026-10-18', eventId: 'e4' },
+      { text: '上午的事', done: false, time: '09:30', dueDate: '2026-10-17', eventId: 'e5' },
+    ] },
+    { section: '随手记', source: 'note', items: [
+      { text: '非日程来源不进主页', done: false, time: '10:00', dueDate: '2026-10-17', eventId: '' },
+    ] },
+  ];
+  const feed = todoFeed(sections, saturday);
+  assert.equal(feed.title, '今日待办 · 1/4 已完成');
+  assert.equal(feed.total, 4);
+  assert.equal(feed.doneCount, 4 - 3);
+  assert.deepEqual(feed.items.map((item) => item.text), ['上午的事', '下午的事', '全天的事', '已完成的事'], 'undone first, time ascending, all-day (99:99) last, done tail');
+  assert.equal(feed.items[0].dueLabel, '今天 周六 · 09:30');
+  assert.equal(feed.items[2].dueLabel, '今天 周六 · 全天');
+  const empty = todoFeed([], saturday);
+  assert.equal(empty.title, '今日待办');
+  assert.equal(empty.total, 0);
+  assert.deepEqual(todoFeed(sections, new Date(2026, 9, 18)).items.map((item) => item.text), ['明天的事'], 'switching the day never borrows another day\'s tasks');
+});
+
+test('dashboard real-data wiring: weather chip/line, todo list, icon-keyed head actions, orange status', () => {
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  const app = readFileSync(new URL('../src/app.js', import.meta.url), 'utf8');
+  const css = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
+  for (const id of ['dash-weather-place', 'dash-weather', 'dash-todo-summary', 'dash-todo-list']) {
+    assert.match(html, new RegExp(`id="${id}"`), id);
+  }
+  assert.match(html, /id="dash-weather-place"[^>]*hidden/, 'the city chip starts hidden until weather arrives');
+  for (const symbol of ['icon-panel', 'icon-atlas']) assert.match(html, new RegExp(`symbol id="${symbol}"`), symbol);
+  assert.match(html, /id="worker-toggle"[^>]*aria-controls="side-notes"[^>]*aria-expanded="false"[^>]*><svg class="icon"[^>]*><use href="#icon-panel"/, 'worker toggle is an icon button but keeps its drawer contract');
+  assert.match(html, /id="memory-button"[^>]*><svg class="icon"[^>]*><use href="#icon-atlas"/);
+  assert.doesNotMatch(html, /现场 <span aria-hidden="true">↗/, 'text buttons with arrows are gone from the head');
+  assert.match(app, /import \{ clockText, greetingFor, todoFeed, weekStrip \} from '\.\/home-dashboard\.js\?v=23'/);
+  assert.match(app, /state\.dash = \{ appearance: \{ nicknames: \{\}, avatars: \{\} \}, todos: null, weather: null, weatherFailed: false \}/, 'logout resets the dashboard channel');
+  assert.match(app, /adapter\.getTodos\(\)/);
+  assert.match(app, /adapter\.getDashAppearance\(\)/);
+  assert.match(app, /adapter\.getWeather\(\{ city: HOME_DEFAULT_CITY \}\)/);
+  assert.match(app, /const HOME_DEFAULT_CITY = '北京'/);
+  assert.match(app, /setInterval\(\(\) => void loadDashData\(\), DASH_DATA_INTERVAL_MS\)/);
+  assert.match(app, /const DASH_DATA_INTERVAL_MS = 15 \* 60_000/);
+  assert.match(app, /state\.dash\.appearance\.nicknames\[item\?\.id\] \|\| item\?\.name/, 'server nickname overrides the contacts name');
+  assert.match(css, /\.dash-place-chip\{position:absolute;top:14px;right:14px/);
+  assert.match(css, /\.dash-todo-item\.is-done \.dash-todo-text\{color:var\(--dim\);text-decoration:line-through\}/);
+  assert.match(css, /\.avatar-img\{display:block;width:100%;height:100%;border-radius:50%;object-fit:cover\}/);
+  assert.match(css, /#contact-status\{color:var\(--oxide\)\}/, 'the header status line is oxide orange');
+  assert.match(css, /\.chat-list\{display:flex;flex-wrap:nowrap;gap:8px;margin-top:13px;overflow-x:auto/, 'the avatar row scrolls sideways instead of clipping');
+  assert.match(css, /\.chat-list \.chat-card\{display:grid;flex:0 0 auto/, 'cards keep their width while scrolling');
 });

@@ -55,6 +55,7 @@ button,input,textarea{font:inherit}button{cursor:pointer}button:focus-visible,a:
 .contact-avatar,.contact-sub{display:none}
 .signal-dot{width:8px;height:8px;flex:0 0 auto;border:1px solid var(--moss);border-radius:50%}
 .signal-dot.is-busy{border-color:var(--brass);background:var(--brass);animation:pulse 1.5s infinite}
+#contact-status{color:var(--oxide)}
 .eyebrow{margin:0 0 4px;color:var(--dim);font:500 10px var(--sans);letter-spacing:.07em}
 .contact-heading h1,.instrument h2,.workers-panel h2,.page-view h2{margin:0;font:600 26px/1.1 var(--sans);letter-spacing:.01em;color:var(--ink)}
 .head-actions{display:flex;align-items:center;gap:16px}
@@ -316,7 +317,7 @@ body[data-appearance='compact'] .composer{padding-block:11px}
 .page-sub{margin:6px 0 0;color:var(--dim);font-size:11px}
 .glass-card{border:1px solid var(--line);border-radius:16px;padding:16px;background:rgba(30,21,15,.72);color:var(--ink);text-align:left;box-shadow:0 8px 22px rgba(8,4,2,.3)}
 .glass-card h3{margin:4px 0 6px;font:600 16px/1.3 var(--sans);color:var(--ink)}
-.empty-card .empty-note,.app-card .app-card-note{margin:0;color:var(--dim);font-size:11px;line-height:1.6}
+.app-card .app-card-note{margin:0;color:var(--dim);font-size:11px;line-height:1.6}
 .app-card{width:100%;cursor:pointer;font:inherit;transition:border-color .18s,transform .18s}
 .app-card:hover{border-color:var(--brass);transform:translateY(-1px)}
 .rail-tabs{display:grid;gap:4px;margin-bottom:16px}
@@ -331,9 +332,12 @@ body[data-appearance='compact'] .composer{padding-block:11px}
 
 /* Home dashboard (Android home parity): clock, greeting, week strip, todos, contacts. */
 .dash-stack{display:grid;gap:12px}
+.dash-clock-card{position:relative}
+.dash-place-chip{position:absolute;top:14px;right:14px;max-width:45%;overflow:hidden;border:1px solid var(--line);border-radius:999px;padding:4px 11px;background:var(--glass-soft);color:var(--muted);font:10px var(--mono);text-overflow:ellipsis;white-space:nowrap}
 .dash-clock-time{margin:0;font:600 44px/1 var(--sans);letter-spacing:.01em}
 .dash-clock-date{margin:7px 0 0;color:var(--muted);font-size:13px}
 .dash-note{margin:12px 0 0;color:var(--dim);font-size:10.5px}
+.dash-weather-line{color:var(--muted);font-size:12px}
 .dash-quote-card h3{margin:3px 0 7px;font-size:19px;line-height:1.45}
 .dash-quote-sub{margin:0;color:var(--muted);font-size:12px;line-height:1.65}
 .dash-quote-rule{width:64px;height:3px;margin-top:13px;border-radius:3px;background:linear-gradient(90deg,var(--oxide),#b05a4c)}
@@ -346,14 +350,24 @@ body[data-appearance='compact'] .composer{padding-block:11px}
 .dash-week-col small{color:var(--dim);font-size:9.5px}
 .dash-week-day{display:grid;place-items:center;width:34px;height:34px;border-radius:11px;color:var(--muted);font-size:12.5px}
 .dash-week-day.is-today{background:linear-gradient(135deg,#d4836f,#b05a4c);color:#fdf3ea;font-weight:700}
-.chat-list{display:flex;flex-wrap:wrap;gap:8px;margin-top:13px}
-.chat-list .chat-card{display:grid;justify-items:center;gap:7px;width:72px;border:0;padding:2px;background:transparent;color:var(--ink);font:inherit}
+.dash-todo-list{display:grid;gap:8px;margin:12px 0 0;padding:0;list-style:none}
+.dash-todo-item{display:flex;align-items:center;gap:9px;min-width:0}
+.dash-todo-check{display:grid;place-items:center;flex:0 0 auto;width:17px;height:17px;border:1.5px solid var(--control-border);border-radius:50%}
+.dash-todo-item.is-done .dash-todo-check{border-color:var(--moss);background:var(--moss);box-shadow:inset 0 0 0 2.5px var(--bg)}
+.dash-todo-text{min-width:0;overflow:hidden;color:var(--ink);font-size:12.5px;text-overflow:ellipsis;white-space:nowrap}
+.dash-todo-item.is-done .dash-todo-text{color:var(--dim);text-decoration:line-through}
+.dash-todo-due{margin-left:auto;flex:0 0 auto;color:var(--dim);font:9.5px var(--mono)}
+.dash-todo-empty{margin:0;color:var(--dim);font-size:11.5px}
+/* Contact avatar row scrolls sideways instead of clipping (Astra 2026-10-17). */
+.chat-list{display:flex;flex-wrap:nowrap;gap:8px;margin-top:13px;overflow-x:auto;padding-bottom:6px;scrollbar-color:var(--line) transparent}
+.chat-list .chat-card{display:grid;flex:0 0 auto;justify-items:center;gap:7px;width:72px;border:0;padding:2px;background:transparent;color:var(--ink);font:inherit}
 .chat-card-face{position:relative;display:grid;place-items:center;width:56px;height:56px}
 .chat-card-face .avatar{width:56px;height:56px;font-size:20px}
 .chat-card-face .unread-badge{position:absolute;top:-3px;right:-6px;margin-left:0}
 .chat-card-face .contact-led{position:absolute;right:-3px;bottom:0;margin-left:0}
-.chat-list .chat-card>strong{font-size:11.5px;font-weight:600}
+.chat-list .chat-card>strong{max-width:100%;overflow:hidden;font-size:11.5px;font-weight:600;text-overflow:ellipsis;white-space:nowrap}
 .chat-list .chat-card:hover .avatar{filter:brightness(1.12)}
+.avatar-img{display:block;width:100%;height:100%;border-radius:50%;object-fit:cover}
 
 /* Tablet and wider: dashboard cards flow in two columns, contacts span the row. */
 @media (min-width:768px){
@@ -399,7 +413,7 @@ body[data-appearance='compact'] .composer{padding-block:11px}
   .desk-shell{grid-template-columns:214px minmax(0,1fr)}
   .side-notes{position:fixed;z-index:20;top:14px;right:14px;bottom:14px;width:min(360px,calc(100vw - 38px));transform:translateX(calc(100% + 16px));transition:transform .2s ease}
   .workers-open .side-notes{transform:translateX(0)}
-  .worker-toggle{display:inline-block}
+  .worker-toggle{display:grid}
   .drawer-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
   .drawer-head .eyebrow{margin:0}
   .workers-open::after{position:fixed;z-index:19;inset:0;content:'';background:var(--scrim)}
@@ -426,8 +440,8 @@ body[data-appearance='compact'] .composer{padding-block:11px}
   .contact-sub .signal-dot{width:7px;height:7px}
   .head-actions{gap:10px}
   .connection-state,.logout-button{display:none}
-  .worker-toggle{display:inline-block}
-  .head-actions .worker-toggle,.head-actions #memory-button{display:inline-block}
+  .worker-toggle{display:grid}
+  .head-actions .worker-toggle,.head-actions #memory-button{display:grid}
   .conversation-scroll{padding:0 14px 16px}
   .date-rule{margin:15px 0}
   .messages{gap:20px}
@@ -461,7 +475,7 @@ body[data-appearance='compact'] .composer{padding-block:11px}
 }
 @media (max-width:390px){
   .head-actions .text-button{display:none}
-  .head-actions .worker-toggle,.head-actions #memory-button{display:inline-block}
+  .head-actions .worker-toggle,.head-actions #memory-button{display:grid}
   .conversation-head{padding-inline:13px}
   .conversation-scroll{padding-inline:12px}
   .composer{margin-inline:10px;padding-inline:11px}

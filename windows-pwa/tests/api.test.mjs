@@ -8,6 +8,7 @@ import { createComposerState } from '../src/composer-state.js';
 import { PAIRING_ALPHABET, formatPairingCode, normalizePairingCode } from '../src/pairing-code.js';
 import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from '../src/live-messages.js';
 import { insertStickerToken, normalizeStickerCatalog, parseStickerParts, removeStickerToken, stickerTokens } from '../src/sticker-protocol.js';
+import { todayKey } from '../src/memory-calendar.js';
 
 function hexToken(css, token) {
   const match = css.match(new RegExp(`--${token}:(#[0-9a-fA-F]{6})`));
@@ -259,6 +260,45 @@ test('stop routing preserves the opaque per-contact server fence', async () => {
   await adapter.stop('xiaoke', fence);
   assert.deepEqual(calls[0], { path: '/chat/stop', options: { method: 'POST', body: fence.body } });
   await assert.rejects(() => adapter.stop('kairos', fence), /valid stop request/);
+});
+
+test('dashboard adapters hit the allowlisted read-only routes with encoded params', async () => {
+  const calls = [];
+  const adapter = createHttpAdapter({ request: async (path) => {
+    calls.push(path);
+    if (path === '/todos') return { ok: true, sections: [{ section: '日程', source: 'schedule', items: [{ text: '验收', done: false, time: '14:00', dueDate: '2026-10-17', event_id: 'e1' }] }] };
+    if (path === '/plugins/xiaonan-dash/appearance') return { ok: true, contact_nicknames: { kimi: '卡拉米' }, contact_avatar_uris: { kimi: '/appearance-assets/contact_avatar_kimi.jpg', evil: '/appearance-assets/../secret' } };
+    if (path.startsWith('/plugins/xiaonan-dash/weather')) return { ok: true, place: { name: '北京' }, temperature_c: 15.4, weather_code: 82, label: '有雨' };
+    return { ok: true };
+  } });
+  const todos = await adapter.getTodos();
+  assert.deepEqual(todos, [{ section: '日程', source: 'schedule', items: [{ text: '验收', done: false, time: '14:00', dueDate: '2026-10-17', eventId: 'e1' }] }]);
+  const appearance = await adapter.getDashAppearance();
+  assert.deepEqual(appearance, { nicknames: { kimi: '卡拉米' }, avatars: { kimi: '/appearance-assets/contact_avatar_kimi.jpg' } }, 'traversal avatar URIs are dropped client-side too');
+  const weather = await adapter.getWeather({ city: '北京' });
+  assert.deepEqual(weather, { place: '北京', temperatureC: 15, weatherCode: 82, label: '有雨' });
+  await adapter.getWeather({ lat: 39.9042, lon: 116.4074 });
+  await assert.rejects(() => adapter.getWeather({}), /city or lat\+lon required/);
+  assert.deepEqual(calls, [
+    '/todos',
+    '/plugins/xiaonan-dash/appearance',
+    '/plugins/xiaonan-dash/weather?city=%E5%8C%97%E4%BA%AC',
+    '/plugins/xiaonan-dash/weather?lat=39.9042&lon=116.4074',
+  ], 'exact route + query contract; the rejected call never hits the network');
+});
+
+test('mock adapter dashboard fixtures resolve placeholders against the real today', async () => {
+  const adapter = createMockAdapter();
+  const sections = await adapter.getTodos();
+  const today = todayKey();
+  const texts = sections[0].items.map((item) => [item.text, item.dueDate]);
+  assert.deepEqual(texts.filter(([, due]) => due === today).length, 2, 'two items land today');
+  assert.ok(texts.some(([, due]) => due !== today), 'the tomorrow item stays off today');
+  const weather = await adapter.getWeather({ city: '北京' });
+  assert.deepEqual(weather, { place: '北京', temperatureC: 15, weatherCode: 82, label: '有雨' });
+  const appearance = await adapter.getDashAppearance();
+  assert.equal(appearance.nicknames.kimi, '卡拉米');
+  assert.deepEqual(appearance.avatars, {}, 'avatar fixtures stay empty to exercise the initial fallback');
 });
 
 test('production live subscription performs network snapshots and accepts same-contact SSE events', async () => {
@@ -520,11 +560,11 @@ test('PWA shell declares installability and has no secret persistence', async ()
   assert.match(manifest, /icon-192\.png/);
   assert.match(manifest, /icon-512\.png/);
   assert.match(serviceWorker, /addEventListener\('fetch'/);
-  assert.match(serviceWorker, /cccompanion-desk-v22/);
-  assert.match(serviceWorker, /src\/styles\.css\?v=22/);
-  assert.match(serviceWorker, /src\/app\.js\?v=22/);
-  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=22/);
-  assert.match(serviceWorker, /src\/sticker-protocol\.js\?v=22/);
+  assert.match(serviceWorker, /cccompanion-desk-v23/);
+  assert.match(serviceWorker, /src\/styles\.css\?v=23/);
+  assert.match(serviceWorker, /src\/app\.js\?v=23/);
+  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=23/);
+  assert.match(serviceWorker, /src\/sticker-protocol\.js\?v=23/);
   assert.match(serviceWorker, /src\/live-messages\.js/);
   assert.match(serviceWorker, /src\/pairing-code\.js/);
   assert.doesNotMatch(source, /shared_secret|localStorage\.setItem|sessionStorage\.setItem|credentials:\s*'include'/);
@@ -541,8 +581,8 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   ]);
   assert.match(html, /id="latest-button"/);
   assert.match(html, /id="pairing-code"/);
-  assert.match(html, /href="\.\/src\/styles\.css\?v=22"/);
-  assert.match(html, /src="\.\/src\/app\.js\?v=22"/);
+  assert.match(html, /href="\.\/src\/styles\.css\?v=23"/);
+  assert.match(html, /src="\.\/src\/app\.js\?v=23"/);
   assert.match(html, /autocomplete="one-time-code"/);
   assert.match(html, /id="pairing-form"/);
   assert.match(html, /<details class="password-fallback">/);
@@ -624,7 +664,7 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   assert.match(css, /\[hidden\]\{display:none!important\}/);
   assert.match(css, /attachment-chip button,.taxonomy-choices button\{min-width:44px/);
   assert.equal((css.match(/@media \(max-width:390px\)/g) || []).length, 1);
-  assert.match(css, /\.head-actions \.worker-toggle,\.head-actions #memory-button\{display:inline-block\}/);
+  assert.match(css, /\.head-actions \.worker-toggle,\.head-actions #memory-button\{display:grid\}/);
   assert.match(serviceWorker, /web\\\/session\|chat\|memory\|attachments/);
   assert.match(serviceWorker, /const isShellAsset = ASSETS\.some/);
   assert.match(serviceWorker, /if \(url\.origin !== self\.location\.origin \|\| !isShellAsset \|\| isPrivateRoute\) return/);

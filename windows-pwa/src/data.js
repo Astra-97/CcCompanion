@@ -1,8 +1,47 @@
 // Fixtures are used only by createMockAdapter() when /web/pwa/?mock=1 is explicit.
 export const MOCK_CONTACTS = [
   { id: 'xiaoke', name: '小克', channel: 'CC COMPANION', initials: '克', accent: 'oxide', note: 'Fable 5 · 私人链路' },
+  { id: 'kimi', name: 'Kimi', channel: 'KIMI CODE', initials: 'K', accent: 'oxide', note: 'Kimi · 月之暗面' },
+  { id: 'kiro', name: 'Kiro', channel: 'KIRO IDE', initials: 'K', accent: 'brass', note: 'Kiro · 工作台' },
   { id: 'kairos', name: 'Kairos', channel: 'CODEX APP', initials: 'K', accent: 'brass', note: 'Kairos · 专属坐标' },
 ];
+
+// Appearance fixtures mirror the server subset from
+// /plugins/xiaonan-dash/appearance: nickname overrides rename Kimi to 卡拉米;
+// avatar URIs stay empty so the screenshots exercise the initial fallback.
+export const MOCK_APPEARANCE = {
+  contact_nicknames: { kimi: '卡拉米' },
+  contact_avatar_uris: {},
+};
+
+// /todos projection fixtures: schedule-sourced items with the server's field
+// names (dueDate + time, not dueTime); one done, one pending today, and one
+// tomorrow item the dashboard must filter out.
+export const MOCK_TODOS = {
+  ok: true,
+  sections: [
+    {
+      section: '日程',
+      source: 'schedule',
+      count: 3,
+      pending: 2,
+      items: [
+        { text: '和妈妈视频', done: true, unsure: false, actor: 'xiaoke', heading: '', rawText: '', lineIndex: 0, dueDate: '__TODAY__', time: '09:30', priority: '', file_mtime: 0, event_id: 'mock-evt-1' },
+        { text: '验收网页版天气待办', done: false, unsure: false, actor: 'xiaoke', heading: '', rawText: '', lineIndex: 1, dueDate: '__TODAY__', time: '14:00', priority: 'high', file_mtime: 0, event_id: 'mock-evt-2' },
+        { text: '周复盘', done: false, unsure: false, actor: 'xiaoke', heading: '', rawText: '', lineIndex: 2, dueDate: '__TOMORROW__', time: null, priority: '', file_mtime: 0, event_id: 'mock-evt-3' },
+      ],
+    },
+  ],
+};
+
+// Weather proxy fixture: same payload shape as /plugins/xiaonan-dash/weather.
+export const MOCK_WEATHER = {
+  ok: true,
+  place: { name: '北京', admin1: '北京市', latitude: 39.9042, longitude: 116.4074 },
+  temperature_c: 15,
+  weather_code: 82,
+  label: '有雨',
+};
 
 export const MOCK_TAXONOMY = {
   version: 1,
@@ -57,6 +96,12 @@ export const INITIAL_CONVERSATIONS = {
     { id: 'x1', role: 'assistant', body: '早。今天先把最烦的那一件收掉，别让它一直占着你的脑子。', time: '08:41' },
     { id: 'x2', role: 'user', body: '我需要看一下 Windows 端怎么做。', time: '08:43' },
     { id: 'x3', role: 'assistant', body: '行，桌面端要保持你习惯的联系感，不只是把手机聊天框拉宽。', time: '08:44' },
+  ],
+  kimi: [
+    { id: 'km1', role: 'assistant', body: '卡拉米报到。网页版的天气和待办今天接通真数据。', time: '08:45' },
+  ],
+  kiro: [
+    { id: 'kr1', role: 'assistant', body: 'Kiro 在。工作台的四联系人横排和 App 主页对齐了。', time: '08:46' },
   ],
   kairos: [
     { id: 'k1', role: 'assistant', body: '我在。小星星，Windows 端会和这里一样把你的记忆、工作现场和消息放在一个桌面里。', time: '08:46' },
