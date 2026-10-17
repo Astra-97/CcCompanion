@@ -206,6 +206,43 @@ class PluginAppearanceTest(unittest.TestCase):
         h.do_GET()
         self.assertEqual(self.last(h)[0], 404)
 
+    # ---------- 4.5 联系人昵称/头像子集 (2026-10-17 网页版对齐 App) ----------
+
+    def test_contact_nicknames_and_avatar_uris_sanitized_subset(self):
+        self.write_user_settings({
+            "bgUri": "",
+            "contactNicknames": {
+                "kimi": "卡拉米",
+                "xiaoke": " 小\x07克 ",   # 控制字符剥离 + 首尾空白
+                "blank": "   ",            # 清洗后为空 -> 丢弃
+            },
+            "contactAvatarUris": {
+                "kimi": "/appearance-assets/contact_avatar_kimi.jpg",
+                "xiaoke": "content://media/image/1234",          # 非本站形态丢弃
+                "kairos": "/appearance-assets/../secret",        # 穿越丢弃
+                "kiro": "/appearance-assets/nested/a.png",       # 非扁平丢弃
+                "toolbot": "/appearance-assets/.hidden",         # 隐藏文件丢弃
+                "empty": "/appearance-assets/",                  # 空文件名丢弃
+            },
+        })
+
+        h = self.handler("/plugins/packing/appearance", headers=self.auth())
+        h.do_GET()
+        status, payload, _ = self.last(h)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["contact_nicknames"], {"kimi": "卡拉米", "xiaoke": "小克"})
+        self.assertEqual(payload["contact_avatar_uris"], {"kimi": "/appearance-assets/contact_avatar_kimi.jpg"})
+
+    def test_contact_fields_absent_when_settings_lack_them(self):
+        self.write_user_settings({"bgUri": ""})
+
+        h = self.handler("/plugins/packing/appearance", headers=self.auth())
+        h.do_GET()
+        status, payload, _ = self.last(h)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["contact_nicknames"], {})
+        self.assertEqual(payload["contact_avatar_uris"], {})
+
     # ---------- 5. 旧版设置文件回落 ----------
 
     def test_fallback_to_appearance_settings_file(self):

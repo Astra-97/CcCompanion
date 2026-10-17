@@ -382,6 +382,66 @@ class WebPwaContractTest(unittest.TestCase):
         handler.command = "POST"
         self.assertFalse(handler._web_session_route_allowed())
 
+    def test_web_session_route_adds_read_only_todos_weather_and_appearance_assets(self):
+        # 2026-10-17 放行（Astra 批准网页版与 App 对齐），全部 GET 只读。
+        handler = self.handler("/todos", "GET")
+        self.assertTrue(handler._web_session_route_allowed())
+        handler.command = "HEAD"
+        self.assertTrue(handler._web_session_route_allowed())
+        handler.command = "POST"
+        self.assertFalse(handler._web_session_route_allowed())
+        for path in ("/todos/toggle", "/todos/add", "/todos/edit"):
+            handler.path = path
+            handler.command = "GET"
+            self.assertFalse(handler._web_session_route_allowed(), path)
+
+        # 联系人头像：扁平 GET 放行，写/其余方法不放行
+        handler.path = "/appearance-assets/contact_avatar_kimi.jpg"
+        handler.command = "GET"
+        self.assertTrue(handler._web_session_route_allowed())
+        handler.command = "POST"
+        self.assertFalse(handler._web_session_route_allowed())
+
+        # 天气只读代理经 /plugins/ 前缀放行
+        handler.path = "/plugins/xiaonan-dash/weather?city=%E5%8C%97%E4%BA%AC"
+        handler.command = "GET"
+        self.assertTrue(handler._web_session_route_allowed())
+
+    def test_cookie_appearance_assets_handler_rejects_traversal_and_missing(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            (root / "contact_avatar_kimi.jpg").write_bytes(b"jpeg-bytes")
+            original = PushHandler._APPEARANCE_ASSETS_DIR
+            PushHandler._APPEARANCE_ASSETS_DIR = root
+            self.addCleanup(setattr, PushHandler, "_APPEARANCE_ASSETS_DIR", original)
+
+            sent = {"status": None, "headers": {}}
+            handler = self.handler("/appearance-assets/contact_avatar_kimi.jpg", "GET")
+            handler.send_response = lambda code: sent.update(status=code)
+            handler.send_header = lambda k, v: sent["headers"].__setitem__(str(k).lower(), str(v))
+            handler.end_headers = lambda: None
+            handler.wfile = io.BytesIO()
+            handler._handle_appearance_assets_get()
+            self.assertEqual(sent["status"], 200)
+            self.assertEqual(sent["headers"].get("content-type"), "image/jpeg")
+            self.assertEqual(handler.wfile.getvalue(), b"jpeg-bytes")
+
+            for bad in (
+                "/appearance-assets/../user_settings.json",
+                "/appearance-assets/%2e%2e/secret",
+                "/appearance-assets/nested/a.png",
+                "/appearance-assets/.hidden",
+                "/appearance-assets/",
+            ):
+                handler = self.handler(bad, "GET")
+                handler._handle_appearance_assets_get()
+                self.assertEqual(handler.responses[-1][0], 400, bad)
+
+            handler = self.handler("/appearance-assets/gone.jpg", "GET")
+            handler._handle_appearance_assets_get()
+            self.assertEqual(handler.responses[-1][0], 404)
+
+
     def test_create_session_never_returns_shared_secret(self):
         handler = self.handler("/web/session", "POST")
         handler.state = types.SimpleNamespace(

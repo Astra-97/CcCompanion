@@ -5827,8 +5827,13 @@ class PushHandler(BaseHTTPRequestHandler):
         get_exact = {
             "/chat/contacts", "/chat/history", "/chat/draft", "/chat/status",
             "/chat/stream", "/stickers/catalog", "/plugins",
+            # 2026-10-17 放行（Astra 批准网页版与 App 对齐）：今日待办只读投影；
+            # 写操作 toggle/add/edit 仍不放行。
+            "/todos",
         }
-        get_prefixes = ("/memory/", "/plugins/")
+        # /appearance-assets/<flat> 由 handler 自带扁平文件名+防穿越校验，
+        # 与 /attachments/<flat> 同级；用于网页端联系人头像。
+        get_prefixes = ("/memory/", "/plugins/", "/appearance-assets/")
         post_exact = {
             "/web/session/logout", "/chat/send", "/chat/stop", "/chat/upload", "/chat/upload/cancel",
             "/stickers/upload",
@@ -11092,6 +11097,13 @@ class PushHandler(BaseHTTPRequestHandler):
                 return
             self._handle_plugin_dash_data_get(rel[0])
             return
+        # 天气只读代理 (2026-10-17): 网页 CSP connect-src 'self' 无法直连
+        # open-meteo, 由服务端转发; 同 panel-data 只对 xiaonan-dash 生效。
+        if len(rel) == 2 and rel[1] == "weather" and rel[0] == self._DASH_PANEL_PLUGIN_ID:
+            if not self._require_auth():
+                return
+            self._handle_plugin_weather_get(rel[0])
+            return
         # 其余路径按静态托管: /plugins/<id>[/...] -> 插件目录下的文件 (默认 entry)。
         if not self._require_auth():
             return
@@ -11200,8 +11212,33 @@ class PushHandler(BaseHTTPRequestHandler):
             return None
         return target
 
+    @staticmethod
+    def _plugin_appearance_contact_map(value: Any, *, avatar: bool) -> dict[str, str]:
+        """清洗 contactNicknames/contactAvatarUris 为安全的 str->str 子集。
+
+        头像 URI 只放行本站 /appearance-assets/<扁平文件名> 形态（与
+        _handle_appearance_assets_get 同一套口径），其余一律丢弃。
+        """
+        if not isinstance(value, dict):
+            return {}
+        result: dict[str, str] = {}
+        for raw_key, raw_val in value.items():
+            key = re.sub(r"[\x00-\x1f\x7f]", "", str(raw_key)).strip()[:80]
+            val = re.sub(r"[\x00-\x1f\x7f]", "", str(raw_val)).strip()[:200]
+            if not key or not val:
+                continue
+            if avatar:
+                prefix = "/appearance-assets/"
+                if not val.startswith(prefix):
+                    continue
+                filename = val[len(prefix):]
+                if not filename or "/" in filename or "\\" in filename or ".." in filename or filename.startswith("."):
+                    continue
+            result[key] = val
+        return result
+
     def _handle_plugin_appearance_get(self, plugin_id: str) -> None:
-        """GET /plugins/<id>/appearance — 壁纸相关子集, 不倒整份 settings。"""
+        """GET /plugins/<id>/appearance — 壁纸 + 联系人昵称/头像子集, 不倒整份 settings。"""
         if self._plugin_store().load_manifest(plugin_id) is None:
             self._send_json(404, {"ok": False, "error": "not_found"})
             return
@@ -11213,6 +11250,9 @@ class PushHandler(BaseHTTPRequestHandler):
                     f"/plugins/{plugin_id}/appearance-asset"
                     if self._plugin_appearance_bg_target() is not None else None
                 ),
+                # 2026-10-17 网页版对齐 App 显示名/头像：只加字段, 不改既有键。
+                "contact_nicknames": self._plugin_appearance_contact_map(appearance.get("contactNicknames"), avatar=False),
+                "contact_avatar_uris": self._plugin_appearance_contact_map(appearance.get("contactAvatarUris"), avatar=True),
             }
             veil = appearance.get("veil")
             if isinstance(veil, dict):
@@ -11262,6 +11302,54 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"ok": False, "error": "dash panel unavailable"})
             return
         self._send_json(200, payload)
+
+    _weather_proxy_service = None
+
+    @classmethod
+    def _weather_proxy(cls):
+        if cls._weather_proxy_service is None:
+            from weather_proxy import WeatherProxy
+            cls._weather_proxy_service = WeatherProxy()
+        return cls._weather_proxy_service
+
+    def _handle_plugin_weather_get(self, plugin_id: str) -> None:
+        """GET /plugins/xiaonan-dash/weather?city=北京 | ?lat=..&lon=.. — open-meteo 只读代理。"""
+        if self._plugin_store().load_manifest(plugin_id) is None:
+            self._send_json(404, {"ok": False, "error": "not_found"})
+            return
+        from urllib.parse import parse_qs, urlparse
+
+        from weather_proxy import WeatherCityNotFound, WeatherProxyError
+
+        query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+        city = (query.get("city") or [""])[0].strip()
+        try:
+            lat = float((query.get("lat") or [""])[0]) if query.get("lat") else None
+            lon = float((query.get("lon") or [""])[0]) if query.get("lon") else None
+        except (TypeError, ValueError):
+            self._send_json(400, {"ok": False, "error": "invalid coordinates"})
+            return
+        if city and (lat is not None or lon is not None):
+            self._send_json(400, {"ok": False, "error": "city and lat/lon are mutually exclusive"})
+            return
+        if (lat is None) != (lon is None):
+            self._send_json(400, {"ok": False, "error": "lat and lon must come in pairs"})
+            return
+        if not city and lat is None:
+            self._send_json(400, {"ok": False, "error": "city or lat+lon required"})
+            return
+        try:
+            payload = self._weather_proxy().forecast(
+                city=city or None, latitude=lat, longitude=lon,
+            )
+        except WeatherCityNotFound:
+            self._send_json(404, {"ok": False, "error": "city not found"})
+            return
+        except WeatherProxyError as exc:
+            logger.warning("weather proxy fail: %s", exc)
+            self._send_json(502, {"ok": False, "error": "weather unavailable"})
+            return
+        self._send_json(200, {"ok": True, **payload})
 
     def _serve_web_chat(self, auth_token=None):
         html = WEB_CHAT_HTML
@@ -27776,7 +27864,9 @@ class PushHandler(BaseHTTPRequestHandler):
         return ok, error, message_id
 
     def _handle_todos_list(self):
-        if not self._check_auth():
+        # 2026-10-17: web 会话放行（白名单限定 GET /todos），只读投影；
+        # native shared_secret 与 legacy strict_auth=false 行为不变。
+        if not (self._check_auth() or self._web_session_matches()):
             self._send_json(401, {"error": "auth required"})
             return
         try:

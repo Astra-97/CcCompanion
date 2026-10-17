@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 import todos
-from push import PushHandler, _channel_transport_post, _format_schedule_todo_when
+from push import PushHandler, WebSessionStore, _channel_transport_post, _format_schedule_todo_when
 
 
 def _event(event_id: str, title: str, date: str, event_time: str | None, *, done=False, note=None):
@@ -328,6 +328,31 @@ class TodosHandlerAuthTest(unittest.TestCase):
             handler._handle_todos_list()
         self.assertEqual(handler.responses, [(400, {"ok": False, "error": "invalid todos date range"})])
         collect_all.assert_not_called()
+
+    def test_get_accepts_web_session_cookie_but_toggle_still_needs_shared_secret(self):
+        # 2026-10-17 网页版放行 /todos GET（Astra 批准）；写路径仍只认 shared_secret。
+        store = WebSessionStore(300)
+        token, _ = store.create()
+        handler = self.handler()  # 无 X-Auth-Token
+        handler.headers = {"Cookie": f"__Host-cccompanion={token}"}
+        handler.state.web_session_enabled = True
+        handler.state.web_sessions = store
+        handler._handle_todos_list()
+        self.assertEqual(handler.responses[0][0], 200)
+        self.assertEqual(handler.responses[0][1]["sections"][0]["items"][0]["event_id"], "evt1")
+
+        handler.responses.clear()
+        handler._handle_todos_toggle({"event_id": "evt1", "expected_done": False})
+        self.assertEqual(handler.responses[0][0], 401)
+
+        # 无效 cookie 不放行
+        handler = self.handler()
+        handler.headers = {"Cookie": "__Host-cccompanion=forged"}
+        handler.state.web_session_enabled = True
+        handler.state.web_sessions = store
+        handler._handle_todos_list()
+        self.assertEqual(handler.responses[0][0], 401)
+
 
     def test_get_dispatches_todos_path_with_calendar_query(self):
         handler = object.__new__(PushHandler)
