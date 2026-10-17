@@ -46,6 +46,15 @@ export function latestAssistantTs(records = []) {
   }, '');
 }
 
+/** Seed a fresh device to each contact's current latest assistant message. */
+export function seedUnreadCursors(store, historiesById = {}) {
+  Object.entries(historiesById || {}).forEach(([contactId, records]) => {
+    if (!contactId || store.lastSeen(contactId)) return;
+    const ts = latestAssistantTs(records);
+    if (ts) store.markSeen(contactId, ts);
+  });
+}
+
 /** New assistant records since the read cursor, oldest first. */
 export function unseenAssistant(records = [], lastSeenTs = '') {
   if (!lastSeenTs) return [];

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { createHttpAdapter, historyCursor, mergeHistoryDelta, normalizeRecord } from '../src/api.js';
-import { createUnreadStore, previewText, unreadCount, unseenAssistant } from '../src/unread.js';
+import { createUnreadStore, previewText, seedUnreadCursors, unreadCount, unseenAssistant } from '../src/unread.js';
 import { createNotifier } from '../src/notifications.js';
 
 function memoryStorage() {
@@ -114,6 +114,27 @@ test('unread store tolerates corrupted storage payloads', () => {
   assert.equal(createUnreadStore({ storage }).lastSeen('xiaoke'), '');
 });
 
+test('initial unread seeding marks existing histories read without touching established cursors', () => {
+  const storage = memoryStorage();
+  const store = createUnreadStore({ storage });
+  store.markSeen('kairos', '2026-10-17T01:30:00+00:00');
+  seedUnreadCursors(store, {
+    xiaoke: [
+      { id: 'u1', role: 'user', ts: '2026-10-17T01:00:00+00:00' },
+      { id: 'a1', role: 'assistant', ts: '2026-10-17T01:01:00+00:00' },
+    ],
+    kairos: [
+      { id: 'k1', role: 'assistant', ts: '2026-10-17T01:02:00+00:00' },
+      { id: 'k2', role: 'assistant', ts: '2026-10-17T01:40:00+00:00' },
+    ],
+    empty: [],
+  });
+  assert.equal(store.lastSeen('xiaoke'), '2026-10-17T01:01:00+00:00');
+  assert.equal(store.lastSeen('kairos'), '2026-10-17T01:30:00+00:00', 'existing cursor stays advance-only');
+  assert.equal(store.lastSeen('empty'), '');
+  assert.equal(store.unreadFor('xiaoke', [{ id: 'a2', role: 'assistant', ts: '2026-10-17T01:03:00+00:00' }]), 1);
+});
+
 test('preview text clips long bodies, folds code blocks, and prefixes own messages', () => {
   assert.equal(previewText({ role: 'assistant', body: '短消息' }), '短消息');
   assert.equal(previewText({ role: 'user', body: '我发的' }), '我: 我发的');
@@ -199,7 +220,7 @@ test('first-batch UX source contracts: no innerHTML, markdown renderer, thinking
   assert.match(app, /state\.notifier\.notify/);
   assert.match(app, /startBackgroundPolling\(\)/);
   assert.match(html, /id="notification-button"[^>]*aria-pressed="false"/);
-  assert.match(sw, /src\/markdown\.js\?v=14/);
-  assert.match(sw, /src\/unread\.js\?v=14/);
-  assert.match(sw, /src\/notifications\.js\?v=14/);
+  assert.match(sw, /src\/markdown\.js\?v=15/);
+  assert.match(sw, /src\/unread\.js\?v=15/);
+  assert.match(sw, /src\/notifications\.js\?v=15/);
 });

@@ -1,13 +1,13 @@
-import { createPwaBootstrap } from './bootstrap.js?v=14';
-import { createComposerState } from './composer-state.js?v=14';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=14';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=14';
-import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=14';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=14';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=14';
-import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=14';
-import { createUnreadStore, previewText, unseenAssistant } from './unread.js?v=14';
-import { createNotifier } from './notifications.js?v=14';
+import { createPwaBootstrap } from './bootstrap.js?v=15';
+import { createComposerState } from './composer-state.js?v=15';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=15';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=15';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=15';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=15';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=15';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=15';
+import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=15';
+import { createNotifier } from './notifications.js?v=15';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -582,7 +582,7 @@ window.addEventListener('beforeinstallprompt', (event) => { event.preventDefault
 workerDrawerQuery.addEventListener('change', syncWorkerPanel); syncWorkerPanel(); document.body.append($('#svg-defs').content.cloneNode(true)); if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js'));
 async function start() {
   try { await bootstrap.checkSession(); } catch (error) { if (!bootstrap.mock) { showLogin(); return; } }
-  try { state.contacts = await adapter.contacts(); if (!state.contacts.length) throw new Error('没有可用联系人'); state.activeContactId = state.contacts.find(({ id }) => id === 'xiaoke')?.id || state.contacts[0].id; state.contacts.forEach(({ id }) => { state.histories[id] = []; state.live[id] = { replyState: 'idle', statusText: '待命', workers: [] }; composer(id); state.followLatest[id] = true; }); await Promise.all(state.contacts.map(({ id }) => refreshContact(id))); markActiveSeen(); watchLive(state.activeContactId); state.stopBackground?.(); state.stopBackground = startBackgroundPolling(); syncNotificationButton(); renderAll({ forceLatest: true }); void loadStickerCatalog(); }
+  try { state.contacts = await adapter.contacts(); if (!state.contacts.length) throw new Error('没有可用联系人'); state.activeContactId = state.contacts.find(({ id }) => id === 'xiaoke')?.id || state.contacts[0].id; state.contacts.forEach(({ id }) => { state.histories[id] = []; state.live[id] = { replyState: 'idle', statusText: '待命', workers: [] }; composer(id); state.followLatest[id] = true; }); await Promise.all(state.contacts.map(({ id }) => refreshContact(id))); seedUnreadCursors(state.unread, state.histories); markActiveSeen(); watchLive(state.activeContactId); state.stopBackground?.(); state.stopBackground = startBackgroundPolling(); syncNotificationButton(); renderAll({ forceLatest: true }); void loadStickerCatalog(); }
   catch (error) { $('#connection-state').textContent = '连接不可用'; console.warn('PWA bootstrap failed', error); }
 }
 function pairingError(error) {
