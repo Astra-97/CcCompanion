@@ -1,17 +1,17 @@
-import { createPwaBootstrap } from './bootstrap.js?v=24';
-import { createComposerState } from './composer-state.js?v=24';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=24';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=24';
-import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=24';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=24';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=24';
-import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=24';
-import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=24';
-import { createNotifier } from './notifications.js?v=24';
-import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=24';
-import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=24';
+import { createPwaBootstrap } from './bootstrap.js?v=25';
+import { createComposerState } from './composer-state.js?v=25';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=25';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=25';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord } from './api.js?v=25';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=25';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=25';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=25';
+import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=25';
+import { createNotifier } from './notifications.js?v=25';
+import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=25';
+import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=25';
 
-const WEB_SHELL_VERSION = 'desk-v24 · 2026-10-17';
+const WEB_SHELL_VERSION = 'desk-v25 · 2026-10-17';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -46,6 +46,13 @@ function contact() { return state.contacts.find(({ id }) => id === state.activeC
 /** Server nickname overrides win over the contacts payload (App parity). */
 function displayNameOf(item) { return state.dash.appearance.nicknames[item?.id] || item?.name || ''; }
 function avatarUriOf(id) { return state.dash.appearance.avatars[id] || ''; }
+// Fallback accent colors mirror Android ChatListScreen.toChatContact(): fixed
+// brand hues for known contacts; everyone else picks from the same six-color
+// palette via Java String.hashCode() (Android dynamicContactColor).
+const AVATAR_ACCENTS = { xiaoke: 'oxide', apples: 'rose', kairos: 'brass', kimi: 'lavender', toolbot: 'steel' };
+const AVATAR_ACCENT_PALETTE = ['oxide', 'brass', 'rose', 'lavender', 'steel', 'moss'];
+function javaStringHash(text) { let hash = 0; for (let i = 0; i < text.length; i += 1) hash = (Math.imul(hash, 31) + text.charCodeAt(i)) | 0; return hash; }
+function avatarAccentOf(id) { return AVATAR_ACCENTS[id] || AVATAR_ACCENT_PALETTE[(javaStringHash(id) & 0x7fffffff) % AVATAR_ACCENT_PALETTE.length]; }
 /** Round avatar: server image when allowed, first-character fallback otherwise. */
 function avatarFace(item, accent) {
   const face = el('span', { class: `avatar ${accent}` });
@@ -83,7 +90,7 @@ function renderContacts() {
     const preview = previewText(history.at(-1)) || item.note;
     const name = displayNameOf(item);
     const button = el('button', { class: `contact-button ${item.id === state.activeContactId ? 'is-active' : ''}`, type: 'button', 'aria-current': item.id === state.activeContactId ? 'page' : 'false' });
-    const accent = item.id === 'kairos' ? 'brass' : 'oxide';
+    const accent = avatarAccentOf(item.id);
     button.append(avatarFace(item, accent), el('span', { class: 'contact-copy' }, [el('strong', { text: name }), el('small', { class: 'contact-preview', text: preview })]));
     if (unread > 0) button.append(el('span', { class: 'unread-badge', text: unread > 99 ? '99+' : String(unread), 'aria-label': `${unread} 条未读消息` }));
     button.append(el('span', { class: `contact-led ${busy ? 'is-busy' : ''}`, 'aria-label': busy ? '正在处理' : '待命' }));
@@ -182,7 +189,7 @@ function renderChatListPage() {
     const busy = isBusy(item.id);
     const history = state.histories[item.id] || [];
     const unread = state.unread.unreadFor(item.id, history);
-    const accent = item.id === 'kairos' ? 'brass' : 'oxide';
+    const accent = avatarAccentOf(item.id);
     const name = displayNameOf(item);
     const button = el('button', { type: 'button', class: 'chat-card', 'aria-label': `打开与 ${name} 的对话` });
     const face = el('span', { class: 'chat-card-face' }, [avatarFace(item, accent)]);
@@ -199,7 +206,7 @@ function renderHeader() {
   const name = displayNameOf(current) || current.name;
   $('#contact-name').textContent = name; $('#contact-mode').textContent = current.channel;
   const headerAvatar = $('#contact-avatar');
-  headerAvatar.className = `avatar contact-avatar ${current.id === 'kairos' ? 'brass' : 'oxide'}`;
+  headerAvatar.className = `avatar contact-avatar ${avatarAccentOf(current.id)}`;
   headerAvatar.replaceChildren();
   const headerAvatarUri = avatarUriOf(current.id);
   if (headerAvatarUri) {
@@ -643,7 +650,7 @@ function renderTerminalPage() {
     const live = state.terminalSnapshots[item.id];
     const terminal = live?.terminal || { available: false, busy: false, phase: 'unavailable', events: [] };
     const status = !live ? '读取失败，下一次轮询重试' : !terminal.available ? '观察器暂不可用' : terminal.busy ? terminal.phase : '空闲 · 没有正在运行的安全事件';
-    const accent = item.id === 'kairos' ? 'brass' : 'oxide';
+    const accent = avatarAccentOf(item.id);
     const name = displayNameOf(item);
     const card = el('article', { class: 'glass-card terminal-page-card' });
     card.append(el('div', { class: 'terminal-page-head' }, [avatarFace(item, accent), el('div', {}, [el('strong', { text: name }), el('small', { text: item.channel })])]));
