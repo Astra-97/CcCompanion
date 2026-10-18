@@ -447,5 +447,89 @@ class AbridgedRetryCacheSaltTest(unittest.TestCase):
         self.assertFalse(translate_api._looks_abridged(short_source, "y"))
 
 
+class PerPathModelConfigTest(unittest.TestCase):
+    """两条独立翻译路 (2026-10-18)：思维链预翻译与语音翻译各自读自己的
+    模型配置（env/drop-in 覆盖），缺省共享 TRANSLATE_MODEL，互不干扰。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        # 隔离真实 systemd drop-in：本机 /etc/.../openrouter.conf 不得影响断言
+        self.no_file = Path(self.tmp.name) / "absent.conf"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_default_model_is_smarter_235b(self) -> None:
+        # 2026-10-18 升级钉版：默认从 qwen3-30b-a3b（激活 3B，实测翻译质量差、
+        # 身份自述横跳）换成 qwen3-235b-a22b-2507（激活 22B，输入同价）。
+        self.assertEqual(translate_api.TRANSLATE_MODEL, "qwen/qwen3-235b-a22b-2507")
+
+    def test_resolvers_default_to_shared_model(self) -> None:
+        with patch.dict("os.environ", {}, clear=True), \
+             patch.object(translate_api, "SERVICE_ENV_FILE", self.no_file):
+            self.assertEqual(translate_api.thinking_translate_model(), translate_api.TRANSLATE_MODEL)
+            self.assertEqual(translate_api.voice_translate_model(), translate_api.TRANSLATE_MODEL)
+
+    def test_env_overrides_are_independent(self) -> None:
+        env = {
+            "TRANSLATE_MODEL_THINKING": "vendor/thinking-model",
+            "TRANSLATE_MODEL_VOICE": "vendor/voice-model",
+        }
+        with patch.dict("os.environ", env, clear=True), \
+             patch.object(translate_api, "SERVICE_ENV_FILE", self.no_file):
+            self.assertEqual(translate_api.thinking_translate_model(), "vendor/thinking-model")
+            self.assertEqual(translate_api.voice_translate_model(), "vendor/voice-model")
+
+    def test_single_override_leaves_other_path_on_default(self) -> None:
+        with patch.dict("os.environ", {"TRANSLATE_MODEL_VOICE": "vendor/voice-model"}, clear=True), \
+             patch.object(translate_api, "SERVICE_ENV_FILE", self.no_file):
+            self.assertEqual(translate_api.voice_translate_model(), "vendor/voice-model")
+            self.assertEqual(translate_api.thinking_translate_model(), translate_api.TRANSLATE_MODEL)
+
+    def test_model_file_fallback_reads_systemd_override(self) -> None:
+        fake = Path(self.tmp.name) / "openrouter.conf"
+        fake.write_text(
+            '[Service]\nEnvironment="TRANSLATE_MODEL_THINKING=vendor/from-file"\n',
+            encoding="utf-8",
+        )
+        with patch.dict("os.environ", {}, clear=True), \
+             patch.object(translate_api, "SERVICE_ENV_FILE", fake):
+            self.assertEqual(translate_api.thinking_translate_model(), "vendor/from-file")
+
+    def test_thinking_auto_uses_thinking_model(self) -> None:
+        with patch.dict("os.environ", {"TRANSLATE_MODEL_THINKING": "vendor/thinking-model"}, clear=True), \
+             patch.object(translate_api, "SERVICE_ENV_FILE", self.no_file), \
+             patch.object(
+                 translate_api, "translate_text",
+                 return_value={"translated": "译文", "cached": False},
+             ) as mock_translate:
+            translate_api.translate_thinking_auto(SAMPLE_THINKING)
+        self.assertEqual(mock_translate.call_args.kwargs["model"], "vendor/thinking-model")
+
+    def test_thinking_auto_explicit_model_kwarg_wins(self) -> None:
+        with patch.dict("os.environ", {"TRANSLATE_MODEL_THINKING": "vendor/env-model"}, clear=True), \
+             patch.object(translate_api, "SERVICE_ENV_FILE", self.no_file), \
+             patch.object(
+                 translate_api, "translate_text",
+                 return_value={"translated": "译文", "cached": False},
+             ) as mock_translate:
+            translate_api.translate_thinking_auto(SAMPLE_THINKING, model="vendor/explicit")
+        self.assertEqual(mock_translate.call_args.kwargs["model"], "vendor/explicit")
+
+    def test_chat_translate_handler_uses_voice_model(self) -> None:
+        responses: list[tuple[int, dict]] = []
+        handler = object.__new__(PushHandler)
+        handler._send_json = lambda status, payload: responses.append((status, payload))
+        with patch.dict("os.environ", {"TRANSLATE_MODEL_VOICE": "vendor/voice-model"}, clear=True), \
+             patch.object(translate_api, "SERVICE_ENV_FILE", self.no_file), \
+             patch.object(
+                 translate_api, "translate_text",
+                 return_value={"translated": "译文", "cached": False, "truncated": False},
+             ) as mock_translate:
+            handler._handle_chat_translate({"text": SAMPLE_THINKING})
+        self.assertEqual(mock_translate.call_args.kwargs["model"], "vendor/voice-model")
+        self.assertEqual(responses[0][0], 200)
+
+
 if __name__ == "__main__":
     unittest.main()

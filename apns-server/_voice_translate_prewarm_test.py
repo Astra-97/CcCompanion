@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from chat_history import ChatHistory
 from push import PushHandler
+import translate_api
 
 
 class _FakeChat:
@@ -100,7 +101,11 @@ class VoiceTranslatePrewarmTest(unittest.TestCase):
                 handler._handle_voice_push({"text": "hello [laughs]"})
 
             self.assertEqual(200, handler.responses[-1][0])
-            translate_mock.assert_called_once_with("hello [laughs]")
+            # 预热必须与 _handle_chat_translate 同走 voice_translate_model()
+            # (2026-10-18 分路)，否则 App 点「译」换模型后缓存永不命中。
+            translate_mock.assert_called_once_with(
+                "hello [laughs]", model=translate_api.voice_translate_model()
+            )
 
     def test_kimi_rejection_does_not_prewarm(self):
         with tempfile.TemporaryDirectory() as tmp:

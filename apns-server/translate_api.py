@@ -9,11 +9,21 @@
 sha256(PROMPT_VERSION + text) 落盘缓存（``tokens/translate_cache/``），
 同一思考链重复翻译不再烧钱；prompt 版本变化即自动失效旧缓存。
 
-模型选型 (2026-09-08 实测 OpenRouter /models 在售价格)：
-``qwen/qwen3-30b-a3b-instruct-2507`` —— $0.048/M 输入 + $0.193/M 输出，
-是 qwen3-14b ($0.23/M 输入) 的 ~1/5，262k 上下文；MoE 激活 3B 延迟低，
-且是 instruct 版不会输出思考标签浪费 output token，直译质量对
-思考链这种技术英文足够。一段 ~2000 词的思考链单次约 $0.0005。
+模型选型 (2026-10-18 升级，实测 OpenRouter /models 在售价格)：
+``qwen/qwen3-235b-a22b-2507`` —— $0.09/M 输入 + $0.55/M 输出，262k 上下文，
+instruct 版不输出思考标签浪费 output token。此前默认
+``qwen/qwen3-30b-a3b-instruct-2507``（MoE 仅激活 3B）被 Astra 实测翻译
+质量差、身份自述混乱（自称 ChatGPT/GPT-4.1 横跳）、译文 tab 偶发残留英文
+原文；235b-a22b 激活 22B 是前者 7 倍+，输入同价、输出 ~1.8 倍，一段
+~2000 词的思考链单次约 $0.001，属「稍微聪明」档里性价比最高的一步。
+
+两条独立翻译路 (2026-10-18 Astra 拍板拆分，互不干扰)：
+- 思维链预翻译 :func:`translate_thinking_auto` 用 :func:`thinking_translate_model`
+  （env/drop-in ``TRANSLATE_MODEL_THINKING`` 覆盖，缺省回落共享默认）。
+- 语音翻译 ``POST /chat/translate`` + 后台预热用 :func:`voice_translate_model`
+  （env/drop-in ``TRANSLATE_MODEL_VOICE`` 覆盖，缺省同上）。
+两路模型可各自独立换，缓存条目带 model 字段，换模型旧缓存自动失效、
+互不串味；同模型时缓存照常共享（语音预热与手动「译」必须同模型才能命中）。
 
 任何失败（无 key / 超时 / 402 / 网络）都抛 :class:`TranslateError`，
 调用方返回错误码让 app 静默降级，绝不影响聊天主流程。
@@ -38,7 +48,11 @@ import httpx
 logger = logging.getLogger(__name__)
 
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
-TRANSLATE_MODEL = "qwen/qwen3-30b-a3b-instruct-2507"
+TRANSLATE_MODEL = "qwen/qwen3-235b-a22b-2507"
+# 两路独立覆盖项：env 优先，其次 cc-companion.service 的 systemd drop-in
+# （与 OPENROUTER_API_KEY 同一读取口径）。只设 env 名，值绝不入库。
+TRANSLATE_MODEL_THINKING_ENV = "TRANSLATE_MODEL_THINKING"
+TRANSLATE_MODEL_VOICE_ENV = "TRANSLATE_MODEL_VOICE"
 MAX_TEXT_CHARS = 20_000
 DEFAULT_TIMEOUT_SEC = 90.0
 # 服务端自动预翻译 (2026-09-08) 同步阻塞聊天入库，超时要短，宁可存原文不拖累消息。
@@ -80,23 +94,41 @@ _inflight: dict[str, threading.Event] = {}
 _CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 
 
-def openrouter_api_key() -> str:
+def _service_env_value(name: str) -> str:
     """Env first, then the cc-companion.service systemd override file."""
 
-    key = str(os.environ.get("OPENROUTER_API_KEY") or "").strip()
-    if key:
-        return key
+    value = str(os.environ.get(name) or "").strip()
+    if value:
+        return value
     try:
         for line in SERVICE_ENV_FILE.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line.startswith("Environment="):
                 continue
             assignment = line[len("Environment="):].strip().strip('"').strip("'")
-            if assignment.startswith("OPENROUTER_API_KEY="):
-                return assignment[len("OPENROUTER_API_KEY="):].strip()
+            if assignment.startswith(f"{name}="):
+                return assignment[len(name) + 1:].strip()
     except OSError:
         pass
     return ""
+
+
+def openrouter_api_key() -> str:
+    """Env first, then the cc-companion.service systemd override file."""
+
+    return _service_env_value("OPENROUTER_API_KEY")
+
+
+def thinking_translate_model() -> str:
+    """思维链预翻译路模型：``TRANSLATE_MODEL_THINKING`` 覆盖，缺省共享默认。"""
+
+    return _service_env_value(TRANSLATE_MODEL_THINKING_ENV) or TRANSLATE_MODEL
+
+
+def voice_translate_model() -> str:
+    """语音翻译路模型：``TRANSLATE_MODEL_VOICE`` 覆盖，缺省共享默认。"""
+
+    return _service_env_value(TRANSLATE_MODEL_VOICE_ENV) or TRANSLATE_MODEL
 
 
 def _cache_key(text: str, salt: str = "") -> str:
@@ -379,6 +411,9 @@ def translate_thinking_auto(
         return text, None, False
     if _is_chinese_dominant(source):
         return text, None, False
+    # 思维链路独立模型 (2026-10-18 分路)：调用方未显式给 model 时走
+    # thinking_translate_model()，与语音路 voice_translate_model() 互不干扰。
+    kwargs.setdefault("model", thinking_translate_model())
     try:
         result = translate_text(source, timeout=timeout, **kwargs)
     except Exception as exc:

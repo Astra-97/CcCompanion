@@ -23560,12 +23560,15 @@ class PushHandler(BaseHTTPRequestHandler):
         # 需要确认到达的文本与语音记录是否一致、缓存是否命中、服务端耗时。
         req_text = str(body.get("text") or "")
         req_sha = hashlib.sha256(req_text.encode("utf-8")).hexdigest()[:8]
+        # 语音翻译路独立模型 (2026-10-18 分路)：与思维链预翻译路互不干扰；
+        # 必须与 _prewarm_voice_translation 同模型，预热缓存才能命中。
+        voice_model = translate_api.voice_translate_model()
         t0 = time.monotonic()
         try:
-            result = translate_api.translate_text(req_text)
+            result = translate_api.translate_text(req_text, model=voice_model)
         except translate_api.TranslateError as exc:
-            logger.info("chat_translate: sha=%s len=%d error=%s ms=%d",
-                        req_sha, len(req_text), exc, int((time.monotonic() - t0) * 1000))
+            logger.info("chat_translate: sha=%s len=%d model=%s error=%s ms=%d",
+                        req_sha, len(req_text), voice_model, exc, int((time.monotonic() - t0) * 1000))
             status = 400 if str(exc) == "empty_text" else 502
             self._send_json(status, {"ok": False, "error": str(exc)})
             return
@@ -23573,8 +23576,8 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.exception("chat translate unexpected failure")
             self._send_json(500, {"ok": False, "error": "translate_internal_error"})
             return
-        logger.info("chat_translate: sha=%s len=%d cached=%s ms=%d",
-                    req_sha, len(req_text), result.get("cached"),
+        logger.info("chat_translate: sha=%s len=%d model=%s cached=%s ms=%d",
+                    req_sha, len(req_text), voice_model, result.get("cached"),
                     int((time.monotonic() - t0) * 1000))
         self._send_json(200, {
             "ok": True,
@@ -24767,11 +24770,13 @@ class PushHandler(BaseHTTPRequestHandler):
         思维链快是因为入库前 translate_thinking_auto 已同步翻好；语音此前是
         App 点「译」才冷调 OpenRouter。这里趁 TTS 生成的窗口后台预跑一次
         translate_text，同一文本同一缓存键，App 点「译」即缓存命中秒出。
-        任何失败静默，绝不影响推送主流程。
+        必须与 _handle_chat_translate 同走 voice_translate_model()
+        （2026-10-18 分路），模型不一致缓存永不命中。任何失败静默，
+        绝不影响推送主流程。
         """
         def _run() -> None:
             try:
-                translate_api.translate_text(text)
+                translate_api.translate_text(text, model=translate_api.voice_translate_model())
             except Exception as exc:
                 logger.warning("voice translate prewarm failed: %s", exc)
 
