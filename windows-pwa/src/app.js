@@ -1,17 +1,17 @@
-import { createPwaBootstrap } from './bootstrap.js?v=27';
-import { createComposerState } from './composer-state.js?v=27';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=27';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=27';
-import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord, controlPanelSupported } from './api.js?v=27';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=27';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=27';
-import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=27';
-import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=27';
-import { createNotifier } from './notifications.js?v=27';
-import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=27';
-import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=27';
+import { createPwaBootstrap } from './bootstrap.js?v=28';
+import { createComposerState } from './composer-state.js?v=28';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=28';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=28';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord, controlPanelSupported } from './api.js?v=28';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=28';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=28';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=28';
+import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=28';
+import { createNotifier } from './notifications.js?v=28';
+import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=28';
+import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=28';
 
-const WEB_SHELL_VERSION = 'desk-v27 · 2026-10-17';
+const WEB_SHELL_VERSION = 'desk-v28 · 2026-10-18';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -63,6 +63,9 @@ const DEFAULT_AVATAR_URIS = {
   toolbot: './assets/default_avatar_toolbot.jpg',
 };
 function avatarUriOf(id) { return state.dash.appearance.avatars[id] || DEFAULT_AVATAR_URIS[id] || ''; }
+// Bundled fallback for the user's own avatar, mirroring Android
+// ContactDisplay.DEFAULT_USER_AVATAR_URI (default_avatar_user.jpg).
+const USER_AVATAR_URI = './assets/default_avatar_user.jpg';
 // Fallback accent colors mirror Android ChatListScreen.toChatContact(): fixed
 // brand hues for known contacts; everyone else picks from the same six-color
 // palette via Java String.hashCode() (Android dynamicContactColor).
@@ -81,6 +84,21 @@ function avatarFace(item, accent) {
   } else face.textContent = displayNameOf(item).slice(0, 1) || '·';
   return face;
 }
+/** 30px avatar beside every message bubble, like Android MessageBubble rows
+    (assistant left / user right, 8dp gap). User side falls back to the bundled
+    default user avatar, then the "我" initial on the App's cardBg tone. */
+function messageAvatar(role) {
+  const isUser = role === 'user';
+  const face = el('span', { class: `avatar message-avatar ${isUser ? 'user-side' : avatarAccentOf(state.activeContactId)}`, 'aria-hidden': 'true' });
+  const uri = isUser ? USER_AVATAR_URI : avatarUriOf(state.activeContactId);
+  const initial = isUser ? '我' : (displayNameOf(contact()) || contact().name || '克').slice(0, 1);
+  if (uri) {
+    const img = el('img', { class: 'avatar-img', src: uri, alt: '', loading: 'lazy', decoding: 'async' });
+    img.addEventListener('error', () => { img.remove(); face.textContent = initial; }, { once: true });
+    face.append(img);
+  } else face.textContent = initial;
+  return face;
+}
 function isBusy(id = state.activeContactId) { const live = state.live[id]; return Boolean(live?.busy || ['generating', 'queued'].includes(live?.replyState)); }
 function composer(id = state.activeContactId) { return state.composerState.get(id); }
 function sendOperation(id = state.activeContactId) { return state.composerState.current(id); }
@@ -96,12 +114,12 @@ function attachmentPreflight(files) {
   return tooLarge ? `${attachmentName(tooLarge)} 为空或超过 ${formatLimit(limits.max_file_bytes)}` : '';
 }
 function renderDateRule() {
-  const now = new Date(); const label = new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric', weekday: 'short' }).format(now);
-  $('#date-rule-label').textContent = `今天 · ${label}`;
+  const now = new Date();
+  // App parity: the date separator pill shows just "10月18日" (formatDatePill).
+  $('#date-rule-label').textContent = `${now.getMonth() + 1}月${now.getDate()}日`;
 }
 function renderContacts() {
   contactList.replaceChildren(...state.contacts.map((item) => {
-    const busy = isBusy(item.id);
     const history = state.histories[item.id] || [];
     const unread = item.id === state.activeContactId ? 0 : state.unread.unreadFor(item.id, history);
     const preview = previewText(history.at(-1)) || item.note;
@@ -109,8 +127,9 @@ function renderContacts() {
     const button = el('button', { class: `contact-button ${item.id === state.activeContactId ? 'is-active' : ''}`, type: 'button', 'aria-current': item.id === state.activeContactId ? 'page' : 'false' });
     const accent = avatarAccentOf(item.id);
     button.append(avatarFace(item, accent), el('span', { class: 'contact-copy' }, [el('strong', { text: name }), el('small', { class: 'contact-preview', text: preview })]));
+    // App parity: no status LED on contact rows (Astra 2026-10-18); the unread
+    // badge stays.
     if (unread > 0) button.append(el('span', { class: 'unread-badge', text: unread > 99 ? '99+' : String(unread), 'aria-label': `${unread} 条未读消息` }));
-    button.append(el('span', { class: `contact-led ${busy ? 'is-busy' : ''}`, 'aria-label': busy ? '正在处理' : '待命' }));
     button.addEventListener('click', () => switchContact(item.id)); return button;
   }));
 }
@@ -190,7 +209,7 @@ function renderDashboard() {
 async function loadDashAppearance() {
   try {
     state.dash.appearance = await adapter.getDashAppearance();
-    renderContacts(); renderChatListPage(); renderHeader();
+    renderContacts(); renderChatListPage(); renderHeader(); renderMessages();
   } catch { /* nickname/avatar overrides stay empty; contacts payload names remain */ }
 }
 async function loadDashData() {
@@ -203,15 +222,14 @@ function renderChatListPage() {
   renderDashboard();
   const list = $('#chat-list');
   list.replaceChildren(...state.contacts.map((item) => {
-    const busy = isBusy(item.id);
     const history = state.histories[item.id] || [];
     const unread = state.unread.unreadFor(item.id, history);
     const accent = avatarAccentOf(item.id);
     const name = displayNameOf(item);
     const button = el('button', { type: 'button', class: 'chat-card', 'aria-label': `打开与 ${name} 的对话` });
     const face = el('span', { class: 'chat-card-face' }, [avatarFace(item, accent)]);
+    // App parity: no status LED on the avatar row either; unread badge stays.
     if (unread > 0) face.append(el('span', { class: 'unread-badge', text: unread > 99 ? '99+' : String(unread), 'aria-label': `${unread} 条未读消息` }));
-    face.append(el('span', { class: `contact-led ${busy ? 'is-busy' : ''}`, 'aria-label': busy ? '正在处理' : '待命' }));
     button.append(face, el('strong', { text: name }));
     button.addEventListener('click', () => openMobileChat(item.id));
     return button;
@@ -232,12 +250,13 @@ function renderHeader() {
     headerAvatar.append(img);
   } else headerAvatar.textContent = (name || '克').slice(0, 1);
   $('#contact-status').textContent = live.statusText || '待命';
-  input.placeholder = `写给${name}…`;
+  input.placeholder = `跟${name}说点什么…`;
   // App parity: the single status line under the name carries the busy text;
   // #connection-state stays the transport line ('已连接') between the
   // transient error flashes written by send/paste/subscribe paths.
   $('#connection-state').textContent = '已连接';
-  $('#signal-dot').classList.toggle('is-busy', isBusy());
+  // App parity: the header status dot is a static green online dot
+  // (OnlineGreen, ChatHeaderBar); busy state lives in the status text only.
   // The stop key tracks the busy turn itself: it replaces the send key the
   // moment a send goes optimistic-busy, armed only with a server fence.
   const stopControl = stopControlState(live);
@@ -462,19 +481,21 @@ function renderMessageActions(message) {
   return actions;
 }
 function messageSignature(message) {
-  return [message.role, message.time, message.body, message.thinking, message.thinkingOriginal, message.streaming, message.attachments?.length || 0].map((part) => String(part ?? '').length + ':' + String(part ?? '')).join('|');
+  return [message.role, message.time, message.body, message.thinking, message.thinkingOriginal, message.streaming, message.attachments?.length || 0, avatarUriOf(state.activeContactId)].map((part) => String(part ?? '').length + ':' + String(part ?? '')).join('|');
 }
 function buildMessageNode(item, message) {
   item.className = `message ${message.role === 'user' ? 'from-user' : 'from-assistant'}`;
-  // App parity: the timestamp line sits under the bubble, 10.5px and faint.
-  const meta = el('div', { class: 'message-meta' }, [el('span', { text: message.role === 'user' ? 'ASTRA' : (displayNameOf(contact()) || contact().name).toUpperCase() }), el('time', { text: message.time || '刚刚' })]);
+  // App parity: the timestamp line sits alone under the bubble (10.5px, faint
+  // white@52%); no sender name in 1:1 windows (ChatScreen.kt MessageBubble).
+  const meta = el('div', { class: 'message-meta' }, [el('time', { text: message.time || '刚刚' })]);
   const rendered = renderMessageBody(message); item.classList.toggle('has-sticker-only', rendered.standalone);
-  const children = [];
-  if (message.role === 'assistant' && (message.thinking || message.thinkingOriginal)) children.push(renderThinking(message));
-  children.push(rendered.body);
-  if (message.attachments?.length) children.push(el('div', { class: 'message-files', role: 'list', 'aria-label': '消息附件' }, message.attachments.map(renderAttachment)));
-  children.push(meta, renderMessageActions(message));
-  item.replaceChildren(...children);
+  const stack = el('div', { class: 'message-stack' });
+  if (message.role === 'assistant' && (message.thinking || message.thinkingOriginal)) stack.append(renderThinking(message));
+  stack.append(rendered.body);
+  if (message.attachments?.length) stack.append(el('div', { class: 'message-files', role: 'list', 'aria-label': '消息附件' }, message.attachments.map(renderAttachment)));
+  stack.append(meta, renderMessageActions(message));
+  if (message.role === 'user') item.replaceChildren(stack, messageAvatar('user'));
+  else item.replaceChildren(messageAvatar('assistant'), stack);
   return item;
 }
 /** Reuse one <li> per message id; rebuild content only when the record changed. */
@@ -515,10 +536,11 @@ function renderMessages({ forceLatest = false } = {}) {
 }
 function createTypingBubble() {
   const item = el('li', { class: 'message from-assistant typing-bubble', 'data-contact-id': state.activeContactId, 'aria-hidden': 'true' });
-  const meta = el('div', { class: 'message-meta' }, [el('span', { text: (displayNameOf(contact()) || contact().name).toUpperCase() }), el('time', { text: '现在' })]);
+  const meta = el('div', { class: 'message-meta' }, [el('time', { text: '现在' })]);
   const body = el('p', { class: 'message-body typing-bubble-body' });
   body.append(el('span', { class: 'typing-dots', 'aria-hidden': 'true' }, [el('i'), el('i'), el('i')]));
-  item.append(body, meta);
+  const stack = el('div', { class: 'message-stack' }, [body, meta]);
+  item.append(messageAvatar('assistant'), stack);
   return item;
 }
 function renderAttachment(file) {

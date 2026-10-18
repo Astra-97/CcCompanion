@@ -119,7 +119,7 @@ test('Android-shell source contracts: four tabs, full pages, view switching, moc
   assert.match(app, /adapter\.searchMemories\(query, \{ limit: 20 \}\)/);
   assert.match(app, /adapter\.getMemoryBoard\(\{ page, perPage: 20 \}\)/);
   assert.match(app, /adapter\.listPlugins\(\)/);
-  assert.match(app, /WEB_SHELL_VERSION = 'desk-v27 · 2026-10-17'/);
+  assert.match(app, /WEB_SHELL_VERSION = 'desk-v28 · 2026-10-18'/);
   const mockHook = app.slice(app.indexOf('if (bootstrap.mock)'));
   assert.match(mockHook, /params\.get\('view'\)/, 'the deep-link hook stays mock-gated');
   assert.match(css, /\.tab-bar\{[^}]*display:none/, 'the bottom tab bar is phone-only');
@@ -130,7 +130,7 @@ test('Android-shell source contracts: four tabs, full pages, view switching, moc
   assert.match(css, /\.calendar-day\.has-entries\{background:linear-gradient/);
   assert.match(css, /\.calendar-weekdays,\.calendar-grid\{display:grid;grid-template-columns:repeat\(7,1fr\)/);
   assert.match(css, /\.side-notes\.view-hidden\{display:none\}/);
-  assert.match(sw, /src\/memory-calendar\.js\?v=27/);
+  assert.match(sw, /src\/memory-calendar\.js\?v=28/);
 });
 
 test('home dashboard helpers: deterministic greeting, clock text, Monday-first week strip', () => {
@@ -185,28 +185,86 @@ test('visual parity pass 2: dashboard cards, sans-only typography, transparent g
   for (const id of ['dash-clock-time', 'dash-clock-date', 'dash-quote-eyebrow', 'dash-quote-title', 'dash-quote-sub', 'dash-week-title', 'dash-week-days', 'dash-todo-card', 'dash-full-calendar', 'contact-avatar', 'contact-status']) {
     assert.match(html, new RegExp(`id="${id}"`), id);
   }
-  assert.match(app, /from '\.\/home-dashboard\.js\?v=27'/);
+  assert.match(app, /from '\.\/home-dashboard\.js\?v=28'/);
   assert.match(app, /function renderDashboard\(\)/);
   assert.match(app, /\$\('#dash-full-calendar'\)\.addEventListener\('click', openMemory\)/);
-  assert.match(sw, /src\/home-dashboard\.js\?v=27/);
+  assert.match(sw, /src\/home-dashboard\.js\?v=28/);
   assert.doesNotMatch(css, /--serif/, 'the shell drops serif typography entirely');
   assert.match(css, /\.eyebrow\{[^}]*font:500 10px var\(--sans\);letter-spacing:\.07em/);
   assert.match(css, /--glass:rgba\(24,17,12,\.42\)/);
   assert.match(css, /backdrop-filter:blur\(26px\) saturate\(1\.3\)/);
   assert.match(css, /\.dash-week-day\.is-today\{background:linear-gradient/);
   assert.match(css, /\.chat-card-face\{position:relative/);
-  assert.match(css, /\.composer \.send-button\{display:grid;place-items:center;width:48px;height:48px;min-height:48px;border-radius:50%;padding:0;background:#d97757;color:#2c1608/, 'the composer send key is the App 48px Clay circle at every shell size');
+  assert.match(css, /\.composer \.send-button\{display:grid;place-items:center;width:48px;height:48px;min-height:48px;border-radius:50%;padding:0;background:#d4725c;color:#2c1608/, 'the composer send key is the App 48px circle in the synced themeColor #D4725C at every shell size');
   assert.match(css, /\.stop-glyph\{display:block;width:14px;height:14px;border-radius:3px;background:currentColor\}/, 'busy swaps in the stop square on the same circle');
   assert.match(css, /\.composer\{[^}]*grid-template-columns:auto minmax\(0,1fr\) auto/, 'composer row is [+] · pill · send');
   assert.match(css, /\.composer-pill\{[^}]*border-radius:22px;background:rgba\(255,255,255,\.1\)/, 'the input pill mirrors ChatInputBarShell');
   assert.match(css, /\.composer-pill \.sticker-button\{[^}]*border:0/, 'the emoji key lives inside the pill');
-  assert.match(css, /\.message\{position:relative;min-width:0/, 'grid items may shrink below code-block min-content: no horizontal scrollbar under the message column');
+  assert.match(css, /\.message\{position:relative;display:flex;min-width:0/, 'message rows are flex rows with 30px avatars; grid items may shrink below code-block min-content: no horizontal scrollbar under the message column');
   assert.match(css, /\*\{scrollbar-width:thin;scrollbar-color:rgba\(255,240,222,\.26\) transparent\}/, 'thin translucent scrollbars everywhere');
   assert.match(css, /@media \(min-width:768px\)\{[^]*?\.dash-stack\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)\}/, 'tablet/desktop dashboard uses a two-column card grid');
   assert.match(css, /@media \(min-width:768px\)\{[^]*?\.dash-contacts-card\{grid-column:1 \/ -1\}/);
   assert.match(app, /const homeQuery = window\.matchMedia\('\(max-width:1199px\)'\)/, 'the narrow-shell media query still gates the drawer and back key');
   assert.match(app, /function chatSurface\(\) \{ return state\.mobileChatOpen \? 'conversation' : 'chat-list-page'; \}/, 'the dashboard is the chat landing on every shell size');
   assert.match(app, /if \(!state\.mobileChatOpen\) \{ state\.mobileChatOpen = true; syncView\(\); \}/, 'picking a contact opens the conversation on any shell');
+});
+
+test('v28 Android skin alignment: no contact LEDs, message avatars, time-only meta, App veil/composer/header values', () => {
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  const app = readFileSync(new URL('../src/app.js', import.meta.url), 'utf8');
+  const css = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
+  const sw = readFileSync(new URL('../sw.js', import.meta.url), 'utf8');
+  // Astra 2026-10-18: the gray status dots on contact rows / dashboard avatar
+  // row are gone (Android ChatListScreen has no such LED); the unread badge stays.
+  assert.doesNotMatch(app, /contact-led/, 'no contact-led element is rendered anywhere');
+  assert.doesNotMatch(css, /contact-led/, 'no contact-led CSS survives');
+  assert.match(app, /class: 'unread-badge'/, 'the unread badge stays');
+  // Message rows carry 30px avatars on both sides like Android MessageBubble
+  // (ChatScreen.kt:13047-13095), the user side falling back to the bundled
+  // default_avatar_user.jpg (ContactDisplay.DEFAULT_USER_AVATAR_URI).
+  assert.match(app, /function messageAvatar\(role\)/);
+  assert.match(app, /const USER_AVATAR_URI = '\.\/assets\/default_avatar_user\.jpg'/);
+  assert.match(app, /item\.replaceChildren\(stack, messageAvatar\('user'\)\)/, 'user rows put the avatar on the right');
+  assert.match(app, /item\.replaceChildren\(messageAvatar\('assistant'\), stack\)/, 'assistant rows put the avatar on the left');
+  assert.match(css, /\.message-avatar\{width:30px;height:30px/, '30px row avatars (Android 30dp)');
+  assert.match(css, /\.message\{[^}]*gap:8px/, '8px avatar-bubble gap (Android 8dp)');
+  assert.match(sw, /'\.\/assets\/default_avatar_user\.jpg'/, 'the user default avatar is precached');
+  // The meta line is the bare timestamp (Android: no sender name in 1:1
+  // windows), 10.5px white@52%, 3px under the bubble.
+  assert.match(app, /el\('div', \{ class: 'message-meta' \}, \[el\('time', \{ text: message\.time \|\| '刚刚' \}\)\]\)/, 'meta carries the time only');
+  assert.doesNotMatch(app, /ASTRA' :/, 'the uppercase sender name is gone from the meta line');
+  assert.match(css, /\.message-meta\{display:flex;gap:8px;margin:3px 0 0 2px;color:rgba\(255,255,255,\.52\);font-size:10\.5px/, 'meta is 10.5px white@52% 3px under the bubble');
+  // List rhythm: Android AppearanceSettings gap default 4 (Astra's synced
+  // value), LazyColumn spacedBy(settings.gap).
+  assert.match(css, /\.messages\{display:grid;gap:4px;/, 'the message list uses the Android 4px gap');
+  assert.match(css, /\.from-assistant \.message-stack\{max-width:min\(calc\(100% - 88px\),600px\)\}/, 'assistant bubble column caps at screen-112dp minus the avatar gutter');
+  assert.match(css, /\.from-user \.message-stack\{[^}]*max-width:min\(76%,600px\)/, 'user bubble column caps at 76% (ChatScreen.kt:12802)');
+  // Date separator: centered black@22% pill with "10月18日" (formatDatePill).
+  assert.match(css, /\.date-rule>span\{border-radius:999px;padding:3px 11px;background:rgba\(0,0,0,\.22\)\}/, 'the date separator is the Android pill');
+  assert.match(app, /textContent = `\$\{now\.getMonth\(\) \+ 1\}月\$\{now\.getDate\(\)\}日`/, 'date pill text mirrors formatDatePill');
+  assert.doesNotMatch(css, /\.date-rule::before/, 'the old rule lines beside the date are gone');
+  // Wallpaper veil mirrors chatWallpaperOverlayStops (dark): #1E1A16 at
+  // 88/40/36/70/94% so the wallpaper shows through the middle of the chat.
+  assert.match(css, /linear-gradient\(180deg,rgba\(30,26,22,\.88\) 0%,rgba\(30,26,22,\.4\) 14%,rgba\(30,26,22,\.36\) 56%,rgba\(30,26,22,\.7\) 84%,rgba\(30,26,22,\.94\) 100%\)/, 'the veil uses the Android overlay stops');
+  // Header: 16.5px semibold white name, 12px Clay status, static 6px online
+  // dot #8FD08F, 11px online badge on the avatar (ChatHeaderBar).
+  assert.match(css, /\.contact-heading h1\{margin:0;font:600 16\.5px\/1\.2 var\(--sans\);letter-spacing:\.01em;color:#fff\}/, 'the header name matches ChatHeaderBar 16.5sp semibold');
+  assert.match(css, /\.contact-sub\{display:flex;align-items:center;gap:5px;margin:3px 0 0;color:var\(--dim\);font-size:12px\}/, 'the status line is 12px with a 5px gap');
+  assert.match(css, /\.signal-dot\{width:6px;height:6px;flex:0 0 auto;border-radius:50%;background:#8fd08f\}/, 'the status dot is the static OnlineGreen dot');
+  assert.doesNotMatch(css, /\.signal-dot\.is-busy/, 'the dot no longer pulses on busy');
+  assert.doesNotMatch(app, /#signal-dot'\)\.classList/, 'renderHeader no longer toggles the dot');
+  assert.match(css, /\.contact-heading \.avatar\.contact-avatar::after\{position:absolute;right:1px;bottom:1px;width:11px;height:11px;border:2px solid #1c1815;border-radius:50%;background:#8fd08f/, 'the avatar carries the 11px online badge');
+  // Composer: flat bar in inputBarBg #1C1815@58%, 9/11 vertical padding,
+  // 16px field text, white@52% placeholder (ChatInputBarShell).
+  assert.match(css, /\.composer\{[^}]*padding:9px clamp\(18px,3vw,30px\) 11px;border-radius:0 0 23px 23px;background:rgba\(28,24,21,\.58\)/, 'the composer bar is the App inputBarBg');
+  assert.match(css, /textarea\{[^}]*padding:8px 0;background:transparent;color:#fff;font-size:16px;line-height:1\.375\}/, 'the field text is 16px like the App composer');
+  assert.match(css, /textarea::placeholder\{color:rgba\(255,255,255,\.52\)/, 'the placeholder is white@52% (textFaint)');
+  assert.match(app, /input\.placeholder = `跟\$\{name\}说点什么…`/, 'the placeholder mirrors the Android default 跟X说点什么…');
+  // The phone composer is the flat App bar, not a floating pill.
+  const phone = css.slice(css.indexOf('@media (max-width:767px)'));
+  assert.match(phone, /\.composer\{gap:9px;margin:0;padding:9px 12px 11px;border:0;border-radius:0;background:rgba\(28,24,21,\.58\)/, 'phone composer is the flat App input bar');
+  assert.match(phone, /\.conversation-head\{min-height:64px;padding:11px 16px;gap:10px;border-radius:0;background:rgba\(28,24,21,\.55\)/, 'phone header is the App headerBg bar');
+  assert.doesNotMatch(html, /id="signal-dot"[^>]*class="signal-dot is-busy"/, 'the header dot starts in the plain online state');
 });
 
 test('desktop reskin (>=1200px): nav rail + contacts column + dashboard landing, instrument beside conversation', () => {
@@ -226,7 +284,7 @@ test('desktop reskin (>=1200px): nav rail + contacts column + dashboard landing,
   assert.match(desktop, /\.desk-shell\[data-view='chat'\]\[data-surface='dashboard'\] \.side-notes\{display:none\}/, 'dashboard hides the instrument panel');
   assert.match(desktop, /#chat-list-page\{grid-column:3\}/, 'dashboard sits beside the contacts column');
   assert.match(desktop, /\.desk-shell:not\(\[data-view='chat'\]\) \.contact-list\{display:none\}/, 'non-chat views collapse the rail to nav only');
-  assert.match(css, /\.contact-heading \.avatar\.contact-avatar\{display:grid;width:40px/, 'the header shows the round avatar on every shell (App parity)');
+  assert.match(css, /\.contact-heading \.avatar\.contact-avatar\{display:grid;overflow:visible;width:40px/, 'the header shows the round avatar on every shell (App parity), unclipped so the online dot can straddle the edge');
   assert.match(css, /\.contact-sub\{display:flex/, 'the header shows the single status line on every shell');
   assert.match(desktop, /\.contact-heading \.avatar\.contact-avatar\{width:44px/, 'desktop keeps the larger 44px header avatar');
   assert.doesNotMatch(html, /id="contact-mode"/, 'the KIMI-WEB-style eyebrow above the contact name is gone');
@@ -274,7 +332,7 @@ test('dashboard real-data wiring: weather chip/line, todo list, icon-keyed head 
   assert.match(html, /id="worker-toggle"[^>]*aria-controls="side-notes"[^>]*aria-expanded="false"[^>]*><svg class="icon"[^>]*><use href="#icon-panel"/, 'worker toggle is an icon button but keeps its drawer contract');
   assert.match(html, /id="memory-button"[^>]*><svg class="icon"[^>]*><use href="#icon-atlas"/);
   assert.doesNotMatch(html, /现场 <span aria-hidden="true">↗/, 'text buttons with arrows are gone from the head');
-  assert.match(app, /import \{ clockText, greetingFor, todoFeed, weekStrip \} from '\.\/home-dashboard\.js\?v=27'/);
+  assert.match(app, /import \{ clockText, greetingFor, todoFeed, weekStrip \} from '\.\/home-dashboard\.js\?v=28'/);
   assert.match(app, /state\.dash = \{ appearance: \{ nicknames: \{\}, avatars: \{\} \}, todos: null, weather: null, weatherFailed: false \}/, 'logout resets the dashboard channel');
   assert.match(app, /adapter\.getTodos\(\)/);
   assert.match(app, /adapter\.getDashAppearance\(\)/);
@@ -308,7 +366,7 @@ test('dashboard real-data wiring: weather chip/line, todo list, icon-keyed head 
   }
   const fixtures = readFileSync(new URL('../src/data.js', import.meta.url), 'utf8');
   for (const id of ['hakimi', 'apples', 'toolbot']) assert.match(fixtures, new RegExp(`\\{ id: '${id}'`), `mock contact ${id}`);
-  assert.match(css, /#contact-status\{color:var\(--oxide\)\}/, 'the header status line is oxide orange');
+  assert.match(css, /#contact-status\{color:#d97757\}/, 'the header status line is the App Clay #D97757');
   assert.match(css, /\.chat-list\{display:flex;flex-wrap:nowrap;gap:8px;margin-top:13px;overflow-x:auto/, 'the avatar row scrolls sideways instead of clipping');
   assert.match(css, /\.chat-list\{[^}]*min-width:0/, 'a long avatar row never stretches the mobile dashboard');
   assert.match(css, /\.dash-contacts-card\{min-width:0\}/, 'the contacts grid item yields its track on narrow shells');

@@ -542,11 +542,14 @@ test('dark glass palette preserves AA text, wallpaper layering, and glass struct
   assert.match(css, /\.contact-button\.is-active\{border-color:var\(--line-strong\)/);
   assert.match(css, /\.contact-button\.is-active \.contact-copy strong\{font-weight:700/);
   assert.match(css, /\.send-button:disabled\{opacity:\.55;box-shadow:none;cursor:not-allowed\}/);
-  const userBubble = css.match(/\.from-user \.message-body\{[^}]*color:(#[0-9a-fA-F]{6})/);
+  const userBubble = css.match(/\.from-user \.message-body\{[^}]*color:(#[0-9a-fA-F]{3,6})/);
   assert.ok(userBubble, 'the user bubble keeps an explicit text color');
-  assert.ok(contrastRatio(userBubble[1], '#a35347') >= 4.5, 'user bubble text stays AA on the solid Brand bubble');
-  assert.match(css, /\.from-user \.message-body\{padding:9px 13px;border-radius:20px;background:#a35347/, 'user bubble is solid Brand with uniform 20px corners (App AppearanceSettings)');
-  assert.match(css, /\.from-assistant \.message-body:not\(\.sticker-only-message\)\{padding:9px 13px;border:1px solid rgba\(255,255,255,\.18\);border-radius:20px;background:rgba\(27,23,20,\.4\)/, 'assistant bubble is the App glass card');
+  const userBubbleText = userBubble[1].length === 4 ? `#${userBubble[1][1]}${userBubble[1][1]}${userBubble[1][2]}${userBubble[1][2]}${userBubble[1][3]}${userBubble[1][3]}` : userBubble[1];
+  // The App's terracotta glass (#CE7849 clamped to 50% over pageBase #241F1B)
+  // composites to ~#794b32 behind the text.
+  assert.ok(contrastRatio(userBubbleText, '#794b32') >= 4.5, 'user bubble text stays AA on the terracotta glass bubble');
+  assert.match(css, /\.from-user \.message-body\{padding:9px 13px;border:1px solid rgba\(255,255,255,\.2\);border-radius:20px;background:rgba\(206,120,73,\.5\);backdrop-filter:blur\(16px\)/, 'user bubble is the App terracotta glass: synced darkUserColor #CE7849, alpha clamped to 50% (ChatScreen.kt userGlassBackgroundColor), 20% white border');
+  assert.match(css, /\.from-assistant \.message-body:not\(\.sticker-only-message\)\{padding:9px 13px;border:1px solid rgba\(255,255,255,\.18\);border-radius:20px;background:rgba\(27,23,20,\.4\);backdrop-filter:blur\(16px\)/, 'assistant bubble is the App glass card with 16px blur');
   assert.match(css, /@supports \(backdrop-filter:blur\(2px\)\)/, 'solid-by-default glass lowers alpha only where blur exists');
 });
 
@@ -562,11 +565,11 @@ test('PWA shell declares installability and has no secret persistence', async ()
   assert.match(manifest, /icon-192\.png/);
   assert.match(manifest, /icon-512\.png/);
   assert.match(serviceWorker, /addEventListener\('fetch'/);
-  assert.match(serviceWorker, /cccompanion-desk-v27/);
-  assert.match(serviceWorker, /src\/styles\.css\?v=27/);
-  assert.match(serviceWorker, /src\/app\.js\?v=27/);
-  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=27/);
-  assert.match(serviceWorker, /src\/sticker-protocol\.js\?v=27/);
+  assert.match(serviceWorker, /cccompanion-desk-v28/);
+  assert.match(serviceWorker, /src\/styles\.css\?v=28/);
+  assert.match(serviceWorker, /src\/app\.js\?v=28/);
+  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=28/);
+  assert.match(serviceWorker, /src\/sticker-protocol\.js\?v=28/);
   assert.match(serviceWorker, /src\/live-messages\.js/);
   assert.match(serviceWorker, /src\/pairing-code\.js/);
   assert.doesNotMatch(source, /shared_secret|localStorage\.setItem|sessionStorage\.setItem|credentials:\s*'include'/);
@@ -583,8 +586,8 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   ]);
   assert.match(html, /id="latest-button"/);
   assert.match(html, /id="pairing-code"/);
-  assert.match(html, /href="\.\/src\/styles\.css\?v=27"/);
-  assert.match(html, /src="\.\/src\/app\.js\?v=27"/);
+  assert.match(html, /href="\.\/src\/styles\.css\?v=28"/);
+  assert.match(html, /src="\.\/src\/app\.js\?v=28"/);
   assert.match(html, /autocomplete="one-time-code"/);
   assert.match(html, /id="pairing-form"/);
   assert.match(html, /<details class="password-fallback">/);
