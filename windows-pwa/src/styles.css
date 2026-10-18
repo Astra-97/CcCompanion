@@ -37,10 +37,17 @@ textarea:focus-visible{outline:none}
 .skip-link{position:fixed;left:12px;top:-60px;z-index:30;padding:9px 13px;border-radius:10px;color:var(--avatar-ink);background:var(--brass);transition:top .15s}.skip-link:focus{top:12px}
 .grain{position:fixed;inset:0;pointer-events:none;opacity:.05;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 160 160' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.35'/%3E%3C/svg%3E");mix-blend-mode:overlay}
 
-/* Shell: three floating glass panels on the wallpaper. */
+/* Shell: three floating glass panels on the wallpaper.  On desktop the shell
+   itself carries a soft blurred veil so the 14px panel gaps never show raw
+   unblurred wallpaper (the sharp gap strips Astra circled 2026-10-18); below
+   1200px the layout is a single column and .side-notes goes fixed, which a
+   shell backdrop-filter would re-contain, so the veil stays desktop-only. */
 .desk-shell{position:relative;display:grid;grid-template-columns:236px minmax(0,1fr) 312px;gap:14px;height:100vh;height:100dvh;max-width:1680px;margin:auto;padding:14px}
 .rail,.side-notes,.conversation{border:1px solid var(--line);border-radius:24px;background:var(--glass);backdrop-filter:blur(26px) saturate(1.3);box-shadow:var(--shadow)}
-.rail{display:flex;min-height:0;flex-direction:column;padding:22px 12px 14px}
+/* The contacts panel sits over the wallpaper's bright portrait backdrop; give
+   it a denser tint than the other panels so that white edge cannot read
+   through as a vertical band (Astra 2026-10-18). */
+.rail{display:flex;min-height:0;flex-direction:column;padding:22px 12px 14px;background:rgba(24,17,12,.7)}
 .rail-brand{display:flex;align-items:center;gap:10px;padding:4px 10px 26px;font:500 14px var(--mono);letter-spacing:-.06em;color:var(--ink)}
 .rail-brand>span span{color:var(--dim)}.mark{width:19px;height:19px;color:var(--brass)}
 .contact-list{display:grid;gap:8px;overflow-y:auto;scrollbar-color:var(--line) transparent}
@@ -80,9 +87,9 @@ textarea:focus-visible{outline:none}
 .text-button{min-height:44px;border:0;border-bottom:1px solid rgba(210,160,106,.55);padding:5px 0;background:transparent;color:var(--muted);font-size:12px;white-space:nowrap}
 .text-button:hover{color:var(--brass)}
 .worker-toggle{display:none}
-/* Desktop gutters track the App's LazyColumn 12dp horizontal padding
-   (ChatScreen.kt:6011) instead of ballooning to 56px on wide windows. */
-.conversation-scroll{position:relative;overflow-y:auto;overscroll-behavior:contain;padding:8px clamp(12px,1.8vw,28px) 14px;scrollbar-color:var(--line) transparent}
+/* Message column hugs the App's LazyColumn 12dp horizontal padding
+   (ChatScreen.kt:6011) at every width — no wide desktop gutter. */
+.conversation-scroll{position:relative;overflow-y:auto;overscroll-behavior:contain;padding:8px 12px 14px;scrollbar-color:var(--line) transparent}
 /* App parity (ChatScreen.kt date separator): centered "10月18日" pill. */
 .date-rule{display:flex;justify-content:center;margin:6px 0;color:rgba(255,255,255,.52);font-size:11.5px;letter-spacing:.03em}
 .date-rule>span{border-radius:999px;padding:3px 11px;background:rgba(0,0,0,.22)}
@@ -490,7 +497,6 @@ body[data-appearance='compact'] .composer{padding-block:7px}
   .connection-state,.logout-button{display:none}
   .worker-toggle{display:grid}
   .head-actions .worker-toggle,.head-actions #memory-button{display:grid}
-  .conversation-scroll{padding:8px 12px 14px}
   .code-block pre{font-size:11.5px;padding:11px 13px}
   .composer{gap:9px;margin:0;padding:9px 12px 11px;border:0;border-radius:0;background:rgba(28,24,21,.58);backdrop-filter:blur(16px);box-shadow:none}
   .composer-actions{gap:7px}
@@ -526,7 +532,9 @@ body[data-appearance='compact'] .composer{padding-block:7px}
    open conversation.  Tablet (768-1199) rules above are untouched. */
 .rail-contacts-head{display:none}
 @media (min-width:1200px){
-  .desk-shell{grid-template-columns:208px 272px minmax(0,1fr) 312px;gap:16px;padding:16px}
+  /* Blurred veil behind the desktop panel gaps: raw wallpaper never shows
+     through the seams (the sharp strips Astra circled 2026-10-18). */
+  .desk-shell{grid-template-columns:208px 272px minmax(0,1fr) 312px;gap:16px;padding:16px;background:rgba(24,17,12,.34);backdrop-filter:blur(24px) saturate(1.2)}
   .rail{display:grid;grid-column:1 / 3;grid-template-rows:auto auto minmax(0,1fr) auto;grid-template-columns:208px minmax(0,1fr);padding:0;overflow:hidden}
   .rail-brand{grid-column:1;padding:22px 14px 18px}
   .rail-tabs{grid-column:1;padding:0 10px}
