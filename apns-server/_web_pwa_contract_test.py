@@ -1448,6 +1448,31 @@ class WebPwaContractTest(unittest.TestCase):
         handler._handle_windows_pwa_asset("/web/pwa/%2e%2e/secret.txt")
         self.assertEqual(handler.responses[-1][0], 404)
 
+    def test_every_sw_precache_asset_is_servable(self):
+        # 2026-10-18 事故钉：头像 jpg/webp 不在静态白名单 → cache.addAll 原子失败
+        # → 新版 SW 永远装不上，客户端永久停在旧版。sw.js 预缓存清单里的每个
+        # 资产都必须真能 200，否则上线即静默死锁。
+        import re
+
+        import push as push_module
+
+        sw = (push_module.WINDOWS_PWA_ROOT / "sw.js").read_text(encoding="utf-8")
+        match = re.search(r"const ASSETS = \[(.*?)\];", sw, re.S)
+        self.assertIsNotNone(match)
+        assets = re.findall(r"'([^']+)'", match.group(1))
+        self.assertGreater(len(assets), 5)
+        for asset in assets:
+            asset_path = asset.removeprefix("./").split("?", 1)[0]
+            handler = self.handler(f"/web/pwa/{asset_path}")
+            handler.send_response = lambda _status: None
+            handler.send_header = lambda _name, _value: None
+            handler.end_headers = lambda: None
+            handler.wfile = io.BytesIO()
+            handler.responses = []
+            handler._handle_windows_pwa_asset(f"/web/pwa/{asset_path}")
+            self.assertEqual(handler.responses, [], f"{asset} must be servable, got {handler.responses}")
+            self.assertGreater(len(handler.wfile.getvalue()), 0, f"{asset} must serve bytes")
+
 
 if __name__ == "__main__":
     unittest.main()

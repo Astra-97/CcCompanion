@@ -11037,7 +11037,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 return
             # PWA shell assets are a deliberately narrow static format set;
             # never let this route turn into a generic source/runtime browser.
-            allowed_suffixes = {".html", ".js", ".css", ".svg", ".webmanifest", ".png", ".ico"}
+            allowed_suffixes = {".html", ".js", ".css", ".svg", ".webmanifest", ".png", ".ico", ".jpg", ".jpeg", ".webp"}
             if candidate.suffix.lower() not in allowed_suffixes:
                 self._send_json(404, {"error": "not found"})
                 return
