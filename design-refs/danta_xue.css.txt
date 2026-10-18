@@ -1,0 +1,734 @@
+
+
+/* 玻璃雪（兔k版）by蛋挞。源代码ee，整理喵个弥，菜单栏by愫。可二改自用，不可二传₍ᐢ..ᐢ₎♡ */
+
+/* === A. 全局样式 === */
+
+:root {
+  --screen-width: 350px;
+  --screen-height: 650px;
+  --secondary-bg: #f8f8f8;
+  --border-color: #e5e5e5;
+  --text-primary: rgba(40,40,40,0.82);
+  --text-secondary: rgba(90,90,90,0.70);
+  --accent-color: rgba(60,60,60,0.78);
+}
+
+/* 隐藏兔k心跳按钮 */
+#char-heart-btn {
+display: none !important;
+}
+
+/* 隐藏角色状态*/
+.status-dot,
+.status-text,
+.status {
+  display: none !important;
+  visibility: hidden !important;
+}
+
+/* 隐藏时间戳 */
+.message-wrapper.user .timestamp,
+.message-wrapper.ai .timestamp {
+display: none !important;
+}
+
+/* === B. 顶部栏 === */
+
+#chat-interface-screen .header {
+  background: transparent !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  border: none !important;
+  box-shadow: none !important;
+}
+
+#chat-interface-screen .header::before,
+#chat-interface-screen .header::after {
+  content: none !important;
+  display: none !important;
+}
+
+/* 返回按钮 */
+#chat-interface-screen .header .back-btn {
+  font-size: 0 !important;
+  background: url('https://i.postimg.cc/K816y6z2/IMG-7891.png') center/contain no-repeat !important;
+  width: 38px !important;
+  height: 38px !important;
+}
+
+/* 设置按钮 */
+#chat-settings-btn img {
+  content: url('https://i.postimg.cc/8ckYX39S/IMG-7850.png') !important;
+  width: 30px !important;
+  height: 30px !important;
+  object-fit: contain !important;
+}
+
+#listen-together-btn img {
+ content: url('https://i.postimg.cc/1XZsVn1h/IMG-7872.png') !important;
+ width: 28px !important; height: 28px !important; object-fit: contain !important;
+ animation: none !important;
+}
+
+#listen-together-btn img.rotating {
+ content: url('https://i.postimg.cc/1XZsVn1h/IMG-7872.png') !important;
+ width: 28px !important; height: 28px !important; object-fit: contain !important;
+ animation: spin 2s linear infinite !important;
+}
+
+#listen-together-btn img.rotating.paused {
+ animation-play-state: paused !important;
+}
+
+#chat-header-title-wrapper {
+  position: absolute !important;
+  left: 52px !important;
+  top: 50% !important;
+  transform: translateY(calc(-50% + 29px)) !important;
+}
+
+#chat-header-title {
+  padding: 5px 14px !important;
+  background: rgba(255, 255, 255, 0.12) !important;
+  backdrop-filter: blur(8px) saturate(180%) !important;
+  -webkit-backdrop-filter: blur(8px) saturate(180%) !important;
+  border-radius: 999px !important;
+  border: 1px solid rgba(255, 255, 255, 0.22) !important;
+  color: rgba(40, 40, 40, 0.80) !important;
+  font-weight: 500 !important;
+  font-size: 15px !important;
+  box-shadow:
+    0 4px 12px rgba(0,0,0,0.12),
+    inset 0 0 6px rgba(255,255,255,0.35) !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+}
+
+/* --- “自定义对方正在输入中...” --- */
+
+#chat-header-title.typing-status {
+  font-size: 0 !important;
+  color: transparent !important;
+  animation: typing-pulse 1.5s infinite;
+}
+
+#chat-header-title.typing-status::before {
+  content: &quot;[ 눈이 내리다…❄️ ]&quot;;
+  color: #b0b0b0;
+  font-style: italic;
+  font-weight: 500;
+  font-size: 14px;
+}
+
+/* === C. 底部栏 === */
+
+/* 菜单按钮代码来源@愫 */
+
+#chat-input-actions-top .chat-action-icon-btn,
+#chat-input-actions-top #reroll-btn {
+  display: none !important;
+  opacity: 0 !important;
+  transform: scale(0.5) !important;
+  pointer-events: none !important;
+}
+ 
+#chat-input-actions-top {
+  position: absolute !important;
+  left: 5px !important;
+  bottom: 48px !important;
+  z-index: 1000 !important;
+  width: 38px !important;
+  height: 38px !important;
+  pointer-events: none !important;
+  transition: all 0.3s ease !important;
+}
+ 
+#chat-input-actions-top::before {
+  content: '' !important;
+  position: absolute !important;
+  width: 40px !important;
+  height: 40px !important;
+  background-image: url('') !important;
+  background-size: contain !important;
+  background-position: center !important;
+  background-repeat: no-repeat !important;
+  background-color: transparent !important;
+  border: none !important;
+  border-radius: 0 !important;
+  font-size: 0 !important;
+  color: transparent !important;
+  cursor: pointer !important;
+  pointer-events: auto !important;
+  z-index: 1001 !important;
+  transition: all 0.3s ease !important;
+}
+ 
+#chat-input-actions-top.menu-open,
+#chat-input-actions-top:hover {
+  width: auto !important;
+  min-width: 280px !important;
+  max-width: 90vw !important;
+  height: auto !important;
+  background: #ffffff !important;
+  border-radius: 12px !important;
+  padding: 12px !important;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.12) !important;
+  pointer-events: auto !important;
+  left: 10px !important;
+  bottom: 5px !important;
+  display: grid !important;
+  grid-template-columns: repeat(3, 1fr) !important;
+  gap: 8px !important;
+  border: 1px solid #e0e0e0 !important;
+  align-items: start !important;
+}
+ 
+#chat-input-actions-top.menu-open::before,
+#chat-input-actions-top:hover::before {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+ 
+#chat-input-actions-top.menu-open::after,
+#chat-input-actions-top:hover::after {
+  content: '' !important;
+  grid-column: 1 !important;
+  width: 35px !important;
+  height: 35px !important;
+  background: transparent !important;
+  pointer-events: none !important;
+  visibility: hidden !important;
+}
+ 
+#chat-input-actions-top.menu-open .chat-action-icon-btn,
+#chat-input-actions-top:hover .chat-action-icon-btn,
+#chat-input-actions-top.menu-open #reroll-btn,
+#chat-input-actions-top:hover #reroll-btn {
+  display: flex !important;
+  opacity: 1 !important;
+  transform: scale(1) !important;
+  pointer-events: auto !important;
+  width: 100% !important;
+  height: 32px !important;
+  min-width: auto !important;
+  padding: 0 10px 0 30px !important;
+  background: #f8f9fa !important;
+  border: 1px solid #e9ecef !important;
+  border-radius: 6px !important;
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  color: #495057 !important;
+  align-items: center !important;
+  justify-content: flex-start !important;
+  cursor: pointer !important;
+  position: relative !important;
+  transition: all 0.2s ease !important;
+  margin: 0 !important;
+  z-index: 1002 !important;
+}
+ 
+#chat-input-actions-top .chat-action-icon-btn svg,
+#chat-input-actions-top #reroll-btn svg {
+display: inline-block !important;
+position: absolute !important;
+left: 8px !important;
+top: 50% !important;
+transform: translateY(-50%) !important;
+width: 16px !important;
+height: 16px !important;
+color: #2d2d2d !important;
+}
+ 
+#chat-input-actions-top.menu-open .chat-action-icon-btn::after,
+#chat-input-actions-top:hover .chat-action-icon-btn::after,
+#chat-input-actions-top.menu-open #reroll-btn::after,
+#chat-input-actions-top:hover #reroll-btn::after {
+display: inline-block !important;
+}
+ 
+#open-sticker-panel-btn::after { content: &quot;表情&quot; !important; }
+#send-photo-btn::after { content: &quot;照片&quot; !important; }
+#upload-image-btn::after { content: &quot;相册&quot; !important; }
+#transfer-btn::after { content: &quot;转账&quot; !important; }
+#voice-message-btn::after { content: &quot;语音&quot; !important; }
+#send-waimai-request-btn::after { content: &quot;外卖&quot; !important; }
+#video-call-btn::after { content: &quot;视频&quot; !important; }
+#group-video-call-btn::after { content: &quot;群视频&quot; !important; }
+#send-poll-btn::after { content: &quot;投票&quot; !important; }
+#share-link-btn::after { content: &quot;分享&quot; !important; }
+#send-location-btn::after { content: &quot;定位&quot; !important; }
+#reroll-btn::after { content: &quot;重试&quot; !important; }
+#open-tarot-btn::after { content: &quot;塔罗&quot; !important; }
+#pet-action-btn::after { content: &quot;宠物&quot; !important; }
+ 
+#chat-input-actions-top .chat-action-icon-btn:hover,
+#chat-input-actions-top #reroll-btn:hover {
+  background: #e9ecef !important;
+  border-color: #dee2e6 !important;
+  transform: translateY(-1px) !important;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1) !important;
+}
+
+ /* 响应式适配 */
+@media (max-width: 380px) {
+  #chat-input-area #chat-input-actions-top.menu-open,
+  #chat-input-area #chat-input-actions-top:hover {
+    grid-template-columns: repeat(2, 1fr) !important;
+    min-width: 200px !important;
+    left: 5px !important;
+  }
+}
+
+@media (min-width: 768px) {
+  #chat-input-area #chat-input-actions-top.menu-open,
+  #chat-input-area #chat-input-actions-top:hover {
+    grid-template-columns: repeat(4, 1fr) !important;
+    min-width: 320px !important;
+  }
+}
+
+#chat-input-area {
+  position: relative;
+  display: flex; 
+  align-items: center;
+  width: 100%;
+  gap: 0;
+  background: transparent !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  border: none !important;
+  box-shadow: none !important;
+  padding: 12px 10px;
+  z-index: 20;
+  min-height: 78px;
+}
+
+#chat-input-main-row {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  gap: 5px;
+  position: relative;
+}
+
+#chat-input {
+  flex: 1 !important;
+  width: 100% !important;
+
+  background: rgba(255, 255, 255, 0.10) !important;
+  backdrop-filter: blur(6px) saturate(160%) !important;
+  -webkit-backdrop-filter: blur(6px) saturate(160%) !important;
+  border-radius: 18px !important;
+  padding: 14px 18px !important;
+  border: 1px solid rgba(255, 255, 255, 0.22) !important;
+  box-shadow:
+    0 4px 14px rgba(0,0,0,0.10),
+    inset 0 0 4px rgba(255,255,255,0.35) !important;
+  color: rgba(40,40,40,0.82) !important;
+  font-size: 14px;
+}
+
+#chat-input::placeholder {
+  color: transparent;
+}
+
+#chat-input-main-row {
+  position: relative;
+}
+
+#chat-input-main-row::before {
+  content: '♪ Every moment feels like forever ♪';
+  position: absolute;
+  top: 50%;
+  left: 15px;
+  transform: translateY(-50%);
+  font-size: 13px;
+  color: #b0b0b0;
+  font-style: italic;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+  z-index: 2;
+}
+
+/* 当 focus 或有文字时，隐藏伪 placeholder */
+#chat-input-main-row:focus-within::before,
+#chat-input-main-row:has(#chat-input:not(:placeholder-shown))::before {
+  opacity: 0;
+}
+
+#chat-input:focus {
+outline: none !important;
+}
+
+#chat-input-area .send-button,
+#chat-input-area .toggle-button {
+  transform: scale(0.65) translateX(-8px);
+  margin-left: 0 !important;
+  padding: 0 !important;
+}
+
+/* 隐藏原本的文字与图片 */
+#send-btn,
+#wait-reply-btn {
+  font-size: 0 !important;
+}
+
+#send-btn img,
+#wait-reply-btn img {
+  display: none !important;
+}
+
+#send-btn {
+  width: 66px !important;
+  height: 44px !important;
+  border-radius: 22px !important;
+  background: rgba(255, 255, 255, 0.12) !important;
+  backdrop-filter: blur(6px) saturate(160%) !important;
+  -webkit-backdrop-filter: blur(6px) saturate(160%) !important;
+  border: 1px solid rgba(255, 255, 255, 0.26) !important;
+  box-shadow:
+    0 4px 14px rgba(0,0,0,0.12),
+    inset 0 0 4px rgba(255,255,255,0.35) !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  cursor: pointer !important;
+  padding: 0 !important;
+  transform: scale(0.85) !important;
+  margin-left: 0 !important;
+}
+
+#send-btn::after {
+  content: &quot;send&quot;;
+  font-size: 15px !important;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+  color: #b0b0b0;
+}
+
+#wait-reply-btn {
+  width: 44px !important;
+  height: 44px !important;
+  border-radius: 50% !important;
+  background: rgba(255, 255, 255, 0.12) !important;
+  backdrop-filter: blur(6px) saturate(160%) !important;
+  -webkit-backdrop-filter: blur(6px) saturate(160%) !important;
+  border: 1px solid rgba(255, 255, 255, 0.28) !important;
+  box-shadow:
+    0 4px 14px rgba(0,0,0,0.12),
+    inset 0 0 4px rgba(255,255,255,0.4) !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  cursor: pointer !important;
+  padding: 0 !important;
+  transform: scale(0.85) !important;
+  margin-right: -8px !important;
+}
+
+#wait-reply-btn::after {
+  content: &quot;💭&quot; !important;
+  font-size: 20px !important;
+  color: rgba(30, 30, 30, 0.75);
+}
+
+#send-btn:hover,
+#wait-reply-btn:hover {
+  background: rgba(255, 255, 255, 0.18) !important;
+  border-color: rgba(255, 255, 255, 0.43) !important;
+  box-shadow:
+    0 6px 18px rgba(0,0,0,0.15),
+    inset 0 0 5px rgba(255,255,255,0.55) !important;
+  transform: scale(0.88) !important;
+}
+
+/* === D. 聊天区 === */
+
+.date-stamp-bubble,
+.message-bubble.system-bubble,
+.recalled-message-placeholder {
+    background: rgba(255, 255, 255, 0.08) !important;
+    backdrop-filter: blur(14px) saturate(180%) !important;
+    -webkit-backdrop-filter: blur(14px) saturate(180%) !important;
+    border: 1px solid rgba(255, 255, 255, 0.12) !important;
+    color: rgba(40, 40, 40, 0.78) !important;
+    border-radius: 12px !important;
+    padding: 4px 10px !important;
+    box-shadow:
+        0 4px 12px rgba(0,0,0,0.08),
+        inset 0 0 6px rgba(255,255,255,0.35) !important;
+    font-size: 12px !important;
+    text-align: center;
+}
+
+/* 消息整体容器 */
+.message-bubble {
+    display: flex !important;
+    align-items: flex-start !important;
+    gap: 10px;
+}
+
+/* 气泡样式 */
+.message-bubble .content {
+    display: inline-block !important;
+    max-width: 75% !important;
+    padding: 8px 18px !important;
+    line-height: 1.42 !important;
+    border-radius: 20px !important;
+    word-break: break-word !important;
+    background: rgba(255, 255, 255, 0.08) !important;
+    backdrop-filter: blur(14px) saturate(180%) !important;
+    -webkit-backdrop-filter: blur(14px) saturate(180%) !important;
+    border: 1px solid rgba(255,255,255,0.12) !important;
+    color: rgba(40, 40, 40, 0.78) !important;
+    box-shadow:
+        0 4px 12px rgba(0,0,0,0.08),
+        inset 0 0 6px rgba(255,255,255,0.35) !important;
+}
+
+/* 移除气泡尾巴 */
+.message-bubble .content::before,
+.message-bubble .content::after {
+    display: none !important;
+}
+
+/* 头像样式 */
+.message-bubble .avatar,
+.message-bubble .avatar img {
+    width: 40px !important;
+    height: 40px !important;
+    border-radius: 50% !important;
+    object-fit: cover !important;
+    background: rgba(255,255,255,0.12) !important;
+    border: 1px solid rgba(255,255,255,0.18) !important;
+    backdrop-filter: blur(12px) !important;
+    box-shadow:
+        0 4px 10px rgba(0,0,0,0.08),
+        inset 0 0 4px rgba(255,255,255,0.35) !important;
+    margin-top: 0 !important;
+}
+
+/* 文本优化 */
+.message-bubble .content p {
+    margin: 0 !important;
+}
+
+/* 小屏幕适配 */
+@media (max-width:480px) {
+  .message-bubble .avatar,
+  .message-bubble .avatar img {
+    width: 36px !important;
+    height: 36px !important;
+  }
+  .message-bubble .content {
+    max-width: 78% !important;
+    padding: 6px 14px !important;
+  }
+}
+
+/* 发送后的状态重置 */
+#chat-input:empty {
+  height: 40px !important;
+}
+
+#chat-input:empty::before {
+  opacity: 1 !important;
+}
+
+/* === E.功能类 === */
+
+/* 转账卡片 */
+
+#chat-messages .message-bubble.is-transfer .content {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  border-radius: 0 !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+#chat-messages .message-bubble .transfer-card {
+  background: rgba(255, 255, 255, 0.08) !important;
+  backdrop-filter: blur(14px) saturate(180%) !important;
+  -webkit-backdrop-filter: blur(14px) saturate(180%) !important;
+  border: 1px solid rgba(255, 255, 255, 0.12) !important;
+  border-radius: 14px !important;
+  padding: 8px 18px !important;
+  margin: 4px 0 -13px 0 !important;
+  min-width: 150px !important;
+  max-width: 260px !important;   
+  box-shadow:
+    0 4px 12px rgba(0,0,0,0.08),
+    inset 0 0 6px rgba(255,255,255,0.35) !important;
+  color: rgba(30, 30, 30, 0.85) !important;
+  width: fit-content !important;
+  transition: transform .25s ease, opacity .2s ease !important;
+  position: relative !important;
+  z-index: 1 !important;
+}
+
+#chat-messages .message-bubble.user .transfer-card {
+  transform: scale(.82) !important;
+  transform-origin: right top !important;
+}
+
+#chat-messages .message-bubble.ai .transfer-card {
+  transform: scale(.82) !important;
+  transform-origin: left top !important;
+}
+
+#chat-messages .message-bubble.ai .transfer-card::before,
+#chat-messages .message-bubble.user .transfer-card::before,
+#chat-messages .message-bubble .transfer-card::after {
+  display: none !important;
+  content: none !important;
+}
+
+.message-bubble.is-sticker .content, 
+.message-bubble.is-red-packet .content,
+.message-bubble.is-location .content, 
+.message-bubble.is-poll .content,
+.message-bubble.is-waimai-request .content, 
+.message-bubble.is-link-share .content, 
+.message-bubble.has-image .content {
+  background: transparent !important; 
+  border: none !important; 
+  box-shadow: none !important; 
+  padding: 0 !important; 
+  margin: 0 !important; 
+  border-radius: 0 !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+#chat-messages .message-bubble .transfer-card .transfer-title svg {
+  display: none !important;
+}
+
+#chat-messages .message-bubble .transfer-card .transfer-title::before {
+  content: &quot;❄️&quot; !important;
+  font-size: 18px !important;
+  filter: brightness(0.9) !important;
+  opacity: 0.9 !important;
+  display: inline-block !important;
+  margin-right: 8px !important;
+}
+
+#chat-messages .message-bubble .transfer-card .transfer-title,
+#chat-messages .message-bubble .transfer-card .transfer-amount,
+#chat-messages .message-bubble .transfer-card .transfer-note {
+  color: rgba(30, 30, 30, 0.85) !important;
+  position: relative !important;
+  z-index: 2 !important;
+}
+
+#transfer-actions-modal .transfer-actions-content,
+#transfer-modal .transfer-content {
+  backdrop-filter: blur(22px);
+  -webkit-backdrop-filter: blur(22px);
+  background: rgba(255,255,255,0.55) !important;
+  border: 1px solid rgba(255,255,255,0.7) !important;
+  border-radius: 22px !important;
+  box-shadow: 0 8px 28px rgba(0,0,0,0.08);
+}
+
+#transfer-actions-modal .transfer-actions-header,
+#transfer-modal .transfer-header {
+  font-size: 18px !important;
+  font-weight: 600 !important;
+  color: rgba(40,40,40,0.82) !important;
+}
+
+#transfer-actions-modal .transfer-actions-body p,
+#transfer-modal .transfer-input-group label {
+  color: rgba(80,80,80,0.75) !important;
+}
+
+#transfer-modal .transfer-input-group input {
+  background: rgba(255,255,255,0.65) !important;
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255,255,255,0.55) !important;
+  border-radius: 12px !important;
+  padding: 10px !important;
+  color: rgba(40,40,40,0.82) !important;
+  box-shadow:
+    inset 2px 2px 4px rgba(0,0,0,0.04),
+    inset -2px -2px 4px rgba(255,255,255,0.8);
+}
+
+#transfer-actions-modal .action-btn.accept,
+#transfer-modal #transfer-confirm-btn {
+  background: rgba(255,255,255,0.7) !important;
+  backdrop-filter: blur(10px);
+  border-radius: 14px !important;
+  color: rgba(40,40,40,0.82) !important;
+  border: 1px solid rgba(255,255,255,0.8) !important;
+  font-weight: 600;
+  box-shadow: 0 3px 10px rgba(0,0,0,0.06);
+}
+
+#transfer-actions-modal .action-btn.decline,
+#transfer-modal #transfer-cancel-btn {
+  background: rgba(255,255,255,0.45) !important;
+  border-radius: 14px !important;
+  color: rgba(70,70,70,0.75) !important;
+  border: 1px solid rgba(255,255,255,0.6) !important;
+  font-weight: 500;
+}
+
+/* 语音转文字 */
+.message-bubble .voice-transcript {
+    background: rgba(255, 255, 255, 0.08) !important;
+    backdrop-filter: blur(14px) saturate(180%) !important;
+    -webkit-backdrop-filter: blur(14px) saturate(180%) !important;
+    border: 1px solid rgba(255, 255, 255, 0.12) !important;
+    border-radius: 12px !important;
+    color: rgba(40, 40, 40, 0.78) !important;
+    padding: 8px 14px !important;
+    margin-top: 6px !important;
+    margin-bottom: 4px !important;
+    width: fit-content !important;
+    max-width: 75% !important;
+    line-height: 1.45 !important;
+    box-shadow:
+        0 4px 12px rgba(0,0,0,0.08),
+        inset 0 0 6px rgba(255,255,255,0.35) !important;
+    word-break: break-word !important;
+}
+
+.message-bubble .voice-message-body,
+.message-bubble .voice-duration {
+    color: rgba(40, 40, 40, 0.78) !important;
+}
+
+.loading-spinner {
+    border-top-color: rgba(40, 40, 40, 0.78) !important;
+}
+
+.message-wrapper {
+   margin-top: -5px !important;
+}
+
+#chat-input-area {
+  transform: translateY(-10px) !important;
+  padding: 12px 10px !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 6px !important;
+}
+
+#chat-input-main-row {
+  flex: 1 1 auto !important;
+  min-width: 0 !important;
+}
+
+#chat-input {
+  flex: 1 1 auto !important;
+  min-width: 130px !important;
+  max-width: 280px !important; 
+}

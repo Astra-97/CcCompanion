@@ -1,0 +1,665 @@
+
+
+/* 淡淡的（毛玻璃顶栏330版）by蛋挞。源代码ee，整理喵个弥，菜单栏by愫。可二改自用，不可二传₍ᐢ..ᐢ₎♡ */
+/* 素材来源：xhs@冰冻雪饼 @DorisWorld */
+
+/* === A. 全局样式 === */
+
+:root {
+  --screen-width: 350px;
+  --screen-height: 650px;
+  --secondary-bg: #ffffff;
+  --border-color: #e0e0e0;
+  --text-primary: #1f1f1f;
+  --text-secondary: #8a8a8a;
+  --accent-color: #1f1f1f;
+
+/* 330将“总结记忆”按钮图标变为透明 */
+#open-memory-screen-btn svg {
+opacity: 0;
+}
+
+/* === B. 顶部栏 === */
+
+/* === B. 顶部栏 === */
+
+/* 顶部背景图设置 */
+
+#chat-interface-screen .header {
+  position: relative;
+  background: rgba(255, 255, 255, 0.4);
+  backdrop-filter: blur(12px) saturate(180%);
+  -webkit-backdrop-filter: blur(12px) saturate(180%); 
+  border: none !important;
+  border-radius: 0 0 18px 18px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+  overflow: hidden;
+  z-index: 10;
+}
+
+#chat-interface-screen .header::after {
+  content: &quot;&quot;;
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 25px;
+  background: linear-gradient(to bottom, rgba(255,255,255,0) 0%, rgba(255,255,255,0.6) 100%);
+  border-bottom-left-radius: 18px;
+  border-bottom-right-radius: 18px;
+  pointer-events: none;
+  z-index: 2;
+}
+
+#chat-interface-screen .header .back-btn {
+  font-size: 0 !important;
+  background: url('https://i.postimg.cc/XqMvtzYc/IMG-5446.jpg') center/contain no-repeat !important;
+  width: 38px !important;
+  height: 38px !important;
+  margin: 5px 0 0 3px;
+  border-radius: 50% !important;
+  overflow: hidden;
+}
+
+#chat-settings-btn img {
+ content: url('https://i.postimg.cc/4dnZ4k3F/IMG-5944.png') !important;
+ width: 30px !important; height: 30px !important; object-fit: contain !important;
+}
+
+#listen-together-btn img {
+ content: url(' HYPERLINK &quot;https://i.postimg.cc/sXSDkrQ6/IMG-5946.png&quot;https://i.postimg.cc/sXSDkrQ6/IMG-5946.png') !important;
+ width: 30px !important; height: 30px !important; object-fit: contain !important;
+ animation: none !important;
+}
+
+#listen-together-btn img.rotating {
+ content: url(' HYPERLINK &quot;https://i.postimg.cc/sXSDkrQ6/IMG-5946.png&quot;https://i.postimg.cc/sXSDkrQ6/IMG-5946.png') !important;
+ width: 30px !important; height: 30px !important; object-fit: contain !important;
+ animation: spin 2s linear infinite !important;
+}
+
+#listen-together-btn img.rotating.paused {
+ animation-play-state: paused !important;
+}
+
+/* --- “对方正在输入...” --- */
+
+#chat-header-title.typing-status {
+  font-size: 0; 
+  animation: typing-pulse 1.5s infinite;
+}
+
+#chat-header-title.typing-status::before {
+  content: &quot;[ 送信中♡.. ]&quot;;
+  color: #b0b0b0;
+  font-style: italic;
+  font-weight: 500;
+  font-size: 14px
+}
+
+/* 隐藏角色状态*/
+.status-dot,
+.status-text,
+.status {
+  display: none !important;
+  visibility: hidden !important;
+}
+
+/* === C. 底部栏 === */
+
+/* --- 默认状态下，彻底隐藏并禁用所有菜单内按钮 --- */
+#chat-input-actions-top .chat-action-icon-btn,
+#chat-input-actions-top #reroll-btn {
+  display: none !important;
+  opacity: 0 !important;
+  transform: scale(0.5) !important;
+  pointer-events: none !important;
+}
+ 
+/* --- 【已修改】“+”号按钮位置 --- */
+#chat-input-actions-top {
+  position: absolute !important;
+  left: 5px !important;
+  bottom: 48px !important;
+  z-index: 1000 !important;
+  width: 38px !important;
+  height: 38px !important;
+  pointer-events: none !important;
+  transition: all 0.3s ease !important;
+}
+ 
+#chat-input-actions-top::before {
+  content: '' !important;
+  position: absolute !important;
+  width: 40px !important;
+  height: 40px !important;
+  background-image: url('') !important;
+  background-size: contain !important; /* 使用 contain 确保图片完整显示 */
+  background-position: center !important;
+  background-repeat: no-repeat !important;
+  background-color: transparent !important;
+  border: none !important;
+  border-radius: 0 !important;
+  font-size: 0 !important; /* 确保无文字显示 */
+  color: transparent !important; /* 确保无文字显示 */
+  cursor: pointer !important;
+  pointer-events: auto !important;
+  z-index: 1001 !important;
+  transition: all 0.3s ease !important;
+}
+ 
+#chat-input-actions-top.menu-open,
+#chat-input-actions-top:hover {
+  width: auto !important;
+  min-width: 280px !important;
+  max-width: 90vw !important;
+  height: auto !important;
+  background: #ffffff !important;
+  border-radius: 12px !important;
+  padding: 12px !important;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.12) !important;
+  pointer-events: auto !important;
+  left: 10px !important;
+  bottom: 5px !important;
+  display: grid !important;
+  grid-template-columns: repeat(3, 1fr) !important;
+  gap: 8px !important;
+  border: 1px solid #e0e0e0 !important;
+  align-items: start !important;
+}
+ 
+#chat-input-actions-top.menu-open::before,
+#chat-input-actions-top:hover::before {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+ 
+#chat-input-actions-top.menu-open::after,
+#chat-input-actions-top:hover::after {
+  content: '' !important;
+  grid-column: 1 !important;
+  width: 35px !important;
+  height: 35px !important;
+  background: transparent !important;
+  pointer-events: none !important;
+  visibility: hidden !important; /* 隐藏但占据空间 */
+}
+ 
+#chat-input-actions-top.menu-open .chat-action-icon-btn,
+#chat-input-actions-top:hover .chat-action-icon-btn,
+#chat-input-actions-top.menu-open #reroll-btn,
+#chat-input-actions-top:hover #reroll-btn {
+  display: flex !important;
+  opacity: 1 !important;
+  transform: scale(1) !important;
+  pointer-events: auto !important;
+  width: 100% !important;
+  height: 32px !important;
+  min-width: auto !important;
+  padding: 0 10px 0 30px !important;
+  background: #f8f9fa !important;
+  border: 1px solid #e9ecef !important;
+  border-radius: 6px !important;
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  color: #495057 !important;
+  align-items: center !important;
+  justify-content: flex-start !important;
+  cursor: pointer !important;
+  position: relative !important;
+  transition: all 0.2s ease !important;
+  margin: 0 !important;
+  z-index: 1002 !important;
+}
+ 
+#chat-input-actions-top .chat-action-icon-btn svg,
+#chat-input-actions-top #reroll-btn svg {
+display: inline-block !important;
+position: absolute !important;
+left: 8px !important;
+top: 50% !important;
+transform: translateY(-50%) !important;
+width: 16px !important;
+height: 16px !important;
+color: #2d2d2d !important;
+}
+ 
+#chat-input-actions-top.menu-open .chat-action-icon-btn::after,
+#chat-input-actions-top:hover .chat-action-icon-btn::after,
+#chat-input-actions-top.menu-open #reroll-btn::after,
+#chat-input-actions-top:hover #reroll-btn::after {
+display: inline-block !important;
+}
+ 
+#open-sticker-panel-btn::after { content: &quot;表情&quot; !important; }
+#send-photo-btn::after { content: &quot;照片&quot; !important; }
+#upload-image-btn::after { content: &quot;图片&quot; !important; }
+#transfer-btn::after { content: &quot;转账&quot; !important; }
+#voice-message-btn::after { content: &quot;语音&quot; !important; }
+#send-waimai-request-btn::after { content: &quot;外卖&quot; !important; }
+#video-call-btn::after { content: &quot;视频&quot; !important; }
+#group-video-call-btn::after { content: &quot;群视频&quot; !important; }
+#send-poll-btn::after { content: &quot;投票&quot; !important; }
+#share-link-btn::after { content: &quot;链接&quot; !important; }
+#send-location-btn::after { content: &quot;定位&quot; !important; }
+#reroll-btn::after { content: &quot;重生成&quot; !important; }
+#open-tarot-btn::after { content: &quot;塔罗占卜&quot; !important; } /* &lt;-- 已为您添加 */
+ 
+#chat-input-actions-top .chat-action-icon-btn:hover,
+#chat-input-actions-top #reroll-btn:hover {
+  background: #e9ecef !important;
+  border-color: #dee2e6 !important;
+  transform: translateY(-1px) !important;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1) !important;
+}
+
+ /* 响应式适配 */
+@media (max-width: 380px) {
+  #chat-input-area #chat-input-actions-top.menu-open,
+  #chat-input-area #chat-input-actions-top:hover {
+    grid-template-columns: repeat(2, 1fr) !important;
+    min-width: 200px !important;
+    left: 5px !important;
+  }
+}
+
+@media (min-width: 768px) {
+  #chat-input-area #chat-input-actions-top.menu-open,
+  #chat-input-area #chat-input-actions-top:hover {
+    grid-template-columns: repeat(4, 1fr) !important;
+    min-width: 320px !important;
+  }
+}
+
+#chat-input-area {
+  position: relative;
+  display: flex; 
+  align-items: center;
+  gap: 8px; 
+  background: rgba(255, 255, 255, 0.35);
+  backdrop-filter: blur(12px) saturate(180%);
+  -webkit-backdrop-filter: blur(12px) saturate(180%);
+  border-top: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: 18px 18px 0 0;
+  box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.1);
+  background-image: url(' HYPERLINK &quot;https://i.postimg.cc/MTz3jD6t/IMG-5926.jpg&quot;https://i.postimg.cc/MTz3jD6t/IMG-5926.jpg');
+  background-size: cover;
+  background-position: center;
+  padding: 10px 12px; 
+  min-height: 55px;
+  z-index: 10;
+}
+
+#chat-input-main-row {
+  display: flex;
+  align-items: center;
+  flex: 1; 
+  position: relative;
+}
+
+#chat-input {
+  flex: 1;
+  min-width: 0;
+  background: rgba(255, 255, 255, 0.55);
+  border-radius: 10px;
+  padding: 8px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  box-shadow: 
+    inset 0 1px 2px rgba(255,255,255,0.4),
+    0 2px 6px rgba(0,0,0,0.1);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  font-size: 14px;
+  color: #222;
+}
+
+#chat-input-area &gt; * {
+  transform: translateY(-10px);
+}
+
+/* 聊天输入框提示语自定义 */
+
+#chat-input::placeholder {
+  color: transparent;
+}
+
+#chat-input-main-row {
+  position: relative;
+}
+
+#chat-input-main-row::before {
+  content: '˶ᗜ 𖥦 ᗜ˶ಣ';
+  position: absolute;
+  top: 50%;
+  left: 15px;
+  transform: translateY(-50%);
+  font-size: 13px;
+  color: #b0b0b0;
+  font-style: italic;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+  z-index: 2;
+}
+
+/* 当 focus 或有文字时，隐藏伪 placeholder */
+#chat-input-main-row:focus-within::before,
+#chat-input-main-row:has(#chat-input:not(:placeholder-shown))::before {
+  opacity: 0;
+}
+
+#chat-input:focus {
+outline: none !important;
+}
+
+#send-btn {
+ background-image: url(' HYPERLINK &quot;https://i.postimg.cc/jq64PtVV/IMG-5922.png&quot;https://i.postimg.cc/jq64PtVV/IMG-5922.png');
+ background-size: contain;
+ background-repeat: no-repeat;
+ background-position: center;
+ width: 44px;
+ background-color: transparent !important;
+ border: none !important;
+ font-size: 0 !important;
+}
+
+#wait-reply-btn img {
+content: url(' HYPERLINK &quot;https://i.postimg.cc/D0K3SsWJ/IMG-6002.png&quot;https://i.postimg.cc/D0K3SsWJ/IMG-6002.png');
+width: 44px !important;
+height: 34px !important;
+margin-right:-13px !important;
+margin-bottom : 0 !important;
+}
+ 
+#wait-reply-btn {
+background: transparent !important;
+border: none !important;
+box-shadow: none !important;
+transform: translateY(-1px);
+}
+
+/* === D. 聊天区 === */
+
+/* 隐藏界面时间戳 */
+ 
+.message-wrapper.ai .timestamp {
+opacity: 0 !important;
+}
+.message-wrapper.user .timestamp {
+opacity: 0 !important;
+}
+ 
+/* --- 隐藏所有特殊消息的时间戳 --- */
+ 
+.message-wrapper:has(.message-bubble.is-transfer),
+.message-wrapper:has(.message-bubble.is-waimai-request),
+.message-wrapper:has(.message-bubble.is-red-packet),
+.message-wrapper:has(.message-bubble.is-poll),
+.message-wrapper:has(.message-bubble.is-link-share),
+.message-wrapper:has(.message-bubble.is-sticker),
+.message-wrapper:has(.message-bubble.system-bubble) {
+ padding-bottom: 0 !important;
+}
+ 
+.message-wrapper:has(.message-bubble.is-transfer) .timestamp,
+.message-wrapper:has(.message-bubble.is-waimai-request) .timestamp,
+.message-wrapper:has(.message-bubble.is-red-packet) .timestamp,
+.message-wrapper:has(.message-bubble.is-poll) .timestamp,
+.message-wrapper:has(.message-bubble.is-link-share) .timestamp,
+.message-wrapper:has(.message-bubble.is-sticker) .timestamp,
+.message-wrapper:has(.message-bubble.system-bubble) .timestamp {
+ display: none !important;
+}
+
+/* 通用气泡容器 */
+.message-bubble {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 4px 0;
+}
+
+/* 头像样式 */
+.message-bubble .avatar,
+.message-bubble .avatar img {
+  width: 45px;
+  height: 45px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex-shrink: 0;
+  margin-top: 0;
+  background: #f0f0f0;
+  box-shadow: 
+    4px 4px 8px rgba(0,0,0,0.1),
+    -4px -4px 8px rgba(255,255,255,0.7),
+    inset 2px 2px 4px rgba(0,0,0,0.04),
+    inset -2px -2px 4px rgba(255,255,255,0.5);
+  transition: box-shadow 0.2s ease;
+}
+
+/* 通用气泡样式 */
+.message-bubble .content {
+  display: inline-block;
+  max-width: 72%;
+  padding: 8px 12px;
+  line-height: 1.45;
+  border-radius: 22px;
+  word-break: break-word;
+  border: 1px solid rgba(255,255,255,0.4);
+  box-shadow:
+  inset 4px 4px 6px rgba(0,0,0,0.08),
+  inset -4px -4px 6px rgba(255,255,255,0.5);
+}
+
+/* 用户气泡 */
+.message-bubble.user {
+  justify-content: flex-end;
+}
+
+.message-bubble.user .content {
+  background: #f5f5f5;
+  color: #111;
+  border-radius: 22px 22px 10px 22px;
+  margin-right: 4px;
+  border: none;
+}
+
+/* AI 气泡 */
+
+.message-bubble.ai {
+  justify-content: flex-start;
+}
+
+.message-bubble.ai .content {
+  background: #e8e8e8;
+  color: #111;
+  border-radius: 22px 22px 22px 10px;
+  margin-left: 4px;
+  border: none;
+}
+
+/* 移除气泡尾巴 */
+.message-bubble .content::before,
+.message-bubble .content::after {
+  content: none !important;
+  display: none !important;
+}
+
+/* 多行文字优化 */
+.message-bubble .content p {
+  margin: 0;
+  padding: 0;
+}
+
+/* 响应式调整 */
+@media (max-width:480px) {
+  .message-bubble .avatar,
+  .message-bubble .avatar img {
+    width: 38px;
+    height: 38px;
+  }
+  .message-bubble .content {
+    max-width: 78%;
+    padding: 8px 12px;
+  }
+}
+
+/* === E.功能类 === */
+
+/* “我”的转账卡片 */
+#chat-messages .message-bubble.user .transfer-card {
+  position: relative;
+  background: url(' HYPERLINK &quot;https://i.postimg.cc/R0XdMfj2/IMG-5983.jpg&quot;https://i.postimg.cc/R0XdMfj2/IMG-5983.jpg') center/cover no-repeat !important;
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,0.3);
+  box-shadow:
+    inset 4px 4px 6px rgba(0,0,0,0.05),
+    inset -4px -4px 6px rgba(255,255,255,0.8),
+    0 4px 10px rgba(0,0,0,0.05);
+  overflow: hidden;
+}
+
+/* 半透明覆盖层，保证文字可读 */
+#chat-messages .message-bubble.user .transfer-card::after {
+  content: '';
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  background: rgba(245,245,245,0.4);
+  border-radius: 14px;
+  pointer-events: none;
+}
+
+/* 内部文字 */
+#chat-messages .message-bubble.user .transfer-card .transfer-title,
+#chat-messages .message-bubble.user .transfer-card .transfer-amount,
+#chat-messages .message-bubble.user .transfer-card .transfer-note {
+  position: relative;
+  color: #333 !important;
+  z-index: 1;
+}
+
+/* “对方”的转账卡片 */
+#chat-messages .message-bubble.ai .transfer-card {
+  position: relative;
+  background: url(' HYPERLINK &quot;https://i.postimg.cc/R0XdMfj2/IMG-5983.jpg&quot;https://i.postimg.cc/R0XdMfj2/IMG-5983.jpg') center/cover no-repeat !important;
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,0.3);
+  box-shadow:
+    inset 4px 4px 6px rgba(0,0,0,0.03),
+    inset -4px -4px 6px rgba(255,255,255,0.7),
+    0 4px 10px rgba(0,0,0,0.03);
+  overflow: hidden;
+}
+
+/* 半透明覆盖层 */
+#chat-messages .message-bubble.ai .transfer-card::after {
+  content: '';
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  background: rgba(232,232,232,0.4);
+  border-radius: 14px;
+  pointer-events: none;
+}
+
+/* 内部文字 */
+#chat-messages .message-bubble.ai .transfer-card .transfer-title,
+#chat-messages .message-bubble.ai .transfer-card .transfer-amount,
+#chat-messages .message-bubble.ai .transfer-card .transfer-note {
+  position: relative;
+  color: #333 !important;
+  z-index: 1;
+}
+
+/* 弹窗主容器样式 */
+#transfer-actions-modal .transfer-actions-content,
+#transfer-modal .transfer-content {
+  background-color: #f5f5f5 !important;
+  border: 1px solid #d0d0d0 !important;
+  border-radius: 20px !important;
+  box-shadow: inset 4px 4px 6px rgba(0,0,0,0.03),
+              inset -4px -4px 6px rgba(255,255,255,0.7),
+              0 5px 20px rgba(0,0,0,0.05) !important;
+  font-family: -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, Roboto, sans-serif !important;
+  background-image: url(' HYPERLINK &quot;https://i.postimg.cc/R0XdMfj2/IMG-5983.jpg&quot;https://i.postimg.cc/R0XdMfj2/IMG-5983.jpg') !important;
+  background-size: cover !important;
+  background-position: center !important;
+}
+
+/* 弹窗标题 */
+#transfer-actions-modal .transfer-actions-header,
+#transfer-modal .transfer-header {
+  font-size: 18px !important;
+  font-weight: 600 !important;
+  color: #333 !important;
+  margin-bottom: 16px !important;
+}
+
+/* 弹窗正文文字 */
+#transfer-actions-modal .transfer-actions-body p {
+  font-size: 14px !important;
+  color: #555 !important;
+}
+
+/* 输入框标签 */
+#transfer-modal .transfer-input-group label {
+  color: #888 !important;
+  font-weight: 500 !important;
+  font-size: 13px !important;
+}
+
+/* 输入框本身 */
+#transfer-modal .transfer-input-group input {
+  background-color: #f0f0f0 !important;
+  border: 1px solid #d0d0d0 !important;
+  border-radius: 12px !important;
+  padding: 10px !important;
+  font-size: 15px !important;
+  box-shadow: inset 2px 2px 4px rgba(0,0,0,0.05),
+              inset -2px -2px 4px rgba(255,255,255,0.7);
+}
+
+/* 输入框聚焦效果 */
+#transfer-modal .transfer-input-group input:focus {
+  border-color: #aaa !important;
+  box-shadow: inset 2px 2px 4px rgba(0,0,0,0.05),
+              inset -2px -2px 4px rgba(255,255,255,0.8),
+              0 0 6px rgba(0,0,0,0.08);
+}
+
+/* 按钮样式 */
+#transfer-actions-modal .action-btn.accept,
+#transfer-modal #transfer-confirm-btn {
+  background: linear-gradient(135deg, #e0e0e0, #f5f5f5) !important;
+  color: #333 !important;
+  border-radius: 12px !important;
+  box-shadow: inset 2px 2px 4px rgba(0,0,0,0.05),
+              inset -2px -2px 4px rgba(255,255,255,0.7),
+              0 4px 8px rgba(0,0,0,0.05);
+  border: none !important;
+  font-weight: 600;
+}
+
+/* 拒绝按钮 */
+#transfer-actions-modal .action-btn.decline,
+#transfer-modal #transfer-cancel-btn {
+  background: linear-gradient(135deg, #dcdcdc, #e8e8e8) !important;
+  color: #555 !important;
+  border-radius: 12px !important;
+  border: none !important;
+  font-weight: 500;
+  box-shadow: inset 2px 2px 4px rgba(0,0,0,0.03),
+              inset -2px -2px 4px rgba(255,255,255,0.7),
+              0 4px 8px rgba(0,0,0,0.03);
+}
+
+/* 右上角关闭按钮 */
+#transfer-actions-modal .cancel-btn {
+  background-color: rgba(0,0,0,0.05) !important;
+  color: #555 !important;
+  border-radius: 50% !important;
+  width: 28px !important;
+  height: 28px !important;
+  font-size: 18px !important;
+  line-height: 28px !important;
+}
