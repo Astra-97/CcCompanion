@@ -535,7 +535,7 @@ test('dark glass palette preserves AA text, wallpaper layering, and glass struct
   assert.match(css, /url\('\/plugins\/xiaonan-dash\/appearance-asset'\) center\/cover no-repeat fixed/);
   assert.match(css, /background-color:var\(--bg\)/);
   assert.doesNotMatch(css, /#fff6ec|fonts\.googleapis|fonts\.gstatic/);
-  assert.match(css, /backdrop-filter:blur\(26px\) saturate\(1\.3\)/);
+  assert.match(css, /backdrop-filter:blur\(26px\) saturate\(1\.6\)/);
   assert.match(css, /\.avatar\{[^}]*color:var\(--avatar-ink\)/);
   assert.match(css, /\.login-card input\{[^}]*border:1px solid var\(--control-border\)/);
   assert.match(css, /input::placeholder\{color:var\(--placeholder\);opacity:1\}/);
@@ -550,6 +550,11 @@ test('dark glass palette preserves AA text, wallpaper layering, and glass struct
   assert.ok(contrastRatio(userBubbleText, '#794b32') >= 4.5, 'user bubble text stays AA on the terracotta glass bubble');
   assert.match(css, /\.from-user \.message-body\{padding:9px 13px;border:1px solid rgba\(255,255,255,\.2\);border-radius:20px;background:rgba\(206,120,73,\.5\);backdrop-filter:blur\(16px\)/, 'user bubble is the App terracotta glass: synced darkUserColor #CE7849, alpha clamped to 50% (ChatScreen.kt userGlassBackgroundColor), 20% white border');
   assert.match(css, /\.from-assistant \.message-body:not\(\.sticker-only-message\)\{padding:9px 13px;border:1px solid rgba\(255,255,255,\.18\);border-radius:20px;background:rgba\(27,23,20,\.4\);backdrop-filter:blur\(16px\)/, 'assistant bubble is the App glass card with 16px blur');
+  // Glass texture pass (2026-10-18, danta 玻璃雪 recipe): saturate(1.5) lifts
+  // the wallpaper hue through the bubble; an inset top highlight + soft drop
+  // shadow give edge-refraction depth. Colors/borders/blur stay her sync values.
+  assert.match(css, /\.from-user \.message-body\{[^}]*saturate\(1\.5\);box-shadow:inset 0 1px 0 rgba\(255,244,230,\.18\),0 4px 14px rgba\(8,4,2,\.3\)/, 'user bubble carries the inset edge highlight and soft drop shadow');
+  assert.match(css, /\.from-assistant \.message-body:not\(\.sticker-only-message\)\{[^}]*saturate\(1\.5\);box-shadow:inset 0 1px 0 rgba\(255,244,230,\.1\)/, 'assistant bubble carries the same texture at lower alpha');
   assert.match(css, /@supports \(backdrop-filter:blur\(2px\)\)/, 'solid-by-default glass lowers alpha only where blur exists');
 });
 
@@ -565,11 +570,11 @@ test('PWA shell declares installability and has no secret persistence', async ()
   assert.match(manifest, /icon-192\.png/);
   assert.match(manifest, /icon-512\.png/);
   assert.match(serviceWorker, /addEventListener\('fetch'/);
-  assert.match(serviceWorker, /cccompanion-desk-v28/);
-  assert.match(serviceWorker, /src\/styles\.css\?v=28/);
-  assert.match(serviceWorker, /src\/app\.js\?v=28/);
-  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=28/);
-  assert.match(serviceWorker, /src\/sticker-protocol\.js\?v=28/);
+  assert.match(serviceWorker, /cccompanion-desk-v29/);
+  assert.match(serviceWorker, /src\/styles\.css\?v=29/);
+  assert.match(serviceWorker, /src\/app\.js\?v=29/);
+  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=29/);
+  assert.match(serviceWorker, /src\/sticker-protocol\.js\?v=29/);
   assert.match(serviceWorker, /src\/live-messages\.js/);
   assert.match(serviceWorker, /src\/pairing-code\.js/);
   assert.doesNotMatch(source, /shared_secret|localStorage\.setItem|sessionStorage\.setItem|credentials:\s*'include'/);
@@ -586,8 +591,8 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   ]);
   assert.match(html, /id="latest-button"/);
   assert.match(html, /id="pairing-code"/);
-  assert.match(html, /href="\.\/src\/styles\.css\?v=28"/);
-  assert.match(html, /src="\.\/src\/app\.js\?v=28"/);
+  assert.match(html, /href="\.\/src\/styles\.css\?v=29"/);
+  assert.match(html, /src="\.\/src\/app\.js\?v=29"/);
   assert.match(html, /autocomplete="one-time-code"/);
   assert.match(html, /id="pairing-form"/);
   assert.match(html, /<details class="password-fallback">/);
