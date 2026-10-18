@@ -101,3 +101,18 @@ export function previewText(record, { maxLength = 42 } = {}) {
   const clipped = body.length > maxLength ? `${body.slice(0, maxLength)}…` : body;
   return prefix + clipped;
 }
+
+/**
+ * Latest record worth previewing: tool/activity rows (role "task") and
+ * event-only noise are skipped so the contact list shows real chat content
+ * (Astra 2026-10-18: tool calls must never surface in the preview).
+ */
+export function latestChatRecord(records = []) {
+  if (!Array.isArray(records)) return null;
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    const record = records[index];
+    if (!record || record.role === 'task') continue;
+    if (humanPreviewText(record.body) || record.attachments?.length) return record;
+  }
+  return null;
+}

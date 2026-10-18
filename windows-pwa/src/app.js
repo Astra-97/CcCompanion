@@ -1,17 +1,17 @@
-import { createPwaBootstrap } from './bootstrap.js?v=29';
-import { createComposerState } from './composer-state.js?v=29';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=29';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=29';
-import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord, controlPanelSupported } from './api.js?v=29';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=29';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=29';
-import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=29';
-import { createUnreadStore, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=29';
-import { createNotifier } from './notifications.js?v=29';
-import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=29';
-import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=29';
+import { createPwaBootstrap } from './bootstrap.js?v=30';
+import { createComposerState } from './composer-state.js?v=30';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=30';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=30';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord, controlPanelSupported } from './api.js?v=30';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=30';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=30';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=30';
+import { createUnreadStore, latestChatRecord, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=30';
+import { createNotifier } from './notifications.js?v=30';
+import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=30';
+import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=30';
 
-const WEB_SHELL_VERSION = 'desk-v29 · 2026-10-18';
+const WEB_SHELL_VERSION = 'desk-v30 · 2026-10-18';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -122,7 +122,7 @@ function renderContacts() {
   contactList.replaceChildren(...state.contacts.map((item) => {
     const history = state.histories[item.id] || [];
     const unread = item.id === state.activeContactId ? 0 : state.unread.unreadFor(item.id, history);
-    const preview = previewText(history.at(-1)) || item.note;
+    const preview = previewText(latestChatRecord(history)) || item.note;
     const name = displayNameOf(item);
     const button = el('button', { class: `contact-button ${item.id === state.activeContactId ? 'is-active' : ''}`, type: 'button', 'aria-current': item.id === state.activeContactId ? 'page' : 'false' });
     const accent = avatarAccentOf(item.id);
@@ -515,6 +515,12 @@ function reconcileChildren(parent, desired) {
   [...parent.children].forEach((child) => { if (!keep.has(child)) child.remove(); });
   desired.forEach((node) => parent.append(node));
 }
+/** Consecutive tool/activity rows (role "task") collapse into one truncated
+   gray line, mirroring Android's groupMessagesWithToolStacks ToolStack fold. */
+function taskRunNode(run) {
+  const text = run.count > 1 ? `${run.text} · 共 ${run.count} 条` : run.text;
+  return el('li', { class: 'tool-run', role: 'listitem' }, [el('span', { class: 'tool-run-text', text })]);
+}
 function renderMessages({ forceLatest = false } = {}) {
   const shouldFollow = forceLatest || (state.followLatest[state.activeContactId] !== false && nearBottom());
   const history = composeLiveMessages(state.histories[state.activeContactId] || [], state.live[state.activeContactId], { contactId: state.activeContactId, stream: state.streams[state.activeContactId] });
@@ -526,7 +532,22 @@ function renderMessages({ forceLatest = false } = {}) {
     typingStatus.setAttribute('aria-hidden', String(!showTyping));
     typingStatus.textContent = showTyping ? '正在输入…' : '';
   }
-  const desired = history.filter((message) => !(message.role === 'assistant' && message.streaming && !String(message.body || '').trim())).map(messageNode);
+  const desired = [];
+  let taskRun = null;
+  const flushTaskRun = () => { if (taskRun) { desired.push(taskRunNode(taskRun)); taskRun = null; } };
+  history.filter((message) => !(message.role === 'assistant' && message.streaming && !String(message.body || '').trim())).forEach((message) => {
+    if (message.role === 'task') {
+      const text = String(message.body || '').trim();
+      if (!text) return;
+      if (!taskRun) taskRun = { count: 0, text: '' };
+      taskRun.count += 1;
+      taskRun.text = text;
+      return;
+    }
+    flushTaskRun();
+    desired.push(messageNode(message));
+  });
+  flushTaskRun();
   if (showTyping) {
     const existingTyping = [...messages.children].find((node) => node.classList?.contains('typing-bubble'));
     desired.push(existingTyping || createTypingBubble());

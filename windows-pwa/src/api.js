@@ -1,6 +1,6 @@
-import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY, MOCK_MEMORY_STATS, MOCK_MEMORY_CALENDAR_ENTRIES, MOCK_MEMORY_BOARD, MOCK_MEMORY_SEARCH, MOCK_PLUGINS, MOCK_TODOS, MOCK_WEATHER, MOCK_APPEARANCE, MOCK_CONTROL } from './data.js?v=29';
-import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=29';
-import { normalizeStickerCatalog } from './sticker-protocol.js?v=29';
+import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY, MOCK_MEMORY_STATS, MOCK_MEMORY_CALENDAR_ENTRIES, MOCK_MEMORY_BOARD, MOCK_MEMORY_SEARCH, MOCK_PLUGINS, MOCK_TODOS, MOCK_WEATHER, MOCK_APPEARANCE, MOCK_CONTROL } from './data.js?v=30';
+import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=30';
+import { normalizeStickerCatalog } from './sticker-protocol.js?v=30';
 
 const clone = (value) => structuredClone(value);
 const now = () => new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
@@ -215,7 +215,11 @@ export function normalizeRecord(record = {}) {
     // the same record could then be inserted again when the next snapshot
     // arrives.  Real chat records have either an id or a canonical timestamp.
     id: String(record.id || record.ts || record.created_at || ''),
-    role: record.role === 'user' ? 'user' : 'assistant',
+    // role="task" rows are tool/activity events (metadata.activity_summary,
+    // codex:kairos:activity, kimi/kiro tool cards).  Android folds them into
+    // a ToolStack (groupMessagesWithToolStacks); coercing them to 'assistant'
+    // here would render every tool call as a full chat bubble.
+    role: record.role === 'user' ? 'user' : (record.role === 'task' ? 'task' : 'assistant'),
     body: String(record.text ?? record.content ?? record.body ?? ''),
     time,
     // Raw server timestamp drives incremental `since` polling and unread

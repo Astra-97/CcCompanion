@@ -30,13 +30,16 @@ body{min-width:320px;min-height:100vh;min-height:100dvh;margin:0;overflow:hidden
   radial-gradient(circle at 78% 6%,rgba(193,107,94,.3),transparent 30rem),
   linear-gradient(125deg,#241812 0%,#1a110c 48%,#120b07 100%);
   background-color:var(--bg);font-family:var(--sans)}
-button,input,textarea{font:inherit}button{cursor:pointer}button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--brass);outline-offset:3px}
+button,input,textarea{font:inherit}button{cursor:pointer}button:focus-visible,a:focus-visible,input:focus-visible{outline:2px solid var(--brass);outline-offset:3px}
+/* App parity: the composer field takes no focus ring (ChatInputBarShell has
+   none); focus is expressed by the pill border brightening instead. */
+textarea:focus-visible{outline:none}
 .skip-link{position:fixed;left:12px;top:-60px;z-index:30;padding:9px 13px;border-radius:10px;color:var(--avatar-ink);background:var(--brass);transition:top .15s}.skip-link:focus{top:12px}
 .grain{position:fixed;inset:0;pointer-events:none;opacity:.05;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 160 160' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.35'/%3E%3C/svg%3E");mix-blend-mode:overlay}
 
 /* Shell: three floating glass panels on the wallpaper. */
 .desk-shell{position:relative;display:grid;grid-template-columns:236px minmax(0,1fr) 312px;gap:14px;height:100vh;height:100dvh;max-width:1680px;margin:auto;padding:14px}
-.rail,.side-notes,.conversation{border:1px solid var(--line);border-radius:24px;background:var(--glass);backdrop-filter:blur(26px) saturate(1.6);box-shadow:var(--shadow),inset 0 1px 0 rgba(255,244,230,.09)}
+.rail,.side-notes,.conversation{border:1px solid var(--line);border-radius:24px;background:var(--glass);backdrop-filter:blur(26px) saturate(1.3);box-shadow:var(--shadow)}
 .rail{display:flex;min-height:0;flex-direction:column;padding:22px 12px 14px}
 .rail-brand{display:flex;align-items:center;gap:10px;padding:4px 10px 26px;font:500 14px var(--mono);letter-spacing:-.06em;color:var(--ink)}
 .rail-brand>span span{color:var(--dim)}.mark{width:19px;height:19px;color:var(--brass)}
@@ -90,6 +93,12 @@ button,input,textarea{font:inherit}button{cursor:pointer}button:focus-visible,a:
 .message{position:relative;display:flex;min-width:0;width:100%;align-items:flex-start;gap:8px}
 .message.from-user{justify-content:flex-end}
 .message-stack{position:relative;display:grid;min-width:0;max-width:min(88%,600px);justify-items:start}
+/* Grid children default to min-width:auto, so a single 339-char code line
+   (kimi relay loves one-liner ssh commands) used to stretch the whole column
+   to 2613px and grow a horizontal scrollbar on .conversation-scroll
+   (overflow-y:auto computes overflow-x to auto).  Cap every child at the
+   track width so .code-block pre scrolls internally instead. */
+.message-stack>*{min-width:0;max-width:100%}
 .from-user .message-stack{max-width:min(76%,600px);justify-items:end}
 .from-assistant .message-stack{max-width:min(calc(100% - 88px),600px)}
 .message-avatar{width:30px;height:30px;margin-top:2px;font-size:11px}
@@ -102,12 +111,17 @@ button,input,textarea{font:inherit}button{cursor:pointer}button:focus-visible,a:
 /* Android AppearanceSettings (Astra's synced values): user = glass #CE7849
    clamped to 50% alpha with a 20% white border (userGlass follows the AI
    glass master switch), assistant = dark glass #1B1714@40% with an 18% white
-   border; both blur 16, 20px corners, 9/13 padding, white text.  Texture only
-   (danta 玻璃雪 recipe): saturate lifts the wallpaper hue through the glass,
-   an inset top highlight + soft drop shadow give the edge-refraction depth. */
-.from-user .message-body{padding:9px 13px;border:1px solid rgba(255,255,255,.2);border-radius:20px;background:rgba(206,120,73,.5);backdrop-filter:blur(16px) saturate(1.5);box-shadow:inset 0 1px 0 rgba(255,244,230,.18),0 4px 14px rgba(8,4,2,.3);color:#fff}
+   border; both blur 16, 20px corners, 9/13 padding, white text.  The user
+   bubble is pixel-locked to this (Astra 2026-10-18); only the assistant
+   bubble carries the light texture pass (danta 玻璃雪 recipe: saturate lift,
+   inset top highlight, soft drop shadow). */
+.from-user .message-body{padding:9px 13px;border:1px solid rgba(255,255,255,.2);border-radius:20px;background:rgba(206,120,73,.5);backdrop-filter:blur(16px) saturate(1.3);color:#fff}
 .from-assistant .message-body:not(.sticker-only-message){padding:9px 13px;border:1px solid rgba(255,255,255,.18);border-radius:20px;background:rgba(27,23,20,.4);backdrop-filter:blur(16px) saturate(1.5);box-shadow:inset 0 1px 0 rgba(255,244,230,.1),0 4px 14px rgba(8,4,2,.3);color:#fff}
 .is-streaming::after{display:inline-block;content:'▍';margin-left:3px;color:var(--brass);animation:blink .8s steps(2) infinite}
+/* Tool/activity events: one truncated gray line per consecutive run, inset to
+   the bubble column (30px avatar + 8px gap); never a full chat bubble. */
+.tool-run{margin:1px 0 1px 38px;list-style:none}
+.tool-run-text{display:block;overflow:hidden;color:rgba(255,255,255,.42);font-size:11px;line-height:1.5;text-overflow:ellipsis;white-space:nowrap}
 .message-files{display:flex;max-width:100%;flex-wrap:wrap;gap:6px;margin-top:8px}
 .message-files a{border:1px solid var(--line);border-radius:8px;padding:6px 9px;background:var(--glass-soft);color:var(--muted);font:10px var(--mono)}
 .message-files a:hover{border-color:var(--brass);color:var(--brass)}

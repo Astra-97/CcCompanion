@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { createHttpAdapter, historyCursor, mergeHistoryDelta, normalizeRecord } from '../src/api.js';
-import { createUnreadStore, previewText, seedUnreadCursors, unreadCount, unseenAssistant } from '../src/unread.js';
+import { createUnreadStore, latestChatRecord, previewText, seedUnreadCursors, unreadCount, unseenAssistant } from '../src/unread.js';
 import { createNotifier } from '../src/notifications.js';
 
 function memoryStorage() {
@@ -144,6 +144,27 @@ test('preview text clips long bodies, folds code blocks, and prefixes own messag
   assert.equal(previewText(null), '');
 });
 
+test('task/tool-event rows stay out of the contact preview and unread count', () => {
+  const history = [
+    { id: 'm1', role: 'assistant', body: '真实回复', ts: '2026-10-18T01:00:00+00:00' },
+    { id: 't1', role: 'task', body: '⚡执行命令: cd /tmp && ls', ts: '2026-10-18T01:01:00+00:00' },
+    { id: 't2', role: 'task', body: '⚡执行命令: rm -rf /tmp/old', ts: '2026-10-18T01:02:00+00:00' },
+  ];
+  assert.equal(latestChatRecord(history)?.id, 'm1', 'preview walks back past tool events to the latest real chat record');
+  assert.equal(previewText(latestChatRecord(history)), '真实回复');
+  assert.equal(latestChatRecord([{ id: 't3', role: 'task', body: '⚡执行命令: pwd' }]), null, 'a history of only tool events has no previewable record');
+  const store = createUnreadStore({ storage: memoryStorage() });
+  store.markSeen('kimi', '2026-10-18T00:59:00+00:00');
+  assert.equal(store.unreadFor('kimi', history), 1, 'tool events never count as unread chat');
+});
+
+test('normalizeRecord keeps role "task" instead of coercing tool events to assistant bubbles', () => {
+  const task = normalizeRecord({ id: 't1', role: 'task', text: '⚡执行命令: cd /tmp', ts: '2026-10-18T01:01:00+00:00' });
+  assert.equal(task.role, 'task');
+  assert.equal(normalizeRecord({ id: 'a1', role: 'assistant', text: '好' }).role, 'assistant');
+  assert.equal(normalizeRecord({ id: 'u1', role: 'user', text: '嗯' }).role, 'user');
+});
+
 test('notifier fires only when enabled, granted, and the page is hidden', async () => {
   const storage = memoryStorage(); const fired = [];
   const FakeNotification = class {
@@ -220,7 +241,7 @@ test('first-batch UX source contracts: no innerHTML, markdown renderer, thinking
   assert.match(app, /state\.notifier\.notify/);
   assert.match(app, /startBackgroundPolling\(\)/);
   assert.match(html, /id="notification-button"[^>]*aria-pressed="false"/);
-  assert.match(sw, /src\/markdown\.js\?v=29/);
-  assert.match(sw, /src\/unread\.js\?v=29/);
-  assert.match(sw, /src\/notifications\.js\?v=29/);
+  assert.match(sw, /src\/markdown\.js\?v=30/);
+  assert.match(sw, /src\/unread\.js\?v=30/);
+  assert.match(sw, /src\/notifications\.js\?v=30/);
 });

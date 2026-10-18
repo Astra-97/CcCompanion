@@ -167,6 +167,9 @@ export const INITIAL_CONVERSATIONS = {
     { id: 'x3', role: 'assistant', body: '行，桌面端要保持你习惯的联系感，不只是把手机聊天框拉宽。', time: '08:44' },
   ],
   kimi: [
+    { id: 'km0', role: 'user', body: '帮我把 /tmp 下的旧截图清一清。', time: '08:44' },
+    { id: 'kmt1', role: 'task', body: '⚡执行命令: cd /tmp && ls -la | grep screenshot-archive', time: '08:44' },
+    { id: 'kmt2', role: 'task', body: '⚡执行命令: rm -rf /tmp/screenshot-archive-2026-09', time: '08:45' },
     { id: 'km1', role: 'assistant', body: '卡拉米报到。网页版的天气和待办今天接通真数据。', time: '08:45' },
   ],
   kiro: [

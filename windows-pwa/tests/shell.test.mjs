@@ -119,7 +119,7 @@ test('Android-shell source contracts: four tabs, full pages, view switching, moc
   assert.match(app, /adapter\.searchMemories\(query, \{ limit: 20 \}\)/);
   assert.match(app, /adapter\.getMemoryBoard\(\{ page, perPage: 20 \}\)/);
   assert.match(app, /adapter\.listPlugins\(\)/);
-  assert.match(app, /WEB_SHELL_VERSION = 'desk-v29 · 2026-10-18'/);
+  assert.match(app, /WEB_SHELL_VERSION = 'desk-v30 · 2026-10-18'/);
   const mockHook = app.slice(app.indexOf('if (bootstrap.mock)'));
   assert.match(mockHook, /params\.get\('view'\)/, 'the deep-link hook stays mock-gated');
   assert.match(css, /\.tab-bar\{[^}]*display:none/, 'the bottom tab bar is phone-only');
@@ -130,7 +130,7 @@ test('Android-shell source contracts: four tabs, full pages, view switching, moc
   assert.match(css, /\.calendar-day\.has-entries\{background:linear-gradient/);
   assert.match(css, /\.calendar-weekdays,\.calendar-grid\{display:grid;grid-template-columns:repeat\(7,1fr\)/);
   assert.match(css, /\.side-notes\.view-hidden\{display:none\}/);
-  assert.match(sw, /src\/memory-calendar\.js\?v=29/);
+  assert.match(sw, /src\/memory-calendar\.js\?v=30/);
 });
 
 test('home dashboard helpers: deterministic greeting, clock text, Monday-first week strip', () => {
@@ -185,14 +185,14 @@ test('visual parity pass 2: dashboard cards, sans-only typography, transparent g
   for (const id of ['dash-clock-time', 'dash-clock-date', 'dash-quote-eyebrow', 'dash-quote-title', 'dash-quote-sub', 'dash-week-title', 'dash-week-days', 'dash-todo-card', 'dash-full-calendar', 'contact-avatar', 'contact-status']) {
     assert.match(html, new RegExp(`id="${id}"`), id);
   }
-  assert.match(app, /from '\.\/home-dashboard\.js\?v=29'/);
+  assert.match(app, /from '\.\/home-dashboard\.js\?v=30'/);
   assert.match(app, /function renderDashboard\(\)/);
   assert.match(app, /\$\('#dash-full-calendar'\)\.addEventListener\('click', openMemory\)/);
-  assert.match(sw, /src\/home-dashboard\.js\?v=29/);
+  assert.match(sw, /src\/home-dashboard\.js\?v=30/);
   assert.doesNotMatch(css, /--serif/, 'the shell drops serif typography entirely');
   assert.match(css, /\.eyebrow\{[^}]*font:500 10px var\(--sans\);letter-spacing:\.07em/);
   assert.match(css, /--glass:rgba\(24,17,12,\.42\)/);
-  assert.match(css, /backdrop-filter:blur\(26px\) saturate\(1\.6\)/);
+  assert.match(css, /backdrop-filter:blur\(26px\) saturate\(1\.3\)/);
   assert.match(css, /\.dash-week-day\.is-today\{background:linear-gradient/);
   assert.match(css, /\.chat-card-face\{position:relative/);
   assert.match(css, /\.composer \.send-button\{display:grid;place-items:center;width:48px;height:48px;min-height:48px;border-radius:50%;padding:0;background:#d4725c;color:#2c1608/, 'the composer send key is the App 48px circle in the synced themeColor #D4725C at every shell size');
@@ -238,6 +238,20 @@ test('v28 Android skin alignment: no contact LEDs, message avatars, time-only me
   // value), LazyColumn spacedBy(settings.gap).
   assert.match(css, /\.messages\{display:grid;gap:4px;/, 'the message list uses the Android 4px gap');
   assert.match(css, /\.conversation-scroll\{[^}]*padding:8px clamp\(12px,1\.8vw,28px\) 14px/, 'desktop message gutters track the App 12dp padding instead of ballooning on wide windows (ChatScreen.kt:6011)');
+  // Tool/activity events (role "task") fold into one truncated gray line per
+  // consecutive run — Android groupMessagesWithToolStacks parity (2026-10-18).
+  assert.match(app, /function taskRunNode\(run\)/, 'consecutive task rows collapse into a single line node');
+  assert.match(app, /message\.role === 'task'/, 'renderMessages detects task rows');
+  assert.match(css, /\.tool-run-text\{[^}]*overflow:hidden;color:rgba\(255,255,255,\.42\);font-size:11px;[^}]*text-overflow:ellipsis;white-space:nowrap\}/, 'the folded tool line is small gray and truncated');
+  assert.match(app, /previewText\(latestChatRecord\(history\)\)/, 'contact previews skip tool events');
+  // The kimi relay writes one-line 300+ char shell commands into code blocks;
+  // grid children capped at the track width keep .code-block pre scrolling
+  // internally instead of growing a horizontal scrollbar on the message
+  // column (CDP-located 2026-10-18: .message-stack child min-width:auto).
+  assert.match(css, /\.message-stack>\*\{min-width:0;max-width:100%\}/, 'message column children are capped at the track width');
+  // No focus ring on the composer field (App ChatInputBarShell has none).
+  assert.match(css, /textarea:focus-visible\{outline:none\}/, 'the composer field takes no brass focus ring');
+  assert.doesNotMatch(css, /input:focus-visible,textarea:focus-visible/, 'textarea is out of the global focus-ring rule');
   assert.match(css, /\.from-assistant \.message-stack\{max-width:min\(calc\(100% - 88px\),600px\)\}/, 'assistant bubble column caps at screen-112dp minus the avatar gutter');
   assert.match(css, /\.from-user \.message-stack\{[^}]*max-width:min\(76%,600px\)/, 'user bubble column caps at 76% (ChatScreen.kt:12802)');
   // Date separator: centered black@22% pill with "10月18日" (formatDatePill).
@@ -333,7 +347,7 @@ test('dashboard real-data wiring: weather chip/line, todo list, icon-keyed head 
   assert.match(html, /id="worker-toggle"[^>]*aria-controls="side-notes"[^>]*aria-expanded="false"[^>]*><svg class="icon"[^>]*><use href="#icon-panel"/, 'worker toggle is an icon button but keeps its drawer contract');
   assert.match(html, /id="memory-button"[^>]*><svg class="icon"[^>]*><use href="#icon-atlas"/);
   assert.doesNotMatch(html, /现场 <span aria-hidden="true">↗/, 'text buttons with arrows are gone from the head');
-  assert.match(app, /import \{ clockText, greetingFor, todoFeed, weekStrip \} from '\.\/home-dashboard\.js\?v=29'/);
+  assert.match(app, /import \{ clockText, greetingFor, todoFeed, weekStrip \} from '\.\/home-dashboard\.js\?v=30'/);
   assert.match(app, /state\.dash = \{ appearance: \{ nicknames: \{\}, avatars: \{\} \}, todos: null, weather: null, weatherFailed: false \}/, 'logout resets the dashboard channel');
   assert.match(app, /adapter\.getTodos\(\)/);
   assert.match(app, /adapter\.getDashAppearance\(\)/);
