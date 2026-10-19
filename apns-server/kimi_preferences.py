@@ -24,6 +24,7 @@ KIMI_APP_MODELS = (
     "kimi-code/kimi-for-coding-highspeed",
     "deepseek/v4-pro",
     "deepseek/v4-flash",
+    "deepseek/v4.1-flash-1017",
     "zhipu/glm-5.3",
     "zhipu/glm-5.3-flash",
     "openrouter/gemini-3.7-flash",
@@ -34,11 +35,13 @@ KIMI_APP_DEFAULT_MODEL = "kimi-code/k3-256k"
 KIMI_APP_DEFAULT_EFFORT = "high"
 # These allowlisted aliases declare no support_efforts in the local Kimi
 # config; the engine hard-fails any thinking effort submitted for them
-# (v4-pro thinking is a boolean, v4-flash has no thinking at all).  The App
+# (v4-pro thinking is a boolean, v4-flash and the pinned v4.1-flash-1017
+# have no thinking at all).  The App
 # picker still stores an effort value, but it is never forwarded for these.
 KIMI_APP_EFFORTLESS_MODELS = (
     "deepseek/v4-pro",
     "deepseek/v4-flash",
+    "deepseek/v4.1-flash-1017",
 )
 
 
