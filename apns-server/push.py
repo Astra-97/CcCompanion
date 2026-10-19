@@ -5709,6 +5709,42 @@ class _QueuedSendResponderProxy:
         self.responses.append((status, payload))
 
 
+class _RecentIdSet:
+    """Bounded, TTL'd, thread-safe set of recently accepted message ids."""
+
+    def __init__(self, max_items: int = 1000, ttl_seconds: float = 24 * 3600) -> None:
+        self._items: "OrderedDict[str, float]" = OrderedDict()
+        self._lock = threading.Lock()
+        self._max = max_items
+        self._ttl = ttl_seconds
+
+    def reserve(self, key: str) -> bool:
+        """Return True if ``key`` is new (and record it), False if seen."""
+        now = time.monotonic()
+        with self._lock:
+            while self._items:
+                oldest_key, oldest_at = next(iter(self._items.items()))
+                if now - oldest_at <= self._ttl and len(self._items) < self._max:
+                    break
+                self._items.pop(oldest_key, None)
+            if key in self._items:
+                return False
+            self._items[key] = now
+            return True
+
+    def release(self, key: str) -> None:
+        with self._lock:
+            self._items.pop(key, None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+
+# 双猫花园 webhook 去重（进程内足够：Cloudflare 重试在秒~分钟级）。
+_GARDEN_WEBHOOK_SEEN = _RecentIdSet()
+
+
 class PushHandler(BaseHTTPRequestHandler):
     state: ServerState  # set by run_server before serving
 
@@ -8495,6 +8531,12 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(401, {"error": "unauthorized"})
                 return
             self._handle_music_card()
+            return
+        # 双猫花园聊天 webhook (2026-10-19)：Cloudflare Worker 推送玩家在花园
+        # 说的话。它拿不到 shared_secret，用独立的 X-Garden-Webhook-Secret
+        # 鉴权（0600 文件，fail-closed），所以必须排在 _require_write_auth 前。
+        if request_path == "/garden/webhook":
+            self._handle_garden_webhook()
             return
         # Keep this before generic JSON parsing: imports are intentionally much
         # larger than ordinary App mutations, and the reading proxy owns its
@@ -12216,6 +12258,11 @@ class PushHandler(BaseHTTPRequestHandler):
             and body["metadata"].get("via") == "card"
         )
         source = self._source_for_request("card" if is_card_action else "")
+        # 花园 webhook 内部委托时由 _handle_garden_webhook 在 handler 实例上
+        # 设置（客户端 body 无法触达）：只追加到注入会话的文本，不进历史。
+        garden_hint = str(getattr(self, "_garden_injection_hint", "") or "")
+        if garden_hint:
+            source = "garden"
         voice_reply_token = ""
         voice_mode = "conversation"
         voice_continuation = False
@@ -12300,7 +12347,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 injection_text="\n\n".join(
                     part
                     for part in (
-                        text,
+                        f"{text}\n{garden_hint}" if garden_hint else text,
                         link_context,
                         health_context_prompt,
                         voice_reply_instruction,
@@ -12388,6 +12435,8 @@ class PushHandler(BaseHTTPRequestHandler):
                 injected = f"{turn_marker}\n{ts_prefix} {tts_hint}[引用 \"{rec['quoted_text']}\"]\n{loc_str}"
                 if text:
                     injected = f"{injected}\n{text}"
+        if garden_hint:
+            injected = f"{injected}\n{garden_hint}"
         if link_context:
             injected = f"{injected}\n\n{link_context}"
         if health_context_prompt:
@@ -26462,6 +26511,125 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"ok": False, "error": "append failed"})
             return
         self._send_json(200, {"ok": True, "contact_id": contact_id, "ts": rec.get("ts")})
+
+    # ── 双猫花园聊天 webhook (2026-10-19) ───────────────────────────────
+    _GARDEN_WEBHOOK_SECRET_FILE_ENV = "CC_COMPANION_GARDEN_WEBHOOK_SECRET_FILE"
+    _GARDEN_WEBHOOK_DEFAULT_SECRET_FILE = Path("/root/.rainholm/webhook_secret")
+    _GARDEN_WEBHOOK_REQUEST_LIMIT = 8 * 1024
+    _GARDEN_WEBHOOK_TEXT_LIMIT = 500
+    _GARDEN_USER_PREFIX = "［🌱方小南在花园说:］"
+    _GARDEN_REPLY_HINT = (
+        "（回复请用 python3 /root/.rainholm/garden_cli.py garden_action "
+        "'{\"action\":\"say\",...}' 在花园里说，会自动同步到 app）"
+    )
+
+    @classmethod
+    def _garden_webhook_secret(cls) -> str:
+        """Read the garden webhook secret from its 0600 file (per request).
+
+        Same fail-closed rules as the music-card token: owner-only regular
+        file, no symlink, bounded size.  The value never enters logs.
+        """
+        raw_path = os.environ.get(cls._GARDEN_WEBHOOK_SECRET_FILE_ENV, "").strip()
+        path = Path(raw_path).expanduser() if raw_path else cls._GARDEN_WEBHOOK_DEFAULT_SECRET_FILE
+        try:
+            info = path.lstat()
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                return ""
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags)
+            try:
+                raw = os.read(fd, 4096 + 1)
+            finally:
+                os.close(fd)
+            if len(raw) > 4096:
+                return ""
+            secret = raw.decode("utf-8").strip()
+            return secret if 16 <= len(secret) <= 4096 else ""
+        except (OSError, UnicodeError):
+            return ""
+
+    def _garden_webhook_auth_status(self) -> int:
+        """0 = ok, 401 = missing credential, 403 = wrong credential."""
+        expected = self._garden_webhook_secret()
+        supplied = str(self.headers.get("X-Garden-Webhook-Secret", "") or "").strip()
+        if not expected or not supplied:
+            return 401
+        try:
+            ok = hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+        except UnicodeError:
+            ok = False
+        return 0 if ok else 403
+
+    def _handle_garden_webhook(self) -> None:
+        """POST /garden/webhook — 方小南在双猫花园说话 → 小克私聊。
+
+        body: {"scene", "text", "at", "id"}.  效果等同她在 app 里发了一条
+        ``［🌱方小南在花园说:］原文``：整体委托 _handle_chat_send（同入库 +
+        turn_token + tmux 直注 / 忙时 channel 排队），只是注入会话的文本末尾
+        多一行回复提示。按 id 去重（Cloudflare 可能重试）。
+        """
+        auth = self._garden_webhook_auth_status()
+        if auth:
+            self.close_connection = True
+            self._send_json(auth, {"ok": False, "error": "unauthorized" if auth == 401 else "forbidden"})
+            return
+        incoming = self._reading_read_body(self._GARDEN_WEBHOOK_REQUEST_LIMIT)
+        if incoming is None:
+            return
+        text = incoming.get("text")
+        raw_id = incoming.get("id")
+        if not isinstance(text, str) or not text.strip():
+            self._send_json(400, {"ok": False, "error": "text required"})
+            return
+        if isinstance(raw_id, bool) or not isinstance(raw_id, (str, int)) or not str(raw_id).strip():
+            self._send_json(400, {"ok": False, "error": "id required"})
+            return
+        message_id = str(raw_id).strip()[:128]
+        text = text.strip()[: self._GARDEN_WEBHOOK_TEXT_LIMIT]
+        scene = incoming.get("scene")
+        scene = scene.strip()[:32] if isinstance(scene, str) and scene.strip() else "garden"
+        at = incoming.get("at")
+        garden_meta: dict[str, Any] = {"id": message_id, "scene": scene}
+        if isinstance(at, (int, float)) and not isinstance(at, bool):
+            garden_meta["at"] = at
+        if not _GARDEN_WEBHOOK_SEEN.reserve(message_id):
+            self._send_json(200, {"ok": True, "duplicate": True, "id": message_id})
+            return
+        forward = {
+            "contact_id": "xiaoke",
+            "text": f"{self._GARDEN_USER_PREFIX}{text}",
+            "metadata": {"source": "garden", "garden": garden_meta},
+        }
+        outcome: list[tuple[int, Any]] = []
+        original_send_json = self._send_json
+
+        def capture(status: int, payload: Any, **kwargs: Any) -> Any:
+            outcome.append((status, payload))
+            return original_send_json(status, payload, **kwargs)
+
+        self._send_json = capture  # type: ignore[method-assign]
+        self._garden_injection_hint = self._GARDEN_REPLY_HINT
+        try:
+            self._handle_chat_send(forward)
+        except Exception:
+            logger.exception("garden webhook delivery failed")
+            if not outcome:
+                original_send_json(500, {"ok": False, "error": "delivery failed"})
+                outcome.append((500, {}))
+        finally:
+            self._send_json = original_send_json  # type: ignore[method-assign]
+            self._garden_injection_hint = ""
+        status, payload = outcome[-1] if outcome else (500, {})
+        # 历史没写进去（如 409 忙且 channel 不可用）就释放 id，让重试有机会；
+        # 已写入历史（含 502 注入失败）则保留，避免重复气泡。
+        if not (200 <= status < 300) and not (isinstance(payload, dict) and payload.get("record")):
+            _GARDEN_WEBHOOK_SEEN.release(message_id)
 
 
     def _reading_ai_grant_from_metadata(self, contact_id: str, metadata: Any) -> None:
