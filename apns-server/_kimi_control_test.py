@@ -50,8 +50,7 @@ class KimiPreferencesTest(unittest.TestCase):
             config.write_text(
                 '[models."kimi-code/k3-256k"]\nmodel="k3-256k"\n'
                 '[models."deepseek/v4-pro"]\nmodel="deepseek-v4-pro"\n'
-                '[models."deepseek/v4-flash"]\nmodel="deepseek-v4-flash"\n'
-                '[models."deepseek/v4.1-flash-1017"]\nmodel="deepseek/deepseek-v4.1-flash-1017"\n',
+                '[models."deepseek/v4-flash"]\nmodel="deepseek-flash"\n',
                 encoding="utf-8",
             )
             store = KimiPreferenceStore(root / "prefs.json", config_path=config)
@@ -59,24 +58,10 @@ class KimiPreferencesTest(unittest.TestCase):
             self.assertEqual(("deepseek/v4-pro", "high"), store.snapshot())
             store.save_validated("deepseek/v4-flash", "low")
             self.assertEqual(("deepseek/v4-flash", "low"), store.snapshot())
-            store.save_validated("deepseek/v4.1-flash-1017", "high")
-            self.assertEqual(("deepseek/v4.1-flash-1017", "high"), store.snapshot())
 
             missing = KimiPreferenceStore(root / "other.json", config_path=root / "missing.toml")
             with self.assertRaises(ValueError):
                 missing.save_validated("deepseek/v4-pro", "high")
-
-    def test_pinned_v41_flash_is_effortless_like_v4_flash(self):
-        self.assertIn("deepseek/v4.1-flash-1017", KIMI_APP_EFFORTLESS_MODELS)
-        self.assertEqual("", effective_kimi_effort("deepseek/v4.1-flash-1017", "high"))
-        store = KimiPreferenceStore(
-            Path(tempfile.gettempdir()) / "kimi-control-v41-prefs.json",
-            allowed_models=("deepseek/v4-flash", "deepseek/v4.1-flash-1017"),
-        )
-        by_id = {item["id"]: item for item in store.payload_models()}
-        for alias in ("deepseek/v4-flash", "deepseek/v4.1-flash-1017"):
-            self.assertEqual([], by_id[alias]["supported_reasoning_efforts"])
-            self.assertEqual("", by_id[alias]["default_reasoning_effort"])
 
     def test_effortless_models_never_forward_a_thinking_effort(self):
         for model in KIMI_APP_EFFORTLESS_MODELS:

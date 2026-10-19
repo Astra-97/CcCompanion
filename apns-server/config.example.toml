@@ -141,8 +141,9 @@ allowed_ips = []
 # pins+reads it back on every ACP prepare/load/new/forge. It never writes Kimi
 # Code's global config.toml. Only the locally configured audited aliases
 # k3-256k, k3, kimi-for-coding, kimi-for-coding-highspeed, deepseek/v4-pro,
-# deepseek/v4-flash and deepseek/v4.1-flash-1017 (pinned via OpenRouter) are
-# selectable. The DeepSeek aliases declare no
+# deepseek/v4-flash are selectable. On DeepSeek's official API the model id is
+# "deepseek-flash" (currently v4.1-flash); "deepseek-v4-flash" is a legacy alias
+# that resolves to the same model. The DeepSeek aliases declare no
 # support_efforts, so no thinking effort is ever forwarded for them.
 # Default: kimi-code/k3-256k with high effort.
 # kimi_config_path = "/root/.kimi-code/config.toml"
