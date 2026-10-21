@@ -5775,8 +5775,43 @@ class _NfcTapGate:
             self._last = None
 
 
-# NFC 螃蟹挂件 (2026-10-21)：双击/抖动的重复碰卡 20s 内只通知一次。
-_NFC_TAP_GATE = _NfcTapGate()
+class _NfcTapGates:
+    """One 20s gate per tag id (床头/门口 互不吞)."""
+
+    def __init__(self, window_seconds: float = 20.0) -> None:
+        self.window = window_seconds
+        self._gates: dict[str, _NfcTapGate] = {}
+        self._lock = threading.Lock()
+
+    def get(self, tag_id: str) -> _NfcTapGate:
+        with self._lock:
+            gate = self._gates.get(tag_id)
+            if gate is None:
+                gate = self._gates[tag_id] = _NfcTapGate(self.window)
+            return gate
+
+    def reset(self) -> None:
+        with self._lock:
+            self._gates.clear()
+
+
+# NFC 螃蟹挂件 (2026-10-21)：双击/抖动的重复碰卡 20s 内只处理一次（含设备动作）。
+_NFC_TAP_GATES = _NfcTapGates()
+_NFC_SUN_MODULE: list[Any] = []
+
+
+def _nfc_sun_minutes(day: date) -> dict:
+    """Reuse /usr/local/bin/sun-bubble's sunrise/sunset math (loaded once)."""
+    if not _NFC_SUN_MODULE:
+        from importlib.machinery import SourceFileLoader
+        import importlib.util
+
+        loader = SourceFileLoader("_sun_bubble_for_nfc", "/usr/local/bin/sun-bubble")
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        _NFC_SUN_MODULE.append(module)
+    return _NFC_SUN_MODULE[0].sun_minutes(day)
 
 
 class PushHandler(BaseHTTPRequestHandler):
@@ -26886,16 +26921,22 @@ class PushHandler(BaseHTTPRequestHandler):
     # ── NFC 螃蟹挂件 "碰一下召唤小克" (2026-10-21) ─────────────────────────
     _NFC_TAP_SECRET_FILE_ENV = "CC_COMPANION_NFC_TAP_SECRET_FILE"
     _NFC_TAP_DEFAULT_SECRET_FILE = Path("/root/.config/cc-companion/nfc_tap_secret")
+    # 多 tag 档案 (2026-10-21 v2)：{"tags": {"<id>": {"key","name","location","action"}}}
+    # 0600、不进 git。文件不存在时回退旧的单 key 文件 = bedside/summon。
+    _NFC_TAGS_FILE_ENV = "CC_COMPANION_NFC_TAGS_FILE"
+    _NFC_TAGS_DEFAULT_FILE = Path("/root/.config/cc-companion/nfc_tags.json")
+    _NFC_TAG_ACTIONS = ("summon", "home")
     _NFC_TAP_PACKAGE = "com.fangxiaonan.cccompanion"
     _NFC_TAP_EXTRA_CONTACT = "com.fangxiaonan.cccompanion.extra.OPEN_CONTACT_ID"
     _NFC_TAP_CONTACT = "xiaoke"
     _NFC_TAP_ASYNC = True  # tests flip this to deliver inline
+    _NFC_HOME_CMD = ("/root/mihome/venv/bin/python", "/root/mihome/home_arrive.py")
+    _NFC_HOME_TIMEOUT = 90
+    _NFC_HINT = "（她手机正在打开 CC Companion，用 companion reply contact_id=xiaoke 跟她打招呼）"
 
-    @classmethod
-    def _nfc_tap_secret(cls) -> str:
-        """Read the tag secret from its 0600 file per request (fail-closed)."""
-        raw_path = os.environ.get(cls._NFC_TAP_SECRET_FILE_ENV, "").strip()
-        path = Path(raw_path).expanduser() if raw_path else cls._NFC_TAP_DEFAULT_SECRET_FILE
+    @staticmethod
+    def _nfc_read_private_file(path: Path, limit: int) -> str:
+        """Owner-only 0600 regular file, no symlink, bounded; '' on any doubt."""
         try:
             info = path.lstat()
             if (
@@ -26908,49 +26949,249 @@ class PushHandler(BaseHTTPRequestHandler):
             flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(path, flags)
             try:
-                raw = os.read(fd, 257)
+                raw = os.read(fd, limit + 1)
             finally:
                 os.close(fd)
-            secret = raw.decode("utf-8").strip()
-            return secret if 16 <= len(secret) <= 256 else ""
+            if len(raw) > limit:
+                return ""
+            return raw.decode("utf-8")
         except (OSError, UnicodeError):
             return ""
 
+    @classmethod
+    def _nfc_tap_secret(cls) -> str:
+        """Legacy single-key file (bedside) — used only when no tags file."""
+        raw_path = os.environ.get(cls._NFC_TAP_SECRET_FILE_ENV, "").strip()
+        path = Path(raw_path).expanduser() if raw_path else cls._NFC_TAP_DEFAULT_SECRET_FILE
+        secret = cls._nfc_read_private_file(path, 256).strip()
+        return secret if 16 <= len(secret) <= 256 else ""
+
+    @classmethod
+    def _nfc_tags(cls) -> dict[str, dict[str, str]]:
+        """Read tag profiles per request (fail-closed on bad entries)."""
+        raw_path = os.environ.get(cls._NFC_TAGS_FILE_ENV, "").strip()
+        path = Path(raw_path).expanduser() if raw_path else cls._NFC_TAGS_DEFAULT_FILE
+        if not os.path.lexists(path):
+            legacy = cls._nfc_tap_secret()
+            if not legacy:
+                return {}
+            return {"bedside": {"key": legacy, "name": "床头螃蟹", "location": "床头", "action": "summon"}}
+        try:
+            data = json.loads(cls._nfc_read_private_file(path, 16 * 1024) or "null")
+        except ValueError:
+            return {}
+        tags = data.get("tags") if isinstance(data, dict) else None
+        out: dict[str, dict[str, str]] = {}
+        if not isinstance(tags, dict):
+            return out
+        for tag_id, prof in tags.items():
+            if not isinstance(tag_id, str) or not re.fullmatch(r"[a-z0-9_-]{1,32}", tag_id):
+                continue
+            if not isinstance(prof, dict):
+                continue
+            key = prof.get("key")
+            action = prof.get("action") or "summon"
+            if not isinstance(key, str) or not (16 <= len(key.strip()) <= 256):
+                continue
+            if action not in cls._NFC_TAG_ACTIONS:
+                continue
+            out[tag_id] = {
+                "key": key.strip(),
+                "name": str(prof.get("name") or tag_id)[:32],
+                "location": str(prof.get("location") or tag_id)[:16],
+                "action": action,
+            }
+        return out
+
+    @classmethod
+    def _nfc_tag_for_key(cls, supplied: str) -> tuple[str, dict[str, str]] | None:
+        if not supplied:
+            return None
+        found = None
+        for tag_id, prof in cls._nfc_tags().items():
+            try:
+                if hmac.compare_digest(supplied.encode("utf-8"), prof["key"].encode("utf-8")):
+                    found = (tag_id, prof)
+            except UnicodeError:
+                continue
+        return found
+
     @staticmethod
-    def _nfc_tap_notification_text(now: datetime | None = None, *, test: bool = False) -> str:
+    def _nfc_is_night(now: datetime | None = None) -> bool:
+        """北京日落后到次日日出前；日出日落复用 sun-bubble 的算法，失败回退 18:00–06:00。"""
+        now = (now or datetime.now(ZoneInfo("Asia/Shanghai"))).astimezone(ZoneInfo("Asia/Shanghai"))
+        minute = now.hour * 60 + now.minute
+        sunrise, sunset = 360, 1080
+        try:
+            sm = _nfc_sun_minutes(now.date())
+            if isinstance(sm.get("sunrise"), int) and isinstance(sm.get("sunset"), int):
+                sunrise, sunset = sm["sunrise"], sm["sunset"]
+        except Exception:
+            logger.debug("nfc: sun-bubble sun_minutes unavailable, using 18-06", exc_info=True)
+        return minute >= sunset or minute < sunrise
+
+    @classmethod
+    def _nfc_run_home_devices(cls, *, dry_run: bool) -> dict[str, Any]:
+        """Run /root/mihome/home_arrive.py; always returns a normalized dict."""
+        cmd = list(cls._NFC_HOME_CMD) + (["--dry-run"] if dry_run else [])
+
+        def failed(detail: str) -> dict[str, Any]:
+            return {
+                "dry_run": dry_run,
+                "curtain": {"ok": False, "detail": detail},
+                "light": {"ok": False, "already_on": False, "detail": detail},
+            }
+
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=cls._NFC_HOME_TIMEOUT,
+                env={**os.environ, "HOME": "/root"}, cwd="/root/mihome",
+            )
+        except subprocess.TimeoutExpired:
+            return failed("超时")
+        except Exception as exc:
+            return failed(f"{type(exc).__name__}")
+        lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip().startswith("{")]
+        try:
+            data = json.loads(lines[-1]) if lines else None
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            return failed(f"脚本无结果 rc={proc.returncode}")
+        out = failed("无结果")
+        out["dry_run"] = bool(data.get("dry_run", dry_run))
+        for part in ("curtain", "light"):
+            item = data.get(part)
+            if isinstance(item, dict):
+                out[part] = {
+                    "ok": bool(item.get("ok")),
+                    "detail": str(item.get("detail") or "")[:120],
+                    **({"already_on": bool(item.get("already_on"))} if part == "light" else {}),
+                }
+        return out
+
+    @staticmethod
+    def _nfc_home_summary(result: dict[str, Any]) -> str:
+        cur = result.get("curtain") or {}
+        light = result.get("light") or {}
+        parts = [
+            "窗帘已关" if cur.get("ok") else f"窗帘关闭失败（{cur.get('detail') or '未知'}）",
+        ]
+        if light.get("ok") and light.get("already_on"):
+            parts.append("灯本来就开着，没动")
+        elif light.get("ok"):
+            parts.append("灯已开（60% 暖光）")
+        else:
+            parts.append(f"开灯失败（{light.get('detail') or '未知'}）")
+        text = "、".join(parts)
+        if result.get("dry_run"):
+            text += "（dry-run，没真动设备）"
+        return text
+
+    @staticmethod
+    def _nfc_home_bubble_suffix(result: dict[str, Any]) -> str:
+        cur = (result.get("curtain") or {}).get("ok")
+        light = (result.get("light") or {}).get("ok")
+        if cur and light:
+            return " · 窗帘关了，灯亮了"
+        if cur:
+            return " · 窗帘关了"
+        if light:
+            return " · 灯亮了"
+        return ""
+
+    @classmethod
+    def _nfc_tap_notification_text(
+        cls,
+        now: datetime | None = None,
+        *,
+        test: bool = False,
+        profile: dict[str, str] | None = None,
+        night: bool = False,
+        home_result: dict[str, Any] | None = None,
+    ) -> str:
         now = now or datetime.now(ZoneInfo("Asia/Shanghai"))
         hhmm = now.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%H:%M")
+        profile = profile or {"action": "summon"}
+        if profile.get("action") == "home":
+            name = profile.get("name") or "门口螃蟹"
+            tag = f"[NFC·{name}·回家{'·测试' if test else ''}]"
+            if night and home_result is not None:
+                body = cls._nfc_home_summary(home_result)
+            else:
+                body = "白天，没动设备"
+            who = "（测试，不是方小南碰的，不用回她）" if test else cls._NFC_HINT
+            return f"{tag} {hhmm} 方小南到家碰了{name}：{body}{who}"
         if test:
             return (
                 f"[NFC·螃蟹被碰了·测试] {hhmm} 这是一条测试通知"
                 "（施工 agent 用 curl 打的，不是方小南碰的，不用回她）"
             )
-        return (
-            f"[NFC·螃蟹被碰了] {hhmm} 方小南碰了一下螃蟹挂件"
-            "（她手机正在打开 CC Companion，用 companion reply contact_id=xiaoke 跟她打招呼）"
-        )
+        return f"[NFC·螃蟹被碰了] {hhmm} 方小南碰了一下螃蟹挂件{cls._NFC_HINT}"
 
     @classmethod
-    def _nfc_tap_notification(cls, now: datetime | None = None, *, test: bool = False) -> dict[str, Any]:
+    def _nfc_tap_notification(
+        cls,
+        now: datetime | None = None,
+        *,
+        test: bool = False,
+        tag_id: str = "bedside",
+        profile: dict[str, str] | None = None,
+        night: bool = False,
+        home_result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Channel message payload for a tap (no chat-history bubble)."""
-        return {
-            "message_id": f"nfc:{int(time.time() * 1000)}",
-            "contact_id": cls._NFC_TAP_CONTACT,
-            "text": cls._nfc_tap_notification_text(now, test=test),
-            "metadata": {
-                "source": "nfc-tap",
-                "transport": "channel",
-                "nfc_tap": True,
-                "test": bool(test),
-            },
+        profile = profile or {"action": "summon"}
+        meta: dict[str, Any] = {
+            "source": "nfc-tap",
+            "transport": "channel",
+            "nfc_tap": True,
+            "test": bool(test),
+            "nfc_tag": tag_id,
+            "nfc_action": profile.get("action", "summon"),
         }
+        if profile.get("action") == "home":
+            meta["night"] = bool(night)
+            if home_result is not None:
+                meta["home_result"] = home_result
+        return {
+            "message_id": f"nfc:{tag_id}:{int(time.time() * 1000)}",
+            "contact_id": cls._NFC_TAP_CONTACT,
+            "text": cls._nfc_tap_notification_text(
+                now, test=test, profile=profile, night=night, home_result=home_result
+            ),
+            "metadata": meta,
+        }
+
+    def _nfc_append_bubble(
+        self, tag_id: str, profile: dict[str, str], home_result: dict[str, Any] | None
+    ) -> None:
+        """小克私聊系统胶囊（同 sun-bubble：role=assistant + mihome_event 渲染开关）。"""
+        text = f"方小南捏了捏🤏{profile.get('location') or '床头'}的🦀"
+        if home_result is not None:
+            text += self._nfc_home_bubble_suffix(home_result)
+        try:
+            chat = self._chat_for_contact(self._NFC_TAP_CONTACT)
+            chat.append(
+                role="assistant",
+                text=text,
+                source="nfc-tap",
+                metadata={
+                    "mihome_event": True,
+                    "severity": "info",
+                    "items": [{"device": profile.get("name") or "螃蟹挂件", "change": "tap", "human": text}],
+                    "device_event": {"kind": "nfc_tap", "tag": tag_id, "action": profile.get("action")},
+                },
+            )
+        except Exception:
+            logger.warning("nfc tap bubble append failed", exc_info=True)
 
     @staticmethod
     def _deliver_nfc_tap(state: Any, payload: dict[str, Any]) -> tuple[bool, str]:
         """Same path as tool-dispatcher triggers: channel first, tmux fallback.
 
-        Deliberately never writes to the contact's chat history, so 方小南
-        sees no bubble for the notification itself; 小克 replies on its own.
+        The notification itself never enters chat history; the visible pill is
+        written separately by _nfc_append_bubble.
         """
         contact_id = payload["contact_id"]
         if (
@@ -26972,9 +27213,27 @@ class PushHandler(BaseHTTPRequestHandler):
         target = (getattr(state, "active_session", "") or getattr(state, "default_session", "") or "cctg").strip()
         return _inject_to_tmux_session(state, target, payload["text"])
 
-    def _nfc_tap_run_delivery(self, payload: dict[str, Any]) -> None:
+    def _nfc_tap_run_delivery(
+        self,
+        tag_id: str,
+        profile: dict[str, str],
+        *,
+        test: bool,
+        night: bool,
+        now: datetime | None = None,
+    ) -> None:
         def run() -> None:
             try:
+                home_result = None
+                if profile.get("action") == "home" and night:
+                    home_result = self._nfc_run_home_devices(dry_run=test)
+                    logger.info("nfc home devices tag=%s result=%s", tag_id, home_result)
+                if not test:
+                    self._nfc_append_bubble(tag_id, profile, home_result)
+                payload = self._nfc_tap_notification(
+                    now, test=test, tag_id=tag_id, profile=profile,
+                    night=night, home_result=home_result,
+                )
                 ok, err = self._deliver_nfc_tap(self.state, payload)
                 logger.info("nfc tap delivered ok=%s err=%s id=%s", ok, err, payload["message_id"])
             except Exception:
@@ -27007,7 +27266,7 @@ class PushHandler(BaseHTTPRequestHandler):
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="color-scheme" content="dark"><meta name="theme-color" content="#121520">
 <meta name="referrer" content="no-referrer">
-<title>小克来了</title>
+<title>__TITLE__</title>
 <style>
 :root{--ink:rgba(255,244,230,.94);--ink2:rgba(255,236,215,.66);--ink3:rgba(255,236,215,.38);
 --btn-bg:rgba(255,240,220,.07);--btn-bd:rgba(255,240,220,.16);--btn-ink:rgba(255,244,230,.86)}
@@ -27096,20 +27355,21 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
 <rect x="13" y="13" width="1" height="1" fill="#DDD4CC"/><rect x="16" y="13" width="1" height="1" fill="#DDD4CC"/>
 <rect x="3" y="14" width="1" height="1" fill="#F6F0E8"/><rect x="18" y="14" width="1" height="1" fill="#E9E1D8"/>
 </g></svg></div>
-<h1>小克来了</h1><p class="sub">__SUB__</p>
+<h1>__TITLE__</h1><p class="sub">__SUB__</p>
 </div>
 <a class="btn" href="__HREF__"><i></i>打开 CC Companion</a>
 <p class="hint">没有自动跳转的话，点一下上面</p>
 </main><script>__AUTO__</script></body></html>
 """
 
-    def _nfc_tap_page(self, *, intent_url: str, auto: bool, sub: str) -> bytes:
+    def _nfc_tap_page(self, *, intent_url: str, auto: bool, sub: str, title: str = "小克来了") -> bytes:
         import html as _html
 
         js_intent = json.dumps(intent_url).replace("</", "<\\/")
         auto_js = f"setTimeout(function(){{location.href={js_intent};}},350);" if auto else ""
         page = (
             self._NFC_TAP_PAGE_TEMPLATE
+            .replace("__TITLE__", _html.escape(title))
             .replace("__SUB__", _html.escape(sub))
             .replace("__HREF__", _html.escape(intent_url, quote=True))
             .replace("__AUTO__", auto_js)
@@ -27119,35 +27379,34 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
     def _handle_nfc_tap(self) -> None:
         """GET /nfc/tap?k=<secret>[&f=1][&test=1] — NFC 螃蟹挂件被碰。
 
-        错/缺 k → 404 且不通知。正确 → 20s 内首次碰卡给小克会话发一条
-        channel 消息（不进聊天历史），并返回一个立即尝试拉起 app 的小页面。
-        f=1 是 intent 失败后的回落页：不再自动跳、不再通知。
+        k 决定是哪个 tag（床头=summon 叫小克；门口=home 回家模式）。错/缺 → 404
+        且不通知。每个 tag 20s 内只处理首次碰卡：给小克会话发 channel 通知、
+        私聊冒系统胶囊（test 不冒），home 且天黑时异步关窗帘开灯（test 只 dry-run）。
+        f=1 是 intent 失败后的回落页：不再自动跳、不通知、不动设备。
         """
         qs = self._query_params()
         supplied = str((qs.get("k") or [""])[0] or "").strip()
-        expected = self._nfc_tap_secret()
-        ok = False
-        if expected and supplied:
-            try:
-                ok = hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
-            except UnicodeError:
-                ok = False
-        if not ok:
+        found = self._nfc_tag_for_key(supplied)
+        if found is None:
             self._send_json(404, {"error": "not found"})
             return
+        tag_id, profile = found
+        is_home = profile.get("action") == "home"
         is_fallback = (qs.get("f") or [""])[0] == "1"
         is_test = (qs.get("test") or [""])[0] == "1"
+        now = datetime.now(ZoneInfo("Asia/Shanghai"))
+        night = bool(is_home and self._nfc_is_night(now))
         notified = False
-        if not is_fallback and _NFC_TAP_GATE.try_acquire():
+        if not is_fallback and _NFC_TAP_GATES.get(tag_id).try_acquire():
             notified = True
-            self._nfc_tap_run_delivery(self._nfc_tap_notification(test=is_test))
+            self._nfc_tap_run_delivery(tag_id, profile, test=is_test, night=night, now=now)
         try:
             client_ip = self._trusted_client_ip()
         except Exception:
             client_ip = "?"
         logger.info(
-            "nfc tap ip=%s fallback=%s test=%s notified=%s ua=%s",
-            client_ip, is_fallback, is_test, notified,
+            "nfc tap tag=%s ip=%s fallback=%s test=%s night=%s notified=%s ua=%s",
+            tag_id, client_ip, is_fallback, is_test, night, notified,
             str(self.headers.get("User-Agent", "") or "")[:120],
         )
         host = str(self.headers.get("Host", "") or "")
@@ -27156,14 +27415,17 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
         from urllib.parse import quote
 
         fallback = f"https://{host}/nfc/tap?k={quote(supplied, safe='')}&f=1"
+        title = "欢迎回家" if is_home else "小克来了"
         if is_fallback:
             sub = "没能自动打开 app，点下面的按钮试试"
-        elif notified:
-            sub = "我收到啦，马上来找你"
-        else:
+        elif not notified:
             sub = "我已经知道啦，在呢"
+        elif is_home:
+            sub = "窗帘关好了，灯开了，我也来了" if night else "我来了"
+        else:
+            sub = "我收到啦，马上来找你"
         data = self._nfc_tap_page(
-            intent_url=self._nfc_tap_intent_url(fallback), auto=not is_fallback, sub=sub
+            intent_url=self._nfc_tap_intent_url(fallback), auto=not is_fallback, sub=sub, title=title
         )
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
