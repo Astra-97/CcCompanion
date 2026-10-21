@@ -138,11 +138,17 @@ from voice_protocol import (
 )
 import translate_api
 import voice_acoustics
+import voice_call_legacy
 import voice_duration
 import voice_elevenlabs
 import voice_gemini
 import voice_message
 import fable_quota
+
+# Call-sheet legacy PTT echo suppression (see voice_call_legacy.py).  Process
+# wide: /voice-call/asr, /voice-call/ambience-config and /chat/send all run on
+# separate handler threads.
+_LEGACY_CALL_DEDUPE = voice_call_legacy.LegacyCallDedupe()
 from health_records import (
     PERIOD_RECORD_TYPES,
     format_health_context_prompt,
@@ -12281,6 +12287,30 @@ class PushHandler(BaseHTTPRequestHandler):
                 "error": "voice_continuation_mode_inactive",
             })
             return
+        legacy_voice_turn = None
+        if voice_reply_token and not voice_continuation and text:
+            # Noted before the busy gate: even a refused WS turn proves the
+            # call already heard this utterance.
+            legacy_voice_turn = _LEGACY_CALL_DEDUPE.note_voice_turn(contact_id, text)
+        elif not voice_reply_token and text and source == self._source_for_request(""):
+            claim = _LEGACY_CALL_DEDUPE.claim_legacy_send(contact_id, text)
+            if claim is not None:
+                voice_record = _LEGACY_CALL_DEDUPE.wait_for_voice_turn(claim)
+                if voice_record is not None:
+                    logger.info(
+                        "voice-call legacy PTT echo suppressed (WS voice turn ts=%s)",
+                        voice_record.get("ts") or "-",
+                    )
+                    self._send_json(200, {
+                        "ok": True,
+                        "deduped": "voice_call_legacy_duplicate",
+                        "record": voice_record,
+                    })
+                    return
+                logger.warning(
+                    "voice-call legacy PTT transcript passed through as plain chat: "
+                    "no matching WS voice turn"
+                )
         voice_reply_instruction = (
             build_voice_reply_instruction(
                 voice_reply_token, mode=voice_mode, english=voice_elevenlabs.enabled()
@@ -12394,6 +12424,8 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(500, {"ok": False, "error": f"history append failed: {exc}"})
                 return
             self._reading_ai_grant_after_user_append(contact_id, rec)
+            if legacy_voice_turn is not None:
+                _LEGACY_CALL_DEDUPE.set_turn_record(legacy_voice_turn, rec)
         if voice_reply_token:
             self.state.pending_voice_replies.register(
                 voice_reply_token,
@@ -24771,12 +24803,17 @@ class PushHandler(BaseHTTPRequestHandler):
                     f.write(chunk)
                     remaining -= len(chunk)
             ok, payload = self._run_stackchan_voice_helper(["asr", "--input", str(tmp_path)], timeout=90)
+            transcript = str(payload.get("transcript") or "")
+            if ok and contact_id == "xiaoke":
+                # The Android call sheet's leftover PTT path will post this
+                # exact transcript to /chat/send as plain text next.
+                _LEGACY_CALL_DEDUPE.note_legacy_asr(contact_id, filename, transcript)
             self._send_json(
                 200 if ok else 502,
                 {
                     "ok": ok,
                     "contact_id": contact_id,
-                    "transcript": str(payload.get("transcript") or ""),
+                    "transcript": transcript,
                     "error": payload.get("error"),
                 },
             )
@@ -24990,12 +25027,22 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.exception("voice-ambience config read fail")
             cfg = {}
         sha = self._voice_ambience_sha()
+        # Every call sheet fetches this exactly once at open: it is the
+        # call-open anchor for legacy PTT echo suppression.
+        _LEGACY_CALL_DEDUPE.note_call_open("xiaoke")
+        # The App hard-mutes the call mic for each pulse; out-of-envelope
+        # timing silently eats the first utterance (2026-10-21 piano test).
+        timing, adjusted = voice_call_legacy.sanitize_ambience_config(cfg)
+        if adjusted:
+            logger.warning(
+                "voice-ambience config clamped keys=%s raw=%s served=%s",
+                ",".join(adjusted),
+                {k: cfg.get(k) for k in adjusted},
+                {k: timing[k] for k in adjusted},
+            )
         body = {
             "ok": True,
-            "gain": cfg.get("gain", 0.6),
-            "delay_ms": cfg.get("delay_ms", 2000),
-            "on_ms": cfg.get("on_ms", 3000),
-            "off_ms": cfg.get("off_ms", 2000),
+            **timing,
             "sha256": sha or "",
             "audio_url": "/voice-call/ambience",
         }
