@@ -136,7 +136,7 @@ class NfcTapDedupeTest(NfcTapBase):
         h2 = self.tap(f"?k={SECRET}")
         self.assertEqual((h1.status, h2.status), (200, 200))
         self.assertEqual(len(self.channel_calls), 1)
-        self.assertIn("小克已经知道啦", self.body(h2))
+        self.assertIn("我已经知道啦，在呢", self.body(h2))
 
     def test_gate_window_math(self) -> None:
         gate = push._NfcTapGate(window_seconds=20)

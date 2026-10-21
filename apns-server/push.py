@@ -27000,35 +27000,120 @@ class PushHandler(BaseHTTPRequestHandler):
             f"S.browser_fallback_url={quote(fallback_url, safe='')};end"
         )
 
+    # 夜灯风格（同通话界面主题 A）+ 内联 SVG 像素 Clawd 戴紫色星星睡帽。
+    # 模板用占位符替换而不是 f-string，CSS 花括号原样保留。
+    _NFC_TAP_PAGE_TEMPLATE = """<!doctype html>
+<html lang="zh-CN" style="background:#121520"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark"><meta name="theme-color" content="#121520">
+<meta name="referrer" content="no-referrer">
+<title>小克来了</title>
+<style>
+:root{--ink:rgba(255,244,230,.94);--ink2:rgba(255,236,215,.66);--ink3:rgba(255,236,215,.38);
+--btn-bg:rgba(255,240,220,.07);--btn-bd:rgba(255,240,220,.16);--btn-ink:rgba(255,244,230,.86)}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:#121520;color:var(--ink);overflow:hidden}
+body{font-family:-apple-system,"PingFang SC","Noto Sans SC",system-ui,sans-serif;-webkit-font-smoothing:antialiased;-webkit-tap-highlight-color:transparent}
+.bg{position:fixed;inset:0;z-index:0;pointer-events:none;
+background:radial-gradient(60% 38% at 74% 88%,rgba(255,178,96,.36) 0%,rgba(214,130,60,.13) 45%,transparent 75%),
+radial-gradient(90% 55% at 70% 100%,rgba(120,70,35,.55) 0%,transparent 70%),
+linear-gradient(180deg,#121520 0%,#17161c 38%,#241a14 78%,#2b1d13 100%)}
+.curtain{position:absolute;left:0;top:0;bottom:0;width:34%;opacity:.9;
+background:repeating-linear-gradient(90deg,rgba(255,255,255,.035) 0 9px,rgba(0,0,0,.10) 9px 22px,rgba(255,255,255,.02) 22px 30px);
+-webkit-mask-image:linear-gradient(90deg,#000,transparent);mask-image:linear-gradient(90deg,#000,transparent)}
+.lamp{position:absolute;right:5%;bottom:calc(2% + env(safe-area-inset-bottom));width:110px;height:150px;opacity:.3;filter:blur(1px);transform:scale(.78);transform-origin:bottom right}
+.shade{position:absolute;top:0;left:50%;transform:translateX(-50%);width:110px;height:70px;clip-path:polygon(24% 0,76% 0,100% 100%,0 100%);
+background:linear-gradient(180deg,#ffe2b0,#f2b467 60%,#c9813f);box-shadow:0 0 60px 20px rgba(255,190,110,.35)}
+.base{position:absolute;bottom:0;left:50%;transform:translateX(-50%);width:58px;height:74px;border-radius:40% 40% 18% 18%;
+background:radial-gradient(60% 50% at 40% 30%,#8a6040,#4a3020 70%,#2b1b12)}
+.glow{position:absolute;right:0;bottom:6%;width:72%;height:46%;border-radius:50%;
+background:radial-gradient(closest-side,rgba(255,190,110,.2),transparent);animation:flicker 6s ease-in-out infinite}
+.vignette{position:absolute;inset:0;background:radial-gradient(120% 90% at 50% 42%,transparent 50%,rgba(0,0,0,.55) 100%)}
+.dot{position:absolute;width:2px;height:2px;border-radius:50%;background:#fff3dc;opacity:.25;animation:tw 5s ease-in-out infinite}
+main{position:relative;z-index:1;height:100%;display:flex;flex-direction:column;align-items:center;
+padding:calc(24px + env(safe-area-inset-top)) 16px calc(28px + env(safe-area-inset-bottom))}
+.stage{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;width:100%;padding-bottom:4vh}
+.pet{position:relative;width:min(56vw,216px);aspect-ratio:22/26;animation:in .9s cubic-bezier(.2,.7,.2,1) both}
+.pet::after{content:"";position:absolute;left:12%;right:12%;bottom:-6%;height:12%;border-radius:50%;
+background:radial-gradient(closest-side,rgba(0,0,0,.45),transparent)}
+.pet svg{position:relative;z-index:1;width:100%;height:100%;display:block;overflow:visible;
+filter:drop-shadow(0 0 26px rgba(232,150,100,.28))}
+.crab{transform-origin:11px 24px;animation:breathe 4.2s ease-in-out infinite}
+.cap{transform-origin:11px 12px;animation:sway 5.6s ease-in-out infinite}
+.star{transform-origin:17.5px 3.5px;animation:twinkle 2.6s ease-in-out infinite}
+.halo{animation:halo 2.6s ease-in-out infinite}
+h1{margin-top:34px;font-family:"Kaiti SC","STKaiti","KaiTi","LXGW WenKai",cursive;font-weight:400;font-size:38px;letter-spacing:.12em;
+color:var(--ink);text-shadow:0 0 18px rgba(255,190,120,.25);animation:in 1s .15s cubic-bezier(.2,.7,.2,1) both}
+.sub{margin-top:12px;font-size:15px;letter-spacing:.08em;color:var(--ink2);animation:in 1s .3s cubic-bezier(.2,.7,.2,1) both}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:13px 26px;border-radius:999px;background:var(--btn-bg);
+border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-size:14px;letter-spacing:.06em;
+-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);animation:in 1s .45s both}
+.btn:active{background:rgba(255,240,220,.14)}
+.btn i{width:6px;height:6px;border-radius:50%;background:#e8a865;box-shadow:0 0 8px #e8a865}
+.hint{margin-top:12px;font-size:11px;letter-spacing:.06em;color:var(--ink3);animation:in 1s .55s both}
+@keyframes breathe{0%,100%{transform:scale(1,1)}50%{transform:scale(1.015,1.03)}}
+@keyframes sway{0%,100%{transform:rotate(-1.5deg)}50%{transform:rotate(2deg)}}
+@keyframes twinkle{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.78)}}
+@keyframes halo{0%,100%{opacity:.55}50%{opacity:.12}}
+@keyframes flicker{0%,100%{opacity:.85}50%{opacity:1}}
+@keyframes tw{0%,100%{opacity:.08}50%{opacity:.4}}
+@keyframes in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){*,*::after{animation:none!important}}
+</style></head><body>
+<div class="bg" aria-hidden="true"><div class="curtain"></div><div class="glow"></div>
+<div class="lamp"><div class="shade"></div><div class="base"></div></div><div class="vignette"></div>
+<span class="dot" style="left:62%;top:12%"></span><span class="dot" style="left:80%;top:20%;animation-delay:1.6s"></span>
+<span class="dot" style="left:44%;top:8%;animation-delay:3.1s"></span></div>
+<main><div class="stage">
+<div class="pet"><svg viewBox="0 0 22 26" shape-rendering="crispEdges" role="img" aria-label="戴睡帽的小克">
+<g class="crab">
+<rect x="2" y="16" width="2" height="3" fill="#C96A4B"/><rect x="18" y="16" width="2" height="3" fill="#C96A4B"/>
+<rect x="5" y="22" width="1" height="2" fill="#B85F42"/><rect x="7" y="22" width="1" height="2" fill="#B85F42"/>
+<rect x="14" y="22" width="1" height="2" fill="#B85F42"/><rect x="16" y="22" width="1" height="2" fill="#B85F42"/>
+<rect x="4" y="13" width="14" height="9" fill="#D97757"/>
+<rect x="4" y="13" width="14" height="1" fill="#E68E6C"/><rect x="4" y="13" width="1" height="8" fill="#E2866A"/>
+<rect x="4" y="21" width="14" height="1" fill="#BF6346"/><rect x="17" y="14" width="1" height="7" fill="#C66B4D"/>
+<rect x="6" y="17" width="1" height="1" fill="#2B1712"/><rect x="7" y="16" width="1" height="1" fill="#2B1712"/><rect x="8" y="17" width="1" height="1" fill="#2B1712"/>
+<rect x="13" y="17" width="1" height="1" fill="#2B1712"/><rect x="14" y="16" width="1" height="1" fill="#2B1712"/><rect x="15" y="17" width="1" height="1" fill="#2B1712"/>
+<rect x="5" y="18" width="2" height="1" fill="#F4A58E" opacity=".75"/><rect x="15" y="18" width="2" height="1" fill="#F4A58E" opacity=".75"/>
+<g class="cap">
+<rect x="14" y="5" width="2" height="1" fill="#8E6FDA"/>
+<rect x="12" y="6" width="4" height="1" fill="#8466D2"/>
+<rect x="10" y="7" width="5" height="1" fill="#7B5BC4"/>
+<rect x="8" y="8" width="7" height="1" fill="#7B5BC4"/>
+<rect x="7" y="9" width="9" height="1" fill="#7454BC"/>
+<rect x="6" y="10" width="11" height="1" fill="#7454BC"/>
+<rect x="5" y="11" width="13" height="1" fill="#6C4DB3"/>
+<rect x="9" y="8" width="2" height="1" fill="#9A80E2"/><rect x="7" y="10" width="3" height="1" fill="#8C70D8"/><rect x="6" y="11" width="2" height="1" fill="#8466D2"/>
+<rect x="15" y="10" width="2" height="2" fill="#5E43A3"/><rect x="14" y="8" width="1" height="2" fill="#5E43A3"/>
+<rect x="12" y="9" width="1" height="1" fill="#FFE07A"/><rect x="8" y="10" width="1" height="1" fill="#FFE07A"/>
+<circle class="halo" cx="17.5" cy="3.5" r="2.6" fill="#FFD86B" opacity=".4" shape-rendering="geometricPrecision" style="filter:blur(.6px)"/>
+<g class="star"><rect x="17" y="1" width="1" height="5" fill="#FFD86B"/><rect x="15" y="3" width="5" height="1" fill="#FFD86B"/>
+<rect x="16" y="2" width="3" height="3" fill="#FFD86B"/><rect x="17" y="3" width="1" height="1" fill="#FFF4C8"/></g>
+</g>
+<rect x="3" y="12" width="16" height="2" fill="#F6F0E8"/>
+<rect x="4" y="13" width="1" height="1" fill="#DDD4CC"/><rect x="7" y="13" width="1" height="1" fill="#DDD4CC"/><rect x="10" y="13" width="1" height="1" fill="#DDD4CC"/>
+<rect x="13" y="13" width="1" height="1" fill="#DDD4CC"/><rect x="16" y="13" width="1" height="1" fill="#DDD4CC"/>
+<rect x="3" y="14" width="1" height="1" fill="#F6F0E8"/><rect x="18" y="14" width="1" height="1" fill="#E9E1D8"/>
+</g></svg></div>
+<h1>小克来了</h1><p class="sub">__SUB__</p>
+</div>
+<a class="btn" href="__HREF__"><i></i>打开 CC Companion</a>
+<p class="hint">没有自动跳转的话，点一下上面</p>
+</main><script>__AUTO__</script></body></html>
+"""
+
     def _nfc_tap_page(self, *, intent_url: str, auto: bool, sub: str) -> bytes:
         import html as _html
 
-        href = _html.escape(intent_url, quote=True)
         js_intent = json.dumps(intent_url).replace("</", "<\\/")
-        auto_js = (
-            f"setTimeout(function(){{location.href={js_intent};}},120);" if auto else ""
+        auto_js = f"setTimeout(function(){{location.href={js_intent};}},350);" if auto else ""
+        page = (
+            self._NFC_TAP_PAGE_TEMPLATE
+            .replace("__SUB__", _html.escape(sub))
+            .replace("__HREF__", _html.escape(intent_url, quote=True))
+            .replace("__AUTO__", auto_js)
         )
-        page = f"""<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="color-scheme" content="dark"><meta name="referrer" content="no-referrer">
-<title>小克来了</title>
-<style>
-html,body{{margin:0;height:100%;background:#0d0b14;color:#f3ecdf;font-family:-apple-system,"PingFang SC","Noto Sans SC",sans-serif}}
-main{{min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px 16px;box-sizing:border-box;text-align:center;
-background:radial-gradient(circle at 50% 38%,rgba(255,170,90,.22),rgba(13,11,20,0) 55%)}}
-.crab{{font-size:88px;line-height:1;filter:drop-shadow(0 0 22px rgba(255,140,70,.55));animation:b 1.6s ease-in-out infinite}}
-@keyframes b{{0%,100%{{transform:translateY(0)}}50%{{transform:translateY(-8px)}}}}
-h1{{font-size:28px;margin:22px 0 8px;font-weight:600;letter-spacing:2px}}
-.sub{{margin:0 0 30px;color:#bfb3a3;font-size:15px}}
-.btn{{display:inline-block;padding:14px 28px;border-radius:999px;background:#ff8a4c;color:#1a0f08;text-decoration:none;font-weight:600;font-size:16px}}
-.hint{{margin-top:18px;color:#7d7368;font-size:12px}}
-</style></head><body><main>
-<div class="crab">🦀</div><h1>小克来了</h1><p class="sub">{_html.escape(sub)}</p>
-<a class="btn" href="{href}">打开 CC Companion</a>
-<p class="hint">没有自动跳转的话，点上面的按钮</p>
-</main><script>{auto_js}</script></body></html>
-"""
         return page.encode("utf-8")
 
     def _handle_nfc_tap(self) -> None:
@@ -27074,9 +27159,9 @@ h1{{font-size:28px;margin:22px 0 8px;font-weight:600;letter-spacing:2px}}
         if is_fallback:
             sub = "没能自动打开 app，点下面的按钮试试"
         elif notified:
-            sub = "小克收到啦，马上来找你"
+            sub = "我收到啦，马上来找你"
         else:
-            sub = "小克已经知道啦"
+            sub = "我已经知道啦，在呢"
         data = self._nfc_tap_page(
             intent_url=self._nfc_tap_intent_url(fallback), auto=not is_fallback, sub=sub
         )
