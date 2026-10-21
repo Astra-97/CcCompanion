@@ -236,8 +236,14 @@ def normalize_voice_mode(value: object) -> str:
     return normalized if normalized in VOICE_MODES else "conversation"
 
 
-def build_voice_reply_instruction(token: str, *, mode: str = "conversation") -> str:
-    """Build the private terminal-only instruction for a validated token."""
+VOICE_ENGLISH_HINT = "（通话中：请用英文口语回复，短句，可用 [softly]/[laughs] 等 ElevenLabs 标签）"
+
+
+def build_voice_reply_instruction(token: str, *, mode: str = "conversation", english: bool = False) -> str:
+    """Build the private terminal-only instruction for a validated token.
+
+    ``english`` adds the ElevenLabs call hint (spoken English + audio tags).
+    """
 
     valid = normalize_voice_reply_token(token)
     if not valid:
@@ -249,6 +255,8 @@ def build_voice_reply_instruction(token: str, *, mode: str = "conversation") -> 
         "sleep": "这是陪睡模式。语气轻柔、短句、适合闭眼听；可以自然自言自语，不要求用户每次回应。",
         "commute": "这是通勤模式。语气自然、有陪伴感、短句；可以主动延续话题，不要求用户每次回应。",
     }[voice_mode]
+    if english:
+        mode_hint += VOICE_ENGLISH_HINT
     return (
         f"[CCC 通话正式回复协议：{mode_hint}终端里的思考、工具过程和协议外文字"
         "都不是给用户的语音回复，也绝不能触发 TTS。不要让 stop hook 代替正式答复。请只通过 "

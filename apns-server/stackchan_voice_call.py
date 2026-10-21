@@ -16,6 +16,11 @@ Two TTS modes:
   type=1 PCM chunk (16-bit signed little-endian mono at meta.sample_rate).
   type=2 end of stream (length=0).
   type=3 error JSON (utf-8) — caller should treat as fatal.
+
+Voice calls (``asr``, ``tts_stream``, ``tts --call``) prefer ElevenLabs via
+``voice_elevenlabs.py`` and fall back to the xiaozhi providers on error; see
+that module for the on/off switch. ``tts`` without ``--call`` (``/voice/push``)
+is unchanged.
 """
 
 from __future__ import annotations
@@ -31,9 +36,15 @@ import uuid
 import wave
 from pathlib import Path
 
+import voice_elevenlabs
+
 
 XIAOZHI_ROOT = Path(os.environ.get("STACKCHAN_XIAOZHI_ROOT", "/root/stackchan-server-lite/main/xiaozhi-server"))
 XIAOZHI_PYTHON = Path(os.environ.get("STACKCHAN_XIAOZHI_PYTHON", str(XIAOZHI_ROOT / ".venv/bin/python")))
+
+
+def _log(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
 
 
 def _print_json(payload: dict) -> None:
@@ -84,6 +95,12 @@ async def _run_asr(input_path: Path) -> dict:
         return {"ok": False, "error": "empty audio"}
     if duration_ms < 500 or dbfs < -52:
         return {"ok": True, "transcript": ""}
+    if voice_elevenlabs.enabled():
+        try:
+            transcript, model_id = voice_elevenlabs.speech_to_text(input_path)
+            return {"ok": bool(transcript), "transcript": transcript, "provider": "elevenlabs", "model": model_id}
+        except Exception as exc:
+            _log(f"elevenlabs asr failed, falling back to xiaozhi asr: {exc}")
     config = load_config()
     asr = initialize_asr(config)
     transcript, _file_path = await asr.speech_to_text_wrapper(pcm_frames, f"app_voice_{uuid.uuid4().hex}", "pcm")
@@ -91,15 +108,23 @@ async def _run_asr(input_path: Path) -> dict:
     return {"ok": bool(normalized), "transcript": normalized}
 
 
-async def _run_tts(text: str, output_dir: Path) -> dict:
+async def _run_tts(text: str, output_dir: Path, *, call: bool = False) -> dict:
     _prepare_imports()
     from config.settings import load_config
     from core.utils.modules_initialize import initialize_tts
     from core.utils.tts import MarkdownCleaner
 
+    if call and voice_elevenlabs.enabled():
+        try:
+            return voice_elevenlabs.tts_to_file(MarkdownCleaner.clean_markdown(text.strip()), output_dir)
+        except Exception as exc:
+            _log(f"elevenlabs tts failed, falling back to xiaozhi tts: {exc}")
+
     config = load_config()
     tts = initialize_tts(config)
     cleaned = MarkdownCleaner.clean_markdown(text.strip())
+    if call:
+        cleaned = voice_elevenlabs.strip_audio_tags(cleaned)
     if getattr(tts, "_correct_words_pattern", None):
         cleaned = tts._correct_words_pattern.sub(lambda m: tts.correct_words[m.group(0)], cleaned)
     if tts.__class__.__module__.endswith("minimax_httpstream"):
@@ -253,6 +278,46 @@ def _write_frame(frame_type: int, payload: bytes = b"") -> None:
     out.flush()
 
 
+def _elevenlabs_tts_stream(text: str) -> int | None:
+    """ElevenLabs streaming PCM onto the framed stdout protocol.
+
+    Returns an exit code once any audio went out (or on a mid-stream error),
+    or ``None`` when it failed before the first PCM frame so the caller can
+    fall back to the StackChan provider transparently.
+    """
+    sample_rate = voice_elevenlabs.STREAM_SAMPLE_RATE
+    chunk_count = 0
+    try:
+        for pcm in voice_elevenlabs.tts_pcm_stream(text, sample_rate=sample_rate):
+            if chunk_count == 0:
+                _write_frame(
+                    _FRAME_TYPE_META,
+                    json.dumps(
+                        {
+                            "sample_rate": sample_rate,
+                            "channels": 1,
+                            "sample_width": 2,
+                            "format": "pcm_s16le",
+                            "provider": "elevenlabs",
+                            "streaming": True,
+                        }
+                    ).encode("utf-8"),
+                )
+            _write_frame(_FRAME_TYPE_PCM, pcm)
+            chunk_count += 1
+    except Exception as exc:
+        if chunk_count == 0:
+            _log(f"elevenlabs tts_stream failed, falling back to xiaozhi tts: {exc}")
+            return None
+        _write_frame(_FRAME_TYPE_ERROR, json.dumps({"error": f"elevenlabs: {exc}"}).encode("utf-8"))
+        return 1
+    if chunk_count == 0:
+        _log("elevenlabs tts_stream returned no audio, falling back to xiaozhi tts")
+        return None
+    _write_frame(_FRAME_TYPE_END)
+    return 0
+
+
 def _run_tts_stream(text: str) -> int:
     """TTS in real-streaming mode. Yields PCM chunks straight to stdout as
     framed binary so the parent process can push them onto a WebSocket without
@@ -265,10 +330,15 @@ def _run_tts_stream(text: str) -> int:
     from core.utils.modules_initialize import initialize_tts
     from core.utils.tts import MarkdownCleaner
 
+    if voice_elevenlabs.enabled():
+        rc = _elevenlabs_tts_stream(MarkdownCleaner.clean_markdown(text.strip()))
+        if rc is not None:
+            return rc
+
     try:
         config = load_config()
         tts = initialize_tts(config)
-        cleaned = MarkdownCleaner.clean_markdown(text.strip())
+        cleaned = voice_elevenlabs.strip_audio_tags(MarkdownCleaner.clean_markdown(text.strip()))
         if getattr(tts, "_correct_words_pattern", None):
             cleaned = tts._correct_words_pattern.sub(
                 lambda m: tts.correct_words[m.group(0)], cleaned
@@ -376,6 +446,7 @@ async def _main() -> int:
     tts_parser = sub.add_parser("tts")
     tts_parser.add_argument("--text", required=True)
     tts_parser.add_argument("--output-dir", required=True)
+    tts_parser.add_argument("--call", action="store_true", help="voice-call mode: prefer ElevenLabs")
     tts_stream_parser = sub.add_parser("tts_stream")
     tts_stream_parser.add_argument("--text", required=True)
     args = parser.parse_args()
@@ -384,7 +455,7 @@ async def _main() -> int:
         if args.command == "asr":
             _print_json(await _run_asr(Path(args.input)))
         elif args.command == "tts":
-            _print_json(await _run_tts(args.text, Path(args.output_dir)))
+            _print_json(await _run_tts(args.text, Path(args.output_dir), call=args.call))
         elif args.command == "tts_stream":
             return _run_tts_stream(args.text)
         return 0

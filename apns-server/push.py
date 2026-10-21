@@ -139,6 +139,7 @@ from voice_protocol import (
 import translate_api
 import voice_acoustics
 import voice_duration
+import voice_elevenlabs
 import voice_gemini
 import voice_message
 import fable_quota
@@ -12281,7 +12282,9 @@ class PushHandler(BaseHTTPRequestHandler):
             })
             return
         voice_reply_instruction = (
-            build_voice_reply_instruction(voice_reply_token, mode=voice_mode)
+            build_voice_reply_instruction(
+                voice_reply_token, mode=voice_mode, english=voice_elevenlabs.enabled()
+            )
             if voice_reply_token
             else ""
         )
@@ -24787,14 +24790,14 @@ class PushHandler(BaseHTTPRequestHandler):
                 pass
 
     def _handle_voice_call_tts(self, body: dict[str, Any]):
-        """Text -> StackChan/xiaozhi TTS audio file for app playback."""
+        """Text -> call TTS audio file for app playback (ElevenLabs, StackChan fallback)."""
         text = str(body.get("text") or "").strip()
         contact_id = self._contact_id_from_body(body)
         if not text:
             self._send_json(400, {"ok": False, "error": "text required"})
             return
         ok, payload = self._run_stackchan_voice_helper(
-            ["tts", "--text", text, "--output-dir", str(self.state.attachments_dir)],
+            ["tts", "--call", "--text", text, "--output-dir", str(self.state.attachments_dir)],
             timeout=90,
         )
         if not ok:
