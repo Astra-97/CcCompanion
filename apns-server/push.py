@@ -5754,6 +5754,31 @@ class _RecentIdSet:
 _GARDEN_WEBHOOK_SEEN = _RecentIdSet()
 
 
+class _NfcTapGate:
+    """Process-wide "notify at most once per window" gate for NFC taps."""
+
+    def __init__(self, window_seconds: float = 20.0) -> None:
+        self.window = window_seconds
+        self._last: float | None = None
+        self._lock = threading.Lock()
+
+    def try_acquire(self, now: float | None = None) -> bool:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            if self._last is not None and now - self._last < self.window:
+                return False
+            self._last = now
+            return True
+
+    def reset(self) -> None:
+        with self._lock:
+            self._last = None
+
+
+# NFC 螃蟹挂件 (2026-10-21)：双击/抖动的重复碰卡 20s 内只通知一次。
+_NFC_TAP_GATE = _NfcTapGate()
+
+
 class PushHandler(BaseHTTPRequestHandler):
     state: ServerState  # set by run_server before serving
 
@@ -7701,6 +7726,11 @@ class PushHandler(BaseHTTPRequestHandler):
         request_path = urlparse(self.path).path
         if request_path == "/ai-chat" or request_path.startswith("/ai-chat/"):
             self._send_json(404, {"error": "not found"})
+            return
+        # NFC 螃蟹挂件 (2026-10-21)：手机碰 tag → 浏览器打开此 URL。自带
+        # ?k= 密钥鉴权（错/缺 → 404，不通知），必须排在 IP/会话鉴权之前。
+        if request_path == "/nfc/tap":
+            self._handle_nfc_tap()
             return
         if not self._is_public_get() and not self._check_ip_allowed():
             return
@@ -26852,6 +26882,217 @@ class PushHandler(BaseHTTPRequestHandler):
         if not (200 <= status < 300) and not (isinstance(payload, dict) and payload.get("record")):
             _GARDEN_WEBHOOK_SEEN.release(message_id)
 
+
+    # ── NFC 螃蟹挂件 "碰一下召唤小克" (2026-10-21) ─────────────────────────
+    _NFC_TAP_SECRET_FILE_ENV = "CC_COMPANION_NFC_TAP_SECRET_FILE"
+    _NFC_TAP_DEFAULT_SECRET_FILE = Path("/root/.config/cc-companion/nfc_tap_secret")
+    _NFC_TAP_PACKAGE = "com.fangxiaonan.cccompanion"
+    _NFC_TAP_EXTRA_CONTACT = "com.fangxiaonan.cccompanion.extra.OPEN_CONTACT_ID"
+    _NFC_TAP_CONTACT = "xiaoke"
+    _NFC_TAP_ASYNC = True  # tests flip this to deliver inline
+
+    @classmethod
+    def _nfc_tap_secret(cls) -> str:
+        """Read the tag secret from its 0600 file per request (fail-closed)."""
+        raw_path = os.environ.get(cls._NFC_TAP_SECRET_FILE_ENV, "").strip()
+        path = Path(raw_path).expanduser() if raw_path else cls._NFC_TAP_DEFAULT_SECRET_FILE
+        try:
+            info = path.lstat()
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                return ""
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags)
+            try:
+                raw = os.read(fd, 257)
+            finally:
+                os.close(fd)
+            secret = raw.decode("utf-8").strip()
+            return secret if 16 <= len(secret) <= 256 else ""
+        except (OSError, UnicodeError):
+            return ""
+
+    @staticmethod
+    def _nfc_tap_notification_text(now: datetime | None = None, *, test: bool = False) -> str:
+        now = now or datetime.now(ZoneInfo("Asia/Shanghai"))
+        hhmm = now.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%H:%M")
+        if test:
+            return (
+                f"[NFC·螃蟹被碰了·测试] {hhmm} 这是一条测试通知"
+                "（施工 agent 用 curl 打的，不是方小南碰的，不用回她）"
+            )
+        return (
+            f"[NFC·螃蟹被碰了] {hhmm} 方小南碰了一下螃蟹挂件"
+            "（她手机正在打开 CC Companion，用 companion reply contact_id=xiaoke 跟她打招呼）"
+        )
+
+    @classmethod
+    def _nfc_tap_notification(cls, now: datetime | None = None, *, test: bool = False) -> dict[str, Any]:
+        """Channel message payload for a tap (no chat-history bubble)."""
+        return {
+            "message_id": f"nfc:{int(time.time() * 1000)}",
+            "contact_id": cls._NFC_TAP_CONTACT,
+            "text": cls._nfc_tap_notification_text(now, test=test),
+            "metadata": {
+                "source": "nfc-tap",
+                "transport": "channel",
+                "nfc_tap": True,
+                "test": bool(test),
+            },
+        }
+
+    @staticmethod
+    def _deliver_nfc_tap(state: Any, payload: dict[str, Any]) -> tuple[bool, str]:
+        """Same path as tool-dispatcher triggers: channel first, tmux fallback.
+
+        Deliberately never writes to the contact's chat history, so 方小南
+        sees no bubble for the notification itself; 小克 replies on its own.
+        """
+        contact_id = payload["contact_id"]
+        if (
+            getattr(state, "channel_transport_enabled", False)
+            and contact_id in (getattr(state, "channel_transport_contacts", None) or [])
+        ):
+            ok, err = _channel_transport_post(
+                state,
+                message_id=payload["message_id"],
+                contact_id=contact_id,
+                text=payload["text"],
+                metadata=payload["metadata"],
+            )
+            if ok:
+                return True, ""
+            logger.warning("nfc tap: channel transport failed: %s", err)
+            if not getattr(state, "channel_transport_fallback_to_tmux", True):
+                return False, err or "channel transport failed"
+        target = (getattr(state, "active_session", "") or getattr(state, "default_session", "") or "cctg").strip()
+        return _inject_to_tmux_session(state, target, payload["text"])
+
+    def _nfc_tap_run_delivery(self, payload: dict[str, Any]) -> None:
+        def run() -> None:
+            try:
+                ok, err = self._deliver_nfc_tap(self.state, payload)
+                logger.info("nfc tap delivered ok=%s err=%s id=%s", ok, err, payload["message_id"])
+            except Exception:
+                logger.exception("nfc tap delivery crashed")
+
+        if self._NFC_TAP_ASYNC:
+            threading.Thread(target=run, name="nfc-tap-deliver", daemon=True).start()
+        else:
+            run()
+
+    def _nfc_tap_intent_url(self, fallback_url: str) -> str:
+        from urllib.parse import quote
+
+        # VIEW cccompanion://chat/xiaoke + explicit component: browsers that
+        # honour component launch MainActivity straight into 小克私聊 via the
+        # notification extra; Chrome strips component and needs a BROWSABLE
+        # filter (future app build) — otherwise it goes to the fallback page.
+        pkg = self._NFC_TAP_PACKAGE
+        return (
+            "intent://chat/xiaoke#Intent;scheme=cccompanion;"
+            f"package={pkg};component={pkg}/.MainActivity;"
+            f"S.{self._NFC_TAP_EXTRA_CONTACT}={self._NFC_TAP_CONTACT};"
+            f"S.browser_fallback_url={quote(fallback_url, safe='')};end"
+        )
+
+    def _nfc_tap_page(self, *, intent_url: str, auto: bool, sub: str) -> bytes:
+        import html as _html
+
+        href = _html.escape(intent_url, quote=True)
+        js_intent = json.dumps(intent_url).replace("</", "<\\/")
+        auto_js = (
+            f"setTimeout(function(){{location.href={js_intent};}},120);" if auto else ""
+        )
+        page = f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark"><meta name="referrer" content="no-referrer">
+<title>小克来了</title>
+<style>
+html,body{{margin:0;height:100%;background:#0d0b14;color:#f3ecdf;font-family:-apple-system,"PingFang SC","Noto Sans SC",sans-serif}}
+main{{min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px 16px;box-sizing:border-box;text-align:center;
+background:radial-gradient(circle at 50% 38%,rgba(255,170,90,.22),rgba(13,11,20,0) 55%)}}
+.crab{{font-size:88px;line-height:1;filter:drop-shadow(0 0 22px rgba(255,140,70,.55));animation:b 1.6s ease-in-out infinite}}
+@keyframes b{{0%,100%{{transform:translateY(0)}}50%{{transform:translateY(-8px)}}}}
+h1{{font-size:28px;margin:22px 0 8px;font-weight:600;letter-spacing:2px}}
+.sub{{margin:0 0 30px;color:#bfb3a3;font-size:15px}}
+.btn{{display:inline-block;padding:14px 28px;border-radius:999px;background:#ff8a4c;color:#1a0f08;text-decoration:none;font-weight:600;font-size:16px}}
+.hint{{margin-top:18px;color:#7d7368;font-size:12px}}
+</style></head><body><main>
+<div class="crab">🦀</div><h1>小克来了</h1><p class="sub">{_html.escape(sub)}</p>
+<a class="btn" href="{href}">打开 CC Companion</a>
+<p class="hint">没有自动跳转的话，点上面的按钮</p>
+</main><script>{auto_js}</script></body></html>
+"""
+        return page.encode("utf-8")
+
+    def _handle_nfc_tap(self) -> None:
+        """GET /nfc/tap?k=<secret>[&f=1][&test=1] — NFC 螃蟹挂件被碰。
+
+        错/缺 k → 404 且不通知。正确 → 20s 内首次碰卡给小克会话发一条
+        channel 消息（不进聊天历史），并返回一个立即尝试拉起 app 的小页面。
+        f=1 是 intent 失败后的回落页：不再自动跳、不再通知。
+        """
+        qs = self._query_params()
+        supplied = str((qs.get("k") or [""])[0] or "").strip()
+        expected = self._nfc_tap_secret()
+        ok = False
+        if expected and supplied:
+            try:
+                ok = hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+            except UnicodeError:
+                ok = False
+        if not ok:
+            self._send_json(404, {"error": "not found"})
+            return
+        is_fallback = (qs.get("f") or [""])[0] == "1"
+        is_test = (qs.get("test") or [""])[0] == "1"
+        notified = False
+        if not is_fallback and _NFC_TAP_GATE.try_acquire():
+            notified = True
+            self._nfc_tap_run_delivery(self._nfc_tap_notification(test=is_test))
+        try:
+            client_ip = self._trusted_client_ip()
+        except Exception:
+            client_ip = "?"
+        logger.info(
+            "nfc tap ip=%s fallback=%s test=%s notified=%s ua=%s",
+            client_ip, is_fallback, is_test, notified,
+            str(self.headers.get("User-Agent", "") or "")[:120],
+        )
+        host = str(self.headers.get("Host", "") or "")
+        if not re.fullmatch(r"[A-Za-z0-9.-]+(:\d+)?", host):
+            host = "companion-vps2.xiaonancaleb.xyz"
+        from urllib.parse import quote
+
+        fallback = f"https://{host}/nfc/tap?k={quote(supplied, safe='')}&f=1"
+        if is_fallback:
+            sub = "没能自动打开 app，点下面的按钮试试"
+        elif notified:
+            sub = "小克收到啦，马上来找你"
+        else:
+            sub = "小克已经知道啦"
+        data = self._nfc_tap_page(
+            intent_url=self._nfc_tap_intent_url(fallback), auto=not is_fallback, sub=sub
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
+        )
+        self.end_headers()
+        self.wfile.write(data)
 
     def _reading_ai_grant_from_metadata(self, contact_id: str, metadata: Any) -> None:
         """Validate and persist a user-authorized AI-only source cursor.
