@@ -51,6 +51,11 @@ apns-server/config.toml
 apns-server/secrets/
 apns-server/tokens/
 apns-server/state/
+# 通话自定义壁纸是她的私人图片，运行数据不进库（只留 README）
+apns-server/voice-wallpaper/wallpaper.*
+apns-server/voice-wallpaper/.wallpaper-*
+# 罐头音本机备份
+apns-server/voice-ambience/*.orig*
 apns-server/static/
 apns-server/skills-lock.json
 *.p8

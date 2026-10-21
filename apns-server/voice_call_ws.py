@@ -41,6 +41,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 from websockets.asyncio.server import ServerConnection, serve
 
+import screen_capture
 from voice_protocol import (
     VOICE_INTERNAL_HEADER,
     VOICE_INTERNAL_TOKEN_PATH,
@@ -184,6 +185,9 @@ SERVER_CAPABILITIES = (
     "error_severity",
     "turn_accepted_v1",
     "voice_modes_v1",
+    # Screen share (2026-10-21): `screen_capture_request` down, the App uploads
+    # the frame to push.py. See screen_capture.py for the whole flow.
+    screen_capture.CAPABILITY,
 )
 # How often to remind a thinking_frames client that the LLM is still chewing.
 THINKING_TICK_SEC = float(_env_int("CC_VOICE_THINKING_TICK_SEC", 5))
@@ -1815,6 +1819,8 @@ class Session:
         self.voice_mode = "conversation"
         self.mode_epoch = 0
         self.last_continue_generation = 0
+        # The App's MediaProjection grant, reported via `screen_share_state`.
+        self.screen_share_active = False
 
     def _continuation_is_active(self) -> bool:
         return self.continuation_turn_active
@@ -2125,6 +2131,20 @@ class Session:
                 )
             elif mtype == "interrupt":
                 self.interrupt_event.set()
+            elif mtype == "screen_share_state":
+                if screen_capture.CAPABILITY in self.capabilities:
+                    self.screen_share_active = bool(msg.get("active"))
+                    logger.info(
+                        "screen share state session=%s active=%s",
+                        self.session_id,
+                        self.screen_share_active,
+                    )
+            elif mtype == "screen_capture_error":
+                request_id = str(msg.get("request_id") or "")
+                reason = str(msg.get("reason") or "capture_failed")
+                if reason not in screen_capture.ERROR_MESSAGES:
+                    reason = "capture_failed"
+                SCREEN_CAPTURE_MAILBOX.write_error(request_id, reason)
             elif mtype == "mode_change":
                 if "voice_modes_v1" not in self.capabilities:
                     continue
@@ -2285,6 +2305,59 @@ class Session:
 # ---------------------------------------------------------------------------
 
 
+# Live sessions, for routing `call-screenshot` requests to the current call.
+ACTIVE_SESSIONS: set["Session"] = set()
+SCREEN_CAPTURE_MAILBOX = screen_capture.Mailbox()
+SCREEN_CAPTURE_POLL_SEC = 0.25
+
+
+def pick_screen_capture_session(sessions: Any) -> tuple[Optional["Session"], str]:
+    """Most recent started session that can capture; else the error code."""
+    capable = [
+        s
+        for s in sessions
+        if s.started
+        and screen_capture.CAPABILITY in s.capabilities
+        and getattr(s.ws, "close_code", None) is None
+    ]
+    if not capable:
+        return None, "no_active_call"
+    capable.sort(key=lambda s: s.opened_at, reverse=True)
+    for sess in capable:
+        if sess.screen_share_active:
+            return sess, ""
+    return None, "not_authorized"
+
+
+async def dispatch_screen_capture_requests(mailbox: screen_capture.Mailbox) -> None:
+    for request_id in mailbox.take_requests():
+        sess, error = pick_screen_capture_session(ACTIVE_SESSIONS)
+        if sess is None:
+            mailbox.write_error(request_id, error)
+            continue
+        mailbox.mark_pending(request_id)
+        try:
+            await send_json(sess.ws, {"type": "screen_capture_request", "request_id": request_id})
+            logger.info("screen capture requested session=%s", sess.session_id)
+        except Exception as e:
+            mailbox.abandon(request_id)
+            mailbox.write_error(request_id, "send_failed", type(e).__name__)
+
+
+async def screen_capture_loop() -> None:
+    sweep_every = int(10 / SCREEN_CAPTURE_POLL_SEC)
+    tick = 0
+    while True:
+        try:
+            await dispatch_screen_capture_requests(SCREEN_CAPTURE_MAILBOX)
+            tick += 1
+            if tick % sweep_every == 0:
+                SCREEN_CAPTURE_MAILBOX.sweep()
+        except Exception:
+            logger.exception("screen capture dispatch failed")
+        await asyncio.sleep(SCREEN_CAPTURE_POLL_SEC)
+
+
 async def ws_handler(ws: ServerConnection) -> None:
     request = ws.request
     path = request.path if request is not None else ""
@@ -2328,6 +2401,7 @@ async def ws_handler(ws: ServerConnection) -> None:
         headers.get("User-Agent", "")[:80],
     )
     sess = Session(ws)
+    ACTIVE_SESSIONS.add(sess)
     try:
         await sess.run()
     except ConnectionClosed as e:
@@ -2335,6 +2409,8 @@ async def ws_handler(ws: ServerConnection) -> None:
     except Exception as e:
         logger.exception("session crashed")
         sess.close_reason = f"crash: {type(e).__name__}: {e}"
+    finally:
+        ACTIVE_SESSIONS.discard(sess)
     # Log *why* the call ended and how long it lasted. Without this a dropped
     # call was indistinguishable from a normal hangup in the journal.
     logger.info(
@@ -2402,7 +2478,11 @@ async def amain() -> None:
         ping_timeout=WS_PING_TIMEOUT,
         close_timeout=WS_CLOSE_TIMEOUT,
     ):
-        await asyncio.Future()
+        capture_task = asyncio.create_task(screen_capture_loop())
+        try:
+            await asyncio.Future()
+        finally:
+            capture_task.cancel()
 
 
 def main() -> None:

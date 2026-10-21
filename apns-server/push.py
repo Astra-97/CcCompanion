@@ -139,6 +139,8 @@ from voice_protocol import (
 import translate_api
 import voice_acoustics
 import voice_call_legacy
+import voice_wallpaper
+import screen_capture
 import voice_duration
 import voice_elevenlabs
 import voice_gemini
@@ -8008,11 +8010,21 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         # 通话罐头音（服务端可配置，换音频/调音量不用重编 APK）。
         # 精确匹配：ambience-config 必须排在 ambience 之前判断。
-        if self.path == "/voice-call/ambience-config":
+        if request_path == "/voice-call/ambience-config":
             self._handle_voice_ambience_config()
             return
         if self.path == "/voice-call/ambience" or self.path.startswith("/voice-call/ambience?"):
             self._handle_voice_ambience_audio()
+            return
+        # 通话自定义壁纸 (voice-wallpaper/): 私人图片, native 共享密钥 fail-closed.
+        if request_path in {"/voice-call/wallpaper-config", "/voice-call/wallpaper"}:
+            if not self._native_pairing_auth_matches():
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            if request_path == "/voice-call/wallpaper-config":
+                self._send_json(200, self._voice_wallpaper_store().config())
+            else:
+                self._handle_voice_wallpaper_get()
             return
         # 2026-05-07 settings v2 endpoints
         if self.path == "/session/info":
@@ -8558,6 +8570,12 @@ class PushHandler(BaseHTTPRequestHandler):
         if request_path == "/stickers/upload":
             self._handle_sticker_upload()
             return
+        if request_path == "/voice-call/wallpaper":
+            self._handle_voice_wallpaper_upload()
+            return
+        if request_path == "/voice-call/screen-capture":
+            self._handle_voice_screen_capture_upload()
+            return
         if not self._require_write_auth():
             return
         if request_path == "/mcp-services" and not self._native_pairing_auth_matches():
@@ -8935,6 +8953,16 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(401, {"error": "unauthorized"})
                 return
             self._handle_reading_proxy("DELETE")
+            return
+        if request_path == "/voice-call/wallpaper":
+            if not self._native_pairing_auth_matches():
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            try:
+                self._send_json(200, self._voice_wallpaper_store().clear())
+            except Exception:
+                logger.exception("voice-wallpaper clear fail")
+                self._send_json(500, {"ok": False, "error": "clear_failed"})
             return
         self._send_json(404, {"error": "not found"})
 
@@ -25032,7 +25060,11 @@ class PushHandler(BaseHTTPRequestHandler):
         _LEGACY_CALL_DEDUPE.note_call_open("xiaoke")
         # The App hard-mutes the call mic for each pulse; out-of-envelope
         # timing silently eats the first utterance (2026-10-21 piano test).
-        timing, adjusted = voice_call_legacy.sanitize_ambience_config(cfg)
+        from urllib.parse import urlsplit
+
+        caps = voice_call_legacy.parse_client_caps(urlsplit(getattr(self, "path", "") or "").query)
+        no_mute = voice_call_legacy.AMBIENCE_NO_MUTE_CAP in caps
+        timing, adjusted = voice_call_legacy.sanitize_ambience_config(cfg, no_mute=no_mute)
         if adjusted:
             logger.warning(
                 "voice-ambience config clamped keys=%s raw=%s served=%s",
@@ -25046,6 +25078,10 @@ class PushHandler(BaseHTTPRequestHandler):
             "sha256": sha or "",
             "audio_url": "/voice-call/ambience",
         }
+        if no_mute:
+            # Echo the capability back: an APK only drops its pulse-muting when
+            # the server confirms it served the relaxed envelope on purpose.
+            body["mic_policy"] = voice_call_legacy.AMBIENCE_NO_MUTE_CAP
         self._send_json(200, body)
 
     def _handle_voice_ambience_audio(self):
@@ -25090,6 +25126,141 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.debug("voice-ambience client disconnected err=%s", e)
         except Exception:
             logger.exception("voice-ambience stream fail")
+
+    # ------------------------------------------------------------------
+    # 通话自定义壁纸 (voice-wallpaper) — 同 ambience: 每次请求现读目录, 换图不用重启
+    # ------------------------------------------------------------------
+
+    _VOICE_WALLPAPER_DIR = HERE / "voice-wallpaper"
+    _SCREEN_CAPTURE_ROOT = screen_capture.DEFAULT_ROOT
+
+    def _voice_wallpaper_store(self) -> voice_wallpaper.WallpaperStore:
+        return voice_wallpaper.WallpaperStore(self._VOICE_WALLPAPER_DIR)
+
+    def _handle_voice_wallpaper_get(self):
+        """GET /voice-call/wallpaper — 图片字节流, ETag=sha256 前 16 位."""
+        store = self._voice_wallpaper_store()
+        path = store.current_file()
+        if path is None:
+            self._send_json(404, {"ok": False, "error": "not found"})
+            return
+        try:
+            data = path.read_bytes()
+        except Exception:
+            logger.exception("voice-wallpaper read fail")
+            self._send_json(500, {"ok": False, "error": "read fail"})
+            return
+        sha = hashlib.sha256(data).hexdigest()[:16]
+        etag = f'"{sha}"'
+        inm = self.headers.get("If-None-Match", "")
+        if inm and (inm == etag or inm.strip('"') == sha):
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            return
+        ext = path.suffix.lstrip(".").lower()
+        self.send_response(200)
+        self.send_header("Content-Type", voice_wallpaper.EXT_CONTENT_TYPES.get(ext, "application/octet-stream"))
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError) as e:
+            logger.debug("voice-wallpaper client disconnected err=%s", e)
+
+    def _handle_voice_wallpaper_upload(self):
+        """POST /voice-call/wallpaper — raw jpg/png/webp body (≤8MB), 原子替换."""
+        if not self._native_pairing_auth_matches():
+            self.close_connection = True
+            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            self._send_json(400, {"ok": False, "error": "chunked_request_not_supported"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except (TypeError, ValueError):
+            length = -1
+        if not 1 <= length <= voice_wallpaper.MAX_BYTES:
+            self.close_connection = True
+            self._send_json(413 if length > 0 else 400, {"ok": False, "error": "bad_length"})
+            return
+        data = self.rfile.read(length)
+        try:
+            body = self._voice_wallpaper_store().save(data)
+        except ValueError as e:
+            code = 415 if str(e) == "unsupported_media_type" else 400
+            self._send_json(code, {"ok": False, "error": str(e)})
+            return
+        except Exception:
+            logger.exception("voice-wallpaper save fail")
+            self._send_json(500, {"ok": False, "error": "save_failed"})
+            return
+        logger.info("voice-wallpaper updated sha=%s bytes=%d", body.get("sha256"), len(data))
+        self._send_json(200, body)
+
+    def _handle_voice_screen_capture_upload(self):
+        """POST /voice-call/screen-capture?request_id=<32hex> — one captured frame.
+
+        Only ids the voice WS just dispatched (fresh ``pending`` marker, one
+        shot) are accepted; see screen_capture.py.  The image lands in the
+        attachments dir and the waiting ``call-screenshot`` CLI gets its path.
+        """
+        import uuid as _uuid
+        from urllib.parse import parse_qs, urlsplit
+
+        if not self._native_pairing_auth_matches():
+            self.close_connection = True
+            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return
+        request_id = (parse_qs(urlsplit(self.path).query).get("request_id") or [""])[0]
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            self._send_json(400, {"ok": False, "error": "chunked_request_not_supported"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except (TypeError, ValueError):
+            length = -1
+        if not 1 <= length <= screen_capture.MAX_UPLOAD_BYTES:
+            self.close_connection = True
+            self._send_json(413 if length > 0 else 400, {"ok": False, "error": "bad_length"})
+            return
+        data = self.rfile.read(length)
+        mailbox = screen_capture.Mailbox(self._SCREEN_CAPTURE_ROOT)
+        if not mailbox.claim_pending(request_id):
+            self._send_json(409, {"ok": False, "error": "unknown_or_expired_request"})
+            return
+        ext = voice_wallpaper.sniff_image_ext(data)
+        if ext not in {"jpg", "png"}:
+            mailbox.write_error(request_id, "upload_failed", "not an image")
+            self._send_json(415, {"ok": False, "error": "unsupported_media_type"})
+            return
+        try:
+            attachments_dir = Path(self.state.attachments_dir)
+            attachments_dir.mkdir(parents=True, exist_ok=True)
+            target = attachments_dir / f"{_uuid.uuid4().hex}.{ext}"
+            tmp = target.with_suffix(".tmp")
+            tmp.write_bytes(data)
+            tmp.replace(target)
+        except Exception:
+            logger.exception("screen capture save fail")
+            mailbox.write_error(request_id, "upload_failed", "server save failed")
+            self._send_json(500, {"ok": False, "error": "save_failed"})
+            return
+        mailbox.write_result(request_id, {
+            "ok": True,
+            "path": str(target.resolve()),
+            "url": f"/attachments/{target.name}",
+            "bytes": len(data),
+        })
+        logger.info("screen capture saved name=%s bytes=%d", target.name, len(data))
+        self._send_json(200, {"ok": True})
 
     # ------------------------------------------------------------------
     # Tampon Records API (native App only)

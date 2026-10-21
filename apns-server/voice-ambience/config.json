@@ -1,1 +1,1 @@
-{"gain": 0.6, "delay_ms": 2000, "on_ms": 3000, "off_ms": 2000}
+{"gain": 0.6, "delay_ms": 2000, "on_ms": 3000, "off_ms": 2000, "no_mute_v1": {"delay_ms": 800, "on_ms": 60000, "off_ms": 2000}}

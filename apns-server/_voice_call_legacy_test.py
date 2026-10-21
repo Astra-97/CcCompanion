@@ -96,6 +96,70 @@ class AmbienceEnvelopeTest(unittest.TestCase):
         self.assertIn("xiaoke", dedupe._call_open)
 
 
+class AmbienceNoMuteCapabilityTest(unittest.TestCase):
+    """2026-10-21: clients that no longer mute the mic for ambience may get
+    long waiting music; everyone else keeps the old clamp."""
+
+    LONG = {"gain": 0.6, "delay_ms": 300, "on_ms": 60000, "off_ms": 2000}
+
+    def test_caps_query_parsing(self) -> None:
+        self.assertEqual(legacy.parse_client_caps(""), frozenset())
+        self.assertEqual(
+            legacy.parse_client_caps("caps=ambience_no_mute_v1,x&caps=y"),
+            frozenset({"ambience_no_mute_v1", "x", "y"}),
+        )
+        self.assertEqual(legacy.parse_client_caps("%%%"), frozenset())
+
+    def test_relaxed_envelope_only_with_capability(self) -> None:
+        clean, adjusted = legacy.sanitize_ambience_config(self.LONG, no_mute=True)
+        self.assertEqual(clean, self.LONG)
+        self.assertEqual(adjusted, [])
+        old, adjusted = legacy.sanitize_ambience_config(self.LONG)
+        self.assertEqual((old["delay_ms"], old["on_ms"]), (2000, 3000))
+        self.assertEqual(sorted(adjusted), ["delay_ms", "on_ms"])
+        clean, _ = legacy.sanitize_ambience_config({"delay_ms": 10, "on_ms": 999999}, no_mute=True)
+        self.assertEqual((clean["delay_ms"], clean["on_ms"]), (300, 60000))
+
+    def test_override_block_applies_to_capable_clients_only(self) -> None:
+        cfg = {**legacy.AMBIENCE_DEFAULTS, "no_mute_v1": {"delay_ms": 800, "on_ms": 45000, "bogus": 1}}
+        clean, adjusted = legacy.sanitize_ambience_config(cfg, no_mute=True)
+        self.assertEqual((clean["delay_ms"], clean["on_ms"]), (800, 45000))
+        self.assertNotIn("bogus", clean)
+        self.assertEqual(adjusted, [])
+        old, adjusted = legacy.sanitize_ambience_config(cfg)
+        self.assertEqual(old, legacy.AMBIENCE_DEFAULTS)
+        self.assertEqual(adjusted, [])
+
+    def _serve(self, path: str, cfg: dict) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+            handler = object.__new__(push.PushHandler)
+            handler.path = path
+            responses = []
+            handler._send_json = lambda status, payload: responses.append((status, payload))
+            with patch.object(push.PushHandler, "_VOICE_AMBIENCE_DIR", Path(tmp)), \
+                    patch.object(push, "_LEGACY_CALL_DEDUPE", fake_dedupe(FakeClock())):
+                handler._handle_voice_ambience_config()
+        self.assertEqual(responses[-1][0], 200)
+        return responses[-1][1]
+
+    def test_endpoint_echoes_mic_policy_and_relaxes_only_for_capable_client(self) -> None:
+        cfg = {**legacy.AMBIENCE_DEFAULTS, "no_mute_v1": {"delay_ms": 800, "on_ms": 60000}}
+        new = self._serve("/voice-call/ambience-config?caps=ambience_no_mute_v1", cfg)
+        self.assertEqual(new["mic_policy"], "ambience_no_mute_v1")
+        self.assertEqual((new["delay_ms"], new["on_ms"]), (800, 60000))
+        old = self._serve("/voice-call/ambience-config", cfg)
+        self.assertNotIn("mic_policy", old)
+        self.assertEqual((old["delay_ms"], old["on_ms"]), (2000, 3000))
+
+    def test_shipped_config_keeps_old_clients_in_the_safe_envelope(self) -> None:
+        cfg = json.loads(Path(push.PushHandler._VOICE_AMBIENCE_DIR, "config.json").read_text(encoding="utf-8"))
+        _, adjusted = legacy.sanitize_ambience_config(cfg)
+        self.assertEqual(adjusted, [])
+        _, adjusted = legacy.sanitize_ambience_config(cfg, no_mute=True)
+        self.assertEqual(adjusted, [])
+
+
 class LegacyDedupeUnitTest(unittest.TestCase):
     def test_only_call_sheet_uploads_are_tracked(self) -> None:
         d = fake_dedupe(FakeClock())

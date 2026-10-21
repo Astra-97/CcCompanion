@@ -60,13 +60,59 @@ AMBIENCE_BOUNDS: dict[str, tuple[float, float]] = {
 }
 
 
-def sanitize_ambience_config(raw: Any) -> tuple[dict[str, float | int], list[str]]:
-    """Return ``(clean_config, adjusted_keys)`` for the four timing fields."""
-    src = raw if isinstance(raw, dict) else {}
+# Clients that advertise this capability (``?caps=ambience_no_mute_v1`` on the
+# config request) start ambience only after the server's ``turn_accepted`` and
+# never mute the microphone for it, so a long pulse can no longer eat speech.
+# Only for them the envelope is relaxed; everyone else keeps the clamp above.
+AMBIENCE_NO_MUTE_CAP = "ambience_no_mute_v1"
+AMBIENCE_NO_MUTE_BOUNDS: dict[str, tuple[float, float]] = {
+    **AMBIENCE_BOUNDS,
+    "delay_ms": (300, 10000),
+    "on_ms": (500, 60000),
+}
+# Optional block in config.json overriding top-level values for capable clients.
+AMBIENCE_NO_MUTE_OVERRIDE_KEY = "no_mute_v1"
+
+
+def parse_client_caps(query: str) -> frozenset[str]:
+    """``caps=a,b&caps=c`` -> {a, b, c}; anything malformed is ignored."""
+    from urllib.parse import parse_qs
+
+    try:
+        values = parse_qs(query or "", keep_blank_values=False).get("caps", [])
+    except Exception:
+        return frozenset()
+    caps: set[str] = set()
+    for value in values:
+        for item in str(value).split(","):
+            item = item.strip()
+            if item and len(item) <= 64:
+                caps.add(item)
+    return frozenset(caps)
+
+
+def sanitize_ambience_config(
+    raw: Any,
+    *,
+    no_mute: bool = False,
+) -> tuple[dict[str, float | int], list[str]]:
+    """Return ``(clean_config, adjusted_keys)`` for the four timing fields.
+
+    ``no_mute`` selects the relaxed envelope and applies the optional
+    ``no_mute_v1`` override block; it must only be set for clients that
+    advertised :data:`AMBIENCE_NO_MUTE_CAP`.
+    """
+    src = dict(raw) if isinstance(raw, dict) else {}
+    bounds = AMBIENCE_BOUNDS
+    if no_mute:
+        bounds = AMBIENCE_NO_MUTE_BOUNDS
+        override = src.get(AMBIENCE_NO_MUTE_OVERRIDE_KEY)
+        if isinstance(override, dict):
+            src.update({k: v for k, v in override.items() if k in AMBIENCE_DEFAULTS})
     clean: dict[str, float | int] = {}
     adjusted: list[str] = []
     for key, default in AMBIENCE_DEFAULTS.items():
-        lo, hi = AMBIENCE_BOUNDS[key]
+        lo, hi = bounds[key]
         value = src.get(key, default)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
             if key in src:

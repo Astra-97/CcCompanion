@@ -84,6 +84,18 @@ with its own context/memory.
 - `POST /tool/trigger` with `{"rule_id": "..."}` (or `{"text": "...", "contact_id": "..."}`)
   fires immediately without marking the rule served — handy for testing.
 
+### 通话屏幕共享（`screen_capture_v1`，2026-10-21）
+
+小克在通话里想看她手机屏幕时，在 VPS 上跑 `call-screenshot`（`/usr/local/bin/call-screenshot` → 本目录 `call_screenshot.py` 的软链），10 秒内打印截图绝对路径（存在 attachments 目录），再 Read 图片即可。失败退出码：2=没在通话/App 太旧，3=她没开屏幕共享授权，4=超时。
+
+- 流程：CLI 在 `state/screen-capture/requests/` 投递请求 → `voice_call_ws.py` 找到声明了 `screen_capture_v1` 且上报 `screen_share_state{active:true}` 的通话，写 `pending/` 标记并下发 `{"type":"screen_capture_request","request_id"}` → App 抓当前一帧（MediaProjection，长边 ≤1600，JPEG≈80）→ `POST /voice-call/screen-capture?request_id=…`（native shared secret；只接受刚派发过、20s 内的一次性 id）→ 存图并写 `results/`，CLI 取到路径。
+- 授权：App 在通话接通后请求一次系统屏幕录制授权（Android 14+ 每次都要她点同意，状态栏有系统共享指示）；通话页/悬浮窗上有「小克能看到屏幕」标识，点一下即关闭。通话结束自动释放。
+- 旧客户端不声明能力，永远收不到这个帧；协议细节见 `screen_capture.py` 文件头。
+
+### 通话自定义壁纸 / 长等待音乐
+
+见 `voice-wallpaper/README.md` 与 `voice-ambience/README.md`（`ambience_no_mute_v1`）。
+
 其它端点 (`/diary/*`, `/group/*`, `/favorites/*`, `/timeline/*`, `/todos/*`, `/calendar/*` etc.) 是给私有客户端用的, CcCompanion iOS app 不调它们。保留在 codebase 里因为 `push.py` 引用了对应 module — 删模块会让 import graph 散架。
 
 ---
