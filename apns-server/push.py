@@ -8530,6 +8530,32 @@ class PushHandler(BaseHTTPRequestHandler):
                 return
             self._handle_sun_event(body)
             return
+        # 螃蟹桌宠 (2026-10-22)：App 悬浮螃蟹被捏 → 第三个 tag "pet"（summon）。
+        # 与 /tampon-records/action 同一道 native pairing 闸门，fail-closed；
+        # body 可空（{} 或 {"test":true}），超界直接拒。
+        if request_path == "/pet/tap":
+            if not self._native_pairing_auth_matches():
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except (TypeError, ValueError):
+                length = -1
+            if length < 0 or length > 4 * 1024:
+                self.close_connection = True
+                self._send_json(413, {"ok": False, "error": "request_too_large"})
+                return
+            body: Any = {}
+            if length:
+                try:
+                    body = self._read_body()
+                    if not isinstance(body, dict):
+                        raise ValueError("JSON object required")
+                except Exception as exc:
+                    self._send_json(400, {"ok": False, "error": f"bad json: {exc}"})
+                    return
+            self._handle_pet_tap(body)
+            return
         if request_path in ("/device/battery", "/device/app-event", "/device/activity"):
             if not self._native_pairing_auth_matches():
                 self._send_json(401, {"ok": False, "error": "unauthorized"})
@@ -26933,6 +26959,10 @@ class PushHandler(BaseHTTPRequestHandler):
     _NFC_HOME_CMD = ("/root/mihome/venv/bin/python", "/root/mihome/home_arrive.py")
     _NFC_HOME_TIMEOUT = 90
     _NFC_HINT = "（她手机正在打开 CC Companion，用 companion reply contact_id=xiaoke 跟她打招呼）"
+    # 螃蟹桌宠 (2026-10-22)：App 悬浮螃蟹，独立 20s 去重桶 "pet"，不进 nfc_tags.json。
+    _PET_TAG_ID = "pet"
+    _PET_PROFILE = {"name": "桌面螃蟹", "location": "屏幕上", "action": "summon", "kind": "pet"}
+    _PET_HINT = "（她正在用手机，用 companion reply contact_id=xiaoke 跟她打招呼）"
 
     @staticmethod
     def _nfc_read_private_file(path: Path, limit: int) -> str:
@@ -26986,6 +27016,8 @@ class PushHandler(BaseHTTPRequestHandler):
             return out
         for tag_id, prof in tags.items():
             if not isinstance(tag_id, str) or not re.fullmatch(r"[a-z0-9_-]{1,32}", tag_id):
+                continue
+            if tag_id == cls._PET_TAG_ID:  # 保留给 App 桌宠，去重桶不与 NFC 混用
                 continue
             if not isinstance(prof, dict):
                 continue
@@ -27113,6 +27145,13 @@ class PushHandler(BaseHTTPRequestHandler):
         now = now or datetime.now(ZoneInfo("Asia/Shanghai"))
         hhmm = now.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%H:%M")
         profile = profile or {"action": "summon"}
+        if profile.get("kind") == "pet":
+            if test:
+                return (
+                    f"[桌宠·螃蟹被捏了·测试] {hhmm} 这是一条测试通知"
+                    "（施工 agent 用 curl 打的，不是方小南捏的，不用回她）"
+                )
+            return f"[桌宠·螃蟹被捏了] {hhmm} 方小南捏了一下手机屏幕上的螃蟹{cls._PET_HINT}"
         if profile.get("action") == "home":
             name = profile.get("name") or "门口螃蟹"
             tag = f"[NFC·{name}·回家{'·测试' if test else ''}]"
@@ -27142,10 +27181,12 @@ class PushHandler(BaseHTTPRequestHandler):
     ) -> dict[str, Any]:
         """Channel message payload for a tap (no chat-history bubble)."""
         profile = profile or {"action": "summon"}
+        is_pet = profile.get("kind") == "pet"
         meta: dict[str, Any] = {
-            "source": "nfc-tap",
+            "source": "pet-tap" if is_pet else "nfc-tap",
             "transport": "channel",
             "nfc_tap": True,
+            **({"pet_tap": True} if is_pet else {}),
             "test": bool(test),
             "nfc_tag": tag_id,
             "nfc_action": profile.get("action", "summon"),
@@ -27155,7 +27196,7 @@ class PushHandler(BaseHTTPRequestHandler):
             if home_result is not None:
                 meta["home_result"] = home_result
         return {
-            "message_id": f"nfc:{tag_id}:{int(time.time() * 1000)}",
+            "message_id": f"{'pet' if is_pet else 'nfc'}:{tag_id}:{int(time.time() * 1000)}",
             "contact_id": cls._NFC_TAP_CONTACT,
             "text": cls._nfc_tap_notification_text(
                 now, test=test, profile=profile, night=night, home_result=home_result
@@ -27170,17 +27211,22 @@ class PushHandler(BaseHTTPRequestHandler):
         text = f"方小南捏了捏🤏{profile.get('location') or '床头'}的🦀"
         if home_result is not None:
             text += self._nfc_home_bubble_suffix(home_result)
+        is_pet = profile.get("kind") == "pet"
         try:
             chat = self._chat_for_contact(self._NFC_TAP_CONTACT)
             chat.append(
                 role="assistant",
                 text=text,
-                source="nfc-tap",
+                source="pet-tap" if is_pet else "nfc-tap",
                 metadata={
                     "mihome_event": True,
                     "severity": "info",
                     "items": [{"device": profile.get("name") or "螃蟹挂件", "change": "tap", "human": text}],
-                    "device_event": {"kind": "nfc_tap", "tag": tag_id, "action": profile.get("action")},
+                    "device_event": {
+                        "kind": "pet_tap" if is_pet else "nfc_tap",
+                        "tag": tag_id,
+                        "action": profile.get("action"),
+                    },
                 },
             )
         except Exception:
@@ -27375,6 +27421,26 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
             .replace("__AUTO__", auto_js)
         )
         return page.encode("utf-8")
+
+    def _handle_pet_tap(self, body: dict[str, Any]) -> None:
+        """POST /pet/tap — App 悬浮螃蟹桌宠被捏（调用方已过 native pairing 鉴权）。
+
+        等同床头 summon：独立 "pet" 20s 去重桶；通知小克会话 + 私聊冒胶囊
+        「方小南捏了捏🤏屏幕上的🦀」。test（body {"test":true} 或 ?test=1）
+        只发带测试标记的 channel 通知、不冒胶囊。返回 {ok, deduped}。
+        """
+        qs = self._query_params()
+        is_test = (qs.get("test") or [""])[0] == "1" or body.get("test") in (True, 1, "1")
+        tag_id = self._PET_TAG_ID
+        profile = dict(self._PET_PROFILE)
+        notified = _NFC_TAP_GATES.get(tag_id).try_acquire()
+        if notified:
+            self._nfc_tap_run_delivery(
+                tag_id, profile, test=is_test, night=False,
+                now=datetime.now(ZoneInfo("Asia/Shanghai")),
+            )
+        logger.info("pet tap test=%s notified=%s", is_test, notified)
+        self._send_json(200, {"ok": True, "deduped": not notified})
 
     def _handle_nfc_tap(self) -> None:
         """GET /nfc/tap?k=<secret>[&f=1][&test=1] — NFC 螃蟹挂件被碰。
