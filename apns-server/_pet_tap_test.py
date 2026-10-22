@@ -304,6 +304,30 @@ class PetTapHammerTest(PetTapBase):
         self.assertEqual(self.bubbles[0][1]["text"], "方小南抡起爆锤🔨砸晕了屏幕上的🦀")
 
 
+class PetTapAsleepTest(PetTapBase):
+    def test_asleep_single(self) -> None:
+        self.pet(body={"count": 1, "asleep": True})
+        call = self.channel_calls[0]
+        self.assertRegex(
+            call["text"],
+            r"^\[桌宠·螃蟹被捏了\] \d{2}:\d{2} 方小南捏了一下手机屏幕上的螃蟹（螃蟹本来在睡觉）"
+            r"（她正在用手机，用 companion reply contact_id=xiaoke 跟她打招呼）$",
+        )
+        self.assertIs(call["metadata"]["asleep"], True)
+        self.assertEqual(self.bubbles[0][1]["text"], "方小南捏了捏🤏屏幕上的🦀")
+
+    def test_asleep_hammer(self) -> None:
+        self.pet(body={"count": 15, "duration_s": 12, "hammer": True, "asleep": True})
+        self.assertIn("后面抡起爆锤把螃蟹砸晕了（螃蟹本来在睡觉）（她正在用手机", self.channel_calls[0]["text"])
+        self.assertEqual(self.bubbles[0][1]["text"], "方小南抡起爆锤🔨砸晕了屏幕上的🦀 ×15")
+
+    def test_awake_has_no_sleep_note(self) -> None:
+        self.pet(body={"count": 2, "asleep": False})
+        self.pet(body={"count": 2, "asleep": "yes"})
+        for call in self.channel_calls:
+            self.assertNotIn("睡觉", call["text"])
+
+
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64
 
 

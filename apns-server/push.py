@@ -27194,6 +27194,8 @@ class PushHandler(BaseHTTPRequestHandler):
                 what = f"方小南 {duration_s} 秒内捏了 {count} 下手机屏幕上的螃蟹"
             else:
                 what = "方小南捏了一下手机屏幕上的螃蟹"
+            if profile.get("asleep"):
+                what += "（螃蟹本来在睡觉）"
             if test:
                 return (
                     f"[桌宠·螃蟹被捏了·测试] {hhmm} 这是一条测试通知：{what}"
@@ -27239,6 +27241,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 "count": int(profile.get("count") or 1),
                 "duration_s": int(profile.get("duration_s") or 1),
                 "hammer": bool(profile.get("hammer")),
+                "asleep": bool(profile.get("asleep")),
             } if is_pet else {}),
             "test": bool(test),
             "nfc_tag": tag_id,
@@ -27483,7 +27486,8 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
         """POST /pet/tap — App 悬浮螃蟹桌宠被捏（调用方已过 native pairing 鉴权）。
 
         App 端「停手 5 秒」才结算一次，body 带 count（1..999，截断）、duration_s
-        （第一下到最后一下的秒数，最少 1）和 hammer（连击第 8 下起变爆锤砸晕）。等同床头 summon：通知小克会话 + 私聊冒胶囊
+        （第一下到最后一下的秒数，最少 1）、hammer（连击第 8 下起变爆锤砸晕）和 asleep
+        （开始捏时螃蟹在睡觉，手机本地 23:00–07:00 → 文案加「（螃蟹本来在睡觉）」）。等同床头 summon：通知小克会话 + 私聊冒胶囊
         「方小南捏了捏🤏屏幕上的🦀」（count>1 加「 ×N」）。不做 20s 去重，只防刷：
         同一分钟超过 6 次结算的直接丢（deduped=true）。test（body {"test":true} 或
         ?test=1）只发带测试标记的 channel 通知、不冒胶囊。返回 {ok, deduped}。
@@ -27508,8 +27512,12 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
         count = max(1, min(self._PET_MAX_COUNT, count))
         duration_s = max(1, min(self._PET_MAX_DURATION_S, duration_s))
         hammer = body.get("hammer") is True
+        asleep = body.get("asleep") is True
         tag_id = self._PET_TAG_ID
-        profile = {**self._PET_PROFILE, "count": count, "duration_s": duration_s, "hammer": hammer}
+        profile = {
+            **self._PET_PROFILE, "count": count, "duration_s": duration_s,
+            "hammer": hammer, "asleep": asleep,
+        }
         notified = _PET_TAP_LIMIT.try_acquire()
         if notified:
             self._nfc_tap_run_delivery(
@@ -27517,8 +27525,8 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
                 now=datetime.now(ZoneInfo("Asia/Shanghai")),
             )
         logger.info(
-            "pet tap test=%s count=%s duration_s=%s hammer=%s notified=%s",
-            is_test, count, duration_s, hammer, notified,
+            "pet tap test=%s count=%s duration_s=%s hammer=%s asleep=%s notified=%s",
+            is_test, count, duration_s, hammer, asleep, notified,
         )
         self._send_json(200, {"ok": True, "deduped": not notified})
 
