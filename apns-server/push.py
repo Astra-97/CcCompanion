@@ -5795,8 +5795,36 @@ class _NfcTapGates:
             self._gates.clear()
 
 
+class _PetTapRateLimit:
+    """螃蟹桌宠防刷：任意 window 秒内最多放行 limit 次结算，超出的丢弃。"""
+
+    def __init__(self, limit: int = 6, window_seconds: float = 60.0) -> None:
+        self.limit = limit
+        self.window = window_seconds
+        self._hits: list[float] = []
+        self._lock = threading.Lock()
+
+    def try_acquire(self, now: float | None = None) -> bool:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            self._hits = [t for t in self._hits if now - t < self.window]
+            if len(self._hits) >= self.limit:
+                return False
+            self._hits.append(now)
+            return True
+
+    def reset(self) -> None:
+        with self._lock:
+            self._hits.clear()
+
+
 # NFC 螃蟹挂件 (2026-10-21)：双击/抖动的重复碰卡 20s 内只处理一次（含设备动作）。
 _NFC_TAP_GATES = _NfcTapGates()
+# 螃蟹桌宠 (2026-10-22 v2)：App 端已按「停手 5 秒」合并计数，服务端不再 20s 去重，
+# 只留防刷：同一分钟超过 6 次结算就丢。
+_PET_TAP_LIMIT = _PetTapRateLimit()
+# 双击螃蟹截屏：同一分钟最多 6 张。
+_PET_SHOT_LIMIT = _PetTapRateLimit()
 _NFC_SUN_MODULE: list[Any] = []
 
 
@@ -8532,7 +8560,7 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         # 螃蟹桌宠 (2026-10-22)：App 悬浮螃蟹被捏 → 第三个 tag "pet"（summon）。
         # 与 /tampon-records/action 同一道 native pairing 闸门，fail-closed；
-        # body 可空（{} 或 {"test":true}），超界直接拒。
+        # body {"count","duration_s","test"} 均可省（空 body = 捏 1 下），超界直接拒。
         if request_path == "/pet/tap":
             if not self._native_pairing_auth_matches():
                 self._send_json(401, {"ok": False, "error": "unauthorized"})
@@ -8555,6 +8583,14 @@ class PushHandler(BaseHTTPRequestHandler):
                     self._send_json(400, {"ok": False, "error": f"bad json: {exc}"})
                     return
             self._handle_pet_tap(body)
+            return
+        # 螃蟹桌宠双击截屏 (2026-10-22)：raw JPEG/PNG body，同一道 native 闸门。
+        if request_path == "/pet/screenshot":
+            if not self._native_pairing_auth_matches():
+                self.close_connection = True
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            self._handle_pet_screenshot()
             return
         if request_path in ("/device/battery", "/device/app-event", "/device/activity"):
             if not self._native_pairing_auth_matches():
@@ -26959,8 +26995,10 @@ class PushHandler(BaseHTTPRequestHandler):
     _NFC_HOME_CMD = ("/root/mihome/venv/bin/python", "/root/mihome/home_arrive.py")
     _NFC_HOME_TIMEOUT = 90
     _NFC_HINT = "（她手机正在打开 CC Companion，用 companion reply contact_id=xiaoke 跟她打招呼）"
-    # 螃蟹桌宠 (2026-10-22)：App 悬浮螃蟹，独立 20s 去重桶 "pet"，不进 nfc_tags.json。
+    # 螃蟹桌宠 (2026-10-22)：App 悬浮螃蟹，tag "pet" 不进 nfc_tags.json；计数合并在 App 端。
     _PET_TAG_ID = "pet"
+    _PET_MAX_COUNT = 999
+    _PET_MAX_DURATION_S = 24 * 3600
     _PET_PROFILE = {"name": "桌面螃蟹", "location": "屏幕上", "action": "summon", "kind": "pet"}
     _PET_HINT = "（她正在用手机，用 companion reply contact_id=xiaoke 跟她打招呼）"
 
@@ -27146,12 +27184,22 @@ class PushHandler(BaseHTTPRequestHandler):
         hhmm = now.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%H:%M")
         profile = profile or {"action": "summon"}
         if profile.get("kind") == "pet":
+            count = int(profile.get("count") or 1)
+            duration_s = int(profile.get("duration_s") or 1)
+            if profile.get("hammer") and count > 1:
+                what = f"方小南 {duration_s} 秒内捏了 {count} 下，后面抡起爆锤把螃蟹砸晕了"
+            elif profile.get("hammer"):
+                what = "方小南抡起爆锤把手机屏幕上的螃蟹砸晕了"
+            elif count > 1:
+                what = f"方小南 {duration_s} 秒内捏了 {count} 下手机屏幕上的螃蟹"
+            else:
+                what = "方小南捏了一下手机屏幕上的螃蟹"
             if test:
                 return (
-                    f"[桌宠·螃蟹被捏了·测试] {hhmm} 这是一条测试通知"
+                    f"[桌宠·螃蟹被捏了·测试] {hhmm} 这是一条测试通知：{what}"
                     "（施工 agent 用 curl 打的，不是方小南捏的，不用回她）"
                 )
-            return f"[桌宠·螃蟹被捏了] {hhmm} 方小南捏了一下手机屏幕上的螃蟹{cls._PET_HINT}"
+            return f"[桌宠·螃蟹被捏了] {hhmm} {what}{cls._PET_HINT}"
         if profile.get("action") == "home":
             name = profile.get("name") or "门口螃蟹"
             tag = f"[NFC·{name}·回家{'·测试' if test else ''}]"
@@ -27186,7 +27234,12 @@ class PushHandler(BaseHTTPRequestHandler):
             "source": "pet-tap" if is_pet else "nfc-tap",
             "transport": "channel",
             "nfc_tap": True,
-            **({"pet_tap": True} if is_pet else {}),
+            **({
+                "pet_tap": True,
+                "count": int(profile.get("count") or 1),
+                "duration_s": int(profile.get("duration_s") or 1),
+                "hammer": bool(profile.get("hammer")),
+            } if is_pet else {}),
             "test": bool(test),
             "nfc_tag": tag_id,
             "nfc_action": profile.get("action", "summon"),
@@ -27212,6 +27265,10 @@ class PushHandler(BaseHTTPRequestHandler):
         if home_result is not None:
             text += self._nfc_home_bubble_suffix(home_result)
         is_pet = profile.get("kind") == "pet"
+        if is_pet and profile.get("hammer"):
+            text = "方小南抡起爆锤🔨砸晕了屏幕上的🦀"
+        if is_pet and int(profile.get("count") or 1) > 1:
+            text += f" ×{int(profile['count'])}"
         try:
             chat = self._chat_for_contact(self._NFC_TAP_CONTACT)
             chat.append(
@@ -27425,22 +27482,147 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
     def _handle_pet_tap(self, body: dict[str, Any]) -> None:
         """POST /pet/tap — App 悬浮螃蟹桌宠被捏（调用方已过 native pairing 鉴权）。
 
-        等同床头 summon：独立 "pet" 20s 去重桶；通知小克会话 + 私聊冒胶囊
-        「方小南捏了捏🤏屏幕上的🦀」。test（body {"test":true} 或 ?test=1）
-        只发带测试标记的 channel 通知、不冒胶囊。返回 {ok, deduped}。
+        App 端「停手 5 秒」才结算一次，body 带 count（1..999，截断）、duration_s
+        （第一下到最后一下的秒数，最少 1）和 hammer（连击第 8 下起变爆锤砸晕）。等同床头 summon：通知小克会话 + 私聊冒胶囊
+        「方小南捏了捏🤏屏幕上的🦀」（count>1 加「 ×N」）。不做 20s 去重，只防刷：
+        同一分钟超过 6 次结算的直接丢（deduped=true）。test（body {"test":true} 或
+        ?test=1）只发带测试标记的 channel 通知、不冒胶囊。返回 {ok, deduped}。
         """
         qs = self._query_params()
         is_test = (qs.get("test") or [""])[0] == "1" or body.get("test") in (True, 1, "1")
+
+        def as_int(value: Any, default: int) -> int | None:
+            if value is None:
+                return default
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            if value != value or value in (float("inf"), float("-inf")):
+                return None
+            return int(round(value))
+
+        count = as_int(body.get("count"), 1)
+        duration_s = as_int(body.get("duration_s"), 1)
+        if count is None or duration_s is None:
+            self._send_json(400, {"ok": False, "error": "count/duration_s must be numbers"})
+            return
+        count = max(1, min(self._PET_MAX_COUNT, count))
+        duration_s = max(1, min(self._PET_MAX_DURATION_S, duration_s))
+        hammer = body.get("hammer") is True
         tag_id = self._PET_TAG_ID
-        profile = dict(self._PET_PROFILE)
-        notified = _NFC_TAP_GATES.get(tag_id).try_acquire()
+        profile = {**self._PET_PROFILE, "count": count, "duration_s": duration_s, "hammer": hammer}
+        notified = _PET_TAP_LIMIT.try_acquire()
         if notified:
             self._nfc_tap_run_delivery(
                 tag_id, profile, test=is_test, night=False,
                 now=datetime.now(ZoneInfo("Asia/Shanghai")),
             )
-        logger.info("pet tap test=%s notified=%s", is_test, notified)
+        logger.info(
+            "pet tap test=%s count=%s duration_s=%s hammer=%s notified=%s",
+            is_test, count, duration_s, hammer, notified,
+        )
         self._send_json(200, {"ok": True, "deduped": not notified})
+
+    _PET_SHOT_LABEL = "双击螃蟹截屏"
+
+    @classmethod
+    def _pet_screenshot_text(cls, now: datetime, image_path: str, *, test: bool) -> str:
+        hhmm = now.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%H:%M")
+        if test:
+            return (
+                f"[桌宠·截屏·测试] {hhmm} 这是一条测试通知（图片在 {image_path}；"
+                "施工 agent 打的，不是方小南双击的，不用回她）"
+            )
+        return (
+            f"[桌宠·截屏] {hhmm} 方小南双击螃蟹，发来一张当前屏幕截图"
+            f"（图片在 {image_path}，先 Read 看图，再用 companion reply contact_id=xiaoke 回她）"
+        )
+
+    def _handle_pet_screenshot(self) -> None:
+        """POST /pet/screenshot[?test=1] — 双击螃蟹截屏（调用方已过 native 鉴权）。
+
+        body 是一张 JPEG/PNG（≤ screen_capture.MAX_UPLOAD_BYTES）。存进 attachments，
+        以方小南（role=user）的图片消息落进小克私聊（文字「双击螃蟹截屏」，source
+        pet-screenshot），再给小克会话发 channel 通知「[桌宠·截屏] …」带图片绝对路径。
+        test=1 不落私聊、通知带测试标记。防刷：同一分钟最多 6 张（超出 429）。
+        """
+        import uuid as _uuid
+
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            self._send_json(400, {"ok": False, "error": "chunked_request_not_supported"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except (TypeError, ValueError):
+            length = -1
+        if not 1 <= length <= screen_capture.MAX_UPLOAD_BYTES:
+            self.close_connection = True
+            self._send_json(413 if length > 0 else 400, {"ok": False, "error": "bad_length"})
+            return
+        data = self.rfile.read(length)
+        ext = voice_wallpaper.sniff_image_ext(data)
+        if ext not in {"jpg", "png"}:
+            self._send_json(415, {"ok": False, "error": "unsupported_media_type"})
+            return
+        qs = self._query_params()
+        is_test = (qs.get("test") or [""])[0] == "1"
+        if not _PET_SHOT_LIMIT.try_acquire():
+            self._send_json(429, {"ok": False, "error": "rate_limited"})
+            return
+        try:
+            attachments_dir = Path(self.state.attachments_dir)
+            attachments_dir.mkdir(parents=True, exist_ok=True)
+            target = attachments_dir / f"{_uuid.uuid4().hex}.{ext}"
+            tmp = target.with_suffix(".tmp")
+            tmp.write_bytes(data)
+            tmp.replace(target)
+        except Exception:
+            logger.exception("pet screenshot save fail")
+            self._send_json(500, {"ok": False, "error": "save_failed"})
+            return
+        url = f"/attachments/{target.name}"
+        image_path = str(target.resolve())
+        if not is_test:
+            try:
+                self._chat_for_contact(self._NFC_TAP_CONTACT).append(
+                    role="user",
+                    text=self._PET_SHOT_LABEL,
+                    source="pet-screenshot",
+                    attachment_url=url,
+                    attachment_type="image",
+                    attachment_filename=f"{self._PET_SHOT_LABEL}.{ext}",
+                    metadata={"pet_screenshot": True, "source_label": self._PET_SHOT_LABEL},
+                )
+            except Exception:
+                logger.warning("pet screenshot chat append failed", exc_info=True)
+        now = datetime.now(ZoneInfo("Asia/Shanghai"))
+        payload = {
+            "message_id": f"pet:screenshot:{int(time.time() * 1000)}",
+            "contact_id": self._NFC_TAP_CONTACT,
+            "text": self._pet_screenshot_text(now, image_path, test=is_test),
+            "metadata": {
+                "source": "pet-screenshot",
+                "transport": "channel",
+                "pet_screenshot": True,
+                "test": bool(is_test),
+                "image_path": image_path,
+                "attachment_url": url,
+            },
+        }
+
+        def run() -> None:
+            try:
+                ok, err = self._deliver_nfc_tap(self.state, payload)
+                logger.info("pet screenshot delivered ok=%s err=%s id=%s", ok, err, payload["message_id"])
+            except Exception:
+                logger.exception("pet screenshot delivery crashed")
+
+        if self._NFC_TAP_ASYNC:
+            threading.Thread(target=run, name="pet-shot-deliver", daemon=True).start()
+        else:
+            run()
+        logger.info("pet screenshot saved name=%s bytes=%d test=%s", target.name, len(data), is_test)
+        self._send_json(200, {"ok": True, "url": url})
 
     def _handle_nfc_tap(self) -> None:
         """GET /nfc/tap?k=<secret>[&f=1][&test=1] — NFC 螃蟹挂件被碰。

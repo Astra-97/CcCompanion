@@ -3,16 +3,20 @@
 覆盖:
   1. 鉴权: 缺/错 X-Auth-Token → 401 且不通知; strict_auth=false 也不放行 (fail-closed)
   2. 路由: 第三个 tag "pet" (summon), 不动设备
-  3. 去重: pet 自己的 20s 桶, 与 bedside/door 互不吞; 返回 {ok, deduped}
-  4. 通知文本 / 载荷: [桌宠·螃蟹被捏了]; test=1 (query 或 body) 带测试标记
-  5. 私聊胶囊: 「方小南捏了捏🤏屏幕上的🦀」; test 不冒, 去重不冒
-  6. body 校验: 空 body 可; 非 JSON/非对象 400; 过大 413
-  7. nfc_tags.json 里叫 "pet" 的 tag 被忽略 (桶不混用)
+  3. 计数合并 (v2): body count/duration_s; count==1 / >1 两种文案; count 截到 999, duration 最少 1
+  4. 不做 20s 去重, 只防刷: 60s 内第 7 次结算丢弃 (deduped=true); 与 bedside/door 互不影响
+  5. 通知载荷: [桌宠·螃蟹被捏了]; test=1 (query 或 body) 带测试标记
+  6. 私聊胶囊: 「方小南捏了捏🤏屏幕上的🦀」, count>1 加「 ×N」; test 不冒, 被丢不冒
+  7. body 校验: 空 body 可; 非 JSON/非对象/非数字 400; 过大 413
+  8. nfc_tags.json 里叫 "pet" 的 tag 被忽略
+  9. 爆锤 (hammer=true): channel「…后面抡起爆锤把螃蟹砸晕了」, 胶囊「方小南抡起爆锤🔨砸晕了屏幕上的🦀 ×N」
+ 10. POST /pet/screenshot: 鉴权; 存图 + 方小南图片消息落私聊 + [桌宠·截屏] 通知带路径; test 不落私聊; 非图 415; 防刷 429
 
 全部 mock, 不碰线上 8291 服务。
 """
 import io
 import json
+import tempfile
 import types
 import unittest
 from datetime import datetime
@@ -26,7 +30,12 @@ SECRET = "pet-shared-secret-0123456789"
 
 
 class PetTapBase(NfcTapBase):
-    def pet(self, *, token=SECRET, body=b"", query="", strict=True) -> PushHandler:
+    def setUp(self) -> None:
+        super().setUp()
+        push._PET_TAP_LIMIT.reset()
+        self.addCleanup(push._PET_TAP_LIMIT.reset)
+
+    def pet(self, *, token=SECRET, body=b"", query="", strict=True, path="/pet/tap") -> PushHandler:
         h = object.__new__(PushHandler)
         h.responses = []
         h.wfile = io.BytesIO()
@@ -43,6 +52,7 @@ class PetTapBase(NfcTapBase):
             active_session="cctg",
             default_session="cctg",
             contact_chats={},
+            attachments_dir=getattr(self, "attach_dir", None),
         )
         h._chat_for_contact = lambda contact: types.SimpleNamespace(
             append=lambda **rec: self.bubbles.append((contact, rec)) or rec
@@ -51,7 +61,7 @@ class PetTapBase(NfcTapBase):
         if token is not None:
             headers["X-Auth-Token"] = token
         h.headers = _Headers(headers)
-        h.path = "/pet/tap" + query
+        h.path = path + query
         h._check_ip_allowed = lambda: True
         h._send_json = lambda status, payload, **_kw: h.responses.append((status, payload))
         h._trusted_client_ip = lambda: "127.0.0.1"
@@ -78,8 +88,9 @@ class PetTapAuthTest(PetTapBase):
     def test_nfc_key_is_not_a_pet_credential(self) -> None:
         self.assert_401_silent(self.pet(token=BEDSIDE))
 
-    def test_unauthorized_does_not_consume_window(self) -> None:
-        self.pet(token="bad")
+    def test_unauthorized_does_not_consume_limit(self) -> None:
+        for _ in range(10):
+            self.pet(token="bad")
         h = self.pet()
         self.assertEqual(h.responses, [(200, {"ok": True, "deduped": False})])
 
@@ -96,6 +107,7 @@ class PetTapRoutingTest(PetTapBase):
         self.assertEqual(meta["source"], "pet-tap")
         self.assertIs(meta["pet_tap"], True)
         self.assertIs(meta["test"], False)
+        self.assertEqual((meta["count"], meta["duration_s"]), (1, 1))
         self.assertRegex(
             call["text"],
             r"^\[桌宠·螃蟹被捏了\] \d{2}:\d{2} 方小南捏了一下手机屏幕上的螃蟹"
@@ -121,31 +133,94 @@ class PetTapRoutingTest(PetTapBase):
         self.assertIn("[桌宠·螃蟹被捏了]", self.tmux_calls[0][1])
 
 
-class PetTapDedupeTest(PetTapBase):
-    def test_second_tap_within_window_is_deduped(self) -> None:
-        self.pet()
-        h2 = self.pet()
-        self.assertEqual(h2.responses, [(200, {"ok": True, "deduped": True})])
-        self.assertEqual(len(self.channel_calls), 1)
-        self.assertEqual(len(self.bubbles), 1)
+class PetTapCountTest(PetTapBase):
+    def test_count_one_text(self) -> None:
+        self.pet(body={"count": 1, "duration_s": 1})
+        self.assertRegex(self.channel_calls[0]["text"], r"^\[桌宠·螃蟹被捏了\] \d{2}:\d{2} 方小南捏了一下手机屏幕上的螃蟹（")
+        self.assertEqual(self.bubbles[0][1]["text"], "方小南捏了捏🤏屏幕上的🦀")
 
-    def test_after_window_notifies_again(self) -> None:
-        self.pet()
-        push._NFC_TAP_GATES.get("pet")._last -= 21
+    def test_count_many_text_and_bubble(self) -> None:
+        self.pet(body={"count": 7, "duration_s": 12})
+        call = self.channel_calls[0]
+        self.assertRegex(
+            call["text"],
+            r"^\[桌宠·螃蟹被捏了\] \d{2}:\d{2} 方小南 12 秒内捏了 7 下手机屏幕上的螃蟹"
+            r"（她正在用手机，用 companion reply contact_id=xiaoke 跟她打招呼）$",
+        )
+        self.assertEqual((call["metadata"]["count"], call["metadata"]["duration_s"]), (7, 12))
+        self.assertEqual(self.bubbles[0][1]["text"], "方小南捏了捏🤏屏幕上的🦀 ×7")
+        self.assertEqual(self.bubbles[0][1]["metadata"]["items"][0]["human"], "方小南捏了捏🤏屏幕上的🦀 ×7")
+
+    def test_count_clamped_to_999_and_duration_min_1(self) -> None:
+        self.pet(body={"count": 5000, "duration_s": 0})
+        meta = self.channel_calls[0]["metadata"]
+        self.assertEqual((meta["count"], meta["duration_s"]), (999, 1))
+        self.assertIn("1 秒内捏了 999 下", self.channel_calls[0]["text"])
+
+    def test_nonpositive_count_is_one(self) -> None:
+        self.pet(body={"count": -3})
+        self.assertEqual(self.channel_calls[0]["metadata"]["count"], 1)
+        self.assertIn("捏了一下", self.channel_calls[0]["text"])
+
+    def test_float_duration_rounds(self) -> None:
+        self.pet(body={"count": 3, "duration_s": 4.6})
+        self.assertIn("5 秒内捏了 3 下", self.channel_calls[0]["text"])
+
+    def test_non_numeric_count_400(self) -> None:
+        for bad in ({"count": "7"}, {"count": True}, {"duration_s": [1]}):
+            h = self.pet(body=bad)
+            self.assertEqual(h.responses[0][0], 400, bad)
+        self.assertEqual(self.channel_calls, [])
+
+    def test_test_text_mentions_count(self) -> None:
+        self.pet(body={"count": 4, "duration_s": 3, "test": True})
+        text = self.channel_calls[0]["text"]
+        self.assertTrue(text.startswith("[桌宠·螃蟹被捏了·测试] "))
+        self.assertIn("3 秒内捏了 4 下", text)
+        self.assertEqual(self.bubbles, [])
+
+
+class PetTapRateLimitTest(PetTapBase):
+    def test_no_20s_dedupe(self) -> None:
+        h1 = self.pet()
         h2 = self.pet()
-        self.assertEqual(h2.responses[0][1]["deduped"], False)
+        self.assertEqual(h1.responses, [(200, {"ok": True, "deduped": False})])
+        self.assertEqual(h2.responses, [(200, {"ok": True, "deduped": False})])
         self.assertEqual(len(self.channel_calls), 2)
+        self.assertEqual(len(self.bubbles), 2)
+
+    def test_seventh_settlement_in_a_minute_is_dropped(self) -> None:
+        for _ in range(6):
+            self.assertFalse(self.pet().responses[0][1]["deduped"])
+        h7 = self.pet(body={"count": 3})
+        self.assertEqual(h7.responses, [(200, {"ok": True, "deduped": True})])
+        self.assertEqual(len(self.channel_calls), 6)
+        self.assertEqual(len(self.bubbles), 6)
+
+    def test_limiter_window_math(self) -> None:
+        lim = push._PetTapRateLimit(limit=6, window_seconds=60)
+        for i in range(6):
+            self.assertTrue(lim.try_acquire(now=100.0 + i))
+        self.assertFalse(lim.try_acquire(now=130.0))
+        self.assertFalse(lim.try_acquire(now=159.9))
+        self.assertTrue(lim.try_acquire(now=160.0))  # first hit (t=100) aged out
+        self.assertFalse(lim.try_acquire(now=160.5))
+
+    def test_default_limit_is_6_per_minute(self) -> None:
+        self.assertEqual((push._PET_TAP_LIMIT.limit, push._PET_TAP_LIMIT.window), (6, 60.0))
 
     def test_independent_of_bedside_and_door(self) -> None:
         self.tap(f"?k={BEDSIDE}")
         self.tap(f"?k={DOOR}")
-        h = self.pet()
-        self.assertEqual(h.responses[0][1]["deduped"], False)
-        self.tap(f"?k={BEDSIDE}")  # bedside still deduped by its own bucket
+        self.assertFalse(self.pet().responses[0][1]["deduped"])
+        self.tap(f"?k={BEDSIDE}")  # bedside still deduped by its own 20s bucket
         self.assertEqual(len(self.channel_calls), 3)
-        push._NFC_TAP_GATES.get("pet")._last -= 21
-        self.tap(f"?k={DOOR}")  # door still deduped; pet's reset does not leak
-        self.assertEqual(len(self.channel_calls), 3)
+        for _ in range(5):
+            self.pet()
+        self.assertTrue(self.pet().responses[0][1]["deduped"])
+        push._NFC_TAP_GATES.get("bedside")._last -= 21
+        self.tap(f"?k={BEDSIDE}")  # pet limiter full does not block NFC
+        self.assertEqual(len(self.channel_calls), 3 + 5 + 1)
 
     def test_pet_tap_does_not_consume_bedside_window(self) -> None:
         self.pet()
@@ -203,6 +278,104 @@ class PetTapBodyTest(PetTapBase):
         h = self.pet(body=b"{" + b" " * 5000 + b"}")
         self.assertEqual(h.responses[0][0], 413)
         self.assertEqual(self.channel_calls, [])
+
+
+class PetTapHammerTest(PetTapBase):
+    def test_hammer_text_and_bubble(self) -> None:
+        self.pet(body={"count": 15, "duration_s": 12, "hammer": True})
+        call = self.channel_calls[0]
+        self.assertRegex(
+            call["text"],
+            r"^\[桌宠·螃蟹被捏了\] \d{2}:\d{2} 方小南 12 秒内捏了 15 下，后面抡起爆锤把螃蟹砸晕了"
+            r"（她正在用手机，用 companion reply contact_id=xiaoke 跟她打招呼）$",
+        )
+        self.assertIs(call["metadata"]["hammer"], True)
+        self.assertEqual(self.bubbles[0][1]["text"], "方小南抡起爆锤🔨砸晕了屏幕上的🦀 ×15")
+
+    def test_hammer_must_be_true_literal(self) -> None:
+        self.pet(body={"count": 9, "duration_s": 4, "hammer": "yes"})
+        self.assertNotIn("爆锤", self.channel_calls[0]["text"])
+        self.assertIs(self.channel_calls[0]["metadata"]["hammer"], False)
+        self.assertEqual(self.bubbles[0][1]["text"], "方小南捏了捏🤏屏幕上的🦀 ×9")
+
+    def test_hammer_single_count(self) -> None:
+        self.pet(body={"count": 1, "hammer": True})
+        self.assertIn("方小南抡起爆锤把手机屏幕上的螃蟹砸晕了", self.channel_calls[0]["text"])
+        self.assertEqual(self.bubbles[0][1]["text"], "方小南抡起爆锤🔨砸晕了屏幕上的🦀")
+
+
+JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64
+
+
+class PetScreenshotTest(PetTapBase):
+    def setUp(self) -> None:
+        super().setUp()
+        push._PET_SHOT_LIMIT.reset()
+        self.addCleanup(push._PET_SHOT_LIMIT.reset)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.attach_dir = push.Path(tmp.name)
+
+    def shot(self, body=JPEG, **kw) -> PushHandler:
+        return self.pet(body=body, path="/pet/screenshot", **kw)
+
+    def test_requires_native_auth(self) -> None:
+        for token in (None, "bad", BEDSIDE):
+            h = self.shot(token=token)
+            self.assertEqual(h.responses, [(401, {"ok": False, "error": "unauthorized"})])
+        self.assertEqual(self.channel_calls, [])
+        self.assertEqual(self.bubbles, [])
+        self.assertEqual(list(self.attach_dir.iterdir()), [])
+
+    def test_saves_appends_and_notifies(self) -> None:
+        h = self.shot()
+        status, payload = h.responses[0]
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertRegex(payload["url"], r"^/attachments/[0-9a-f]{32}\.jpg$")
+        saved = self.attach_dir / payload["url"].rsplit("/", 1)[1]
+        self.assertEqual(saved.read_bytes(), JPEG)
+        contact, rec = self.bubbles[0]
+        self.assertEqual(contact, "xiaoke")
+        self.assertEqual(rec["role"], "user")
+        self.assertEqual(rec["text"], "双击螃蟹截屏")
+        self.assertEqual(rec["source"], "pet-screenshot")
+        self.assertEqual((rec["attachment_url"], rec["attachment_type"]), (payload["url"], "image"))
+        call = self.channel_calls[0]
+        self.assertRegex(
+            call["text"],
+            r"^\[桌宠·截屏\] \d{2}:\d{2} 方小南双击螃蟹，发来一张当前屏幕截图（图片在 /.+\.jpg，",
+        )
+        self.assertIn(str(saved.resolve()), call["text"])
+        self.assertIn("companion reply contact_id=xiaoke", call["text"])
+        self.assertEqual(call["metadata"]["source"], "pet-screenshot")
+        self.assertEqual(call["metadata"]["image_path"], str(saved.resolve()))
+
+    def test_test_flag_no_chat_record(self) -> None:
+        h = self.shot(query="?test=1")
+        self.assertEqual(h.responses[0][0], 200)
+        self.assertEqual(self.bubbles, [])
+        self.assertTrue(self.channel_calls[0]["text"].startswith("[桌宠·截屏·测试] "))
+        self.assertIs(self.channel_calls[0]["metadata"]["test"], True)
+
+    def test_png_ok_garbage_415_empty_400(self) -> None:
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+        self.assertTrue(self.shot(body=png).responses[0][1]["url"].endswith(".png"))
+        self.assertEqual(self.shot(body=b"not an image").responses[0][0], 415)
+        self.assertEqual(self.shot(body=b"").responses[0][0], 400)
+        self.assertEqual(len(self.channel_calls), 1)
+
+    def test_rate_limited_after_6_per_minute(self) -> None:
+        for _ in range(6):
+            self.assertEqual(self.shot().responses[0][0], 200)
+        self.assertEqual(self.shot().responses[0], (429, {"ok": False, "error": "rate_limited"}))
+        self.assertEqual(len(self.channel_calls), 6)
+
+    def test_screenshot_limit_independent_of_tap_limit(self) -> None:
+        for _ in range(6):
+            self.pet()
+        self.assertTrue(self.pet().responses[0][1]["deduped"])
+        self.assertEqual(self.shot().responses[0][0], 200)
 
 
 if __name__ == "__main__":
