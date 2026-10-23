@@ -22,6 +22,8 @@ KIMI_APP_MODELS = (
     "kimi-code/k3",
     "kimi-code/kimi-for-coding",
     "kimi-code/kimi-for-coding-highspeed",
+    "kimi-code/k3.1-pro",
+    "kimi-code/k3.1-pro-highspeed",
     "deepseek/v4-pro",
     "deepseek/v4-flash",
     "zhipu/glm-5.3",

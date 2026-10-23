@@ -140,7 +140,8 @@ allowed_ips = []
 # The Android App keeps a private per-contact model/effort preference and
 # pins+reads it back on every ACP prepare/load/new/forge. It never writes Kimi
 # Code's global config.toml. Only the locally configured audited aliases
-# k3-256k, k3, kimi-for-coding, kimi-for-coding-highspeed, deepseek/v4-pro,
+# k3-256k, k3, k3.1-pro, k3.1-pro-highspeed, kimi-for-coding,
+# kimi-for-coding-highspeed, deepseek/v4-pro,
 # deepseek/v4-flash are selectable. On DeepSeek's official API the model id is
 # "deepseek-flash" (currently v4.1-flash); "deepseek-v4-flash" is a legacy alias
 # that resolves to the same model. The DeepSeek aliases declare no
