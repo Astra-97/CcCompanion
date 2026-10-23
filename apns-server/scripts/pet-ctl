@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""pet-ctl — 小克查看 / 改变方小南手机上的螃蟹桌宠形态 (App v1.9.226+).
+
+用法:
+  pet-ctl get              当前形态 (App 最近一次上报 + 最近一次远程换装)
+  pet-ctl set <动作>       换成某只 (动作名 / 中文名 / 「小克螃蟹·xx」都行)
+  pet-ctl random           随机换一只 (不和当前重复, 不抽 snooze)
+  pet-ctl list             列出 34 个动作 (英文名 + 中文名)
+  加 --json 输出原始 JSON.
+
+走本机 CcCompanion 服务 (127.0.0.1:<config port>):
+  GET  /pet/crab/state   POST /pet/crab/act   GET /pet/crab/acts
+鉴权 X-Auth-Token = config.toml [auth] shared_secret (只在进程内读取, 不打印).
+远程换装经 App 现成的后台实时通道 (/chat/stream?contacts=all 的 pet_act 事件) 下发;
+App 不在线 / 桌宠没显示时会记着, 下次上报或下次浮出来时用上.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+CONFIG = Path(os.environ.get("CC_COMPANION_CONFIG", "/root/CcCompanion/apns-server/config.toml"))
+
+REASONS = {
+    "show": "出来时随机",
+    "resume": "接着上一轮",
+    "remote": "小克远程换的",
+    "remote_pending": "收到远程换装（没在显示，下次出来用）",
+    "triple_tap": "她敲三下换的",
+    "sleep": "到点睡觉了",
+    "wake": "睡醒了",
+    "hide": "收起来了（她回到 App 里了）",
+    "sync": "实时通道重连同步",
+}
+
+
+def _config() -> tuple[str, int]:
+    text = CONFIG.read_text(encoding="utf-8")
+    secret = ""
+    port = 8291
+    section = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("["):
+            section = line
+            continue
+        m = re.match(r'^shared_secret\s*=\s*"(.*)"\s*$', line)
+        if m and not secret:
+            secret = m.group(1)
+        m = re.match(r"^port\s*=\s*(\d+)\s*$", line)
+        if m and section == "[server]":
+            port = int(m.group(1))
+    if not secret:
+        sys.exit("pet-ctl: config.toml 里没有 shared_secret")
+    return secret, port
+
+
+def _call(method: str, path: str, body: dict | None = None) -> dict:
+    secret, port = _config()
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data, method=method)
+    req.add_header("X-Auth-Token", secret)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            payload = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            payload = {"ok": False, "error": f"HTTP {e.code}"}
+        payload.setdefault("http_status", e.code)
+        return payload
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"pet-ctl: 连不上 CcCompanion 服务: {e}")
+
+
+def _ago(seconds: int | None) -> str:
+    if seconds is None:
+        return "?"
+    if seconds < 60:
+        return f"{seconds} 秒前"
+    if seconds < 3600:
+        return f"{seconds // 60} 分钟前"
+    if seconds < 86400:
+        return f"{seconds // 3600} 小时前"
+    return f"{seconds // 86400} 天前"
+
+
+def cmd_get(as_json: bool) -> int:
+    res = _call("GET", "/pet/crab/state")
+    if as_json:
+        print(json.dumps(res, ensure_ascii=False, indent=1))
+        return 0 if res.get("ok") else 1
+    if not res.get("ok"):
+        print(f"失败: {res.get('error')}")
+        return 1
+    st = res.get("state")
+    if not st:
+        print("App 还没上报过形态（v1.9.226 以上、桌宠出来过一次才有）")
+    else:
+        when = datetime.fromtimestamp(st.get("reported_at") or 0, ZoneInfo("Asia/Shanghai")).strftime("%m-%d %H:%M:%S")
+        print(f"当前形态: {st.get('act')}（{st.get('act_zh')}）")
+        if st.get("display_act") != st.get("act"):
+            print(f"屏幕上在演: {st.get('display_act')}（{st.get('display_act_zh')}）")
+        flags = []
+        flags.append("在屏幕上" if st.get("showing") else "没显示")
+        if st.get("asleep"):
+            flags.append("睡觉时段")
+        if not st.get("enabled", True):
+            flags.append("桌宠被她藏起来了")
+        print("状态: " + "，".join(flags))
+        if st.get("pending_act"):
+            print(f"待用（下次出来）: {st['pending_act']}（{st.get('pending_act_zh', '')}）")
+        reason = st.get("reason") or ""
+        print(f"上报: 北京 {when}（{_ago(st.get('age_s'))}），原因: {REASONS.get(reason, reason)}")
+    cmd = res.get("command")
+    if cmd:
+        state = "App 已收到" if cmd.get("acked") else "App 还没收到（离线/通道断，下次上报补发）"
+        print(f"最近一次远程换装: {cmd.get('act')}（{cmd.get('act_zh')}） seq={cmd.get('seq')} — {state}")
+    return 0
+
+
+def cmd_set(act: str, as_json: bool) -> int:
+    res = _call("POST", "/pet/crab/act", {"act": act})
+    if as_json:
+        print(json.dumps(res, ensure_ascii=False, indent=1))
+        return 0 if res.get("ok") else 1
+    if not res.get("ok"):
+        print(f"失败: {res.get('error')}（pet-ctl list 看可用名字）")
+        return 1
+    live = res.get("stream_listeners", 0)
+    print(f"已下发: {res.get('act')}（{res.get('act_zh')}） seq={res.get('seq')}")
+    print("实时通道在线订阅数: " + str(live) + ("" if live else "（没人在线，App 下次上报时补发）"))
+    print("过几秒用 pet-ctl get 看 App 有没有回报")
+    return 0
+
+
+def cmd_list(as_json: bool) -> int:
+    res = _call("GET", "/pet/crab/acts")
+    if as_json:
+        print(json.dumps(res, ensure_ascii=False, indent=1))
+        return 0 if res.get("ok") else 1
+    if not res.get("ok"):
+        print(f"失败: {res.get('error')}")
+        return 1
+    for item in res.get("acts", []):
+        print(f"{item['act']:<16}{item['zh']}")
+    print("random          随机换一只")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    as_json = "--json" in argv
+    args = [a for a in argv if a != "--json"]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    cmd = args[0]
+    if cmd == "get":
+        return cmd_get(as_json)
+    if cmd == "list":
+        return cmd_list(as_json)
+    if cmd == "random":
+        return cmd_set("random", as_json)
+    if cmd == "set" and len(args) >= 2:
+        return cmd_set(" ".join(args[1:]), as_json)
+    print(__doc__.strip())
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

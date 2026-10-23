@@ -82,6 +82,7 @@ from group_chat import GroupChatStore
 from apples_unread import ApplesCursorStore, format_unread_lines, split_unread
 from plugins_store import MAX_DOC_BODY_BYTES, PluginStore
 from calendar_store import CalendarStore, CATEGORIES, CATEGORY_LABELS
+import crab_pet_state
 from rp_history import RPHistory, validate_sid as validate_rp_sid
 from diary import Diary
 from favorites import Favorites
@@ -4872,6 +4873,10 @@ class ServerState:
         self.pet_bus = PetStateBus()
         self.pet_bubble_bus = PetBubbleBus()
         self.pet_activity_bus = PetActivityBus()
+        # 螃蟹桌宠 Clawd 形态 (2026-10-23, App v1.9.226): /pet/crab/state + /pet/crab/act
+        self.crab_pet = crab_pet_state.CrabPetStore(
+            Path(self.token_store_path).parent / "crab_pet_state.json"
+        )
         # typing indicator 状态 (内存 不持久化)
         self.typing_state: dict[str, Any] = {"is_typing": False, "since": None}
         self.contact_typing_states: dict[str, dict[str, Any]] = {
@@ -7844,6 +7849,17 @@ class PushHandler(BaseHTTPRequestHandler):
                 return
             self._handle_device_status_get()
             return
+        # 螃蟹桌宠 Clawd 形态 (2026-10-23)：小克主动查看当前形态 / 动作表。
+        # native pairing fail-closed（同 /pet/tap），不走 cookie。
+        if request_path in ("/pet/crab/state", "/pet/crab/acts"):
+            if not self._native_pairing_auth_matches():
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            if request_path == "/pet/crab/acts":
+                self._send_json(200, {"ok": True, "acts": crab_pet_state.acts_payload()})
+            else:
+                self._handle_crab_pet_state_get()
+            return
         # PWA bootstrap has to answer without an X-Auth-Token header.  It
         # validates only the HttpOnly session cookie itself and never emits a
         # server or memory credential.
@@ -8591,6 +8607,31 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(401, {"ok": False, "error": "unauthorized"})
                 return
             self._handle_pet_screenshot()
+            return
+        # 螃蟹桌宠 Clawd 形态 (2026-10-23)：App 上报形态 / 小克远程换装。同一道 native 闸门。
+        if request_path in ("/pet/crab/state", "/pet/crab/act"):
+            if not self._native_pairing_auth_matches():
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except (TypeError, ValueError):
+                length = -1
+            if length <= 0 or length > 4 * 1024:
+                self.close_connection = True
+                self._send_json(413 if length > 0 else 400, {"ok": False, "error": "bad_length"})
+                return
+            try:
+                body = self._read_body()
+                if not isinstance(body, dict):
+                    raise ValueError("JSON object required")
+            except Exception as exc:
+                self._send_json(400, {"ok": False, "error": f"bad json: {exc}"})
+                return
+            if request_path == "/pet/crab/state":
+                self._handle_crab_pet_state_post(body)
+            else:
+                self._handle_crab_pet_act_post(body)
             return
         if request_path in ("/device/battery", "/device/app-event", "/device/activity"):
             if not self._native_pairing_auth_matches():
@@ -23041,6 +23082,9 @@ class PushHandler(BaseHTTPRequestHandler):
                 "event", "contact_id", "turn_id", "reply_state", "revision",
                 "updated_at", "terminal", "refresh_history", "final_ts",
             )
+        elif kind == crab_pet_state.SSE_EVENT:
+            # 螃蟹桌宠远程换装 (2026-10-23)：不属于任何联系人，只发 contacts=all 订阅。
+            keys = ("event", "act", "seq", "ts")
         else:
             return None
         payload = {key: rec[key] for key in keys if key in rec}
@@ -23173,9 +23217,13 @@ class PushHandler(BaseHTTPRequestHandler):
                     public_rec = self._public_chat_stream_event(rec)
                     if public_rec is None:
                         continue
-                    event_contact = str(public_rec.get("contact_id") or "")
-                    if event_contact not in allowed_contacts:
-                        continue
+                    if public_rec.get("event") == crab_pet_state.SSE_EVENT:
+                        if contact_filter != "all":
+                            continue
+                    else:
+                        event_contact = str(public_rec.get("contact_id") or "")
+                        if event_contact not in allowed_contacts:
+                            continue
                     try:
                         self.wfile.write(f"data: {json.dumps(public_rec, ensure_ascii=False)}\n\n".encode("utf-8"))
                         self.wfile.flush()
@@ -27196,6 +27244,9 @@ class PushHandler(BaseHTTPRequestHandler):
                 what = "方小南捏了一下手机屏幕上的螃蟹"
             if profile.get("asleep"):
                 what += "（螃蟹本来在睡觉）"
+            act_zh = crab_pet_state.ACT_ZH.get(str(profile.get("act") or ""), "")
+            if act_zh:
+                what += f"（当时螃蟹在「{act_zh}」）"
             if test:
                 return (
                     f"[桌宠·螃蟹被捏了·测试] {hhmm} 这是一条测试通知：{what}"
@@ -27242,6 +27293,10 @@ class PushHandler(BaseHTTPRequestHandler):
                 "duration_s": int(profile.get("duration_s") or 1),
                 "hammer": bool(profile.get("hammer")),
                 "asleep": bool(profile.get("asleep")),
+                **({
+                    "act": profile["act"],
+                    "act_zh": crab_pet_state.ACT_ZH.get(profile["act"], ""),
+                } if profile.get("act") else {}),
             } if is_pet else {}),
             "test": bool(test),
             "nfc_tag": tag_id,
@@ -27513,11 +27568,15 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
         duration_s = max(1, min(self._PET_MAX_DURATION_S, duration_s))
         hammer = body.get("hammer") is True
         asleep = body.get("asleep") is True
+        # v1.9.226：结算时屏幕上那只 Clawd（认不出就忽略，不拒）。
+        act = crab_pet_state.normalize_act(body.get("act"))
         tag_id = self._PET_TAG_ID
         profile = {
             **self._PET_PROFILE, "count": count, "duration_s": duration_s,
             "hammer": hammer, "asleep": asleep,
         }
+        if act:
+            profile["act"] = act
         notified = _PET_TAP_LIMIT.try_acquire()
         if notified:
             self._nfc_tap_run_delivery(
@@ -27525,10 +27584,87 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
                 now=datetime.now(ZoneInfo("Asia/Shanghai")),
             )
         logger.info(
-            "pet tap test=%s count=%s duration_s=%s hammer=%s asleep=%s notified=%s",
-            is_test, count, duration_s, hammer, asleep, notified,
+            "pet tap test=%s count=%s duration_s=%s hammer=%s asleep=%s act=%s notified=%s",
+            is_test, count, duration_s, hammer, asleep, act, notified,
         )
         self._send_json(200, {"ok": True, "deduped": not notified})
+
+    def _crab_pet_store(self) -> "crab_pet_state.CrabPetStore":
+        store = getattr(self.state, "crab_pet", None)
+        if store is None:
+            store = crab_pet_state.CrabPetStore(
+                Path(getattr(self.state, "token_store_path", "/tmp/x")).parent / "crab_pet_state.json"
+            )
+            self.state.crab_pet = store
+        return store
+
+    def _handle_crab_pet_state_get(self) -> None:
+        """GET /pet/crab/state — 小克主动查看桌宠形态（调用方已过 native 鉴权）。
+
+        返回 {ok, state, command}：state = App 最近一次上报（act/display_act/asleep/
+        showing/enabled/pending_act/reason/reported_at/age_s + 中文名），没上报过为 null；
+        command = 最近一次远程换装（acked 表示 App 已收到）。
+        """
+        self._send_json(200, {"ok": True, **self._crab_pet_store().snapshot()})
+
+    def _handle_crab_pet_state_post(self, body: dict[str, Any]) -> None:
+        """POST /pet/crab/state — App 上报形态（show 随机 / 三击换 / 远程改 / 睡觉切 snooze / 收起）。
+
+        响应 {ok, command}：command 是 App 还没确认的远程换装（没有为 null），App 离线
+        期间小克改的形态就靠这里补发。
+        """
+        store = self._crab_pet_store()
+        try:
+            state = store.report(body)
+        except ValueError as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        logger.info(
+            "crab pet state act=%s display=%s asleep=%s showing=%s reason=%s",
+            state["act"], state["display_act"], state["asleep"], state["showing"], state["reason"],
+        )
+        self._send_json(200, {"ok": True, "command": store.pending_command()})
+
+    def _handle_crab_pet_act_post(self, body: dict[str, Any]) -> None:
+        """POST /pet/crab/act {act: "<动作名|中文名>" | "random"} — 小克远程换装。
+
+        存成待确认指令，并经 /chat/stream?contacts=all 的 pet_act 事件实时推给 App
+        （RealtimeNotificationService 那条现成的后台 SSE）。App 桌宠没在显示就记着，
+        下次出来用它；App 不在线则下次上报 /pet/crab/state 时在响应里补发。
+        """
+        store = self._crab_pet_store()
+        try:
+            command = store.command(body.get("act"))
+        except ValueError:
+            self._send_json(400, {
+                "ok": False,
+                "error": "unknown act",
+                "acts": [a for a, _ in crab_pet_state.ACTS] + [crab_pet_state.RANDOM],
+            })
+            return
+        listeners = 0
+        bus = getattr(self.state, "chat_stream_bus", None)
+        publish = getattr(bus, "publish", None)
+        if callable(publish):
+            try:
+                publish({
+                    "event": crab_pet_state.SSE_EVENT,
+                    "act": command["act"],
+                    "seq": command["seq"],
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                })
+                count = getattr(bus, "subscriber_count", None)
+                listeners = int(count()) if callable(count) else 0
+            except Exception:
+                logger.warning("crab pet act publish failed", exc_info=True)
+        logger.info("crab pet act=%s seq=%s listeners=%s", command["act"], command["seq"], listeners)
+        self._send_json(200, {
+            "ok": True,
+            "act": command["act"],
+            "act_zh": crab_pet_state.ACT_ZH.get(command["act"], ""),
+            "seq": command["seq"],
+            "stream_listeners": listeners,
+        })
 
     _PET_SHOT_LABEL = "双击螃蟹截屏"
 
