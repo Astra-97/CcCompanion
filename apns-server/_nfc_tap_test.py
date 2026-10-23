@@ -70,6 +70,9 @@ class NfcTapBase(unittest.TestCase):
         self.home_calls = []
         self.home_result = dict(OK_RESULT)
         self._patch_cls("_nfc_is_night", staticmethod(lambda now=None: self.night))
+        # 出门模式 (2026-10-23) 依赖真实时钟/节假日表；默认关掉，专门的测试见 _nfc_leave_test.py。
+        self.leave = False
+        self._patch_cls("_nfc_is_leave_time", classmethod(lambda cls, now=None: self.leave))
 
         def fake_home(*, dry_run):
             self.home_calls.append(dry_run)

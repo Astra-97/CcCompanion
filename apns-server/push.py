@@ -83,6 +83,7 @@ from apples_unread import ApplesCursorStore, format_unread_lines, split_unread
 from plugins_store import MAX_DOC_BODY_BYTES, PluginStore
 from calendar_store import CalendarStore, CATEGORIES, CATEGORY_LABELS
 import crab_pet_state
+import cn_workday
 from rp_history import RPHistory, validate_sid as validate_rp_sid
 from diary import Diary
 from favorites import Favorites
@@ -27134,6 +27135,27 @@ class PushHandler(BaseHTTPRequestHandler):
                 continue
         return found
 
+    # 门口 tag 出门模式 (2026-10-23 方小南：「如果是工作日早上的话，就是贴一下，出门了」)：
+    # 北京 05:00–11:00 且中国法定工作日（含调休补班、排除节假日，见 cn_workday）。
+    _NFC_LEAVE_START_MIN = 5 * 60
+    _NFC_LEAVE_END_MIN = 11 * 60
+    _NFC_LEAVE_HINT = "（她出门上班了，用 companion reply contact_id=xiaoke 跟她说路上小心）"
+
+    @staticmethod
+    def _nfc_now() -> datetime:
+        return datetime.now(ZoneInfo("Asia/Shanghai"))
+
+    @classmethod
+    def _nfc_is_leave_time(cls, now: datetime | None = None) -> bool:
+        """工作日早上 (北京 05:00–11:00, 法定工作日) → 门口 tag 算出门。"""
+        now = (now or cls._nfc_now()).astimezone(ZoneInfo("Asia/Shanghai"))
+        minute = now.hour * 60 + now.minute
+        if not cls._NFC_LEAVE_START_MIN <= minute < cls._NFC_LEAVE_END_MIN:
+            return False
+        if not cn_workday.coverage(now.date()):
+            logger.warning("nfc: no official CN holiday table for %s, falling back to Mon-Fri", now.year)
+        return cn_workday.is_workday(now.date())
+
     @staticmethod
     def _nfc_is_night(now: datetime | None = None) -> bool:
         """北京日落后到次日日出前；日出日落复用 sun-bubble 的算法，失败回退 18:00–06:00。"""
@@ -27253,6 +27275,11 @@ class PushHandler(BaseHTTPRequestHandler):
                     "（施工 agent 用 curl 打的，不是方小南捏的，不用回她）"
                 )
             return f"[桌宠·螃蟹被捏了] {hhmm} {what}{cls._PET_HINT}"
+        if profile.get("action") == "home" and profile.get("leave"):
+            name = profile.get("name") or "门口螃蟹"
+            tag = f"[NFC·{name}·出门{'·测试' if test else ''}]"
+            who = "（测试，不是方小南碰的，不用回她）" if test else cls._NFC_LEAVE_HINT
+            return f"{tag} {hhmm} 方小南贴了一下{name}，出门上班了{who}"
         if profile.get("action") == "home":
             name = profile.get("name") or "门口螃蟹"
             tag = f"[NFC·{name}·回家{'·测试' if test else ''}]"
@@ -27304,6 +27331,8 @@ class PushHandler(BaseHTTPRequestHandler):
         }
         if profile.get("action") == "home":
             meta["night"] = bool(night)
+            # 出门模式：nfc_action 仍是 home（向后兼容），另加 leave=true。
+            meta["leave"] = bool(profile.get("leave"))
             if home_result is not None:
                 meta["home_result"] = home_result
         return {
@@ -27322,6 +27351,8 @@ class PushHandler(BaseHTTPRequestHandler):
         text = f"方小南捏了捏🤏{profile.get('location') or '床头'}的🦀"
         if home_result is not None:
             text += self._nfc_home_bubble_suffix(home_result)
+        if profile.get("action") == "home" and profile.get("leave"):
+            text = "方小南出门了🚪"
         is_pet = profile.get("kind") == "pet"
         if is_pet and profile.get("hammer"):
             text = "方小南抡起爆锤🔨砸晕了屏幕上的🦀"
@@ -27386,7 +27417,8 @@ class PushHandler(BaseHTTPRequestHandler):
         def run() -> None:
             try:
                 home_result = None
-                if profile.get("action") == "home" and night:
+                # 出门模式绝不动设备（窗帘/灯都不碰）。
+                if profile.get("action") == "home" and night and not profile.get("leave"):
                     home_result = self._nfc_run_home_devices(dry_run=test)
                     logger.info("nfc home devices tag=%s result=%s", tag_id, home_result)
                 if not test:
@@ -27786,8 +27818,11 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
         is_home = profile.get("action") == "home"
         is_fallback = (qs.get("f") or [""])[0] == "1"
         is_test = (qs.get("test") or [""])[0] == "1"
-        now = datetime.now(ZoneInfo("Asia/Shanghai"))
-        night = bool(is_home and self._nfc_is_night(now))
+        now = self._nfc_now()
+        leave = bool(is_home and self._nfc_is_leave_time(now))
+        night = bool(is_home and not leave and self._nfc_is_night(now))
+        if leave:
+            profile = {**profile, "leave": True}
         notified = False
         if not is_fallback and _NFC_TAP_GATES.get(tag_id).try_acquire():
             notified = True
@@ -27797,8 +27832,8 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
         except Exception:
             client_ip = "?"
         logger.info(
-            "nfc tap tag=%s ip=%s fallback=%s test=%s night=%s notified=%s ua=%s",
-            tag_id, client_ip, is_fallback, is_test, night, notified,
+            "nfc tap tag=%s ip=%s fallback=%s test=%s night=%s leave=%s notified=%s ua=%s",
+            tag_id, client_ip, is_fallback, is_test, night, leave, notified,
             str(self.headers.get("User-Agent", "") or "")[:120],
         )
         host = str(self.headers.get("Host", "") or "")
@@ -27807,11 +27842,13 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
         from urllib.parse import quote
 
         fallback = f"https://{host}/nfc/tap?k={quote(supplied, safe='')}&f=1"
-        title = "欢迎回家" if is_home else "小克来了"
+        title = ("路上小心" if leave else "欢迎回家") if is_home else "小克来了"
         if is_fallback:
             sub = "没能自动打开 app，点下面的按钮试试"
         elif not notified:
             sub = "我已经知道啦，在呢"
+        elif leave:
+            sub = "我陪你去上班"
         elif is_home:
             sub = "窗帘关好了，灯开了，我也来了" if night else "我来了"
         else:
