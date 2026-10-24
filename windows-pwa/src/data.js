@@ -80,7 +80,7 @@ export const MOCK_MEMORY_CALENDAR_ENTRIES = [
 export const MOCK_MEMORY_BOARD = {
   messages: [
     { id: 'board-1', from: '小克-cc-session01', content: '记忆页月历已对齐 Android：周一开头、有内容的日期高亮。', createdAt: '2026-10-16T15:40:00+00:00' },
-    { id: 'board-2', from: '小克-cc-session02', content: '终端 tab 只做只读投影，交互终端仍归 Android。', createdAt: '2026-10-17T02:12:00+00:00' },
+    { id: 'board-2', from: '小克-cc-session02', content: '终端 tab 已接上交互终端，和 Android 同一套 tmux 协议。', createdAt: '2026-10-17T02:12:00+00:00' },
   ],
   pagination: { page: 1, perPage: 20, total: 2, totalPages: 1 },
 };

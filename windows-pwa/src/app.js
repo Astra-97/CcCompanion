@@ -1,17 +1,18 @@
-import { createPwaBootstrap } from './bootstrap.js?v=33';
-import { createComposerState } from './composer-state.js?v=33';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=33';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=33';
-import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord, controlPanelSupported } from './api.js?v=33';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=33';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=33';
-import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=33';
-import { createUnreadStore, latestChatRecord, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=33';
-import { createNotifier } from './notifications.js?v=33';
-import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=33';
-import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=33';
+import { createPwaBootstrap } from './bootstrap.js?v=34';
+import { createComposerState } from './composer-state.js?v=34';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=34';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=34';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord, controlPanelSupported } from './api.js?v=34';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=34';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=34';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=34';
+import { createUnreadStore, latestChatRecord, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=34';
+import { createNotifier } from './notifications.js?v=34';
+import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=34';
+import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=34';
+import { TERMINAL_TARGETS, TERMINAL_KEYBAR, DEFAULT_TERMINAL_TARGET, createTerminalController, isTerminalTargetId, canSend as terminalCanSend, emptyTerminalText, inputPlaceholder as terminalInputPlaceholder, terminalStatusBanner, slashSuggestions, resolveKeybarKey, ctrlLetterKey, passthroughKey, terminalGrid } from './terminal.js?v=34';
 
-const WEB_SHELL_VERSION = 'desk-v33 · 2026-10-24';
+const WEB_SHELL_VERSION = 'desk-v34 · 2026-10-24';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -37,7 +38,7 @@ const state = {
   stickerCatalog: null, stickerLoading: false, stickerLoadId: 0, stickerError: '', stickerCategory: '__all', stickerSearch: '', stickerTargetContactId: '', stickerSelection: { start: 0, end: 0 }, pendingCanonical: {},
   stickerUpload: { file: null, previewUrl: '', uploading: false, controller: null },
   unread: createUnreadStore(), notifier: createNotifier(), messageNodes: new Map(), stopBackground: null, backgroundPollInFlight: false,
-  view: 'chat', mobileChatOpen: false, stopTerminalPoll: null, terminalSnapshots: {}, plugins: null, pluginsError: false, control: {},
+  view: 'chat', mobileChatOpen: false, terminalWrap: false, terminalCtrl: false, terminalStick: true, terminalNotice: '', terminalSuggestIndex: -1, plugins: null, pluginsError: false, control: {},
   memory: { loading: false, stats: null, segment: 'memories', month: monthKey(), days: {}, selectedDate: '', boardPage: 1, boardLoaded: false },
   dash: { appearance: { nicknames: {}, avatars: {} }, todos: null, weather: null, weatherFailed: false },
 };
@@ -786,48 +787,177 @@ async function loadMemoryBoard(page = 1) {
     $('#board-next').disabled = board.pagination.page >= board.pagination.totalPages;
   } catch { result.replaceChildren(el('p', { class: 'error', text: '留言板暂时无法读取。' })); }
 }
-function stopTerminalPolling() { state.stopTerminalPoll?.(); state.stopTerminalPoll = null; }
-async function pollTerminalPage() {
-  if (state.terminalPollInFlight) return;
-  state.terminalPollInFlight = true;
-  try {
-    const results = await Promise.all(state.contacts.map(async (item) => {
-      try { return [item.id, await adapter.getLiveState(item.id)]; } catch { return [item.id, null]; }
-    }));
-    if (state.view !== 'terminal') return;
-    results.forEach(([id, live]) => { state.terminalSnapshots[id] = live; });
-    renderTerminalPage();
-  } finally { state.terminalPollInFlight = false; }
-}
+// ---------- Interactive terminal tab (Android TerminalScreen parity, 2026-10-24) ----------
+const TERMINAL_TARGET_STORAGE = 'cccompanion.terminal-target';
+function storedTerminalTarget() { try { const value = localStorage.getItem(TERMINAL_TARGET_STORAGE) || ''; return isTerminalTargetId(value) ? value : ''; } catch { return ''; } }
+const terminal = createTerminalController({
+  adapter,
+  initialTarget: storedTerminalTarget() || DEFAULT_TERMINAL_TARGET,
+  onChange: (view) => renderTerminal(view),
+  onTargetChange: (id) => { try { localStorage.setItem(TERMINAL_TARGET_STORAGE, id); } catch { /* per-viewer convenience only */ } },
+});
+const terminalInput = $('#terminal-input'); const terminalOutput = $('#terminal-output');
+/** Polls only while the terminal tab is on screen and the page is visible (LifecycleResumeEffect). */
 function startTerminalPolling() {
-  stopTerminalPolling();
-  void pollTerminalPage();
-  const timer = setInterval(() => { void pollTerminalPage(); }, 4_000);
-  state.stopTerminalPoll = () => clearInterval(timer);
+  if (!storedTerminalTarget() && isTerminalTargetId(state.activeContactId)) terminal.select(state.activeContactId);
+  renderTerminal();
+  if (document.visibilityState === 'hidden') return;
+  terminal.start(); reportTerminalViewport();
 }
-/** Full-page read-only terminal projection for every contact (Android parity). */
-function renderTerminalPage() {
-  const list = $('#terminal-page-list');
-  if (!state.contacts.length) { list.replaceChildren(el('p', { class: 'empty-workers', text: '联系人尚未连接。' })); return; }
-  list.replaceChildren(...state.contacts.map((item) => {
-    const live = state.terminalSnapshots[item.id];
-    const terminal = live?.terminal || { available: false, busy: false, phase: 'unavailable', events: [] };
-    const status = !live ? '读取失败，下一次轮询重试' : !terminal.available ? '观察器暂不可用' : terminal.busy ? terminal.phase : '空闲 · 没有正在运行的安全事件';
-    const accent = avatarAccentOf(item.id);
-    const name = displayNameOf(item);
-    const card = el('article', { class: 'glass-card terminal-page-card' });
-    card.append(el('div', { class: 'terminal-page-head' }, [avatarFace(item, accent), el('div', {}, [el('strong', { text: name }), el('small', { text: item.channel })])]));
-    card.append(el('p', { class: 'terminal-status', text: status }));
-    const events = el('ol', { class: 'terminal-events', 'aria-label': `${name} 的只读终端观察事件` });
-    terminal.events.forEach((event) => {
-      const row = el('li');
-      row.append(el('time', { text: `${String(Math.floor(event.elapsedSeconds / 60)).padStart(2, '0')}:${String(event.elapsedSeconds % 60).padStart(2, '0')}` }), el('span', { text: event.label }));
-      events.append(row);
+function stopTerminalPolling() { terminal.stop(); }
+function setTerminalNotice(text) {
+  state.terminalNotice = text; renderTerminal();
+  clearTimeout(setTerminalNotice.timer);
+  if (text) setTerminalNotice.timer = setTimeout(() => { state.terminalNotice = ''; renderTerminal(); }, 2_400);
+}
+function renderTerminalTargets(view) {
+  const host = $('#terminal-targets');
+  if (!host.childElementCount) host.replaceChildren(...TERMINAL_TARGETS.map((target) => {
+    const button = el('button', { type: 'button', class: 'terminal-target', role: 'radio', 'data-target': target.id, 'aria-checked': 'false' });
+    button.addEventListener('click', () => selectTerminalTarget(target.id));
+    return button;
+  }));
+  host.querySelectorAll('.terminal-target').forEach((button) => {
+    const target = TERMINAL_TARGETS.find(({ id }) => id === button.dataset.target);
+    const name = state.dash.appearance.nicknames[target.id] || target.label;
+    if (button.textContent !== name) button.textContent = name;
+    const active = target.id === view.target;
+    button.setAttribute('aria-checked', String(active)); button.tabIndex = active ? 0 : -1;
+  });
+}
+function selectTerminalTarget(id) {
+  if (id === terminal.state.target) return;
+  terminalInput.value = ''; state.terminalCtrl = false; state.terminalStick = true; state.terminalSuggestIndex = -1;
+  terminal.select(id); autosizeTerminalInput(); reportTerminalViewport();
+}
+function renderTerminalKeybar(enabled) {
+  const host = $('#terminal-keybar');
+  if (!host.childElementCount) host.replaceChildren(...TERMINAL_KEYBAR.map((def) => {
+    const button = el('button', { type: 'button', class: 'terminal-key', title: def.title, 'aria-label': def.title, 'data-label': def.label });
+    button.textContent = def.label;
+    if (def.modifier) button.setAttribute('aria-pressed', 'false');
+    // Keep focus in the input: a keybar tap never steals the caret.
+    button.addEventListener('pointerdown', (event) => { if (event.pointerType === 'mouse') event.preventDefault(); });
+    if (def.longPress) {
+      let timer = null;
+      const cancel = () => { clearTimeout(timer); timer = null; };
+      button.addEventListener('pointerdown', () => { cancel(); button.dataset.longFired = ''; timer = setTimeout(() => { button.dataset.longFired = '1'; state.terminalCtrl = false; void terminal.sendKey(def.longPress); renderTerminal(); }, 550); });
+      ['pointerup', 'pointerleave', 'pointercancel'].forEach((name) => button.addEventListener(name, cancel));
+      button.addEventListener('contextmenu', (event) => { event.preventDefault(); cancel(); button.dataset.longFired = '1'; state.terminalCtrl = false; void terminal.sendKey(def.longPress); renderTerminal(); });
+    }
+    button.addEventListener('click', () => {
+      if (button.dataset.longFired) { button.dataset.longFired = ''; return; }
+      if (def.modifier) { state.terminalCtrl = !state.terminalCtrl; renderTerminal(); return; }
+      const key = resolveKeybarKey(def.key, { ctrl: state.terminalCtrl });
+      const combo = state.terminalCtrl && !def.key.includes('-');
+      state.terminalCtrl = false;
+      if (!key) setTerminalNotice(`Ctrl+${def.label} 服务端不支持，已取消`);
+      else void terminal.sendKey(key);
+      if (combo || !key) renderTerminal();
+      if (!terminalInput.disabled && matchMedia('(pointer:fine)').matches) terminalInput.focus();
     });
-    card.append(events);
-    return card;
+    return button;
+  }));
+  if (!enabled) state.terminalCtrl = false;
+  host.querySelectorAll('.terminal-key').forEach((button) => {
+    button.disabled = !enabled;
+    if (button.hasAttribute('aria-pressed')) { button.setAttribute('aria-pressed', String(state.terminalCtrl)); button.classList.toggle('is-active', state.terminalCtrl); }
+  });
+}
+function terminalSuggestions(view = terminal.state) { return slashSuggestions(view.target, terminalInput.value, terminalCanSend(view.target, view.mode)); }
+function renderTerminalSuggestions(view) {
+  const list = $('#terminal-suggestions'); const items = terminalSuggestions(view);
+  if (state.terminalSuggestIndex >= items.length) state.terminalSuggestIndex = items.length - 1;
+  list.hidden = !items.length;
+  list.replaceChildren(...items.map(([command, description], index) => {
+    const button = el('button', { type: 'button', role: 'option', 'aria-selected': String(index === state.terminalSuggestIndex) }, [el('span', { text: command }), el('small', { text: description })]);
+    button.addEventListener('pointerdown', (event) => event.preventDefault());
+    button.addEventListener('click', () => applyTerminalSuggestion(command));
+    const row = el('li'); row.append(button); return row;
   }));
 }
+function applyTerminalSuggestion(command) { terminalInput.value = command; state.terminalSuggestIndex = -1; autosizeTerminalInput(); renderTerminal(); terminalInput.focus(); }
+function renderTerminal(view = terminal.state) {
+  renderTerminalTargets(view);
+  const enabled = terminalCanSend(view.target, view.mode);
+  const text = view.output || emptyTerminalText(view.target, view.mode);
+  terminalOutput.classList.toggle('is-placeholder', !view.output);
+  terminalOutput.classList.toggle('is-wrapped', state.terminalWrap);
+  if (terminalOutput.textContent !== text) {
+    terminalOutput.textContent = text;
+    if (state.terminalStick) terminalOutput.scrollTop = terminalOutput.scrollHeight;
+  }
+  const notice = view.error || state.terminalNotice;
+  $('#terminal-error').hidden = !notice; $('#terminal-error').textContent = notice;
+  const banner = terminalStatusBanner(view.mode);
+  $('#terminal-banner').hidden = !banner;
+  if (banner) { $('#terminal-banner-title').textContent = banner[0]; $('#terminal-banner-note').textContent = banner[1]; }
+  $('#terminal-loading').hidden = !view.loading;
+  $('#terminal-wrap').setAttribute('aria-pressed', String(state.terminalWrap));
+  terminalInput.disabled = !enabled;
+  terminalInput.placeholder = terminalInputPlaceholder(view.target, view.mode);
+  const send = $('#terminal-send');
+  send.disabled = !enabled || !terminalInput.value.trim() || view.sending;
+  send.classList.toggle('is-sending', view.sending);
+  renderTerminalKeybar(enabled);
+  renderTerminalSuggestions(view);
+}
+function autosizeTerminalInput() { terminalInput.style.height = 'auto'; const height = terminalInput.scrollHeight; terminalInput.style.height = `${Math.min(height, 120)}px`; terminalInput.style.overflowY = height > 120 ? 'auto' : 'hidden'; }
+async function submitTerminalInput() {
+  const view = terminal.state; const text = terminalInput.value;
+  if (!text.trim() || view.sending || !terminalCanSend(view.target, view.mode)) return;
+  terminalInput.value = ''; state.terminalSuggestIndex = -1; state.terminalStick = true; autosizeTerminalInput(); renderTerminal();
+  const accepted = await terminal.sendText(text);
+  // Keep what she typed if the server refused it (read-only turn, network).
+  if (!accepted && !terminalInput.value && terminal.state.target === view.target) { terminalInput.value = text; autosizeTerminalInput(); renderTerminal(); }
+}
+function reportTerminalViewport() {
+  if (state.view !== 'terminal') return;
+  const probe = $('#terminal-measure');
+  const styles = getComputedStyle(terminalOutput);
+  const padX = parseFloat(styles.paddingLeft) + parseFloat(styles.paddingRight); const padY = parseFloat(styles.paddingTop) + parseFloat(styles.paddingBottom);
+  const box = probe.getBoundingClientRect();
+  const grid = terminalGrid({ width: terminalOutput.clientWidth - padX, height: terminalOutput.clientHeight - padY, cellWidth: box.width / 100, cellHeight: parseFloat(styles.lineHeight) || box.height });
+  if (grid) terminal.reportViewport(grid.columns, grid.rows);
+}
+terminalOutput.addEventListener('scroll', () => { state.terminalStick = terminalOutput.scrollHeight - terminalOutput.scrollTop - terminalOutput.clientHeight < 40; }, { passive: true });
+if ('ResizeObserver' in window) new ResizeObserver(() => reportTerminalViewport()).observe(terminalOutput);
+$('#terminal-wrap').addEventListener('click', () => { state.terminalWrap = !state.terminalWrap; renderTerminal(); reportTerminalViewport(); });
+$('#terminal-refresh').addEventListener('click', () => { void terminal.refresh(); });
+$('#terminal-targets').addEventListener('keydown', (event) => {
+  const step = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 }[event.key]; if (!step) return;
+  event.preventDefault();
+  const index = TERMINAL_TARGETS.findIndex(({ id }) => id === terminal.state.target);
+  const next = TERMINAL_TARGETS[(index + step + TERMINAL_TARGETS.length) % TERMINAL_TARGETS.length];
+  selectTerminalTarget(next.id); $(`.terminal-target[data-target="${next.id}"]`)?.focus();
+});
+$('#terminal-form').addEventListener('submit', (event) => { event.preventDefault(); void submitTerminalInput(); });
+terminalInput.addEventListener('input', () => { state.terminalSuggestIndex = -1; autosizeTerminalInput(); renderTerminal(); });
+terminalInput.addEventListener('keydown', (event) => {
+  if (event.isComposing || event.keyCode === 229) return; // IME (中文输入法) owns Enter/arrows
+  const view = terminal.state; const enabled = terminalCanSend(view.target, view.mode);
+  const items = terminalSuggestions(view);
+  if (items.length) {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); const step = event.key === 'ArrowDown' ? 1 : -1; state.terminalSuggestIndex = (state.terminalSuggestIndex + step + items.length + (state.terminalSuggestIndex < 0 && step < 0 ? 1 : 0)) % items.length; renderTerminal(); return; }
+    if (event.key === 'Tab' && !event.shiftKey) { event.preventDefault(); applyTerminalSuggestion(items[Math.max(0, state.terminalSuggestIndex)][0]); return; }
+    if (event.key === 'Enter' && !event.shiftKey && state.terminalSuggestIndex >= 0) { event.preventDefault(); applyTerminalSuggestion(items[state.terminalSuggestIndex][0]); return; }
+    if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); terminalInput.value = ''; state.terminalSuggestIndex = -1; renderTerminal(); return; }
+  }
+  if (!enabled) return;
+  // Sticky CTRL from the keybar + a typed letter → C-x (whitelisted names only).
+  if (state.terminalCtrl && event.key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey) {
+    event.preventDefault(); const key = ctrlLetterKey(event.key); state.terminalCtrl = false;
+    if (key) void terminal.sendKey(key); else setTerminalNotice(`Ctrl+${event.key} 服务端不支持，已取消`);
+    renderTerminal(); return;
+  }
+  if (event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey) {
+    event.preventDefault();
+    if (terminalInput.value.trim()) void submitTerminalInput(); else if (!terminalInput.value) void terminal.sendKey('Enter');
+    return;
+  }
+  if (!terminalInput.value) { const key = passthroughKey(event); if (key) { event.preventDefault(); void terminal.sendKey(key); } }
+});
+
 async function loadPlugins({ force = false } = {}) {
   if (state.plugins && !force) { renderPlugins(); return; }
   try { state.plugins = await adapter.listPlugins(); state.pluginsError = false; }
@@ -1084,12 +1214,13 @@ $('#settings-notification-button').addEventListener('click', toggleNotifications
 $('#settings-logout-button').addEventListener('click', logout);
 $('#settings-version').textContent = WEB_SHELL_VERSION;
 homeQuery.addEventListener('change', syncView);
-async function logout() { state.epoch += 1; state.stickerLoadId += 1; state.composerState.cancelAll(); state.stickerUpload.controller?.abort(); state.stickerUpload.uploading = false; closeStickerDialog(); state.stickerCatalog = null; state.stickerLoading = false; state.stickerError = ''; state.stickerSearch = ''; state.stickerCategory = '__all'; state.stickerTargetContactId = ''; try { await adapter.logout(); } finally { state.stopLive?.(); state.stopLive = null; state.stopBackground?.(); state.stopBackground = null; stopTerminalPolling(); state.terminalSnapshots = {}; state.plugins = null; state.pluginsError = false; state.control = {}; state.contacts = []; state.histories = {}; state.live = {}; state.streams = {}; state.pendingCanonical = {}; state.messageNodes.clear(); messages.replaceChildren(); state.composerState = createComposerState(); state.activeContactId = ''; state.view = 'chat'; state.mobileChatOpen = false; state.taxonomy = null; state.selectedScope = null; state.memory = { loading: false, stats: null, segment: 'memories', month: monthKey(), days: {}, selectedDate: '', boardPage: 1, boardLoaded: false }; state.dash = { appearance: { nicknames: {}, avatars: {} }, todos: null, weather: null, weatherFailed: false }; renderAll(); setMemorySegment('memories'); renderMemorySubtitle(); renderPlugins(); syncView(); if (!bootstrap.mock) showLogin(); } }
+async function logout() { state.epoch += 1; state.stickerLoadId += 1; state.composerState.cancelAll(); state.stickerUpload.controller?.abort(); state.stickerUpload.uploading = false; closeStickerDialog(); state.stickerCatalog = null; state.stickerLoading = false; state.stickerError = ''; state.stickerSearch = ''; state.stickerCategory = '__all'; state.stickerTargetContactId = ''; try { await adapter.logout(); } finally { state.stopLive?.(); state.stopLive = null; state.stopBackground?.(); state.stopBackground = null; terminal.clear(); state.terminalNotice = ''; state.plugins = null; state.pluginsError = false; state.control = {}; state.contacts = []; state.histories = {}; state.live = {}; state.streams = {}; state.pendingCanonical = {}; state.messageNodes.clear(); messages.replaceChildren(); state.composerState = createComposerState(); state.activeContactId = ''; state.view = 'chat'; state.mobileChatOpen = false; state.taxonomy = null; state.selectedScope = null; state.memory = { loading: false, stats: null, segment: 'memories', month: monthKey(), days: {}, selectedDate: '', boardPage: 1, boardLoaded: false }; state.dash = { appearance: { nicknames: {}, avatars: {} }, todos: null, weather: null, weatherFailed: false }; renderAll(); setMemorySegment('memories'); renderMemorySubtitle(); renderPlugins(); syncView(); if (!bootstrap.mock) showLogin(); } }
 $('#logout-button').addEventListener('click', logout); $('#drawer-logout-button').addEventListener('click', logout);
 $('#appearance-button').addEventListener('click', cycleAppearance); $('#drawer-appearance-button').addEventListener('click', cycleAppearance);
 $('#notification-button').addEventListener('click', toggleNotifications);
-document.addEventListener('visibilitychange', () => { if (document.visibilityState !== 'hidden') markActiveSeen(); });
-window.addEventListener('keydown', (event) => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); input.focus(); } if (event.altKey && /^[1-9]$/.test(event.key)) { const target = state.contacts[Number(event.key) - 1]; if (target) switchContact(target.id); } if (event.key === 'Escape') { if ($('#sticker-dialog').open) closeStickerDialog({ returnFocus: true }); else if (state.view === 'memory') switchView('chat'); if (document.body.classList.contains('workers-open')) closeWorkers(); } });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState !== 'hidden') markActiveSeen(); if (state.view === 'terminal') { if (document.visibilityState === 'hidden') stopTerminalPolling(); else startTerminalPolling(); } });
+window.addEventListener('online', () => { if (state.view === 'terminal') void terminal.refresh(); });
+window.addEventListener('keydown', (event) => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); (state.view === 'terminal' && !terminalInput.disabled ? terminalInput : input).focus(); } if (event.altKey && /^[1-9]$/.test(event.key)) { const target = state.contacts[Number(event.key) - 1]; if (target) switchContact(target.id); } if (event.key === 'Escape') { if ($('#sticker-dialog').open) closeStickerDialog({ returnFocus: true }); else if (state.view === 'memory') switchView('chat'); if (document.body.classList.contains('workers-open')) closeWorkers(); } });
 window.addEventListener('beforeinstallprompt', (event) => { event.preventDefault(); state.deferredInstall = event; $('#install-button').hidden = false; }); $('#install-button').addEventListener('click', async () => { await state.deferredInstall?.prompt(); state.deferredInstall = null; $('#install-button').hidden = true; });
 workerDrawerQuery.addEventListener('change', syncWorkerPanel); syncWorkerPanel(); document.body.append($('#svg-defs').content.cloneNode(true)); if ('serviceWorker' in navigator) { let swReloaded = false; navigator.serviceWorker.addEventListener('controllerchange', () => { if (swReloaded) return; swReloaded = true; location.reload(); }); window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js')); }
 async function start() {

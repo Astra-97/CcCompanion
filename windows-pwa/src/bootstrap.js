@@ -1,4 +1,4 @@
-import { createHttpAdapter, createMockAdapter } from './api.js?v=33';
+import { createHttpAdapter, createMockAdapter } from './api.js?v=34';
 
 export function isExplicitMockMode(locationLike = globalThis.location, windowLike = globalThis) {
   const query = new URLSearchParams(locationLike?.search || '');

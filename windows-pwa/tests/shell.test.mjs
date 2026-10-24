@@ -113,13 +113,13 @@ test('Android-shell source contracts: four tabs, full pages, view switching, moc
   assert.match(app, /function switchView\(view\)/);
   assert.match(app, /function syncView\(\)/);
   assert.match(app, /startTerminalPolling\(\); else stopTerminalPolling\(\)/, 'terminal polling runs only while the terminal view is active');
-  assert.match(app, /setInterval\(\(\) => \{ void pollTerminalPage\(\); \}, 4_000\)/);
+  assert.match(app, /function startTerminalPolling\(\) \{[^]*?terminal\.start\(\)/, 'the terminal controller polls (1.5s, Android parity) only while started');
   assert.match(app, /adapter\.getMemoryStats\(\)/);
   assert.match(app, /adapter\.getMemoryCalendar\(month\)/);
   assert.match(app, /adapter\.searchMemories\(query, \{ limit: 20 \}\)/);
   assert.match(app, /adapter\.getMemoryBoard\(\{ page, perPage: 20 \}\)/);
   assert.match(app, /adapter\.listPlugins\(\)/);
-  assert.match(app, /WEB_SHELL_VERSION = 'desk-v33 · 2026-10-24'/);
+  assert.match(app, /WEB_SHELL_VERSION = 'desk-v34 · 2026-10-24'/);
   const mockHook = app.slice(app.indexOf('if (bootstrap.mock)'));
   assert.match(mockHook, /params\.get\('view'\)/, 'the deep-link hook stays mock-gated');
   assert.match(css, /\.tab-bar\{[^}]*display:none/, 'the bottom tab bar is phone-only');
@@ -130,7 +130,7 @@ test('Android-shell source contracts: four tabs, full pages, view switching, moc
   assert.match(css, /\.calendar-day\.has-entries\{background:linear-gradient/);
   assert.match(css, /\.calendar-weekdays,\.calendar-grid\{display:grid;grid-template-columns:repeat\(7,1fr\)/);
   assert.match(css, /\.side-notes\.view-hidden\{display:none\}/);
-  assert.match(sw, /src\/memory-calendar\.js\?v=33/);
+  assert.match(sw, /src\/memory-calendar\.js\?v=34/);
 });
 
 test('home dashboard helpers: deterministic greeting, clock text, Monday-first week strip', () => {
@@ -185,10 +185,10 @@ test('visual parity pass 2: dashboard cards, sans-only typography, transparent g
   for (const id of ['dash-clock-time', 'dash-clock-date', 'dash-quote-eyebrow', 'dash-quote-title', 'dash-quote-sub', 'dash-week-title', 'dash-week-days', 'dash-todo-card', 'dash-full-calendar', 'contact-avatar', 'contact-status']) {
     assert.match(html, new RegExp(`id="${id}"`), id);
   }
-  assert.match(app, /from '\.\/home-dashboard\.js\?v=33'/);
+  assert.match(app, /from '\.\/home-dashboard\.js\?v=34'/);
   assert.match(app, /function renderDashboard\(\)/);
   assert.match(app, /\$\('#dash-full-calendar'\)\.addEventListener\('click', openMemory\)/);
-  assert.match(sw, /src\/home-dashboard\.js\?v=33/);
+  assert.match(sw, /src\/home-dashboard\.js\?v=34/);
   assert.doesNotMatch(css, /--serif/, 'the shell drops serif typography entirely');
   assert.match(css, /\.eyebrow\{[^}]*font:500 10px var\(--sans\);letter-spacing:\.07em/);
   assert.match(css, /--glass:rgba\(24,17,12,\.42\)/);
@@ -318,7 +318,6 @@ test('desktop reskin (>=1200px): nav rail + contacts column + dashboard landing,
   assert.match(css, /\.contact-sub\{display:flex/, 'the header shows the single status line on every shell');
   assert.match(desktop, /\.contact-heading \.avatar\.contact-avatar\{width:44px/, 'desktop keeps the larger 44px header avatar');
   assert.doesNotMatch(html, /id="contact-mode"/, 'the KIMI-WEB-style eyebrow above the contact name is gone');
-  assert.match(desktop, /\.terminal-page-list\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)\}/, 'terminal cards go two-column on wide screens');
   assert.match(desktop, /#memory-browse,#memory-board\{max-width:880px;margin-inline:auto\}/, 'memory page content is width-capped and centered');
   assert.match(css, /body\{[^]*?url\('\/plugins\/xiaonan-dash\/appearance-asset'\)/, 'the wallpaper channel backs the desktop glass too');
 });
@@ -362,7 +361,7 @@ test('dashboard real-data wiring: weather chip/line, todo list, icon-keyed head 
   assert.match(html, /id="worker-toggle"[^>]*aria-controls="side-notes"[^>]*aria-expanded="false"[^>]*><svg class="icon"[^>]*><use href="#icon-panel"/, 'worker toggle is an icon button but keeps its drawer contract');
   assert.match(html, /id="memory-button"[^>]*><svg class="icon"[^>]*><use href="#icon-atlas"/);
   assert.doesNotMatch(html, /现场 <span aria-hidden="true">↗/, 'text buttons with arrows are gone from the head');
-  assert.match(app, /import \{ clockText, greetingFor, todoFeed, weekStrip \} from '\.\/home-dashboard\.js\?v=33'/);
+  assert.match(app, /import \{ clockText, greetingFor, todoFeed, weekStrip \} from '\.\/home-dashboard\.js\?v=34'/);
   assert.match(app, /state\.dash = \{ appearance: \{ nicknames: \{\}, avatars: \{\} \}, todos: null, weather: null, weatherFailed: false \}/, 'logout resets the dashboard channel');
   assert.match(app, /adapter\.getTodos\(\)/);
   assert.match(app, /adapter\.getDashAppearance\(\)/);

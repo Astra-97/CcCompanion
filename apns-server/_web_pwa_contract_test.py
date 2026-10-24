@@ -17,6 +17,7 @@ import types
 import unittest
 from http.client import parse_headers
 from pathlib import Path
+from unittest import mock
 from unittest.mock import patch
 
 from push import (
@@ -486,10 +487,14 @@ class WebPwaContractTest(unittest.TestCase):
     def test_web_cookie_allowlist_rejects_terminal_codex_admin_and_uploads(self):
         store = WebSessionStore(300)
         token, _ = store.create()
-        handler = self.handler("/tmux/capture?session=kairos")
+        # 2026-10-24：PWA 终端只放行四个固定身份（WebPwaTerminalGateTest），
+        # 任意 tmux 会话名仍拒。
+        handler = self.handler("/tmux/capture?session=scratch")
         handler.headers = {"Cookie": f"__Host-cccompanion={token}"}
         handler.state = types.SimpleNamespace(web_session_enabled=True, web_sessions=store)
         self.assertFalse(handler._web_session_matches())
+        handler.path = "/tmux/capture?session=kairos"
+        self.assertTrue(handler._web_session_matches())
         for path in (
             "/tmux/sessions", "/uploads/private.bin",
             "/admin/rotate-secret", "/tokens",
@@ -497,7 +502,7 @@ class WebPwaContractTest(unittest.TestCase):
             handler.path = path
             handler.command = "GET"
             self.assertFalse(handler._web_session_matches(), path)
-        for path in ("/terminal/key", "/tmux/send", "/codex/forge", "/codex/switch"):
+        for path in ("/tmux/kill", "/terminal/kill", "/codex/forge", "/codex/switch"):
             handler.path = path
             handler.command = "POST"
             self.assertFalse(handler._web_session_matches(), path)
@@ -1472,6 +1477,150 @@ class WebPwaContractTest(unittest.TestCase):
             handler._handle_windows_pwa_asset(f"/web/pwa/{asset_path}")
             self.assertEqual(handler.responses, [], f"{asset} must be servable, got {handler.responses}")
             self.assertGreater(len(handler.wfile.getvalue()), 0, f"{asset} must serve bytes")
+
+
+class WebPwaTerminalGateTest(unittest.TestCase):
+    """2026-10-24：PWA 终端 tab 与安卓 TerminalScreen 对齐的最小 cookie 开口。
+
+    cookie 只能触达五条终端路由、四个固定身份；写动作必须 origin+CSRF；
+    任意 tmux 会话名、物理 pane、/tmux/sessions 仍只对 native pairing 开放。
+    """
+
+    ORIGIN = "https://pwa.example"
+
+    def setUp(self):
+        self.sessions = WebSessionStore(300)
+        self.token, _ = self.sessions.create()
+        self.csrf = self.sessions.csrf_token(self.token)
+
+    def state(self, **overrides):
+        values = dict(
+            web_session_enabled=True,
+            web_sessions=self.sessions,
+            shared_secret="native-only",
+            strict_auth=True,
+            allow_remote_control=True,
+            public_server_url=self.ORIGIN,
+            allowed_ips=[],
+        )
+        values.update(overrides)
+        return types.SimpleNamespace(**values)
+
+    def handler(self, path, method="GET", *, headers=None, body=None):
+        handler = object.__new__(PushHandler)
+        handler.path = path
+        handler.command = method
+        handler.headers = dict(headers or {})
+        handler.client_address = ("127.0.0.1", 1)
+        handler.state = self.state()
+        handler.responses = []
+        handler._send_json = lambda status, payload, **kwargs: handler.responses.append((status, payload))
+        handler._check_ip_allowed = lambda: True
+        handler._read_body = mock.Mock(return_value=body if body is not None else {})
+        for name in (
+            "_handle_tmux_capture", "_handle_tmux_sessions", "_handle_tmux_send",
+            "_handle_terminal_key", "_handle_terminal_resize", "_handle_terminal_release",
+        ):
+            setattr(handler, name, mock.Mock())
+        return handler
+
+    def cookie(self, *, csrf=True, origin=True):
+        headers = {"Cookie": f"__Host-cccompanion={self.token}"}
+        if csrf:
+            headers["X-CC-Web-CSRF"] = self.csrf
+        if origin:
+            headers["Origin"] = self.ORIGIN
+        return headers
+
+    def test_cookie_capture_reaches_only_the_four_android_targets(self):
+        for session in ("cctg", "kairos", "kimi", "kiro"):
+            with self.subTest(session=session):
+                handler = self.handler(f"/tmux/capture?session={session}&lines=120", headers=self.cookie())
+                handler.do_GET()
+                handler._handle_tmux_capture.assert_called_once_with()
+                self.assertEqual(handler.responses, [])
+
+    def test_cookie_capture_rejects_arbitrary_or_ambiguous_sessions(self):
+        for query in (
+            "session=other", "session=ccc-kimi-terminal", "session=CCTG", "session=cctg%3A0.0",
+            "", "session=cctg&session=other", "session=",
+        ):
+            with self.subTest(query=query):
+                handler = self.handler(f"/tmux/capture?{query}", headers=self.cookie())
+                handler.do_GET()
+                handler._handle_tmux_capture.assert_not_called()
+                self.assertEqual(handler.responses[-1][0], 401)
+
+    def test_cookie_still_cannot_list_tmux_sessions(self):
+        handler = self.handler("/tmux/sessions", headers=self.cookie())
+        handler.do_GET()
+        handler._handle_tmux_sessions.assert_not_called()
+        self.assertEqual(handler.responses[-1][0], 401)
+
+    def test_expired_or_missing_cookie_cannot_capture(self):
+        self.sessions.revoke(self.token)
+        handler = self.handler("/tmux/capture?session=cctg", headers=self.cookie())
+        handler.do_GET()
+        handler._handle_tmux_capture.assert_not_called()
+        self.assertEqual(handler.responses[-1][0], 401)
+
+    def test_cookie_terminal_writes_reach_fixed_targets_with_csrf(self):
+        cases = (
+            ("/tmux/send", {"session": "cctg", "keys": "hi", "enter": True}, "_handle_tmux_send"),
+            ("/tmux/send", {"session": "kimi", "keys": "hi"}, "_handle_tmux_send"),
+            ("/terminal/key", {"session": "kairos", "key": "Escape"}, "_handle_terminal_key"),
+            ("/terminal/resize", {"session": "kiro", "columns": 100, "rows": 30}, "_handle_terminal_resize"),
+            ("/terminal/release", {"target": "kairos"}, "_handle_terminal_release"),
+        )
+        for path, body, method in cases:
+            with self.subTest(path=path, body=body):
+                handler = self.handler(path, "POST", headers=self.cookie(), body=body)
+                handler.do_POST()
+                getattr(handler, method).assert_called_once_with(body)
+
+    def test_cookie_terminal_writes_require_origin_and_csrf_before_body(self):
+        for headers in (self.cookie(csrf=False), self.cookie(origin=False)):
+            with self.subTest(headers=sorted(headers)):
+                handler = self.handler("/tmux/send", "POST", headers=headers, body={"session": "cctg", "keys": "x"})
+                handler.do_POST()
+                self.assertEqual(handler.responses[-1], (403, {"error": "web_session_csrf_forbidden"}))
+                handler._read_body.assert_not_called()
+                handler._handle_tmux_send.assert_not_called()
+
+    def test_cookie_terminal_writes_reject_unlisted_or_implicit_targets(self):
+        cases = (
+            ("/tmux/send", {"keys": "x"}),  # native would default to active_session
+            ("/tmux/send", {"session": "other", "keys": "x"}),
+            ("/tmux/send", {"session": "ccc-kimi-terminal", "keys": "x"}),
+            ("/terminal/key", {"session": "cctg:1", "key": "Enter"}),
+            ("/terminal/resize", {"session": ["cctg"], "columns": 80, "rows": 24}),
+            ("/terminal/release", {"target": "cctg"}),
+            ("/terminal/release", {"target": "kimi", "lease": "a" * 43}),  # never SIGTERM a Kimi turn from the web
+            ("/terminal/release", {"target": "kiro"}),
+            ("/terminal/release", {}),
+        )
+        for path, body in cases:
+            with self.subTest(path=path, body=body):
+                handler = self.handler(path, "POST", headers=self.cookie(), body=body)
+                handler.do_POST()
+                self.assertEqual(handler.responses[-1], (403, {"error": "web_terminal_target_forbidden"}))
+                for name in ("_handle_tmux_send", "_handle_terminal_key", "_handle_terminal_resize", "_handle_terminal_release"):
+                    getattr(handler, name).assert_not_called()
+
+    def test_cookie_without_session_cannot_write_terminal(self):
+        handler = self.handler("/terminal/key", "POST", headers={"Origin": self.ORIGIN}, body={"session": "cctg", "key": "Enter"})
+        handler.do_POST()
+        self.assertEqual(handler.responses[-1][0], 401)
+        handler._read_body.assert_not_called()
+        handler._handle_terminal_key.assert_not_called()
+
+    def test_native_secret_terminal_contract_is_unchanged(self):
+        handler = self.handler("/tmux/send", "POST", headers={"X-Auth-Token": "native-only"}, body={"session": "scratch", "keys": "x"})
+        handler.do_POST()
+        handler._handle_tmux_send.assert_called_once_with({"session": "scratch", "keys": "x"})
+        capture = self.handler("/tmux/capture?session=scratch", headers={"X-Auth-Token": "native-only"})
+        capture.do_GET()
+        capture._handle_tmux_capture.assert_called_once_with()
 
 
 if __name__ == "__main__":

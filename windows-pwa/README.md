@@ -23,6 +23,7 @@ At `/web/pwa/`, `src/bootstrap.js` first checks `GET /web/session`. A failed che
 | Dynamic memory taxonomy | `getTaxonomy()` | `GET /memory/taxonomy` → `{categories:[{key,label,subcategories:[]}]}` |
 | Memory list | `listMemories(scope)` | `GET /memory/list?category=…&subcategory=…` |
 | Upload | `uploadAttachments(contactId, files)` | Raw bytes to `POST /chat/upload?contact_id=…&filename=…`; stages `{attachment_id,…}` only, then one `/chat/send` consumes those IDs. `/chat/upload/cancel` removes staged pre-send files. `/web/session` advertises the current per-file, count, and pending-total-byte limits; the client preflights those dynamic values (safe total fallback: 64 MiB). |
+| Interactive terminal tab (Android `TerminalScreen` parity) | `getTerminalCapture` / `sendTerminalText` / `sendTerminalKey` / `resizeTerminal` / `releaseTerminal` (driven by `src/terminal.js`) | `GET /tmux/capture?session=…&lines=…` polled every 1.5s while the tab is visible; `POST /tmux/send {session,keys}`, `/terminal/key {session,key}`, `/terminal/resize` (Kimi/Kiro only), `/terminal/release {target:'kairos'}`. The cookie may only name `cctg`/`kairos`/`kimi`/`kiro` (server `WEB_TERMINAL_*`); writes carry CSRF. |
 
 `subscribe(listener, {contactId})` delivers contact-scoped SSE deltas, connection state, and polling snapshots. It closes/aborts cleanly on a contact switch, hidden tab, offline event, or logout; state must never cross Xiaoke/Kairos histories, drafts, busy flags, or stop fences.
 

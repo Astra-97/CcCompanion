@@ -513,6 +513,19 @@ WEB_CONTROL_POST_PATHS = frozenset({
     "/kimi/preferences", "/kiro/preferences",
 })
 
+# 2026-10-24 Astra 批准（「桌面版终端和手机 app 一个功能，完全终端，可以发消息」）：
+# PWA 终端 tab 与安卓 TerminalScreen 对齐。网页 cookie 只触达安卓终端用到的
+# 这五条路由，且目标只能是安卓 TerminalTarget 的四个固定身份（小克 cctg /
+# kairos / kimi / kiro）——任意 tmux 会话名、物理 pane、/tmux/sessions 仍只对
+# native pairing 开放。写动作照常过 _require_write_auth 的 origin+CSRF。
+WEB_TERMINAL_GET_PATH = "/tmux/capture"
+WEB_TERMINAL_POST_PATHS = frozenset({
+    "/tmux/send", "/terminal/key", "/terminal/resize", "/terminal/release",
+})
+WEB_TERMINAL_SESSIONS = frozenset({"cctg", "kairos", "kimi", "kiro"})
+# 释放只对 Kairos 控制台（安卓离开终端时的唯一 release）；Kimi/Kiro 只 detach。
+WEB_TERMINAL_RELEASE_TARGETS = frozenset({"kairos"})
+
 
 class WebSessionStore:
     """Small in-memory store for same-origin PWA sessions.
@@ -5984,6 +5997,9 @@ class PushHandler(BaseHTTPRequestHandler):
             # 前缀闸与通用 auth 之前另有 WEB_CONTROL_* 逐路径登记）。
             *WEB_CONTROL_GET_PATHS,
         }
+        # 2026-10-24：终端 capture 只放行四个固定身份（见 WEB_TERMINAL_*）。
+        if method in {"GET", "HEAD"} and path == WEB_TERMINAL_GET_PATH:
+            return self._web_terminal_capture_target_allowed()
         # /appearance-assets/<flat> 由 handler 自带扁平文件名+防穿越校验，
         # 与 /attachments/<flat> 同级；用于网页端联系人头像。
         get_prefixes = ("/memory/", "/plugins/", "/appearance-assets/")
@@ -5992,6 +6008,9 @@ class PushHandler(BaseHTTPRequestHandler):
             "/stickers/upload",
             # 控制面板写门：仅切模型/effort 的 preferences POST（逐个登记）。
             *WEB_CONTROL_POST_PATHS,
+            # 终端写门（2026-10-24）：目标身份在读 body 后由
+            # _web_terminal_body_allowed 再收窄到四个固定身份。
+            *WEB_TERMINAL_POST_PATHS,
         }
         if method in {"GET", "HEAD"}:
             return (
@@ -6002,6 +6021,34 @@ class PushHandler(BaseHTTPRequestHandler):
         if method == "POST":
             return path in post_exact
         return False
+
+    def _web_terminal_capture_target_allowed(self) -> bool:
+        """PWA capture may name only one of the four Android terminal targets."""
+        from urllib.parse import urlparse, parse_qs
+
+        values = parse_qs(urlparse(self.path).query).get("session", [])
+        return len(values) == 1 and values[0] in WEB_TERMINAL_SESSIONS
+
+    def _web_terminal_session_matches(self) -> bool:
+        """Cookie-only terminal access (no shared secret), gated per route."""
+        if getattr(self, "state", None) is None:
+            return False
+        return self._web_session_matches(require_allowed_route=True)
+
+    @staticmethod
+    def _web_terminal_body_allowed(path: str, body: Any) -> bool:
+        """After the body is parsed: a PWA terminal write targets a fixed identity.
+
+        The native protocol defaults a missing session to the active/default
+        tmux session; the browser must always name it explicitly instead.
+        """
+        if not isinstance(body, dict):
+            return False
+        if path == "/terminal/release":
+            target = body.get("target")
+            return isinstance(target, str) and target in WEB_TERMINAL_RELEASE_TARGETS
+        session = body.get("session")
+        return isinstance(session, str) and session in WEB_TERMINAL_SESSIONS
 
     def _pwa_attachment_request_allowed(self) -> bool:
         """Permit a browser session to fetch one already-rendered flat file."""
@@ -7817,7 +7864,13 @@ class PushHandler(BaseHTTPRequestHandler):
         # reject before generic optional auth or bridge construction.
         if request_path == "/tmux/capture":
             requested = parse_qs(urlparse(self.path).query).get("session", [""])[0]
-            if str(requested).strip().lower() in {KIMI_TERMINAL_ALIAS, KIRO_TERMINAL_ALIAS} and not self._native_pairing_auth_matches():
+            # 2026-10-24：PWA cookie 只在 session 恰为四个固定身份之一时放行
+            # （_web_session_route_allowed → _web_terminal_capture_target_allowed）。
+            if (
+                str(requested).strip().lower() in {KIMI_TERMINAL_ALIAS, KIRO_TERMINAL_ALIAS}
+                and not self._native_pairing_auth_matches()
+                and not self._web_terminal_session_matches()
+            ):
                 self._send_json(401, {"error": "unauthorized"})
                 return
         if request_path in {self._MEMORY_SYNC_PATH, self._MEMORY_DATE_SYNC_PATH}:
@@ -8516,7 +8569,13 @@ class PushHandler(BaseHTTPRequestHandler):
         # session/target lives in the JSON body for these routes. Fail closed
         # for the whole terminal mutation surface before reading it; otherwise
         # strict_auth=false would let an unauthenticated request reach Kimi.
-        if request_path in {"/terminal/key", "/terminal/resize", "/tmux/send", "/terminal/release"} and not self._native_pairing_auth_matches():
+        # 2026-10-24：PWA cookie 也可进入（WEB_TERMINAL_POST_PATHS 逐条登记），
+        # 随后 _require_write_auth 强制 origin+CSRF，读 body 后再收窄目标身份。
+        if (
+            request_path in {"/terminal/key", "/terminal/resize", "/tmux/send", "/terminal/release"}
+            and not self._native_pairing_auth_matches()
+            and not self._web_terminal_session_matches()
+        ):
             self._send_json(401, {"error": "unauthorized"})
             return
         if request_path == "/tampon-records/action":
@@ -8813,6 +8872,15 @@ class PushHandler(BaseHTTPRequestHandler):
             body = self._read_body()
         except Exception as e:
             self._send_json(400, {"error": f"bad json: {e}"})
+            return
+
+        if (
+            request_path in WEB_TERMINAL_POST_PATHS
+            and not self._native_pairing_auth_matches()
+            and not self._web_terminal_body_allowed(request_path, body)
+        ):
+            # Cookie callers only reach the four fixed Android terminal targets.
+            self._send_json(403, {"error": "web_terminal_target_forbidden"})
             return
 
         if self.path == "/register-token":

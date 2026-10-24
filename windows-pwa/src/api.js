@@ -1,6 +1,6 @@
-import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY, MOCK_MEMORY_STATS, MOCK_MEMORY_CALENDAR_ENTRIES, MOCK_MEMORY_BOARD, MOCK_MEMORY_SEARCH, MOCK_PLUGINS, MOCK_TODOS, MOCK_WEATHER, MOCK_APPEARANCE, MOCK_CONTROL } from './data.js?v=33';
-import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=33';
-import { normalizeStickerCatalog } from './sticker-protocol.js?v=33';
+import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY, MOCK_MEMORY_STATS, MOCK_MEMORY_CALENDAR_ENTRIES, MOCK_MEMORY_BOARD, MOCK_MEMORY_SEARCH, MOCK_PLUGINS, MOCK_TODOS, MOCK_WEATHER, MOCK_APPEARANCE, MOCK_CONTROL } from './data.js?v=34';
+import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=34';
+import { normalizeStickerCatalog } from './sticker-protocol.js?v=34';
 
 const clone = (value) => structuredClone(value);
 const now = () => new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
@@ -519,6 +519,17 @@ export function createHttpAdapter({ baseUrl = '', request = defaultRequest, uplo
       const status = await call(url(`/chat/status?contact_id=${encodeURIComponent(contactId)}`), { signal });
       return normalizeLiveState(status);
     },
+    // Interactive terminal (Android TerminalViewModel parity, 2026-10-24).
+    // Same cookie + CSRF as every other write; the server pins the session to
+    // the four fixed targets for browser callers.
+    async getTerminalCapture(session, { lines = 200, signal } = {}) {
+      const query = new URLSearchParams({ session: String(session), lines: String(lines) });
+      return call(url(`/tmux/capture?${query}`), { signal });
+    },
+    async sendTerminalText(session, text) { return call(url('/tmux/send'), { method: 'POST', body: { session: String(session), keys: String(text) } }); },
+    async sendTerminalKey(session, key) { return call(url('/terminal/key'), { method: 'POST', body: { session: String(session), key: String(key) } }); },
+    async resizeTerminal(session, columns, rows) { return call(url('/terminal/resize'), { method: 'POST', body: { session: String(session), columns, rows } }); },
+    async releaseTerminal(target) { return call(url('/terminal/release'), { method: 'POST', body: { target: String(target) } }); },
     async sendMessage(contactId, { text, attachmentIds = [] }) {
       const body = { contact_id: contactId, text, ...(attachmentIds.length ? { attachment_ids: attachmentIds } : {}) };
       const result = await call(url('/chat/send'), { method: 'POST', body });
@@ -752,6 +763,8 @@ async function defaultRequest(path, options = {}) {
   if (!response.ok) {
     const error = new Error(`Request failed: ${response.status}`);
     error.status = response.status;
+    // Keep the server's short JSON reason (e.g. terminal 423/503 detail).
+    try { error.payload = await response.json(); } catch { error.payload = null; }
     throw error;
   }
   return response.json();
@@ -760,6 +773,7 @@ async function defaultRequest(path, options = {}) {
 export function createMockAdapter() {
   const histories = clone(INITIAL_CONVERSATIONS);
   const states = Object.fromEntries(MOCK_CONTACTS.map(({ id }) => [id, normalizeLiveState()]));
+  const terminals = {};
   const listeners = new Set();
   const timers = new Map();
   const emit = (event) => listeners.forEach((listener) => listener(event));
@@ -773,6 +787,15 @@ export function createMockAdapter() {
     async contacts() { return clone(MOCK_CONTACTS); },
     async getHistory(contactId) { return clone(histories[contactId] || []); },
     async getLiveState(contactId) { return clone(states[contactId] || normalizeLiveState()); },
+    // Offline terminal fixture: an echoing shell per fixed target.
+    async getTerminalCapture(session) {
+      terminals[session] ??= [`$ ${session} · mock terminal`, '> 准备好了'];
+      return { ok: true, session, content: terminals[session].slice(-200).join('\n') + '\n', state: 'ready' };
+    },
+    async sendTerminalText(session, text) { (terminals[session] ??= []).push(`> ${text}`, `echo: ${text}`); return { ok: true }; },
+    async sendTerminalKey(session, key) { (terminals[session] ??= []).push(`[${key}]`); return { ok: true, key }; },
+    async resizeTerminal(session, columns, rows) { return { ok: true, session, columns, rows }; },
+    async releaseTerminal(target) { return { ok: true, target, released: true }; },
     async sendMessage(contactId, { text, attachmentIds = [] }) {
       const message = { id: crypto.randomUUID(), role: 'user', body: text, attachments: attachmentIds.map((attachment_id) => ({ name: attachment_id })), time: now() };
       histories[contactId].push(message); emit({ type: 'message', contactId, message: clone(message) });
