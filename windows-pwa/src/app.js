@@ -1,17 +1,17 @@
-import { createPwaBootstrap } from './bootstrap.js?v=31';
-import { createComposerState } from './composer-state.js?v=31';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=31';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=31';
-import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord, controlPanelSupported } from './api.js?v=31';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=31';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=31';
-import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=31';
-import { createUnreadStore, latestChatRecord, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=31';
-import { createNotifier } from './notifications.js?v=31';
-import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=31';
-import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=31';
+import { createPwaBootstrap } from './bootstrap.js?v=32';
+import { createComposerState } from './composer-state.js?v=32';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=32';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=32';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord, controlPanelSupported } from './api.js?v=32';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=32';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=32';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=32';
+import { createUnreadStore, latestChatRecord, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=32';
+import { createNotifier } from './notifications.js?v=32';
+import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=32';
+import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=32';
 
-const WEB_SHELL_VERSION = 'desk-v31 · 2026-10-18';
+const WEB_SHELL_VERSION = 'desk-v32 · 2026-10-24';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {

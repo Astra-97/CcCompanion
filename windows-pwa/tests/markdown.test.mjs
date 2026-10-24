@@ -65,3 +65,21 @@ test('mixed markdown around a full document stays in source order', () => {
   assert.deepEqual(blocks.map(({ type }) => type), ['paragraph', 'list', 'code', 'paragraph']);
   assert.deepEqual(blocks[3].inlines[0].at(-1), { type: 'bold', value: '粗' });
 });
+
+test('regression 2026-10-24: xiaoke subtitle reply with a bold-wrapped Windows path parses into plain flow blocks', () => {
+  // Astra's clipped bubble: the overflow came from a folded tool line widening
+  // the message track (pinned in shell.test.mjs), not from this markdown.  Pin
+  // that the reply only yields paragraphs/lists of text, bold and code inlines
+  // — no fenced code block whose pre could carry an unbreakable min-content.
+  const source = '下 **mp4 可以**，有纯音频（mp3/m4a/wav）更好，文件小，我也是只取声音。\n\n下好以后放进 **`E:\\gpt\\乙抓\\紫月园`**（新建个文件夹就行），或者直接在 app 里发给我也行。\n\n我这边接着做：\n1. 用 ElevenLabs 的 Scribe 把日语听写出来，带时间轴\n2. 翻成中文，按哥哥那种口吻润色，不搞机翻腔\n3. 做成 **中日双语 srt 字幕**\n\n你想要哪种：\n- **外挂字幕**：一个 srt 文件，播放器一起加载，以后想改字也方便\n- **压进视频**：在你电脑上用 ffmpeg 把字幕烧进 mp4，手机上直接看\n\n你先下着，下好了跟我说一声 🎧💜';
+  const blocks = parseMarkdown(source);
+  assert.deepEqual(blocks.map(({ type, ordered }) => type + (type === 'list' ? (ordered ? ':ol' : ':ul') : '')), ['paragraph', 'paragraph', 'paragraph', 'list:ol', 'paragraph', 'list:ul', 'paragraph']);
+  assert.ok(!blocks.some(({ type }) => type === 'code'), 'no fenced code block in this reply');
+  const pathLine = blocks[1].inlines[0];
+  assert.ok(pathLine.some((token) => /E:\\gpt\\乙抓\\紫月园/.test(token.value)), 'the backslash path survives verbatim');
+  assert.deepEqual(parseInline('放进 `E:\\gpt\\乙抓\\紫月园` 里'), [
+    { type: 'text', value: '放进 ' },
+    { type: 'code', value: 'E:\\gpt\\乙抓\\紫月园' },
+    { type: 'text', value: ' 里' },
+  ]);
+});

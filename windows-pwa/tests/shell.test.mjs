@@ -119,7 +119,7 @@ test('Android-shell source contracts: four tabs, full pages, view switching, moc
   assert.match(app, /adapter\.searchMemories\(query, \{ limit: 20 \}\)/);
   assert.match(app, /adapter\.getMemoryBoard\(\{ page, perPage: 20 \}\)/);
   assert.match(app, /adapter\.listPlugins\(\)/);
-  assert.match(app, /WEB_SHELL_VERSION = 'desk-v31 · 2026-10-18'/);
+  assert.match(app, /WEB_SHELL_VERSION = 'desk-v32 · 2026-10-24'/);
   const mockHook = app.slice(app.indexOf('if (bootstrap.mock)'));
   assert.match(mockHook, /params\.get\('view'\)/, 'the deep-link hook stays mock-gated');
   assert.match(css, /\.tab-bar\{[^}]*display:none/, 'the bottom tab bar is phone-only');
@@ -130,7 +130,7 @@ test('Android-shell source contracts: four tabs, full pages, view switching, moc
   assert.match(css, /\.calendar-day\.has-entries\{background:linear-gradient/);
   assert.match(css, /\.calendar-weekdays,\.calendar-grid\{display:grid;grid-template-columns:repeat\(7,1fr\)/);
   assert.match(css, /\.side-notes\.view-hidden\{display:none\}/);
-  assert.match(sw, /src\/memory-calendar\.js\?v=31/);
+  assert.match(sw, /src\/memory-calendar\.js\?v=32/);
 });
 
 test('home dashboard helpers: deterministic greeting, clock text, Monday-first week strip', () => {
@@ -185,10 +185,10 @@ test('visual parity pass 2: dashboard cards, sans-only typography, transparent g
   for (const id of ['dash-clock-time', 'dash-clock-date', 'dash-quote-eyebrow', 'dash-quote-title', 'dash-quote-sub', 'dash-week-title', 'dash-week-days', 'dash-todo-card', 'dash-full-calendar', 'contact-avatar', 'contact-status']) {
     assert.match(html, new RegExp(`id="${id}"`), id);
   }
-  assert.match(app, /from '\.\/home-dashboard\.js\?v=31'/);
+  assert.match(app, /from '\.\/home-dashboard\.js\?v=32'/);
   assert.match(app, /function renderDashboard\(\)/);
   assert.match(app, /\$\('#dash-full-calendar'\)\.addEventListener\('click', openMemory\)/);
-  assert.match(sw, /src\/home-dashboard\.js\?v=31/);
+  assert.match(sw, /src\/home-dashboard\.js\?v=32/);
   assert.doesNotMatch(css, /--serif/, 'the shell drops serif typography entirely');
   assert.match(css, /\.eyebrow\{[^}]*font:500 10px var\(--sans\);letter-spacing:\.07em/);
   assert.match(css, /--glass:rgba\(24,17,12,\.42\)/);
@@ -249,6 +249,16 @@ test('v28 Android skin alignment: no contact LEDs, message avatars, time-only me
   // internally instead of growing a horizontal scrollbar on the message
   // column (CDP-located 2026-10-18: .message-stack child min-width:auto).
   assert.match(css, /\.message-stack>\*\{min-width:0;max-width:100%\}/, 'message column children are capped at the track width');
+  // Regression 2026-10-24 (Astra screenshot, xiaoke 14:27 subtitle reply): a
+  // folded tool line holding a 100-char attachment path is a nowrap grid item
+  // of .messages; with min-width:auto its min-content (713px) widened the one
+  // auto track past the 513px column, every row inherited that width and long
+  // assistant bubbles were clipped behind a horizontal scrollbar.  Every row
+  // must shrink to the track so the tool line ellipsizes instead.
+  assert.match(css, /\.messages>\*\{min-width:0\}/, 'message rows (incl. folded tool lines) never widen the message track');
+  assert.doesNotMatch(css, /\.tool-run\{[^}]*min-width:(?!0)/, 'the folded tool line never pins a content-based minimum width');
+  assert.match(css, /\.inline-code\{[^}]*overflow-wrap:anywhere\}/, 'unbroken inline code (Windows paths with backslashes) can wrap inside the bubble');
+  assert.match(css, /\.message-body\{[^}]*overflow-wrap:anywhere/, 'bubble text breaks long runs instead of widening the bubble');
   // Band removal (Astra 2026-10-18): the contacts panel gets a denser tint so
   // the wallpaper's white portrait edge cannot read through it, and the
   // desktop shell carries a blurred veil so panel gaps never show raw wallpaper.
@@ -352,7 +362,7 @@ test('dashboard real-data wiring: weather chip/line, todo list, icon-keyed head 
   assert.match(html, /id="worker-toggle"[^>]*aria-controls="side-notes"[^>]*aria-expanded="false"[^>]*><svg class="icon"[^>]*><use href="#icon-panel"/, 'worker toggle is an icon button but keeps its drawer contract');
   assert.match(html, /id="memory-button"[^>]*><svg class="icon"[^>]*><use href="#icon-atlas"/);
   assert.doesNotMatch(html, /现场 <span aria-hidden="true">↗/, 'text buttons with arrows are gone from the head');
-  assert.match(app, /import \{ clockText, greetingFor, todoFeed, weekStrip \} from '\.\/home-dashboard\.js\?v=31'/);
+  assert.match(app, /import \{ clockText, greetingFor, todoFeed, weekStrip \} from '\.\/home-dashboard\.js\?v=32'/);
   assert.match(app, /state\.dash = \{ appearance: \{ nicknames: \{\}, avatars: \{\} \}, todos: null, weather: null, weatherFailed: false \}/, 'logout resets the dashboard channel');
   assert.match(app, /adapter\.getTodos\(\)/);
   assert.match(app, /adapter\.getDashAppearance\(\)/);
