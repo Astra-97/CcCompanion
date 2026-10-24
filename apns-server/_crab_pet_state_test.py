@@ -116,6 +116,25 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(crab_pet_state.CrabPetStore(self.path).snapshot(), {"state": None, "command": None})
 
 
+class DiagTest(StoreTest):
+    """App v1.9.227 诊断字段 (方小南 10-24「桌宠消失了」): 只收标量, 不认识的类型丢掉。"""
+
+    def test_diag_sanitized(self) -> None:
+        st = self.store.report({
+            "act": "heart", "showing": True,
+            "diag": {"view": True, "attached": True, "shown": False, "x": 12, "alpha": 0.123456,
+                     "nested": {"a": 1}, "list": [1], "s": "x" * 100, 5: "bad-key"},
+        })
+        self.assertEqual(st["diag"], {"view": True, "attached": True, "shown": False, "x": 12,
+                                      "alpha": 0.123, "s": "x" * 64})
+
+    def test_no_diag_keeps_old_shape(self) -> None:
+        st = self.store.report({"act": "heart"})
+        self.assertNotIn("diag", st)
+        st = self.store.report({"act": "heart", "diag": "nope"})
+        self.assertNotIn("diag", st)
+
+
 class CrabPetRouteTest(PetTapBase):
     def setUp(self) -> None:
         super().setUp()

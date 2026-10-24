@@ -83,6 +83,23 @@ def normalize_act(value: Any) -> str | None:
     return key if key in ACT_ZH else None
 
 
+def _clean_diag(raw: Any) -> dict[str, Any]:
+    """App v1.9.227 诊断字段: 只收标量, 最多 16 个键 (窗口是否挂上/可见/坐标/尺寸/悬浮窗权限)。"""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key, value in list(raw.items())[:16]:
+        if not isinstance(key, str) or not key or len(key) > 32:
+            continue
+        if isinstance(value, bool) or value is None:
+            out[key] = value
+        elif isinstance(value, (int, float)):
+            out[key] = round(value, 3) if isinstance(value, float) else value
+        elif isinstance(value, str):
+            out[key] = value[:64]
+    return out
+
+
 def acts_payload() -> list[dict[str, str]]:
     return [{"act": act, "zh": zh} for act, zh in ACTS]
 
@@ -165,6 +182,9 @@ class CrabPetStore:
             "applied_seq": applied_seq,
             "reported_at": now,
         }
+        diag = _clean_diag(body.get("diag"))
+        if diag:
+            state["diag"] = diag
         with self._lock:
             self._data["state"] = state
             command = self._data["command"]

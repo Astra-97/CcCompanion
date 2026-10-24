@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""phone-ctl — 小克操作方小南的真机 (CC Companion App v1.9.227+ 「手机操控」, Shizuku)。
+
+链路: phone-ctl → 本机 CcCompanion 服务 /phone/tasks (任务队列) → 手机 App 前台服务
+长轮询领任务 → Shizuku UserService (uid 2000/shell) 执行 → 回传结果。连接由手机发起,
+换网络 / 走流量都能用; 手机端有总开关 + 分档权限 (查看状态 / 截屏 / 点按输入 / 文件 / Shell),
+没开的档位会直接报「手机端没开 xx 权限」。
+
+用法:
+  phone-ctl status                    手机在不在线 + 电量/亮屏/前台 app/Shizuku/已开权限
+  phone-ctl app                       当前前台 app 包名
+  phone-ctl apps [--all]              已装 app 包名 (默认只列第三方)
+  phone-ctl open <包名>               打开 app
+  phone-ctl key <键名> [--long]       按键: home back recent power enter delete volume_up ...
+  phone-ctl home | back | recent      常用键快捷写法
+  phone-ctl shot [out.jpg] [--max 1280] [--quality 70] [--png] [--full]
+                                      截屏 (默认长边缩到 1280 的 JPEG; --full 原尺寸 PNG)
+  phone-ctl tap X Y                   点按 (物理像素坐标)
+  phone-ctl swipe X1 Y1 X2 Y2 [毫秒]  滑动
+  phone-ctl longpress X Y [毫秒]      长按
+  phone-ctl text "你好" [--enter] [--mode auto|input|paste]
+                                      输入文字 (ASCII 走 input text; 中文/换行走剪贴板+粘贴)
+  phone-ctl push <本地文件> [手机路径] [--overwrite]
+                                      传文件到手机 (默认 /sdcard/Download/; 以 / 结尾当目录)
+                                      断点续传 + 大小/sha256 校验 + 失败自动重试 (手机端做)
+  phone-ctl pull <手机路径> [本地路径] 从手机拉文件回来 (≤128MB)
+  phone-ctl ls [手机路径]             列目录 (默认 /sdcard)
+  phone-ctl stat <手机路径>           文件大小/时间
+  phone-ctl sh "<命令>" [--timeout 秒] 通用 shell (uid 2000; 手机端 Shell 档默认关闭)
+  phone-ctl tasks                     最近任务
+  phone-ctl cancel <任务id>
+  通用参数: --json 输出原始 JSON; --wait 秒 (等结果的最长时间)
+
+鉴权 X-Auth-Token = config.toml shared_secret (只在进程内读取, 不打印)。
+/phone/tasks 只接受本机 (127.0.0.1 直连) 投递。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+CONFIG = Path(os.environ.get("CC_COMPANION_CONFIG", "/root/CcCompanion/apns-server/config.toml"))
+TIER_ZH = {"status": "查看状态", "screen": "截屏", "input": "点按输入", "files": "文件", "shell": "Shell"}
+SHIZUKU_ZH = {
+    "ready": "就绪",
+    "not_installed": "没装 Shizuku",
+    "not_running": "Shizuku 没在运行（手机重启后要在 Shizuku 里用无线调试重新启动）",
+    "no_permission": "Shizuku 在跑，但还没给 CC Companion 授权",
+    "binding": "正在连接 Shizuku 服务",
+    "service_error": "Shizuku 服务连接失败",
+}
+
+
+class CtlError(Exception):
+    pass
+
+
+def _config() -> tuple[str, str]:
+    base = os.environ.get("PHONE_CTL_BASE", "").rstrip("/")
+    secret = os.environ.get("PHONE_CTL_SECRET", "")
+    if base and secret:
+        return base, secret
+    text = CONFIG.read_text(encoding="utf-8")
+    port = 8291
+    section = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("["):
+            section = line
+            continue
+        m = re.match(r'^shared_secret\s*=\s*"(.*)"\s*$', line)
+        if m and not secret:
+            secret = m.group(1)
+        m = re.match(r"^port\s*=\s*(\d+)\s*$", line)
+        if m and section == "[server]":
+            port = int(m.group(1))
+    if not secret:
+        raise CtlError("config.toml 里没有 shared_secret")
+    return base or f"http://127.0.0.1:{port}", secret
+
+
+def _request(method: str, path: str, body: dict | None = None, *, timeout: float = 30,
+             raw: bool = False):
+    base, secret = _config()
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(base + path, data=data, method=method)
+    req.add_header("X-Auth-Token", secret)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = resp.read()
+            if raw:
+                return payload, resp.headers.get("Content-Type", "")
+            return json.loads(payload.decode("utf-8")) if payload else {}
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            err = {"ok": False, "error": f"HTTP {e.code}"}
+        msg = err.get("message") or err.get("error") or f"HTTP {e.code}"
+        raise CtlError(f"{msg} (HTTP {e.code})") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise CtlError(f"连不上 CcCompanion 服务: {e}") from None
+
+
+def run_task(action: str, args: dict | None = None, *, wait: float = 90, timeout_s: int | None = None,
+             on_progress=None) -> dict:
+    """投递任务并等结果; 返回终态 task dict (status=done 才算成功)。"""
+    body: dict = {"action": action, "args": args or {}}
+    if timeout_s is not None:
+        body["timeout_s"] = timeout_s
+    task = _request("POST", "/phone/tasks", body)["task"]
+    device = task.get("device") or {}
+    if not device.get("online"):
+        ago = device.get("seconds_ago")
+        hint = "从没来过" if ago is None else f"上次来是 {ago} 秒前"
+        print(f"phone-ctl: 手机现在好像不在线（{hint}），先排队等 {task.get('timeout_s')} 秒内领取…",
+              file=sys.stderr)
+    task_id = task["id"]
+    deadline = time.monotonic() + wait
+    last_progress = None
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CtlError(f"等了 {int(wait)} 秒还没结果（任务 {task_id} 仍是 {task['status']}）")
+            step = min(remaining, 20 if on_progress is None else 2)
+            task = _request("GET", f"/phone/tasks/{task_id}?wait={step:.1f}", timeout=step + 15)["task"]
+            if on_progress and task.get("progress") and task["progress"] != last_progress:
+                last_progress = task["progress"]
+                on_progress(last_progress)
+            if task["status"] in ("done", "failed", "timeout", "cancelled"):
+                return task
+    except KeyboardInterrupt:
+        try:
+            _request("POST", f"/phone/tasks/{task_id}/cancel", {})
+            print("\nphone-ctl: 已取消", file=sys.stderr)
+        except CtlError:
+            pass
+        raise SystemExit(130)
+
+
+def ensure_done(task: dict) -> dict:
+    if task["status"] != "done":
+        msg = task.get("message") or task.get("error") or task["status"]
+        raise CtlError(f"{msg}（{task['status']}: {task.get('error')}）")
+    return task.get("result") or {}
+
+
+def _fmt_size(n: int | None) -> str:
+    if n is None:
+        return "?"
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{n}B"
+
+
+def _out(args, data, text: str) -> None:
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=1))
+    else:
+        print(text)
+
+
+# ── 子命令 ────────────────────────────────────────────────────────────────
+
+
+def cmd_status(args) -> None:
+    device = _request("GET", "/phone/device")["device"]
+    lines = []
+    if not device.get("seen"):
+        lines.append("手机: 服务重启以来还没来轮询过（App 手机操控总开关没开 / App 不在后台）")
+    else:
+        state = "在线" if device.get("online") else "离线"
+        lines.append(f"手机: {state}（{device.get('seconds_ago')} 秒前来过）App v{device.get('app_version') or '?'}")
+        caps = device.get("caps") or []
+        lines.append("已开权限: " + ("、".join(TIER_ZH.get(c, c) for c in caps) or "无"))
+        sz = device.get("shizuku") or "?"
+        lines.append(f"Shizuku: {SHIZUKU_ZH.get(sz, sz)}"
+                     + (f" (v{device['shizuku_version']})" if device.get("shizuku_version") else ""))
+    result = None
+    if device.get("online") and "status" in (device.get("caps") or []):
+        try:
+            result = ensure_done(run_task("status", wait=args.wait))
+        except CtlError as e:
+            lines.append(f"状态查询失败: {e}")
+    if result:
+        bat = result.get("battery")
+        lines.append(
+            f"电量: {bat}%{'（充电中）' if result.get('charging') else ''}  "
+            f"屏幕: {'亮' if result.get('screen_on') else '灭'}{'·已锁' if result.get('locked') else ''}  "
+            f"前台: {result.get('foreground') or '?'}"
+        )
+        if result.get("screen_w"):
+            lines.append(f"屏幕尺寸: {result['screen_w']}x{result['screen_h']}")
+        if result.get("shizuku_error"):
+            lines.append(f"Shizuku 提示: {result['shizuku_error']}")
+    _out(args, {"device": device, "status": result}, "\n".join(lines))
+
+
+def cmd_app(args) -> None:
+    r = ensure_done(run_task("foreground", wait=args.wait))
+    _out(args, r, r.get("package") or "unknown")
+
+
+def cmd_apps(args) -> None:
+    r = ensure_done(run_task("apps", {"third_party_only": not args.all}, wait=args.wait))
+    _out(args, r, "\n".join(r.get("packages") or []))
+
+
+def cmd_open(args) -> None:
+    r = ensure_done(run_task("open", {"package": args.package}, wait=args.wait))
+    _out(args, r, f"已打开 {args.package}" + (f"（{r.get('via')}）" if r.get("via") else ""))
+
+
+def cmd_key(args) -> None:
+    key = getattr(args, "key", None) or args.cmd
+    r = ensure_done(run_task("key", {"key": key, "long_press": getattr(args, "long", False)}, wait=args.wait))
+    _out(args, r, f"按了 {key}")
+
+
+def cmd_tap(args) -> None:
+    r = ensure_done(run_task("tap", {"x": args.x, "y": args.y}, wait=args.wait))
+    _out(args, r, f"点了 ({args.x}, {args.y})")
+
+
+def cmd_swipe(args) -> None:
+    r = ensure_done(run_task("swipe", {"x1": args.x1, "y1": args.y1, "x2": args.x2, "y2": args.y2,
+                                       "duration_ms": args.ms}, wait=args.wait))
+    _out(args, r, f"滑了 ({args.x1},{args.y1}) → ({args.x2},{args.y2}) {args.ms}ms")
+
+
+def cmd_longpress(args) -> None:
+    r = ensure_done(run_task("swipe", {"x1": args.x, "y1": args.y, "x2": args.x, "y2": args.y,
+                                       "duration_ms": args.ms}, wait=args.wait))
+    _out(args, r, f"长按 ({args.x}, {args.y}) {args.ms}ms")
+
+
+def cmd_text(args) -> None:
+    r = ensure_done(run_task("text", {"text": args.text, "mode": args.mode, "enter": args.enter},
+                             wait=args.wait))
+    _out(args, r, f"已输入 {len(args.text)} 字（{r.get('via', '?')}）")
+
+
+def cmd_shot(args) -> None:
+    fmt = "png" if (args.png or args.full) else "jpeg"
+    max_side = 0 if args.full else args.max
+    task = run_task("screenshot", {"max_side": max_side, "quality": args.quality, "format": fmt},
+                    wait=args.wait)
+    r = ensure_done(task)
+    data, _ctype = _request("GET", f"/phone/tasks/{task['id']}/blob", raw=True, timeout=60)
+    ext = "png" if fmt == "png" else "jpg"
+    out = Path(args.out) if args.out else Path(f"/tmp/phone-shot-{datetime.now():%Y%m%d-%H%M%S}.{ext}")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(data)
+    scale = r.get("scale") or 1
+    text = (f"{out}  {r.get('width')}x{r.get('height')}（手机原始 {r.get('orig_width')}x{r.get('orig_height')}）"
+            f" {_fmt_size(len(data))}")
+    if scale and scale != 1:
+        text += f"\n点按坐标 = 图上坐标 ÷ {scale:.4f}（≈ ×{1 / scale:.3f}）"
+    _out(args, {**r, "path": str(out)}, text)
+
+
+def cmd_push(args) -> None:
+    src = Path(args.local).expanduser().resolve()
+    if not src.is_file():
+        raise CtlError(f"本地文件不存在: {src}")
+    dest = args.dest or "/sdcard/Download/"
+    if dest.endswith("/"):
+        dest = dest + src.name
+    staged = _request("POST", "/phone/files", {"path": str(src)}, timeout=600)["file"]
+    total = staged["size"]
+    print(f"已挂出 {src.name} {_fmt_size(total)} sha256={staged['sha256'][:12]}… → {dest}", file=sys.stderr)
+    started = time.monotonic()
+
+    def show(progress: dict) -> None:
+        done = progress.get("done", 0)
+        pct = (done / total * 100) if total else 100
+        speed = done / max(0.001, time.monotonic() - started)
+        print(f"\r  {pct:5.1f}%  {_fmt_size(done)}/{_fmt_size(total)}  {_fmt_size(int(speed))}/s   ",
+              end="", file=sys.stderr, flush=True)
+
+    task = run_task("download", {"file_id": staged["file_id"], "dest": dest, "overwrite": args.overwrite},
+                    wait=args.wait if args.wait != 90 else 4 * 3600, timeout_s=args.timeout,
+                    on_progress=None if args.json else show)
+    if not args.json:
+        print(file=sys.stderr)
+    r = ensure_done(task)
+    _out(args, r, f"已传到 {r.get('path', dest)}  {_fmt_size(r.get('size'))}  sha256 校验通过"
+                  + (f"（断点续传 {r['resumed']} 次）" if r.get("resumed") else "")
+                  + (f"（重试 {r['attempts'] - 1} 次）" if r.get("attempts", 1) > 1 else "")
+                  + ("（手机上已有同样的文件，跳过）" if r.get("already") else ""))
+
+
+def cmd_pull(args) -> None:
+    task = run_task("pull", {"path": args.remote}, wait=args.wait if args.wait != 90 else 1800)
+    r = ensure_done(task)
+    data, _ = _request("GET", f"/phone/tasks/{task['id']}/blob", raw=True, timeout=600)
+    out = Path(args.local) if args.local else Path("/tmp") / Path(args.remote).name
+    if out.is_dir():
+        out = out / Path(args.remote).name
+    out.write_bytes(data)
+    _out(args, {**r, "local": str(out)}, f"{out}  {_fmt_size(len(data))}")
+
+
+def cmd_ls(args) -> None:
+    r = ensure_done(run_task("ls", {"path": args.path}, wait=args.wait))
+    rows = []
+    for e in r.get("entries") or []:
+        mtime = datetime.fromtimestamp((e.get("mtime") or 0) / 1000).strftime("%m-%d %H:%M")
+        name = e.get("name", "") + ("/" if e.get("dir") else "")
+        rows.append(f"{'' if e.get('dir') else _fmt_size(e.get('size')):>8}  {mtime}  {name}")
+    if r.get("truncated"):
+        rows.append(f"…（只列了前 {len(r.get('entries') or [])} 项）")
+    _out(args, r, "\n".join(rows) or "(空)")
+
+
+def cmd_stat(args) -> None:
+    r = ensure_done(run_task("stat", {"path": args.path}, wait=args.wait))
+    if not r.get("exists"):
+        _out(args, r, "不存在")
+        return
+    mtime = datetime.fromtimestamp((r.get("mtime") or 0) / 1000).strftime("%Y-%m-%d %H:%M:%S")
+    _out(args, r, f"{'目录' if r.get('dir') else '文件'}  {r.get('size')} 字节 ({_fmt_size(r.get('size'))})  {mtime}")
+
+
+def cmd_sh(args) -> None:
+    r = ensure_done(run_task("shell", {"cmd": args.command, "timeout_s": args.timeout},
+                             wait=max(args.wait, args.timeout + 30)))
+    if args.json:
+        _out(args, r, "")
+        return
+    if r.get("out"):
+        sys.stdout.write(r["out"])
+    if r.get("err"):
+        sys.stderr.write(r["err"])
+    if r.get("timed_out"):
+        print(f"phone-ctl: 命令超时（{args.timeout}s）被杀", file=sys.stderr)
+    raise SystemExit(r.get("code", 0) if isinstance(r.get("code"), int) else 0)
+
+
+def cmd_tasks(args) -> None:
+    data = _request("GET", "/phone/tasks")
+    rows = []
+    for t in data.get("tasks") or []:
+        ts = datetime.fromtimestamp(t["created_at"]).strftime("%H:%M:%S")
+        rows.append(f"{ts}  {t['id'][:8]}  {t['action']:<10} {t['status']:<9} {t.get('message') or ''}")
+    _out(args, data, "\n".join(rows) or "(没有任务)")
+
+
+def cmd_cancel(args) -> None:
+    tasks = _request("GET", "/phone/tasks").get("tasks") or []
+    match = [t for t in tasks if t["id"].startswith(args.task_id)]
+    if len(match) != 1:
+        raise CtlError("找不到唯一匹配的任务 id")
+    r = _request("POST", f"/phone/tasks/{match[0]['id']}/cancel", {})
+    _out(args, r, f"{match[0]['id'][:8]} → {r['task']['status']}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="输出原始 JSON")
+    common.add_argument("--wait", type=float, default=90, help="等结果的最长秒数")
+    p = argparse.ArgumentParser(prog="phone-ctl", description="小克操作方小南的手机（Shizuku）",
+                                parents=[common])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status", parents=[common]).set_defaults(fn=cmd_status)
+    sub.add_parser("app", parents=[common]).set_defaults(fn=cmd_app)
+    s = sub.add_parser("apps", parents=[common]); s.add_argument("--all", action="store_true"); s.set_defaults(fn=cmd_apps)
+    s = sub.add_parser("open", parents=[common]); s.add_argument("package"); s.set_defaults(fn=cmd_open)
+    s = sub.add_parser("key", parents=[common]); s.add_argument("key"); s.add_argument("--long", action="store_true")
+    s.set_defaults(fn=cmd_key)
+    for name in ("home", "back", "recent"):
+        sub.add_parser(name, parents=[common]).set_defaults(fn=cmd_key)
+    s = sub.add_parser("shot", parents=[common]); s.add_argument("out", nargs="?")
+    s.add_argument("--max", type=int, default=1280); s.add_argument("--quality", type=int, default=70)
+    s.add_argument("--png", action="store_true"); s.add_argument("--full", action="store_true")
+    s.set_defaults(fn=cmd_shot)
+    s = sub.add_parser("tap", parents=[common]); s.add_argument("x", type=int); s.add_argument("y", type=int)
+    s.set_defaults(fn=cmd_tap)
+    s = sub.add_parser("swipe", parents=[common])
+    for k in ("x1", "y1", "x2", "y2"):
+        s.add_argument(k, type=int)
+    s.add_argument("ms", type=int, nargs="?", default=300); s.set_defaults(fn=cmd_swipe)
+    s = sub.add_parser("longpress", parents=[common]); s.add_argument("x", type=int); s.add_argument("y", type=int)
+    s.add_argument("ms", type=int, nargs="?", default=800); s.set_defaults(fn=cmd_longpress)
+    s = sub.add_parser("text", parents=[common]); s.add_argument("text"); s.add_argument("--enter", action="store_true")
+    s.add_argument("--mode", choices=["auto", "input", "paste"], default="auto"); s.set_defaults(fn=cmd_text)
+    s = sub.add_parser("push", parents=[common]); s.add_argument("local"); s.add_argument("dest", nargs="?")
+    s.add_argument("--overwrite", action="store_true"); s.add_argument("--timeout", type=int, default=None)
+    s.set_defaults(fn=cmd_push)
+    s = sub.add_parser("pull", parents=[common]); s.add_argument("remote"); s.add_argument("local", nargs="?")
+    s.set_defaults(fn=cmd_pull)
+    s = sub.add_parser("ls", parents=[common]); s.add_argument("path", nargs="?", default="/sdcard"); s.set_defaults(fn=cmd_ls)
+    s = sub.add_parser("stat", parents=[common]); s.add_argument("path"); s.set_defaults(fn=cmd_stat)
+    s = sub.add_parser("sh", parents=[common]); s.add_argument("command"); s.add_argument("--timeout", type=int, default=30)
+    s.set_defaults(fn=cmd_sh)
+    sub.add_parser("tasks", parents=[common]).set_defaults(fn=cmd_tasks)
+    s = sub.add_parser("cancel", parents=[common]); s.add_argument("task_id"); s.set_defaults(fn=cmd_cancel)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        args.fn(args)
+    except CtlError as e:
+        print(f"phone-ctl: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

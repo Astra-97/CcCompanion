@@ -38,6 +38,7 @@ REASONS = {
     "wake": "睡醒了",
     "hide": "收起来了（她回到 App 里了）",
     "sync": "实时通道重连同步",
+    "reset": "她点了「找回螃蟹」",
 }
 
 
@@ -122,6 +123,18 @@ def cmd_get(as_json: bool) -> int:
             print(f"待用（下次出来）: {st['pending_act']}（{st.get('pending_act_zh', '')}）")
         reason = st.get("reason") or ""
         print(f"上报: 北京 {when}（{_ago(st.get('age_s'))}），原因: {REASONS.get(reason, reason)}")
+        diag = st.get("diag") or {}
+        if diag:
+            # App v1.9.227+: 窗口是否真的挂上 / 可见 / 坐标 — 判断「App 以为在显示但看不见」
+            if diag.get("view") is False:
+                print("诊断: 悬浮窗没挂（没在显示）"
+                      + ("，悬浮窗权限被收回了！" if diag.get("overlay_allowed") is False else ""))
+            else:
+                ok = diag.get("attached") and diag.get("shown") and diag.get("window_visible")
+                print(f"诊断: 窗口{'可见' if ok else '挂上了但不可见（系统藏了？）'}"
+                      f" attached={diag.get('attached')} shown={diag.get('shown')} visible={diag.get('window_visible')}"
+                      f" 位置=({diag.get('x')},{diag.get('y')}) 大小={diag.get('w')}x{diag.get('h')}"
+                      f" 屏幕={diag.get('screen_w')}x{diag.get('screen_h')} 悬浮窗权限={diag.get('overlay_allowed')}")
     cmd = res.get("command")
     if cmd:
         state = "App 已收到" if cmd.get("acked") else "App 还没收到（离线/通道断，下次上报补发）"

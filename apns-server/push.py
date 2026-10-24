@@ -83,6 +83,7 @@ from apples_unread import ApplesCursorStore, format_unread_lines, split_unread
 from plugins_store import MAX_DOC_BODY_BYTES, PluginStore
 from calendar_store import CalendarStore, CATEGORIES, CATEGORY_LABELS
 import crab_pet_state
+import phone_control
 import cn_workday
 from rp_history import RPHistory, validate_sid as validate_rp_sid
 from diary import Diary
@@ -4893,6 +4894,10 @@ class ServerState:
         self.crab_pet = crab_pet_state.CrabPetStore(
             Path(self.token_store_path).parent / "crab_pet_state.json"
         )
+        # 手机操控 (2026-10-24, App v1.9.227 Shizuku): /phone/* 任务队列 (只存内存)
+        self.phone_control = phone_control.PhoneControlHub(
+            Path(self.token_store_path).parent / "phone_control"
+        )
         # typing indicator 状态 (内存 不持久化)
         self.typing_state: dict[str, Any] = {"is_typing": False, "since": None}
         self.contact_typing_states: dict[str, dict[str, Any]] = {
@@ -7845,6 +7850,12 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         if not self._is_public_get() and not self._check_ip_allowed():
             return
+        # 手机操控 (2026-10-24, App v1.9.227 Shizuku)：/phone/* 一律 native
+        # shared secret fail-closed（网页 cookie / strict_auth=false 都不放行），
+        # 投递/查结果只许本机。必须排在通用 cookie 鉴权之前。
+        if request_path == "/phone" or request_path.startswith("/phone/"):
+            self._handle_phone_get(request_path)
+            return
         # Kimi control is native-App control, not a PWA capability.  Keep it
         # behind the shared secret even when legacy strict_auth is disabled;
         # importantly, this happens before the generic cookie-aware auth.
@@ -8488,6 +8499,12 @@ class PushHandler(BaseHTTPRequestHandler):
         request_path = urlparse(self.path).path
         if request_path == "/ai-chat" or request_path.startswith("/ai-chat/"):
             self._send_json(404, {"error": "not found"})
+            return
+        # 手机操控 (2026-10-24)：同 do_GET，native shared secret fail-closed。
+        if request_path == "/phone" or request_path.startswith("/phone/"):
+            if not self._check_ip_allowed():
+                return
+            self._handle_phone_post(request_path)
             return
         if request_path == "/web/pairing/create":
             if not self._check_ip_allowed():
@@ -27718,6 +27735,244 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
             is_test, count, duration_s, hammer, asleep, act, notified,
         )
         self._send_json(200, {"ok": True, "deduped": not notified})
+
+    # ━━━━━━━━━━ 手机操控 (2026-10-24, App v1.9.227 Shizuku) ━━━━━━━━━━
+    # 路由表（全部 native shared secret fail-closed；网页 cookie 一律 401）：
+    #   手机侧  GET  /phone/tasks/next?wait=&caps=&shizuku=&v=&sv=   长轮询领任务（200 任务 / 204 无）
+    #          POST /phone/tasks/<id>/result   {ok,result,error,message}
+    #          POST /phone/tasks/<id>/blob     原始 body（截图 / 拉回的文件）
+    #          POST /phone/tasks/<id>/progress {done,total} → {cancelled}
+    #          GET  /phone/files/<file_id>     待下发文件，支持 Range 断点续传
+    #   本机侧（另需 loopback 且非 cloudflared/nginx 转发）：
+    #          POST /phone/tasks {action,args,timeout_s?}    GET /phone/tasks[/<id>?wait=]
+    #          GET  /phone/tasks/<id>/blob     POST /phone/tasks/<id>/cancel
+    #          POST /phone/files {path,name?}  GET /phone/device
+    _PHONE_TASK_PATH = re.compile(r"^/phone/tasks/([0-9a-f]{32})(?:/(result|blob|progress|cancel))?$")
+    _PHONE_FILE_PATH = re.compile(r"^/phone/files/([0-9a-f]{32})$")
+
+    def _phone_hub(self) -> "phone_control.PhoneControlHub":
+        hub = getattr(self.state, "phone_control", None)
+        if hub is None:
+            hub = phone_control.PhoneControlHub(
+                Path(getattr(self.state, "token_store_path", "/tmp/x")).parent / "phone_control"
+            )
+            self.state.phone_control = hub
+        return hub
+
+    def _phone_local_peer(self) -> bool:
+        try:
+            return ipaddress.ip_address(self._trusted_client_ip()).is_loopback
+        except ValueError:
+            return False
+
+    def _phone_auth(self, *, local_only: bool) -> bool:
+        if not self._native_pairing_auth_matches() or (local_only and not self._phone_local_peer()):
+            self.close_connection = True
+            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return False
+        return True
+
+    def _phone_error(self, exc: "phone_control.PhoneTaskError") -> None:
+        self._send_json(exc.status, exc.payload())
+
+    def _phone_read_json(self, limit: int) -> dict[str, Any] | None:
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            self._send_json(400, {"ok": False, "error": "chunked_request_not_supported"})
+            return None
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except (TypeError, ValueError):
+            length = -1
+        if length < 0 or length > limit:
+            self.close_connection = True
+            self._send_json(413, {"ok": False, "error": "bad_length"})
+            return None
+        if length == 0:
+            return {}
+        try:
+            body = json.loads(self.rfile.read(length))
+        except Exception as exc:
+            self._send_json(400, {"ok": False, "error": f"bad json: {exc}"})
+            return None
+        if not isinstance(body, dict):
+            self._send_json(400, {"ok": False, "error": "JSON object required"})
+            return None
+        return body
+
+    def _handle_phone_get(self, request_path: str) -> None:
+        qs = self._query_params()
+
+        def q(name: str, default: str = "") -> str:
+            return (qs.get(name) or [default])[0]
+
+        def q_float(name: str, default: float) -> float:
+            try:
+                return float(q(name, str(default)))
+            except ValueError:
+                return default
+
+        hub = self._phone_hub()
+        try:
+            if request_path == "/phone/tasks/next":
+                if not self._phone_auth(local_only=False):
+                    return
+                task = hub.claim(
+                    wait_s=q_float("wait", 0.0),
+                    caps=q("caps", "") if "caps" in qs else None,
+                    shizuku=q("shizuku") or None,
+                    app_version=q("v") or None,
+                    shizuku_version=q("sv") or None,
+                )
+                if task is None:
+                    self.send_response(204)
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                logger.info("phone task claimed id=%s action=%s", task["id"], task["action"])
+                self._send_json(200, {"ok": True, "task": task})
+                return
+            m = self._PHONE_FILE_PATH.match(request_path)
+            if m:
+                if not self._phone_auth(local_only=False):
+                    return
+                self._serve_phone_file(hub, m.group(1))
+                return
+            if not self._phone_auth(local_only=True):
+                return
+            if request_path == "/phone/device":
+                self._send_json(200, {"ok": True, "device": hub.device()})
+                return
+            if request_path == "/phone/tasks":
+                self._send_json(200, {"ok": True, "tasks": hub.list_tasks(), "device": hub.device()})
+                return
+            m = self._PHONE_TASK_PATH.match(request_path)
+            if m and m.group(2) is None:
+                self._send_json(200, {"ok": True, "task": hub.get(m.group(1), wait_s=q_float("wait", 0.0))})
+                return
+            if m and m.group(2) == "blob":
+                blob = hub.blob(m.group(1))
+                self._send_phone_file(blob["path"], blob["size"], blob["content_type"], None)
+                return
+            self._send_json(404, {"ok": False, "error": "not found"})
+        except phone_control.PhoneTaskError as exc:
+            self._phone_error(exc)
+
+    def _serve_phone_file(self, hub: "phone_control.PhoneControlHub", file_id: str) -> None:
+        entry = hub.outbox_file(file_id)
+        rng = phone_control.parse_range(self.headers.get("Range"), entry["size"])
+        self._send_phone_file(entry["path"], entry["size"], "application/octet-stream", rng,
+                              etag=entry["sha256"])
+
+    def _send_phone_file(self, path: str, size: int, content_type: str,
+                         rng: tuple[int, int] | None, *, etag: str | None = None) -> None:
+        start, end = rng if rng else (0, size - 1)
+        length = max(0, end - start + 1)
+        try:
+            fh = open(path, "rb")
+        except OSError:
+            self._send_json(404, {"ok": False, "error": "file_not_found"})
+            return
+        with fh:
+            self.send_response(206 if rng else 200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(length))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            if etag:
+                self.send_header("ETag", f'"{etag}"')
+            if rng:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.end_headers()
+            fh.seek(start)
+            remaining = length
+            try:
+                while remaining > 0:
+                    chunk = fh.read(min(remaining, 256 * 1024))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+            except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                self.close_connection = True
+
+    def _handle_phone_post(self, request_path: str) -> None:
+        hub = self._phone_hub()
+        try:
+            m = self._PHONE_TASK_PATH.match(request_path)
+            kind = m.group(2) if m else None
+            if m and kind in ("result", "blob", "progress"):
+                if not self._phone_auth(local_only=False):
+                    return
+                task_id = m.group(1)
+                if kind == "blob":
+                    if self.headers.get("Transfer-Encoding"):
+                        self.close_connection = True
+                        self._send_json(400, {"ok": False, "error": "chunked_request_not_supported"})
+                        return
+                    try:
+                        length = int(self.headers.get("Content-Length", ""))
+                    except (TypeError, ValueError):
+                        length = -1
+                    if not 0 < length <= phone_control.MAX_BLOB_BYTES:
+                        self.close_connection = True
+                        self._send_json(413, {"ok": False, "error": "bad_length"})
+                        return
+                    try:
+                        payload = hub.put_blob(task_id, self.rfile, length,
+                                               self.headers.get("Content-Type", ""))
+                    except phone_control.PhoneTaskError:
+                        self.close_connection = True
+                        raise
+                    self._send_json(200, payload)
+                    return
+                body = self._phone_read_json(
+                    phone_control.MAX_RESULT_JSON_BYTES if kind == "result" else 4096
+                )
+                if body is None:
+                    return
+                if kind == "result":
+                    payload = hub.submit_result(task_id, body)
+                    logger.info("phone task result id=%s status=%s", task_id, payload.get("status"))
+                    self._send_json(200, payload)
+                else:
+                    payload = hub.progress(task_id, body.get("done"), body.get("total"))
+                    self._send_json(200 if payload.get("ok") else 409, payload)
+                return
+            if not self._phone_auth(local_only=True):
+                return
+            if request_path == "/phone/tasks":
+                body = self._phone_read_json(64 * 1024)
+                if body is None:
+                    return
+                task = hub.enqueue(
+                    body.get("action"), body.get("args"),
+                    timeout_s=body.get("timeout_s"), claim_timeout_s=body.get("claim_timeout_s"),
+                )
+                logger.info("phone task queued id=%s action=%s", task["id"], task["action"])
+                self._send_json(200, {"ok": True, "task": task})
+                return
+            if m and kind == "cancel":
+                if self._phone_read_json(4096) is None:
+                    return
+                self._send_json(200, {"ok": True, "task": hub.cancel(m.group(1))})
+                return
+            if request_path == "/phone/files":
+                body = self._phone_read_json(8 * 1024)
+                if body is None:
+                    return
+                source = body.get("path")
+                if not isinstance(source, str) or not source.startswith("/"):
+                    self._send_json(400, {"ok": False, "error": "bad_path", "message": "path 必须是本机绝对路径"})
+                    return
+                name = body.get("name") if isinstance(body.get("name"), str) else None
+                self._send_json(200, {"ok": True, "file": hub.stage_file(source, name=name)})
+                return
+            self._send_json(404, {"ok": False, "error": "not found"})
+        except phone_control.PhoneTaskError as exc:
+            self._phone_error(exc)
 
     def _crab_pet_store(self) -> "crab_pet_state.CrabPetStore":
         store = getattr(self.state, "crab_pet", None)
