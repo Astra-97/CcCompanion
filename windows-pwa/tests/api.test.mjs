@@ -567,14 +567,14 @@ test('PWA shell declares installability and has no secret persistence', async ()
   assert.match(manifest, /"display": "standalone"/);
   assert.match(manifest, /"background_color": "#17100b"/);
   assert.match(manifest, /"theme_color": "#17100b"/);
-  assert.match(manifest, /icon-192\.png/);
-  assert.match(manifest, /icon-512\.png/);
+  assert.match(manifest, /\.\/assets\/app-icon-192\.png/);
+  assert.match(manifest, /\.\/assets\/app-icon-512\.png/);
   assert.match(serviceWorker, /addEventListener\('fetch'/);
-  assert.match(serviceWorker, /cccompanion-desk-v32/);
-  assert.match(serviceWorker, /src\/styles\.css\?v=32/);
-  assert.match(serviceWorker, /src\/app\.js\?v=32/);
-  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=32/);
-  assert.match(serviceWorker, /src\/sticker-protocol\.js\?v=32/);
+  assert.match(serviceWorker, /cccompanion-desk-v33/);
+  assert.match(serviceWorker, /src\/styles\.css\?v=33/);
+  assert.match(serviceWorker, /src\/app\.js\?v=33/);
+  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=33/);
+  assert.match(serviceWorker, /src\/sticker-protocol\.js\?v=33/);
   assert.match(serviceWorker, /src\/live-messages\.js/);
   assert.match(serviceWorker, /src\/pairing-code\.js/);
   assert.doesNotMatch(source, /shared_secret|localStorage\.setItem|sessionStorage\.setItem|credentials:\s*'include'/);
@@ -591,8 +591,8 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   ]);
   assert.match(html, /id="latest-button"/);
   assert.match(html, /id="pairing-code"/);
-  assert.match(html, /href="\.\/src\/styles\.css\?v=32"/);
-  assert.match(html, /src="\.\/src\/app\.js\?v=32"/);
+  assert.match(html, /href="\.\/src\/styles\.css\?v=33"/);
+  assert.match(html, /src="\.\/src\/app\.js\?v=33"/);
   assert.match(html, /autocomplete="one-time-code"/);
   assert.match(html, /id="pairing-form"/);
   assert.match(html, /<details class="password-fallback">/);
@@ -687,4 +687,33 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   assert.match(serviceWorker, /web\\\/session\|chat\|memory\|attachments/);
   assert.match(serviceWorker, /const isShellAsset = ASSETS\.some/);
   assert.match(serviceWorker, /if \(url\.origin !== self\.location\.origin \|\| !isShellAsset \|\| isPrivateRoute\) return/);
+});
+
+test('PWA icons mirror the Android launcher (2026-10-24): any + maskable in 192/512, favicon and apple-touch wired and precached', async () => {
+  const [manifestText, html, sw, notifications] = await Promise.all([
+    readFile(new URL('../manifest.webmanifest', import.meta.url), 'utf8'),
+    readFile(new URL('../index.html', import.meta.url), 'utf8'),
+    readFile(new URL('../sw.js', import.meta.url), 'utf8'),
+    readFile(new URL('../src/notifications.js', import.meta.url), 'utf8'),
+  ]);
+  const icons = JSON.parse(manifestText).icons;
+  const key = (icon) => `${icon.purpose}:${icon.sizes}:${icon.src}`;
+  assert.deepEqual(icons.map(key).sort(), [
+    'any:192x192:./assets/app-icon-192.png',
+    'any:512x512:./assets/app-icon-512.png',
+    'maskable:192x192:./assets/app-icon-maskable-192.png',
+    'maskable:512x512:./assets/app-icon-maskable-512.png',
+  ], 'maskable gets its own safe-zone render instead of reusing the rounded any icon');
+  // PNG IHDR width/height must match the declared sizes.
+  const pngSize = async (rel) => { const buf = await readFile(new URL(`../${rel}`, import.meta.url)); assert.equal(buf.toString('ascii', 1, 4), 'PNG', rel); return `${buf.readUInt32BE(16)}x${buf.readUInt32BE(20)}`; };
+  for (const icon of icons) assert.equal(await pngSize(icon.src), icon.sizes, icon.src);
+  assert.equal(await pngSize('assets/favicon-32.png'), '32x32');
+  assert.equal(await pngSize('assets/apple-touch-icon.png'), '180x180');
+  assert.match(html, /<link rel="icon" href="\.\/assets\/favicon-32\.png" type="image\/png" sizes="32x32" \/>/);
+  assert.match(html, /<link rel="apple-touch-icon" href="\.\/assets\/apple-touch-icon\.png" sizes="180x180" \/>/);
+  assert.doesNotMatch(html + sw + manifestText + notifications, /cc-mark\.svg|assets\/icon-(192|512)\.png/, 'the old diamond mark is gone everywhere');
+  for (const file of ['favicon-32.png', 'apple-touch-icon.png', 'app-icon-192.png', 'app-icon-512.png', 'app-icon-maskable-192.png', 'app-icon-maskable-512.png']) {
+    assert.ok(sw.includes(`'./assets/${file}'`), `${file} is precached`);
+  }
+  assert.match(notifications, /icon = '\.\/assets\/app-icon-192\.png'/, 'desktop notifications use the new icon');
 });

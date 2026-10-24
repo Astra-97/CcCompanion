@@ -10,7 +10,7 @@ export function createNotifier({
   visibility = globalThis.document,
   storage = globalThis.localStorage,
   windowLike = globalThis,
-  icon = './assets/icon-192.png',
+  icon = './assets/app-icon-192.png',
 } = {}) {
   let enabled = false;
   try { enabled = storage?.getItem(STORAGE_KEY) === '1'; } catch { enabled = false; }
