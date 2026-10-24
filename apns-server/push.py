@@ -2577,8 +2577,10 @@ KIMI_FORGE_TASK_LIST_LIMIT = 12
 KIMI_FORGE_SEED_RETAIN_DEFAULT = 80
 KIMI_FORGE_SEED_RETAIN_MAX = 160
 KIMI_FORGE_SEED_TAIL_MAX_BYTES = 64 * 1024
+# Kimi 的 forge/状态栏统一使用固定 300k token 窗口；较小模型按实际上限收缩。
+KIMI_CONTEXT_WINDOW_TOKENS = 300_000
 # 自助延期的安全阀（2026-10-10）：Kimi 用 [[CCC_KIMI_FORGE_DEFER]] 标记延期
-# 自动 forge 后，usage 到达该硬上限仍照常 forge，防止上下文彻底爆掉。
+# 自动 forge 后，usage 到达模型实际窗口的该硬上限仍照常 forge，防止上下文彻底爆掉。
 KIMI_FORGE_DEFER_HARD_CAP = 0.92
 # Kimi 自助延期标记：只允许单独一行、全文出现一次，服务端入库前剥离。
 KIMI_FORGE_DEFER_MARKER = "[[CCC_KIMI_FORGE_DEFER]]"
@@ -4986,7 +4988,7 @@ class ServerState:
         self.kiro_chat_queue: deque[dict[str, Any]] = deque()
         self.kiro_chat_queue_worker_running = False
         # kiro 自动 forge (2026-10-08)：上下文使用率超过阈值时自动 forge
-        # （默认 80，对齐 codex_auto_forge_threshold_percent / Kimi 的 0.8）。
+        # （默认 80，对齐 codex_auto_forge_threshold_percent）。
         # 用量来源是 ACP `_kiro.dev/metadata` 通知里的
         # contextUsagePercentage（kiro_acp 缓存最新值，kiro 状态栏同款）；
         # 还没有任何用量读数（None）时不触发。自动 forge 挂在 Kiro 聊天路径
@@ -5036,24 +5038,17 @@ class ServerState:
             except Exception:
                 return None
         self.kimi_terminal.set_status_probe(_kimi_terminal_status_probe)
-        # 2026-08-22 常驻固定会话 + 产品决策更新：保留上下文阈值自动
-        # forge，默认 0.8（80%，对齐 Kairos 的 codex_auto_forge_threshold_
-        # percent = 80）。自动 forge 挂在 Web 聊天路径上，且与 POST
-        # /kimi/forge 走同一套移交管线（任务盘点 + handoff 登记 + seed
-        # 注入 + 用户通知），绝不做无声 forge。显式设为 0 禁用；(0,1)
-        # 区间生效。Kimi CLI 接近上下文窗口时的自动 compaction 依然
-        # 存在，阈值 forge 是在它之前先把任务移交干净的受控换会话。
+        # Kimi 使用率统一按 min(300k, 模型实际上限) 计算：默认到 1.0
+        # （300k tokens）自动 forge，与 POST /kimi/forge 走同一套移交管线，
+        # 绝不做无声 forge。显式设为 0 禁用；(0,1] 区间生效。
         self.kimi_auto_forge_context_threshold = float(
-            server_cfg.get("kimi_auto_forge_context_threshold", 0.8)
+            server_cfg.get("kimi_auto_forge_context_threshold", 1.0)
         )
-        # 2026-10-10 forge 预警 + 自助延期（Astra）：使用率到预警线（默认
-        # 0.75）但未到 forge 阈值时，投递 prompt 里附一次性系统提示，Kimi
-        # 任务未完结可在回复末尾单独一行输出 [[CCC_KIMI_FORGE_DEFER]] 延期
-        # （服务端剥离标记、不落展示文本）；延期不是无限期的——usage 到
-        # KIMI_FORGE_DEFER_HARD_CAP 硬上限仍照常 forge。显式设为 0 禁用；
-        # (0,1) 生效；≥ forge 阈值时预警带为空、自动不生效。
+        # 默认 0.8（240k tokens）预警；Kimi 可用 [[CCC_KIMI_FORGE_DEFER]]
+        # 自助延期，但最多延到模型实际窗口的 92%，小窗口没有余量时不延期。
+        # 显式设为 0 禁用；(0,1) 生效；≥ forge 阈值时预警不生效。
         self.kimi_auto_forge_warn_threshold = float(
-            server_cfg.get("kimi_auto_forge_warn_threshold", 0.75)
+            server_cfg.get("kimi_auto_forge_warn_threshold", 0.8)
         )
         # 预警注入状态（{"session_id": ..., "injected": True}，同会话同一档
         # 位只注入一次）与延期标志（forge 成功后清除）都是纯内存态。
@@ -14022,16 +14017,14 @@ class PushHandler(BaseHTTPRequestHandler):
         if session_recovery is not None:
             self._notify_kimi_session_recovery(session_recovery[0], session_id, reason=session_recovery[1])
 
-        # 上下文阈值自动 forge（默认 80%）：与 POST /kimi/forge 同一套
-        # 移交管线，换的是本通道（kimi_web）的活跃会话指针。此时仍持有
-        # prepare 预约，管线不会另行加锁。失败或 Kimi 正忙时沿用旧会话，
-        # 绝不影响本条消息发送。
+        # 上下文到 300k tokens 自动 forge（小窗口按实际上限）：与手动 forge
+        # 共用移交管线。失败或 Kimi 正忙时沿用旧会话，不影响本条消息发送。
         try:
             session_id, _forged = self._maybe_forge_kimi_session(session_id)
         except Exception:
             _forged = False
             logger.warning("Kimi auto-forge failed, continuing with existing session", exc_info=True)
-        # forge 预警（默认 75%）：未 forge 且达预警线时，本轮 prompt 附一次性
+        # forge 预警（默认 240k）：未 forge 且达预警线时，本轮 prompt 附一次性
         # 系统提示，Kimi 可用 [[CCC_KIMI_FORGE_DEFER]] 自助延期。
         forge_warn_context = ""
         if not _forged:
@@ -16933,22 +16926,53 @@ class PushHandler(BaseHTTPRequestHandler):
 
     # ---------- kiro 桥接 (2026-09-09) 结束 ----------
 
+    @staticmethod
+    def _kimi_forge_window_tokens(status: dict[str, Any]) -> int:
+        try:
+            model_window = float(status.get("max_context_tokens"))
+        except (TypeError, ValueError):
+            return 0
+        if model_window <= 0:
+            return 0
+        return int(min(KIMI_CONTEXT_WINDOW_TOKENS, model_window))
+
+    @classmethod
+    def _kimi_context_usage_from_status(cls, status: dict[str, Any]) -> float:
+        window = cls._kimi_forge_window_tokens(status)
+        tokens = status.get("context_tokens")
+        if window and isinstance(tokens, (int, float)) and tokens >= 0:
+            return float(tokens) / window
+        usage = status.get("context_usage")
+        if isinstance(usage, (int, float)) and usage >= 0:
+            if window:
+                model_window = float(status.get("max_context_tokens"))
+                return float(usage) * model_window / window
+            return float(usage)
+        return 0.0
+
     def _kimi_context_usage(self, session_id: str) -> float:
-        """Return current Kimi context usage ratio, or 0.0 if unavailable."""
+        """Return usage against min(300k, model window), or 0.0 if unavailable."""
         try:
             self.state.kimi_web.start()
             status = self.state.kimi_web.get_session_status(session_id)
         except KimiWebError as exc:
             logger.warning("Kimi web context query failed: %s", exc)
             return 0.0
-        usage = status.get("context_usage")
-        if isinstance(usage, (int, float)) and usage >= 0:
-            return float(usage)
-        tokens = status.get("context_tokens")
-        limit = status.get("max_context_tokens")
-        if isinstance(tokens, (int, float)) and isinstance(limit, (int, float)) and limit > 0:
-            return float(tokens) / float(limit)
-        return 0.0
+        return self._kimi_context_usage_from_status(status)
+
+    def _kimi_forge_defer_hard_cap(self, session_id: str, threshold: float) -> float:
+        """Keep deferral below 92% of the real model window when headroom exists."""
+        try:
+            self.state.kimi_web.start()
+            status = self.state.kimi_web.get_session_status(session_id)
+            model_window = float(status.get("max_context_tokens"))
+            window = self._kimi_forge_window_tokens(status)
+        except (KimiWebError, TypeError, ValueError) as exc:
+            logger.warning("Kimi defer hard-cap query failed: %s", exc)
+            return max(threshold, KIMI_FORGE_DEFER_HARD_CAP)
+        if model_window <= 0 or window <= 0:
+            return max(threshold, KIMI_FORGE_DEFER_HARD_CAP)
+        return max(threshold, KIMI_FORGE_DEFER_HARD_CAP * model_window / window)
 
     @staticmethod
     def _kimi_reset_text_local(raw: str) -> str:
@@ -17110,7 +17134,7 @@ class PushHandler(BaseHTTPRequestHandler):
         the next turn can retry the forge.
         """
         threshold = self.state.kimi_auto_forge_context_threshold
-        if threshold <= 0 or threshold >= 1:
+        if threshold <= 0 or threshold > 1:
             return session_id, False
         usage = self._kimi_context_usage(session_id)
         deferred = bool(getattr(self.state, "kimi_forge_deferred", False))
@@ -17121,7 +17145,10 @@ class PushHandler(BaseHTTPRequestHandler):
             deferred = False
         if usage < threshold:
             return session_id, False
-        if deferred and usage < KIMI_FORGE_DEFER_HARD_CAP:
+        defer_hard_cap = KIMI_FORGE_DEFER_HARD_CAP
+        if deferred and threshold >= defer_hard_cap:
+            defer_hard_cap = self._kimi_forge_defer_hard_cap(session_id, threshold)
+        if deferred and usage < defer_hard_cap:
             logger.info(
                 "Kimi context usage %.2f%% exceeds threshold %.2f%% but the session deferred auto-forge",
                 usage * 100,
@@ -17130,9 +17157,9 @@ class PushHandler(BaseHTTPRequestHandler):
             return session_id, False
         if deferred:
             logger.info(
-                "Kimi context usage %.2f%% reached the %.2f%% defer hard cap; forging anyway",
+                "Kimi context usage %.2f%% reached the %.2f%% normalized defer hard cap; forging anyway",
                 usage * 100,
-                KIMI_FORGE_DEFER_HARD_CAP * 100,
+                defer_hard_cap * 100,
             )
         else:
             logger.info(
@@ -17162,7 +17189,7 @@ class PushHandler(BaseHTTPRequestHandler):
         已注入过、已达 forge 阈值由 forge 路径接管、或预警/forge 已禁用）。
         """
         forge_threshold = float(getattr(self.state, "kimi_auto_forge_context_threshold", 0.0) or 0.0)
-        if forge_threshold <= 0 or forge_threshold >= 1:
+        if forge_threshold <= 0 or forge_threshold > 1:
             return ""
         warn = float(getattr(self.state, "kimi_auto_forge_warn_threshold", 0.0) or 0.0)
         if warn <= 0 or warn >= 1 or warn >= forge_threshold:
@@ -19677,8 +19704,8 @@ class PushHandler(BaseHTTPRequestHandler):
             )
             if deferred_hardcap:
                 first += (
-                    f"本次 forge 此前按 Kimi 的请求延期过；上下文已到达 "
-                    f"{KIMI_FORGE_DEFER_HARD_CAP * 100:.0f}% 硬上限，为防止上下文爆掉仍执行切换。"
+                    "本次 forge 此前按 Kimi 的请求延期过；上下文已到达模型安全硬上限，"
+                    "为防止上下文爆掉仍执行切换。"
                 )
             lines = [first]
         else:
@@ -19856,14 +19883,14 @@ class PushHandler(BaseHTTPRequestHandler):
         context_usage = 0.0
         context_tokens = 0
         max_context_tokens = 0
+        forge_window_tokens = 0
         if session_id:
             try:
                 session_status = self.state.kimi_web.get_session_status(session_id)
-                context_usage = session_status.get("context_usage") or 0.0
                 context_tokens = session_status.get("context_tokens") or 0
                 max_context_tokens = session_status.get("max_context_tokens") or 0
-                if not context_usage and max_context_tokens:
-                    context_usage = float(context_tokens) / float(max_context_tokens)
+                forge_window_tokens = self._kimi_forge_window_tokens(session_status)
+                context_usage = self._kimi_context_usage_from_status(session_status)
             except KimiWebError as exc:
                 logger.warning("Kimi status context query failed: %s", exc)
 
@@ -19884,12 +19911,14 @@ class PushHandler(BaseHTTPRequestHandler):
             model = actual_model
         if actual_effort in {"low", "high", "max"}:
             effort = actual_effort
+        context_percent = min(100.0, max(0.0, context_usage * 100))
         context_text = (
-            f"已使用 {round(context_usage * 100, 2)}%"
-            if max_context_tokens else "上下文使用情况暂不可用"
+            f"已使用 {round(context_percent, 2)}%"
+            f"（{context_tokens} / {forge_window_tokens} tokens）"
+            if forge_window_tokens else "上下文使用情况暂不可用"
         )
         header_model = self._kimi_header_model(model)
-        header_percent = self._pwa_bounded_percent(context_usage * 100) if max_context_tokens else None
+        header_percent = self._pwa_bounded_percent(context_percent) if forge_window_tokens else None
         header_text = (
             f"{header_model} · {header_percent:.0f}%"
             if header_model and header_percent is not None
@@ -19923,16 +19952,17 @@ class PushHandler(BaseHTTPRequestHandler):
                 "kimi_model_preferences", "kimi_session_control", "kimi_memory_recall",
             ],
             "context": {
-                "available": bool(session_id and max_context_tokens),
-                "used_percent": round(context_usage * 100, 2),
+                "available": bool(session_id and forge_window_tokens),
+                "used_percent": round(context_percent, 2),
                 "input_tokens": context_tokens,
-                "window_tokens": max_context_tokens,
+                "window_tokens": forge_window_tokens,
                 "text": context_text,
             },
             "context_usage": round(context_usage, 6),
             "context_tokens": context_tokens,
             "max_context_tokens": max_context_tokens,
-            "context_usage_percent": round(context_usage * 100, 2),
+            "forge_window_tokens": forge_window_tokens,
+            "context_usage_percent": round(context_percent, 2),
             # The compact header has its own stable contract.  Do not reuse
             # ``provider`` here: "Kimi Code" is a runtime/provider label, not
             # useful status-bar content.
@@ -21733,7 +21763,7 @@ class PushHandler(BaseHTTPRequestHandler):
         handoff_context = self._kimi_web_handoff_context(
             self._chat_for_contact("kimi"), session_id, ""
         )
-        # forge 预警（默认 75%）：群入口投递前同样评估，达线附一次性提示。
+        # forge 预警（默认 240k）：群入口投递前同样评估，达线附一次性提示。
         try:
             forge_warn_context = self._kimi_forge_warn_context(session_id)
         except Exception:

@@ -65,6 +65,23 @@ class KimiWebIsolationTest(unittest.TestCase):
         self.assertEqual(0.25, handler._kimi_context_usage("session-1"))
         self.assertEqual(["start", ("status", "session-1")], web.calls)
 
+    def test_context_usage_uses_fixed_300k_with_small_window_cap(self):
+        cases = (
+            (240_000, 1_048_576, 0.8),
+            (300_000, 1_048_576, 1.0),
+            (204_800, 262_144, 0.78125),
+            (262_144, 262_144, 1.0),
+        )
+        for tokens, model_window, expected in cases:
+            with self.subTest(tokens=tokens, model_window=model_window):
+                web = FakeKimiWeb(status={
+                    "context_tokens": tokens,
+                    "max_context_tokens": model_window,
+                    "context_usage": tokens / model_window,
+                })
+                handler = self.handler(web)
+                self.assertAlmostEqual(expected, handler._kimi_context_usage("session-1"))
+
     def test_context_query_failure_degrades_only_kimi(self):
         web = FakeKimiWeb(start_error=KimiWebError("unavailable"))
         handler = self.handler(web)
@@ -150,6 +167,45 @@ class KimiWebIsolationTest(unittest.TestCase):
         self.assertEqual("K3-256k · 12%", payload["header_display"]["text"])
         self.assertEqual(1, payload["header_display"]["version"])
         self.assertNotIn("Kimi Code", payload["header_display"]["text"])
+
+    def test_status_uses_300k_for_all_context_percentages(self):
+        web = FakeKimiWeb(status={
+            "model": "kimi-code/k3.1-pro",
+            "context_tokens": 240_000,
+            "max_context_tokens": 1_048_576,
+            "context_usage": 240_000 / 1_048_576,
+        })
+        handler = self.handler(web)
+        web.load_active_session_id = lambda: "session-1"
+
+        handler._handle_kimi_status()
+
+        payload = handler.responses[-1][1]
+        self.assertEqual("k3.1-pro · 80%", payload["header_display"]["text"])
+        self.assertEqual(80.0, payload["context"]["used_percent"])
+        self.assertEqual(80.0, payload["context_usage_percent"])
+        self.assertEqual(0.8, payload["context_usage"])
+        self.assertEqual(300_000, payload["context"]["window_tokens"])
+        self.assertEqual(300_000, payload["forge_window_tokens"])
+        self.assertEqual(1_048_576, payload["max_context_tokens"])
+
+    def test_status_percent_stays_bounded_during_deferral(self):
+        web = FakeKimiWeb(status={
+            "model": "kimi-code/k3.1-pro",
+            "context_tokens": 360_000,
+            "max_context_tokens": 1_048_576,
+        })
+        handler = self.handler(web)
+        web.load_active_session_id = lambda: "session-1"
+
+        handler._handle_kimi_status()
+
+        payload = handler.responses[-1][1]
+        self.assertEqual("k3.1-pro · 100%", payload["header_display"]["text"])
+        self.assertEqual(100.0, payload["context"]["used_percent"])
+        self.assertEqual(100.0, payload["context_usage_percent"])
+        self.assertEqual(1.2, payload["context_usage"])
+        self.assertIn("360000 / 300000 tokens", payload["context"]["text"])
 
     def test_real_client_normalizes_network_os_errors_only(self):
         client = KimiWebClient(command="/unused/kimi", start_timeout=5)

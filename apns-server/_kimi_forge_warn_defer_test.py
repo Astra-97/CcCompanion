@@ -29,7 +29,7 @@ def _warn_handler(tmp: str, web: "FakeWeb", *, forge_threshold=0.8, warn=0.75, u
 
 
 class ForgeWarnContextTest(unittest.TestCase):
-    """需求一：75% 预警块的一次性注入语义。"""
+    """预警块的一次性注入语义，以及可配置阈值兼容。"""
 
     def test_below_warn_injects_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -45,6 +45,19 @@ class ForgeWarnContextTest(unittest.TestCase):
             self.assertIn("80%", first)
             # 同一会话同一档位只注入一次。
             self.assertEqual("", handler._kimi_forge_warn_context("session_old"))
+
+    def test_default_240k_warn_and_300k_forge_thresholds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            handler = _warn_handler(
+                tmp, FakeWeb(), forge_threshold=1.0, warn=0.8, usage=0.79,
+            )
+            self.assertEqual("", handler._kimi_forge_warn_context("session_old"))
+            handler._kimi_context_usage = lambda _session: 0.8
+            warning = handler._kimi_forge_warn_context("session_old")
+            self.assertIn("已达 80%", warning)
+            self.assertIn("达到 100%", warning)
+            handler._kimi_context_usage = lambda _session: 1.0
+            self.assertEqual("", handler._kimi_forge_warn_context("session_new"))
 
     def test_usage_fall_below_warn_resets_injection(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -126,6 +139,36 @@ class ForgeDeferAutoForgeTest(unittest.TestCase):
             self.assertEqual(("session_old", False), (session_id, forged))
             scan.assert_not_called()
             self.assertEqual([], web.created)
+            self.assertTrue(handler.state.kimi_forge_deferred)
+
+    def test_defer_hard_cap_uses_real_window_and_small_window_has_no_headroom(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            web = FakeWeb()
+            handler = _warn_handler(tmp, web, forge_threshold=1.0, warn=0.8)
+            web.get_session_status = lambda _session, **_kwargs: {
+                "max_context_tokens": 1_048_576,
+            }
+            self.assertAlmostEqual(
+                0.92 * 1_048_576 / 300_000,
+                handler._kimi_forge_defer_hard_cap("session_old", 1.0),
+            )
+            web.get_session_status = lambda _session, **_kwargs: {
+                "max_context_tokens": 262_144,
+            }
+            self.assertEqual(1.0, handler._kimi_forge_defer_hard_cap("session_old", 1.0))
+
+    def test_default_300k_threshold_still_allows_deferral_with_headroom(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            web = FakeWeb()
+            handler = _warn_handler(
+                tmp, web, forge_threshold=1.0, warn=0.8, usage=1.0,
+            )
+            handler.state.kimi_forge_deferred = True
+            handler._kimi_forge_defer_hard_cap = lambda _session, _threshold: 3.0
+            with patch("push._scan_kimi_session_tasks") as scan:
+                session_id, forged = handler._maybe_forge_kimi_session("session_old")
+            self.assertEqual(("session_old", False), (session_id, forged))
+            scan.assert_not_called()
             self.assertTrue(handler.state.kimi_forge_deferred)
 
     def test_hard_cap_forges_despite_deferral_and_says_so(self):

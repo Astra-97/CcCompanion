@@ -258,6 +258,21 @@ class AutoForgePipelineTest(unittest.TestCase):
             self.assertEqual(("session_old", False), (session_id, forged))
             self.assertEqual([], web.created)
 
+    def test_default_300k_line_allows_100_percent_threshold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            web = FakeWeb()
+            handler = self._auto_handler(tmp, web, threshold=1.0, usage=0.99)
+            self.assertEqual(
+                ("session_old", False),
+                handler._maybe_forge_kimi_session("session_old"),
+            )
+            handler._kimi_context_usage = lambda _session: 1.0
+            with patch("push._scan_kimi_session_tasks", return_value=dict(self.TASKS)):
+                self.assertEqual(
+                    ("session_new", True),
+                    handler._maybe_forge_kimi_session("session_old"),
+                )
+
     def test_auto_forge_runs_full_handoff_pipeline(self):
         with tempfile.TemporaryDirectory() as tmp:
             web = FakeWeb()
