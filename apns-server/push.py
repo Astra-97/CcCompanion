@@ -190,6 +190,7 @@ from device_notice import (
     NOTICE_KIND_APP,
     NOTICE_KIND_BATTERY,
     NOTICE_KIND_SUN,
+    TZ_BEIJING,
     XiaokeLowKeyNotifier,
     build_device_notice,
 )
@@ -9519,33 +9520,11 @@ class PushHandler(BaseHTTPRequestHandler):
         ``device``/``source`` 默认是手机感知（电量/应用开关）；日出日落等本机
         定时事件复用同一胶囊+低调注入，只换胶囊 items 的 device 与 source。
         """
-        try:
-            chat = self._chat_for_contact("xiaoke")
-            chat.append(
-                role="assistant",
-                text=text,
-                source=source,
-                metadata={
-                    # mihome_event + severity + 非空 items 是 Android 端
-                    # MihomeEventPill 的渲染开关（同 roborock-watch）。
-                    "mihome_event": True,
-                    "severity": "warn" if severity == "warn" else "info",
-                    "items": [{
-                        "device": device,
-                        "change": change or str(event_meta.get("kind") or ""),
-                        "human": text,
-                    }],
-                    "device_event": event_meta,
-                },
-            )
-        except Exception:
-            logger.warning("device event bubble append failed", exc_info=True)
-        try:
-            notifier = getattr(self.state, "xiaoke_low_key_notifier", None)
-            if notifier is not None:
-                notifier.enqueue(build_device_notice(notice_kind, text))
-        except Exception:
-            logger.warning("device event notice enqueue failed", exc_info=True)
+        append_device_event_bubble(
+            self.state, self._chat_for_contact, text, event_meta,
+            notice_kind=notice_kind, severity=severity, change=change,
+            device=device, source=source,
+        )
 
     _SUN_EVENT_KINDS = ("sunrise", "sunset")
     _SUN_EVENT_TEXT_MAX = 200
@@ -9636,7 +9615,11 @@ class PushHandler(BaseHTTPRequestHandler):
         })
 
     def _handle_device_app_event(self, body: dict[str, Any]):
-        """POST /device/app-event — 被监 App 开/关；每包名 60s 防抖后冒泡。"""
+        """POST /device/app-event — 被监 App 开/关。
+
+        open 立刻判定冒泡；close 挂起 APP_CLOSE_CONFIRM_SECONDS 秒，期间重新
+        open 就撤销（启动闪屏抖动），到期由 app-close-sweeper 线程补发。
+        """
         event = normalize_app_event(body)
         if event is None:
             self._send_json(400, {
@@ -9646,20 +9629,21 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         should_bubble = self.state.device_activity.record_app_event(event)
         self._maybe_record_device_activity(body)
+        pending = event["event"] == APP_EVENT_CLOSE
         if should_bubble:
-            if event["event"] == APP_EVENT_OPEN:
-                text = f"🎮方小南打开了《{event['label']}》"
-            else:
-                text = f"👋方小南关闭了《{event['label']}》"
-            self._append_device_event_bubble(text, {
-                "kind": f"app_{event['event']}",
+            self._append_device_event_bubble(_app_event_bubble_text(event["label"], APP_EVENT_OPEN), {
+                "kind": "app_open",
                 "package": event["package"],
                 "label": event["label"],
-            }, notice_kind=NOTICE_KIND_APP, change=f"app_{event['event']}")
-            logger.info("device app event %s package=%s", event["event"], event["package"])
+            }, notice_kind=NOTICE_KIND_APP, change="app_open")
+        logger.info(
+            "device app event %s package=%s bubbled=%s pending_close=%s",
+            event["event"], event["package"], should_bubble, pending,
+        )
         self._send_json(200, {
             "ok": True,
             "bubbled": should_bubble,
+            "pending": pending,
             "event": event["event"],
             "package": event["package"],
         })
@@ -31870,6 +31854,97 @@ def load_config(path: Path) -> dict[str, Any]:
     return tomllib.loads(path.read_text())
 
 
+def append_device_event_bubble(
+    state: Any,
+    chat_lookup: Callable[[str], Any],
+    text: str,
+    event_meta: dict[str, Any],
+    *,
+    notice_kind: str = NOTICE_KIND_BATTERY,
+    severity: str = "info",
+    change: str = "",
+    device: str = "手机",
+    source: str = "device-event",
+) -> None:
+    """设备事件胶囊 + cctg 低调注入（处理器与后台 sweeper 共用）。"""
+    try:
+        chat = chat_lookup("xiaoke")
+        chat.append(
+            role="assistant",
+            text=text,
+            source=source,
+            metadata={
+                # mihome_event + severity + 非空 items 是 Android 端
+                # MihomeEventPill 的渲染开关（同 roborock-watch）。
+                "mihome_event": True,
+                "severity": "warn" if severity == "warn" else "info",
+                "items": [{
+                    "device": device,
+                    "change": change or str(event_meta.get("kind") or ""),
+                    "human": text,
+                }],
+                "device_event": event_meta,
+            },
+        )
+    except Exception:
+        logger.warning("device event bubble append failed", exc_info=True)
+    try:
+        notifier = getattr(state, "xiaoke_low_key_notifier", None)
+        if notifier is not None:
+            notifier.enqueue(build_device_notice(notice_kind, text))
+    except Exception:
+        logger.warning("device event notice enqueue failed", exc_info=True)
+
+
+def _app_event_bubble_text(label: str, kind: str, closed_at: float | None = None) -> str:
+    if kind == APP_EVENT_OPEN:
+        return f"🎮方小南打开了《{label}》"
+    if closed_at is None:
+        return f"👋方小南关闭了《{label}》"
+    hhmm = datetime.fromtimestamp(closed_at, TZ_BEIJING).strftime("%H:%M")
+    return f"👋方小南{hhmm}关闭了《{label}》"
+
+
+def flush_due_app_closes(
+    state: Any,
+    chat_lookup: Callable[[str], Any] | None = None,
+    *,
+    now: float | None = None,
+) -> int:
+    """把确认窗口已到期的挂起 close 冒泡；返回冒泡条数。"""
+    store = getattr(state, "device_activity", None)
+    if store is None:
+        return 0
+    if chat_lookup is None:
+        def chat_lookup(contact_id: str) -> Any:
+            return state.contact_chats.get(contact_id) or state.chat
+    due = store.pop_due_closes(now=now)
+    for item in due:
+        text = _app_event_bubble_text(item["label"], APP_EVENT_CLOSE, item["closed_at"])
+        append_device_event_bubble(state, chat_lookup, text, {
+            "kind": "app_close",
+            "package": item["package"],
+            "label": item["label"],
+            "closed_at": item["closed_at"],
+        }, notice_kind=NOTICE_KIND_APP, change="app_close")
+        logger.info("device app event close confirmed package=%s closed_at=%.0f",
+                    item["package"], item["closed_at"])
+    return len(due)
+
+
+APP_CLOSE_SWEEP_INTERVAL_SECONDS = 5.0
+
+
+def app_close_sweeper_loop(state: Any, interval: float = APP_CLOSE_SWEEP_INTERVAL_SECONDS) -> None:
+    """每 interval 秒补发到期的挂起 close；重启后持久化的挂起项同样由它收尾。"""
+    while True:
+        try:
+            time.sleep(interval)
+            flush_due_app_closes(state)
+        except Exception:
+            logger.exception("app close sweeper error")
+
+
 def cleanup_loop(state: ServerState, interval: float = 1800):
     """每 30 min cleanup stale tokens"""
     while True:
@@ -32393,6 +32468,9 @@ def run_server(state: ServerState):
         target=cleanup_loop, args=(state,), daemon=True, name="cleanup"
     )
     cleanup_thread.start()
+    threading.Thread(
+        target=app_close_sweeper_loop, args=(state,), daemon=True, name="app-close-sweeper"
+    ).start()
     # 肥波额度估计采样器：周期读 statusline 的 tmux 全局 option 记账，
     # daemon 线程随服务进程退出，无需单独 stop 通道。
     fable_tracker = getattr(state, "fable_quota_tracker", None)

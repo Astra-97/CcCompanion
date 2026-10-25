@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import tempfile
 import threading
+import time
 import types
 import unittest
 from datetime import datetime
@@ -208,22 +209,88 @@ class DeviceActivityStoreTest(unittest.TestCase):
     def make_store(self):
         return DeviceActivityStore(self.path)
 
-    def test_app_event_debounce_per_package_and_event_type(self):
+    OPEN = {"event": "open", "package": "a.b", "label": "A"}
+    CLOSE = {"event": "close", "package": "a.b", "label": "A"}
+
+    def test_flicker_open_close_open_bubbles_only_first_open(self):
+        # 今天 08:05 实录形状：open → 10s close → 70s 又 open（闪屏抖动）。
         store = self.make_store()
-        open_event = {"event": "open", "package": "a.b", "label": "A"}
-        close_event = {"event": "close", "package": "a.b", "label": "A"}
-        self.assertTrue(store.record_app_event(open_event, now=1000.0))
-        # open/close 分别防抖：60 秒内「开了又关」两条都能看到。
-        self.assertTrue(store.record_app_event(close_event, now=1030.0))
-        # 同类型 60 秒内重复：不冒泡。
-        self.assertFalse(store.record_app_event(open_event, now=1030.0))
-        self.assertFalse(store.record_app_event(close_event, now=1089.0))
-        # 过 60 秒：再次冒泡。
-        self.assertTrue(store.record_app_event(open_event, now=1061.0))
-        self.assertTrue(store.record_app_event(close_event, now=1091.0))
-        # 不同包名互不影响。
-        other = {"event": "open", "package": "c.d", "label": "C"}
-        self.assertTrue(store.record_app_event(other, now=1062.0))
+        self.assertTrue(store.record_app_event(self.OPEN, now=1000.0))
+        self.assertFalse(store.record_app_event(self.CLOSE, now=1010.0))
+        self.assertEqual([], store.pop_due_closes(now=1050.0))
+        self.assertFalse(store.record_app_event(self.OPEN, now=1070.0))
+        # 撤销后窗口到期也不补发 close。
+        self.assertEqual([], store.pop_due_closes(now=1200.0))
+        # 仍在前台：再来 open 也不重复冒泡。
+        self.assertFalse(store.record_app_event(self.OPEN, now=1300.0))
+
+    def test_close_confirmed_after_window_without_reopen(self):
+        store = self.make_store()
+        self.assertTrue(store.record_app_event(self.OPEN, now=1000.0))
+        self.assertFalse(store.record_app_event(self.CLOSE, now=1030.0))
+        # 重复 close 保留最早关闭时间。
+        self.assertFalse(store.record_app_event(self.CLOSE, now=1040.0))
+        self.assertEqual([], store.pop_due_closes(now=1119.0))
+        self.assertEqual(
+            [{"package": "a.b", "label": "A", "closed_at": 1030.0}],
+            store.pop_due_closes(now=1120.0),
+        )
+        self.assertEqual([], store.pop_due_closes(now=1200.0))
+        # 确认关闭后重新打开：照常冒泡。
+        self.assertTrue(store.record_app_event(self.OPEN, now=1300.0))
+
+    def test_two_packages_independent(self):
+        store = self.make_store()
+        other_open = {"event": "open", "package": "c.d", "label": "C"}
+        other_close = {"event": "close", "package": "c.d", "label": "C"}
+        self.assertTrue(store.record_app_event(self.OPEN, now=1000.0))
+        self.assertTrue(store.record_app_event(other_open, now=1001.0))
+        self.assertFalse(store.record_app_event(self.CLOSE, now=1010.0))
+        self.assertFalse(store.record_app_event(other_close, now=1011.0))
+        # a.b 回来撤销自己的 close，不影响 c.d 的挂起 close。
+        self.assertFalse(store.record_app_event(self.OPEN, now=1050.0))
+        due = store.pop_due_closes(now=1110.0)
+        self.assertEqual(["c.d"], [d["package"] for d in due])
+
+    def test_open_debounce_fallback_still_applies(self):
+        store = self.make_store()
+        self.assertTrue(store.record_app_event(self.OPEN, now=1000.0))
+        store.record_app_event(self.CLOSE, now=1001.0)
+        self.assertEqual(1, len(store.pop_due_closes(now=1091.0)))
+        # 已确认关闭，但距上次 open 气泡不足 60 秒：防抖兜底不冒泡。
+        store._last_bubble_at["a.b|open"] = 1080.0
+        self.assertFalse(store.record_app_event(self.OPEN, now=1100.0))
+
+    def test_stale_foreground_reopen_bubbles(self):
+        # 漏报 close 时，前台状态 6 小时后失效，不会永远吞 open。
+        store = self.make_store()
+        self.assertTrue(store.record_app_event(self.OPEN, now=1000.0))
+        self.assertTrue(store.record_app_event(self.OPEN, now=1000.0 + 6 * 3600 + 1))
+
+    def test_pending_close_survives_restart(self):
+        store = self.make_store()
+        store.record_app_event(self.OPEN, now=1000.0)
+        store.record_app_event(self.CLOSE, now=1010.0)
+        reloaded = self.make_store()
+        # 重启后在窗口内回来：照样撤销。
+        self.assertFalse(reloaded.record_app_event(self.OPEN, now=1050.0))
+        reloaded.record_app_event(self.CLOSE, now=1060.0)
+        again = self.make_store()
+        self.assertTrue(again.has_pending_closes())
+        self.assertEqual(
+            [{"package": "a.b", "label": "A", "closed_at": 1060.0}],
+            again.pop_due_closes(now=1200.0),
+        )
+
+    def test_stale_pending_close_dropped_after_long_downtime(self):
+        store = self.make_store()
+        store.record_app_event(self.OPEN, now=1000.0)
+        store.record_app_event(self.CLOSE, now=1010.0)
+        reloaded = self.make_store()
+        self.assertEqual([], reloaded.pop_due_closes(now=1010.0 + 90 + 601))
+        self.assertFalse(reloaded.has_pending_closes())
+        # 丢弃后视为已关闭，下次 open 照常冒泡。
+        self.assertTrue(reloaded.record_app_event(self.OPEN, now=5000.0))
 
     def test_snapshot_keeps_only_latest_and_survives_reload(self):
         store = self.make_store()
@@ -384,27 +451,49 @@ class DeviceAppEventHandlerTest(DeviceHandlerTestBase):
         self.handler._handle_device_app_event(body)
         return self.handler.responses[-1]
 
-    def test_open_close_bubbles(self):
+    def test_open_close_bubbles_after_confirm_window(self):
         status, payload = self.report({
             "event": "open", "package": "com.papegames.lysk.cn", "label": "恋与深空",
         })
         self.assertEqual(200, status)
         self.assertTrue(payload["bubbled"])
         self.assertIn("🎮方小南打开了《恋与深空》", self.bubbles())
-        # open/close 分别防抖：紧跟着的关闭也能冒泡（不挂没有下文的「打开了」）。
+        # close 先挂起，不立刻冒泡。
         _status, payload = self.report({
             "event": "close", "package": "com.papegames.lysk.cn", "label": "恋与深空",
         })
-        self.assertTrue(payload["bubbled"])
-        self.assertIn("👋方小南关闭了《恋与深空》", self.bubbles())
+        self.assertFalse(payload["bubbled"])
+        self.assertTrue(payload["pending"])
+        self.assertEqual(1, len(self.bubbles()))
+        closed_at = self.activity_store._apps["com.papegames.lysk.cn"]["pending_close_at"]
+        self.assertEqual(0, push.flush_due_app_closes(
+            self.handler.state, self.handler._chat_for_contact, now=closed_at + 30))
+        self.assertEqual(1, push.flush_due_app_closes(
+            self.handler.state, self.handler._chat_for_contact, now=closed_at + 90))
+        hhmm = datetime.fromtimestamp(closed_at, TZ_BEIJING).strftime("%H:%M")
+        self.assertEqual(
+            ["🎮方小南打开了《恋与深空》", f"👋方小南{hhmm}关闭了《恋与深空》"], self.bubbles(),
+        )
         metas = [item["metadata"] for item in self.handler.chat.appended]
         self.assertEqual(["app_open", "app_close"], [m["items"][0]["change"] for m in metas])
+        self.assertEqual(closed_at, metas[1]["device_event"]["closed_at"])
         self.assertTrue(all(m["mihome_event"] and m["severity"] == "info" for m in metas))
         notices = self.notices()
         self.assertEqual(2, len(notices))
         self.assertTrue(all(n.startswith("【📱 手机应用·自动触发】") for n in notices))
         self.assertIn("🎮方小南打开了《恋与深空》", notices[0])
-        self.assertIn("👋方小南关闭了《恋与深空》", notices[1])
+        self.assertIn(f"👋方小南{hhmm}关闭了《恋与深空》", notices[1])
+
+    def test_flicker_reopen_cancels_close(self):
+        body = {"event": "open", "package": "a.b", "label": "A"}
+        self.report(body)
+        self.report({"event": "close", "package": "a.b", "label": "A"})
+        _status, payload = self.report(body)
+        self.assertFalse(payload["bubbled"])
+        self.assertEqual(0, push.flush_due_app_closes(
+            self.handler.state, self.handler._chat_for_contact, now=time.time() + 1000))
+        self.assertEqual(["🎮方小南打开了《A》"], self.bubbles())
+        self.assertEqual(1, len(self.notices()))
 
     def test_debounced_second_event_not_bubbled(self):
         body = {"event": "open", "package": "a.b", "label": "A"}
@@ -419,16 +508,21 @@ class DeviceAppEventHandlerTest(DeviceHandlerTestBase):
         self.assertEqual(400, status)
         self.assertFalse(payload["ok"])
 
-    def test_same_event_after_debounce_window_bubbles(self):
+    def test_reopen_after_confirmed_close_bubbles(self):
         body = {"event": "open", "package": "a.b", "label": "A"}
         self.report(body)
-        # 直接拨防抖表模拟 61 秒后，同类型再次冒泡。
+        self.report({"event": "close", "package": "a.b", "label": "A"})
+        # 拨表模拟 61 秒前的 open 气泡 + 确认窗口已到期。
         self.activity_store._last_bubble_at["a.b|open"] -= 61.0
+        push.flush_due_app_closes(
+            self.handler.state, self.handler._chat_for_contact, now=time.time() + 91)
         _status, payload = self.report(body)
         self.assertTrue(payload["bubbled"])
-        self.assertEqual(
-            ["🎮方小南打开了《A》", "🎮方小南打开了《A》"], self.bubbles(),
-        )
+        texts = self.bubbles()
+        self.assertEqual(3, len(texts))
+        self.assertEqual("🎮方小南打开了《A》", texts[0])
+        self.assertTrue(texts[1].startswith("👋方小南") and texts[1].endswith("关闭了《A》"))
+        self.assertEqual("🎮方小南打开了《A》", texts[2])
 
 
 class DeviceNoticeTextTest(unittest.TestCase):
