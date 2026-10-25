@@ -1,18 +1,18 @@
-import { createPwaBootstrap } from './bootstrap.js?v=34';
-import { createComposerState } from './composer-state.js?v=34';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=34';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=34';
-import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord, controlPanelSupported } from './api.js?v=34';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=34';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=34';
-import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=34';
-import { createUnreadStore, latestChatRecord, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=34';
-import { createNotifier } from './notifications.js?v=34';
-import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=34';
-import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=34';
-import { TERMINAL_TARGETS, TERMINAL_KEYBAR, DEFAULT_TERMINAL_TARGET, createTerminalController, isTerminalTargetId, canSend as terminalCanSend, emptyTerminalText, inputPlaceholder as terminalInputPlaceholder, terminalStatusBanner, slashSuggestions, resolveKeybarKey, ctrlLetterKey, passthroughKey, terminalGrid } from './terminal.js?v=34';
+import { createPwaBootstrap } from './bootstrap.js?v=35';
+import { createComposerState } from './composer-state.js?v=35';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=35';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=35';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord, controlPanelSupported } from './api.js?v=35';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=35';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=35';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=35';
+import { createUnreadStore, latestChatRecord, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=35';
+import { createNotifier } from './notifications.js?v=35';
+import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=35';
+import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=35';
+import { TERMINAL_TARGETS, TERMINAL_KEYBAR, DEFAULT_TERMINAL_TARGET, createTerminalController, isTerminalTargetId, canSend as terminalCanSend, emptyTerminalText, inputPlaceholder as terminalInputPlaceholder, terminalStatusBanner, slashSuggestions, resolveKeybarKey, ctrlLetterKey, passthroughKey, terminalGrid } from './terminal.js?v=35';
 
-const WEB_SHELL_VERSION = 'desk-v34 · 2026-10-24';
+const WEB_SHELL_VERSION = 'desk-v35 · 2026-10-25';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -1115,7 +1115,7 @@ function renderStickerPicker() {
     button.addEventListener('keydown', (event) => { if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return; event.preventDefault(); const next = event.key === 'Home' ? 0 : event.key === 'End' ? categoryItems.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + categoryItems.length) % categoryItems.length; const targetId = categoryItems[next].id; state.stickerCategory = targetId; renderStickerPicker(); [...categories.querySelectorAll('[role="tab"]')].find((tab) => tab.dataset.categoryId === targetId)?.focus(); });
     return button;
   }));
-  const query = stickerSearchKey(state.stickerSearch); const filtered = catalog.stickers.filter((sticker) => (state.stickerCategory === '__all' || sticker.categoryId === state.stickerCategory) && (!query || stickerSearchKey(`${sticker.label} ${sticker.name}`).includes(query)));
+  const query = stickerSearchKey(state.stickerSearch); const filtered = catalog.stickers.filter((sticker) => (state.stickerCategory === '__all' || sticker.categoryId === state.stickerCategory) && (!query || stickerSearchKey(`${sticker.label} ${sticker.name} ${(sticker.aliases || []).join(' ')}`).includes(query)));
   status.textContent = filtered.length ? `${filtered.length} 张；点选后加入当前草稿，不会自动发送。` : '没有符合条件的表情包。';
   grid.replaceChildren(...filtered.map((sticker, index) => {
     const button = el('button', { type: 'button', class: 'sticker-tile', 'aria-label': `加入表情包 ${sticker.label}`, 'data-sticker-name': sticker.name });

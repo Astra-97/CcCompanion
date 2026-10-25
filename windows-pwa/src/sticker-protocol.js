@@ -6,6 +6,17 @@ export function isSafeStickerName(value) {
   return typeof value === 'string' && value.length >= 1 && value.length <= MAX_NAME && value === value.normalize('NFC') && value === value.trim() && !/[\[\]:/\\?#%\u0000-\u001f\u007f]/u.test(value);
 }
 
+// Mirrors Android StickerProtocol.stickerDisplayName: a distinct catalog label
+// wins; otherwise strip only the first U+00B7 category segment
+// (「小黄豆·抱抱·2」→「抱抱·2」). Display only — tokens always use the wire name.
+export function stickerDisplayName(name, label = '') {
+  const wire = typeof name === 'string' ? name : '';
+  const display = typeof label === 'string' ? label : '';
+  if (display.trim() && display !== wire) return display;
+  const dot = wire.indexOf('\u00b7');
+  return dot < 0 ? wire : (wire.slice(dot + 1) || wire);
+}
+
 export function normalizeStickerCatalog(raw = {}) {
   const categories = Array.isArray(raw.categories) ? raw.categories.slice(0, 128).map((item) => {
     const id = typeof item?.id === 'string' && /^[a-z0-9](?:[a-z0-9_-]{0,46}[a-z0-9])?$/.test(item.id) ? item.id : '';
@@ -22,7 +33,7 @@ export function normalizeStickerCatalog(raw = {}) {
     const aliases = Array.isArray(item.aliases)
       ? [...new Set(item.aliases.filter((alias) => isSafeStickerName(alias) && alias !== item.name))].slice(0, 8)
       : [];
-    seen.add(item.name); return { name: item.name, label: isSafeStickerName(item.label) ? item.label : item.name, url: url.href, categoryId, ...(aliases.length ? { aliases } : {}) };
+    seen.add(item.name); return { name: item.name, label: stickerDisplayName(item.name, isSafeStickerName(item.label) ? item.label : ''), url: url.href, categoryId, ...(aliases.length ? { aliases } : {}) };
   }).filter(Boolean) : [];
   // Names always win over aliases: a legacy alias colliding with a live name
   // or already claimed by an earlier sticker is dropped, keeping old tokens unambiguous.

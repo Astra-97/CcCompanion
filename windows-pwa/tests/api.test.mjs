@@ -7,7 +7,7 @@ import { createPwaBootstrap, isExplicitMockMode } from '../src/bootstrap.js';
 import { createComposerState } from '../src/composer-state.js';
 import { PAIRING_ALPHABET, formatPairingCode, normalizePairingCode } from '../src/pairing-code.js';
 import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from '../src/live-messages.js';
-import { insertStickerToken, normalizeStickerCatalog, parseStickerParts, removeStickerToken, stickerTokens } from '../src/sticker-protocol.js';
+import { insertStickerToken, normalizeStickerCatalog, parseStickerParts, removeStickerToken, stickerDisplayName, stickerTokens } from '../src/sticker-protocol.js';
 import { todayKey } from '../src/memory-calendar.js';
 
 function hexToken(css, token) {
@@ -111,6 +111,27 @@ test('sticker aliases resolve legacy tokens with name-exact priority and no ambi
   assert.deepEqual(resolved.map(({ name }) => name), ['自嘲熊·大哭', '抱抱', '哥哥熊·蹭蹭']);
   assert.equal(resolved[0].token, '[bqb:大哭]');
   assert.deepEqual(stickerTokens('[bqb:不可以]', catalog), []);
+});
+
+test('sticker display names strip only the first category segment like Android, tokens keep the wire name', () => {
+  assert.equal(stickerDisplayName('迪迪熊·我不', '迪迪熊·我不'), '我不');
+  assert.equal(stickerDisplayName('小黄豆·抱抱·2', ''), '抱抱·2');
+  assert.equal(stickerDisplayName('开心扭扭的小克', '开心扭扭的小克'), '开心扭扭的小克');
+  assert.equal(stickerDisplayName('自嘲熊·OK', 'OK'), 'OK');
+  assert.equal(stickerDisplayName('自嘲熊·大哭', '自定义标签'), '自定义标签');
+  assert.equal(stickerDisplayName('自嘲熊·大哭', '   '), '大哭');
+  assert.equal(stickerDisplayName('自嘲熊・大哭', ''), '自嘲熊・大哭', 'only U+00B7 separates the category, not katakana U+30FB');
+  const catalog = normalizeStickerCatalog({ stickers: [
+    { name: '迪迪熊·我不', label: '迪迪熊·我不', url: 'https://test.xiaonancaleb.xyz/stickers/a.gif', aliases: ['我不'] },
+    { name: '小黄豆·抱抱·2', url: 'https://test.xiaonancaleb.xyz/stickers/b.gif' },
+    { name: '自嘲熊·大哭', label: '[bqb:注入]', url: 'https://test.xiaonancaleb.xyz/stickers/c.gif' },
+  ] });
+  assert.deepEqual(catalog.stickers.map(({ name, label }) => [name, label]), [['迪迪熊·我不', '我不'], ['小黄豆·抱抱·2', '抱抱·2'], ['自嘲熊·大哭', '大哭']]);
+  assert.equal(insertStickerToken('', 0, 0, catalog.stickers[0].name).text, '[bqb:迪迪熊·我不]');
+  assert.deepEqual(stickerTokens('[bqb:迪迪熊·我不] [bqb:我不]', catalog).map(({ name }) => name), ['迪迪熊·我不', '迪迪熊·我不']);
+  const app = readFileSync(new URL('../src/app.js', import.meta.url), 'utf8');
+  assert.match(app, /insertStickerToken\(draft\.text, selection\.start, selection\.end, sticker\.name\)/, 'drafts receive the full wire name, never the display label');
+  assert.match(app, /stickerSearchKey\(`\$\{sticker\.label\} \$\{sticker\.name\} \$\{\(sticker\.aliases \|\| \[\]\)\.join\(' '\)\}`\)/, 'search still matches wire names and aliases');
 });
 
 test('sticker insertion is exact at the cursor, stays contact scoped, and never sends', () => {
@@ -570,11 +591,11 @@ test('PWA shell declares installability and has no secret persistence', async ()
   assert.match(manifest, /\.\/assets\/app-icon-192\.png/);
   assert.match(manifest, /\.\/assets\/app-icon-512\.png/);
   assert.match(serviceWorker, /addEventListener\('fetch'/);
-  assert.match(serviceWorker, /cccompanion-desk-v34/);
-  assert.match(serviceWorker, /src\/styles\.css\?v=34/);
-  assert.match(serviceWorker, /src\/app\.js\?v=34/);
-  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=34/);
-  assert.match(serviceWorker, /src\/sticker-protocol\.js\?v=34/);
+  assert.match(serviceWorker, /cccompanion-desk-v35/);
+  assert.match(serviceWorker, /src\/styles\.css\?v=35/);
+  assert.match(serviceWorker, /src\/app\.js\?v=35/);
+  assert.match(serviceWorker, /src\/clipboard-images\.js\?v=35/);
+  assert.match(serviceWorker, /src\/sticker-protocol\.js\?v=35/);
   assert.match(serviceWorker, /src\/live-messages\.js/);
   assert.match(serviceWorker, /src\/pairing-code\.js/);
   assert.doesNotMatch(source, /shared_secret|localStorage\.setItem|sessionStorage\.setItem|credentials:\s*'include'/);
@@ -591,8 +612,8 @@ test('PWA source contracts preserve responsive, private, and accessible behavior
   ]);
   assert.match(html, /id="latest-button"/);
   assert.match(html, /id="pairing-code"/);
-  assert.match(html, /href="\.\/src\/styles\.css\?v=34"/);
-  assert.match(html, /src="\.\/src\/app\.js\?v=34"/);
+  assert.match(html, /href="\.\/src\/styles\.css\?v=35"/);
+  assert.match(html, /src="\.\/src\/app\.js\?v=35"/);
   assert.match(html, /autocomplete="one-time-code"/);
   assert.match(html, /id="pairing-form"/);
   assert.match(html, /<details class="password-fallback">/);

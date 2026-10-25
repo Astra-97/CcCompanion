@@ -207,6 +207,6 @@ test('terminal tab source contracts: markup, lifecycle, IME, focus and precache'
   assert.match(app, /terminal\.clear\(\);/, 'logout forgets the pane');
   assert.doesNotMatch(app, /terminalOutput\.innerHTML|insertAdjacentHTML/, 'terminal text is textContent only');
   assert.match(css, /\.page-view\.terminal-view\{--term-green:#39d353;/);
-  assert.match(sw, /'\.\/src\/terminal\.js\?v=34'/);
+  assert.match(sw, /'\.\/src\/terminal\.js\?v=35'/);
   assert.match(sw, /stickers\|tmux\|terminal\)/, 'terminal routes are never served from Cache Storage');
 });
