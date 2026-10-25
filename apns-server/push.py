@@ -27235,6 +27235,9 @@ class PushHandler(BaseHTTPRequestHandler):
                 "location": str(prof.get("location") or tag_id)[:16],
                 "action": action,
             }
+            bubble = prof.get("bubble")
+            if isinstance(bubble, str) and bubble.strip():
+                out[tag_id]["bubble"] = bubble.strip()[:40]
         return out
 
     @classmethod
@@ -27463,7 +27466,7 @@ class PushHandler(BaseHTTPRequestHandler):
         self, tag_id: str, profile: dict[str, str], home_result: dict[str, Any] | None
     ) -> None:
         """小克私聊系统胶囊（同 sun-bubble：role=assistant + mihome_event 渲染开关）。"""
-        text = f"方小南捏了捏🤏{profile.get('location') or '床头'}的🦀"
+        text = profile.get("bubble") or f"方小南捏了捏🤏{profile.get('location') or '床头'}的🦀"
         if home_result is not None:
             text += self._nfc_home_bubble_suffix(home_result)
         if profile.get("action") == "home" and profile.get("leave"):
