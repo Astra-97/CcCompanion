@@ -704,7 +704,8 @@ class KimiWebChatRoutingTest(unittest.TestCase):
     @staticmethod
     def wait_idle(handler):
         for _ in range(100):
-            if not handler.state.kimi_active_turn: return
+            if not handler.state.kimi_active_turn and not handler.state.kimi_prepare_token:
+                return
             __import__("time").sleep(0.01)
         raise AssertionError("Kimi Web worker did not finish")
 
@@ -720,6 +721,232 @@ class KimiWebChatRoutingTest(unittest.TestCase):
                 return
             __import__("time").sleep(0.02)
         raise AssertionError("Kimi chat queue did not drain")
+
+    def test_early_ack_follows_history_append_without_waiting_for_session_prepare(self):
+        order = []
+        ensure_started = threading.Event()
+        release_ensure = threading.Event()
+
+        class BlockingPrepareWeb(FakeWebChat):
+            def ensure_active_session(self, *, model, thinking, **_kwargs):
+                order.append("ensure")
+                ensure_started.set()
+                if not release_ensure.wait(2):
+                    raise AssertionError("test did not release session prepare")
+                return "web-session-1"
+
+        handler, chat, web = self.make_handler(web=BlockingPrepareWeb())
+        original_append = chat.append
+
+        def append(**record):
+            order.append("append")
+            return original_append(**record)
+
+        chat.append = append
+        handler._handle_kimi_chat_send({"text": "ack first"}, "kimi")
+
+        self.assertTrue(ensure_started.wait(1))
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertEqual(["ack first"], [row["text"] for row in chat.records])
+        self.assertLess(order.index("append"), order.index("ensure"))
+        self.assertFalse(any(row[0] == "submit" for row in web.calls))
+        self.assertTrue(handler.state.kimi_prepare_token)
+
+        release_ensure.set()
+        self.wait_idle(handler)
+        self.assertEqual(1, len([row for row in web.calls if row[0] == "submit"]))
+
+    def test_prepare_failure_is_visible_over_previous_terminal_reply_state(self):
+        class FailingPrepareWeb(FakeWebChat):
+            def ensure_active_session(self, *, model, thinking, **_kwargs):
+                raise KimiWebError("prepare unavailable")
+
+        handler, _chat, _web = self.make_handler(web=FailingPrepareWeb())
+        handler.state.chat_reply_states["kimi"] = {
+            "user_ts": "previous-turn", "reply_state": "completed", "is_active": False,
+        }
+        handler._handle_kimi_chat_send({"text": "must fail visibly"}, "kimi")
+        self.wait_idle(handler)
+
+        self.assertEqual(200, handler.responses[-1][0])
+        user_ts = handler.responses[-1][1]["turn"]["user_ts"]
+        state = handler.state.chat_reply_states["kimi"]
+        self.assertEqual(user_ts, state["user_ts"])
+        self.assertEqual("failed", state["reply_state"])
+
+    def test_stop_during_prepare_cancels_before_submit(self):
+        ensure_started = threading.Event()
+        release_ensure = threading.Event()
+
+        class BlockingPrepareWeb(FakeWebChat):
+            def ensure_active_session(self, *, model, thinking, **_kwargs):
+                ensure_started.set()
+                if not release_ensure.wait(2):
+                    raise AssertionError("test did not release session prepare")
+                return "web-session-1"
+
+        handler, _chat, web = self.make_handler(web=BlockingPrepareWeb())
+        handler._handle_kimi_chat_send({"text": "stop preparing"}, "kimi")
+        self.assertTrue(ensure_started.wait(1))
+        user_ts = handler.responses[-1][1]["turn"]["user_ts"]
+
+        handler._handle_kimi_chat_stop(user_ts)
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertTrue(handler.responses[-1][1]["stopped"])
+        self.assertNotIn("already_finished", handler.responses[-1][1])
+
+        release_ensure.set()
+        self.wait_idle(handler)
+        self.assertFalse(any(row[0] == "submit" for row in web.calls))
+        self.assertEqual("interrupted", handler.state.chat_reply_states["kimi"]["reply_state"])
+
+    def test_stop_during_prepare_is_not_lost_when_delivery_would_requeue(self):
+        handoff_started = threading.Event()
+        release_handoff = threading.Event()
+
+        def busy_handoff():
+            handoff_started.set()
+            if not release_handoff.wait(2):
+                raise AssertionError("test did not release terminal handoff")
+            raise KimiTerminalBusy("terminal still busy")
+
+        handler, _chat, web = self.make_handler()
+        handler.state.kimi_terminal = types.SimpleNamespace(
+            input_transaction=lambda: __import__("contextlib").nullcontext(),
+            release_for_acp=busy_handoff,
+        )
+        handler._handle_kimi_chat_send({"text": "stop before requeue"}, "kimi")
+        self.assertTrue(handoff_started.wait(1))
+        user_ts = handler.responses[-1][1]["turn"]["user_ts"]
+        handler._handle_kimi_chat_stop(user_ts)
+        release_handoff.set()
+        self.wait_idle(handler)
+
+        self.assertFalse(any(row[0] == "submit" for row in web.calls))
+        self.assertEqual(0, len(handler._kimi_chat_queue()))
+        self.assertEqual("interrupted", handler.state.chat_reply_states["kimi"]["reply_state"])
+
+    def test_recall_overlaps_prepare_and_stream_then_cards_before_submit(self):
+        recall_started = threading.Event()
+        release_recall = threading.Event()
+        stream_started = threading.Event()
+        order = []
+        recall = types.SimpleNamespace(
+            context="safe parallel recall",
+            items=({"date": "2026-10-25", "title": "memory", "snippet": "safe"},),
+            memory_keys=("v1:" + "f" * 64,),
+        )
+
+        class ParallelWeb(FakeWebChat):
+            def load_active_session_id(self):
+                return "web-session-1"
+
+            def ensure_active_session(self, *, model, thinking, **_kwargs):
+                if not recall_started.wait(1):
+                    raise AssertionError("recall did not overlap session prepare")
+                return "web-session-1"
+
+            def stream_session(self, *args, **kwargs):
+                stream_started.set()
+                return super().stream_session(*args, **kwargs)
+
+            def submit_prompt(self, session_id, prompt, **kwargs):
+                order.append("submit")
+                return super().submit_prompt(session_id, prompt, **kwargs)
+
+        handler, chat, web = self.make_handler(web=ParallelWeb())
+        handler.state.kimi_recall_card_lock = threading.Lock()
+
+        def recall_in_background(_text, *, session_id):
+            self.assertEqual("web-session-1", session_id)
+            recall_started.set()
+            if not release_recall.wait(2):
+                raise AssertionError("test did not release recall")
+            return recall
+
+        handler._kimi_semantic_recall = recall_in_background
+        original_card = handler._append_kimi_recall_card
+
+        def append_card(*args, **kwargs):
+            appended = original_card(*args, **kwargs)
+            order.append("card")
+            return appended
+
+        handler._append_kimi_recall_card = append_card
+        handler._handle_kimi_chat_send({"text": "parallel"}, "kimi")
+
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertTrue(stream_started.wait(1), "WebSocket must not wait for recall")
+        self.assertFalse(any(row[0] == "submit" for row in web.calls))
+        self.assertFalse(any((row.get("metadata") or {}).get("recall_card") for row in chat.records))
+
+        release_recall.set()
+        self.wait_idle(handler)
+        self.assertLess(order.index("card"), order.index("submit"))
+        cards = [row for row in chat.records if (row.get("metadata") or {}).get("recall_card")]
+        self.assertEqual(1, len(cards))
+        prompt = next(row[2] for row in web.calls if row[0] == "submit")
+        self.assertIn("safe parallel recall", prompt)
+
+    def test_recall_is_repeated_for_final_session_after_pointer_swap(self):
+        class SwappedSessionWeb(FakeWebChat):
+            def load_active_session_id(self):
+                return "web-session-old"
+
+            def ensure_active_session(self, *, model, thinking, **_kwargs):
+                return "web-session-new"
+
+        handler, chat, web = self.make_handler(web=SwappedSessionWeb())
+        handler.state.kimi_recall_card_lock = threading.Lock()
+        handler._notify_kimi_session_recovery = lambda *_args, **_kwargs: None
+        recall_sessions = []
+
+        def recall(_text, *, session_id):
+            recall_sessions.append(session_id)
+            return types.SimpleNamespace(
+                context=f"recall for {session_id}",
+                items=({"date": "2026-10-25", "title": session_id, "snippet": "safe"},),
+                memory_keys=("v1:" + "a" * 64,),
+            )
+
+        handler._kimi_semantic_recall = recall
+        handler._handle_kimi_chat_send({"text": "swap"}, "kimi")
+        self.wait_idle(handler)
+
+        self.assertEqual(["web-session-old", "web-session-new"], recall_sessions)
+        prompt = next(row[2] for row in web.calls if row[0] == "submit")
+        self.assertIn("recall for web-session-new", prompt)
+        self.assertNotIn("recall for web-session-old", prompt)
+        card = next(row for row in chat.records if (row.get("metadata") or {}).get("recall_card"))
+        self.assertEqual("web-session-new", card["metadata"]["recall_session_id"])
+
+    def test_prepare_status_snapshot_is_reused_by_forge_and_warning(self):
+        class StatusWeb(FakeWebChat):
+            def __init__(self):
+                super().__init__()
+                self.status_calls = 0
+
+            def ensure_active_session(self, *, model, thinking, **kwargs):
+                kwargs["status_snapshot"]["web-session-1"] = {
+                    "busy": False, "context_tokens": 231_000, "max_context_tokens": 300_000,
+                }
+                return "web-session-1"
+
+            def get_session_status(self, _session_id, **_kwargs):
+                self.status_calls += 1
+                raise AssertionError("forge/warning must reuse the prepared status")
+
+        handler, _chat, web = self.make_handler(web=StatusWeb())
+        handler.state.kimi_auto_forge_context_threshold = 0.8
+        handler.state.kimi_auto_forge_warn_threshold = 0.75
+        handler.state.kimi_forge_warn_state = {}
+        handler.state.kimi_forge_deferred = False
+        handler._handle_kimi_chat_send({"text": "cached status"}, "kimi")
+        self.wait_idle(handler)
+
+        self.assertEqual(0, web.status_calls)
+        prompt = next(row[2] for row in web.calls if row[0] == "submit")
+        self.assertIn("上下文预警", prompt)
 
     def test_private_web_turn_never_calls_acp_and_keeps_kimi_history_isolated(self):
         handler, chat, web = self.make_handler()
@@ -934,7 +1161,8 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.wait_idle(handler)
 
         handler._commit_kimi_recall.assert_not_called()
-        self.assertEqual(503, handler.responses[-1][0])
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertEqual("failed", handler.state.chat_reply_states["kimi"]["reply_state"])
 
     def test_web_does_not_commit_recall_when_prompt_is_not_accepted(self):
         class RejectingWeb(FakeWebChat):
@@ -956,7 +1184,8 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.wait_idle(handler)
 
         handler._commit_kimi_recall.assert_not_called()
-        self.assertEqual(503, handler.responses[-1][0])
+        self.assertEqual(200, handler.responses[-1][0])
+        self.assertEqual("failed", handler.state.chat_reply_states["kimi"]["reply_state"])
 
     def test_busy_send_commits_attachment_and_queues_for_later(self):
         """忙时不再 409 丢附件：消息与附件入库入队，等当前轮结束自动发送。"""
@@ -1008,7 +1237,8 @@ class KimiWebChatRoutingTest(unittest.TestCase):
             }, "kimi")
             self.wait_idle(handler)
 
-            self.assertEqual(503, handler.responses[-1][0])
+            self.assertEqual(200, handler.responses[-1][0])
+            self.assertEqual("failed", handler.state.chat_reply_states["kimi"]["reply_state"])
             self.assertEqual("/attachments/committed.pdf", chat.records[0]["attachment_url"])
             self.assertTrue(os.path.isfile(stored_path))
 
@@ -1037,8 +1267,9 @@ class KimiWebChatRoutingTest(unittest.TestCase):
             ),
         )
 
-        with patch("push.threading.Thread"):  # 本用例只断言入队，不跑 worker
+        with patch.object(handler, "_kimi_chat_queue_worker"):  # 只阻断队列轮询，保留后台投递
             handler._handle_kimi_web_chat_send({"text": "must not submit"}, "kimi", web)
+            self.wait_idle(handler)
 
         self.assertEqual(["must not submit"], [row["text"] for row in chat.records])
         self.assertEqual([], web.calls)
@@ -1050,6 +1281,10 @@ class KimiWebChatRoutingTest(unittest.TestCase):
     def test_stream_subscription_is_ready_before_submit_and_exact_stop_is_fenced(self):
         handler, chat, web = self.make_handler(web=FakeWebChat(wait_for_stop=True))
         handler._handle_kimi_chat_send({"text": "hello"}, "kimi")
+        for _ in range(100):
+            if any(row[0] == "submit" for row in web.calls):
+                break
+            __import__("time").sleep(0.01)
         self.assertEqual(["ensure", "stream", "submit"], [row[0] for row in web.calls[:3]])
         user_ts = handler.responses[-1][1]["turn"]["user_ts"]
         handler._handle_kimi_chat_stop(user_ts)
@@ -1143,6 +1378,10 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         with patch("push.KIMI_WEB_ABORT_SETTLE_SECONDS", 0.01):
             handler._handle_kimi_chat_send({"text": "settle"}, "kimi")
             user_ts = handler.responses[-1][1]["turn"]["user_ts"]
+            for _ in range(100):
+                if handler.state.contact_typing_states["kimi"].get("exact_turn"):
+                    break
+                __import__("time").sleep(0.01)
             self.assertTrue(handler.state.contact_typing_states["kimi"]["exact_turn"])
             self.assertFalse(_should_expire_chat_typing("kimi", handler.state.contact_typing_states["kimi"], 3600))
             handler._handle_kimi_chat_stop(user_ts)
@@ -1217,7 +1456,7 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         handler, _chat, web = self.make_handler(chat=BrokenChat())
         handler._handle_kimi_chat_send({"text": "first"}, "kimi")
         self.assertEqual(500, handler.responses[-1][0])
-        self.assertEqual(["ensure"], [row[0] for row in web.calls])
+        self.assertFalse(web.calls)
 
     def test_queued_messages_auto_send_in_order_after_active_turn_ends(self):
         """活跃轮期间的消息按序排队，轮结束后 worker 依次自动发出。"""
@@ -1305,10 +1544,10 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.assertEqual(200, handler.responses[-1][0])
         self.assertTrue(handler.responses[-1][1]["queued"])
         self.assertEqual(1, [row["text"] for row in chat.records].count("retry after orphan"))
-        self.assertEqual(1, sum(bool((row.get("metadata") or {}).get("orphan_recovery")) for row in chat.records))
         self.wait_queue_drained(handler)
         self.wait_idle(handler)
 
+        self.assertEqual(1, sum(bool((row.get("metadata") or {}).get("orphan_recovery")) for row in chat.records))
         self.assertEqual(["ensure", "recover", "ensure", "stream", "submit"], [row[0] for row in web.calls])
         self.assertIn(("recover", "web-session-1"), web.calls)
         # 重投绝不重复入库。
@@ -1374,8 +1613,8 @@ class KimiWebChatRoutingTest(unittest.TestCase):
             self.assertEqual(200, handler.responses[-1][0])
             self.assertTrue(handler.responses[-1][1]["queued"])
             self.assertEqual(["safe conflict"], [row["text"] for row in chat.records])
-            self.assertEqual("", handler.state.kimi_prepare_token)
             self.wait_queue_drained(handler)
+            self.assertEqual("", handler.state.kimi_prepare_token)
         notes = [row["text"] for row in chat.records if row["role"] == "assistant"]
         self.assertTrue(any("未能送出" in note for note in notes))
 
@@ -1423,8 +1662,8 @@ class KimiWebChatRoutingTest(unittest.TestCase):
         self.wait_idle(handler)
 
         self.assertEqual(200, handler.responses[-1][0])
-        # 假忙被证明早于本进程启动：清标记复用旧会话，不开新会话。
-        self.assertEqual("web-session-old", handler.responses[-1][1]["turn"]["session_id"])
+        # 提前 ack 只承诺已接收；假忙恢复与最终 session 在后台完成。
+        self.assertEqual("", handler.responses[-1][1]["turn"]["session_id"])
         self.assertEqual(1, [row["text"] for row in chat.records].count("continue after false busy"))
         self.assertEqual(
             [("reset-stuck", "web-session-old")],

@@ -924,7 +924,14 @@ class KimiWebClient:
         self.save_active_session_id(session_id)
         return session_id
 
-    def ensure_active_session(self, *, model: str = "", thinking: str = "", status_timeout: float = 5.0) -> str:
+    def ensure_active_session(
+        self,
+        *,
+        model: str = "",
+        thinking: str = "",
+        status_timeout: float = 5.0,
+        status_snapshot: dict[str, dict[str, Any]] | None = None,
+    ) -> str:
         """Use the Web-only pointer or create a fresh Web session.
 
         The ACP pointer is deliberately never imported or overwritten.  It
@@ -944,12 +951,17 @@ class KimiWebClient:
         self.start()
         session_id = self.load_active_session_id()
         if session_id:
+            cached = status_snapshot.get(session_id) if status_snapshot is not None else None
             try:
-                status = self.get_session_status(session_id, timeout=status_timeout)
+                status = cached if isinstance(cached, dict) else self.get_session_status(
+                    session_id, timeout=status_timeout,
+                )
             except KimiWebError:
                 # A stale/deleted pointer is recoverable; retain the ACP
                 # pointer untouched and make a fresh Web session below.
                 status = {}
+            if status and status_snapshot is not None:
+                status_snapshot[session_id] = status
             if status:
                 if bool(status.get("busy")):
                     self.note_busy_observed(session_id)

@@ -13798,17 +13798,176 @@ class PushHandler(BaseHTTPRequestHandler):
         return ""
 
     def _handle_kimi_web_chat_send(self, body: dict[str, Any], contact_id: str, web: Any) -> None:
+        text = clean_shared_link_text(str(body.get("text") or "").strip())
+        staged_attachments = list(body.get("_pwa_staged_attachments") or [])
+        precommitted_record = body.get("_kimi_precommitted_record")
+        if not (isinstance(precommitted_record, dict) and str(precommitted_record.get("ts") or "")):
+            precommitted_record = None
+        queued_item = body.get("_kimi_queue_item")
+        if not isinstance(queued_item, dict):
+            queued_item = None
+        if not text and not staged_attachments and precommitted_record is None:
+            self._send_json(400, {"ok": False, "error": "text or attachment required"})
+            return
+        # 队列 worker 已经在后台，直接复用其 responder proxy 的 started /
+        # requeued 判定；只有真实 HTTP 入口需要再派一层 delivery worker。
+        if queued_item is not None:
+            lifecycle = {
+                "session_ready": threading.Event(),
+                "accept_ready": threading.Event(),
+                "recall_done": threading.Event(),
+                "session_id": "",
+                "accepted": False,
+                "result": None,
+            }
+            try:
+                self._deliver_kimi_web_chat_send(
+                    {**body, "_kimi_recall_lifecycle": lifecycle}, contact_id, web,
+                )
+            finally:
+                if not lifecycle["accepted"]:
+                    lifecycle["abandoned"] = True
+                lifecycle["session_ready"].set()
+                lifecycle["accept_ready"].set()
+            return
+
+        with self.state.kimi_turn_lock:
+            turn_busy = bool(
+                self.state.kimi_active_turn
+                or self.state.kimi_prepare_token
+                or getattr(self.state, "kimi_recovery_token", "")
+                or getattr(self.state, "kimi_terminal_acquire_token", "")
+            )
+            queue_ahead = queued_item is None and bool(self._kimi_chat_queue())
+            if turn_busy or queue_ahead:
+                reserve = False
+            else:
+                reserve = True
+                prepare_token = secrets.token_hex(16)
+                self.state.kimi_prepare_token = prepare_token
+        if not reserve:
+            self._deliver_kimi_web_chat_send(body, contact_id, web)
+            return
+
+        rec = precommitted_record
+        link_bundle = None
+        try:
+            if rec is None:
+                link_bundle = self._kimi_link_bundle(text)
+                metadata = merge_preview_metadata(body.get("metadata"), link_bundle)
+                primary_attachment = staged_attachments[0] if staged_attachments else {}
+                rec = self._chat_for_contact(contact_id).append(
+                    role="user",
+                    text=text,
+                    source=self._source_for_request("kimi-web"),
+                    quoted_ts=body.get("quoted_ts") or None,
+                    metadata=metadata,
+                    attachment_url=primary_attachment.get("attachment_url") or None,
+                    attachment_type=primary_attachment.get("type") or None,
+                    attachment_filename=primary_attachment.get("filename") or None,
+                )
+                self._reading_ai_grant_after_user_append(contact_id, rec)
+        except Exception:
+            logger.exception("Kimi Web early history append failed")
+            self._release_kimi_control(prepare_token)
+            self._discard_uncommitted_staged_attachments(staged_attachments)
+            self._send_json(500, {"ok": False, "error": "kimi_history_unavailable"})
+            return
+
+        prepare_cancel_event = threading.Event()
+        with self.state.kimi_turn_lock:
+            if self.state.kimi_prepare_token == prepare_token:
+                self.state.kimi_prepare_user_ts = str(rec.get("ts") or "")
+                self.state.kimi_prepare_cancel_event = prepare_cancel_event
+        self._set_chat_queued(
+            contact_id,
+            user_ts=str(rec.get("ts") or ""),
+            queued_at=str(rec.get("ts") or ""),
+            source="cc-app:kimi-web",
+        )
+        lifecycle = {
+            "session_ready": threading.Event(),
+            "accept_ready": threading.Event(),
+            "recall_done": threading.Event(),
+            "session_id": "",
+            "accepted": False,
+            "result": None,
+        }
+        background_body = {
+            **body,
+            "text": text,
+            "_kimi_precommitted_record": rec,
+            "_kimi_prepare_reservation": prepare_token,
+            "_kimi_recall_lifecycle": lifecycle,
+        }
+        if link_bundle is not None:
+            background_body["_kimi_link_bundle_value"] = link_bundle
+
+        def deliver() -> None:
+            proxy = _QueuedSendResponderProxy(self)
+            try:
+                proxy._deliver_kimi_web_chat_send(background_body, contact_id, web)
+            except Exception:
+                logger.exception("Kimi Web background delivery crashed")
+                with self.state.kimi_turn_lock:
+                    if str(self.state.kimi_active_turn.get("user_ts") or "") == str(rec.get("ts") or ""):
+                        self.state.kimi_active_turn = {}
+                    if self.state.kimi_prepare_token == prepare_token:
+                        self.state.kimi_prepare_token = ""
+                        self.state.kimi_prepare_user_ts = ""
+                        self.state.kimi_prepare_cancel_event = None
+                self._clear_chat_draft(contact_id)
+                self._clear_typing_for_contact_if_turn(contact_id, str(rec.get("ts") or ""))
+                self._set_chat_failed(
+                    contact_id, user_ts=str(rec.get("ts") or ""), source="kimi-web:background-error",
+                )
+            finally:
+                if not lifecycle["accepted"]:
+                    lifecycle["abandoned"] = True
+                lifecycle["session_ready"].set()
+                lifecycle["accept_ready"].set()
+            for status, payload in proxy.responses:
+                if status >= 400:
+                    self._set_chat_failed(
+                        contact_id,
+                        user_ts=str(rec.get("ts") or ""),
+                        source=f"kimi-web:{str((payload or {}).get('error') or 'background-error')}",
+                    )
+                    break
+
+        try:
+            threading.Thread(target=deliver, name="kimi-web-chat-delivery", daemon=True).start()
+        except Exception:
+            logger.exception("Kimi Web background delivery start failed")
+            self._release_kimi_control(prepare_token)
+            self._set_chat_failed(contact_id, user_ts=str(rec.get("ts") or ""), source="kimi-web:worker-start")
+            self._send_json(503, {"ok": False, "error": "kimi_web_unavailable", "record": rec})
+            return
+        self._send_json(200, {
+            "ok": True,
+            "contact_id": contact_id,
+            "record": rec,
+            "queued": True,
+            "turn": {
+                "contact_id": contact_id,
+                "user_ts": rec["ts"],
+                "session_id": "",
+                "transport": "kimi-web",
+            },
+        })
+
+    def _deliver_kimi_web_chat_send(self, body: dict[str, Any], contact_id: str, web: Any) -> None:
         # 同 xiaoke：入口清掉分享套话，链接保留。
         text = clean_shared_link_text(str(body.get("text") or "").strip())
         quoted_ts = body.get("quoted_ts") or None
         staged_attachments = list(body.get("_pwa_staged_attachments") or [])
-        attachments_committed = False
         # 队列 worker 重入标记：`_kimi_precommitted_record` 是入队时已入库的
         # user 消息（历史绝不重复写），`_kimi_queue_item` 是队列项本体（忙时
         # 重投而不是再次入队新记录）。两者都只由本服务内部产生。
         precommitted_record = body.get("_kimi_precommitted_record")
         if not (isinstance(precommitted_record, dict) and str(precommitted_record.get("ts") or "")):
             precommitted_record = None
+        attachments_committed = precommitted_record is not None
         queued_item = body.get("_kimi_queue_item")
         if not isinstance(queued_item, dict):
             queued_item = None
@@ -13820,13 +13979,16 @@ class PushHandler(BaseHTTPRequestHandler):
         if not text and not staged_attachments and precommitted_record is None:
             self._send_json(400, {"ok": False, "error": "text or attachment required"})
             return
-        link_bundle = self._kimi_link_bundle(text)
+        link_bundle = body.get("_kimi_link_bundle_value")
+        if link_bundle is None:
+            link_bundle = self._kimi_link_bundle(text)
         xhs_login_card_allowed = self._kimi_xhs_login_card_allowed(link_bundle)
         netease_login_card_allowed = self._kimi_netease_login_card_allowed()
         jd_login_card_allowed = self._kimi_jd_login_card_allowed()
         meituan_login_card_allowed = self._kimi_meituan_login_card_allowed()
         mt_waimai_login_card_allowed = self._kimi_mt_waimai_login_card_allowed()
         metadata = merge_preview_metadata(body.get("metadata"), link_bundle)
+        prepare_cancel_event = None
 
         def enqueue_busy(reason: str) -> None:
             """忙时唯一出口：新消息入库入队（200 queued），队列重入只重投。
@@ -13836,6 +13998,19 @@ class PushHandler(BaseHTTPRequestHandler):
             failed，绝不静默丢失）。
             """
             nonlocal attachments_committed
+            if (
+                queued_item is None
+                and precommitted_record is not None
+                and prepare_cancel_event is not None
+                and prepare_cancel_event.is_set()
+            ):
+                self._set_chat_interrupted(
+                    contact_id,
+                    user_ts=str(precommitted_record.get("ts") or ""),
+                    source="kimi-web:prepare-stop",
+                )
+                self._send_json(200, {"ok": True, "stopped": True, "record": precommitted_record})
+                return
             if queued_item is not None:
                 kept = self._requeue_kimi_chat_turn(queued_item, reason=reason)
                 self._send_json(200, {
@@ -13938,23 +14113,39 @@ class PushHandler(BaseHTTPRequestHandler):
                 "reason": reason,
             })
 
+        reserved_token = str(body.get("_kimi_prepare_reservation") or "")
         with self.state.kimi_turn_lock:
+            owns_reservation = bool(
+                reserved_token
+                and self.state.kimi_prepare_token == reserved_token
+                and not self.state.kimi_active_turn
+                and not getattr(self.state, "kimi_recovery_token", "")
+                and not getattr(self.state, "kimi_terminal_acquire_token", "")
+            )
             turn_busy = bool(
                 self.state.kimi_active_turn
-                or self.state.kimi_prepare_token
+                or (self.state.kimi_prepare_token and not owns_reservation)
                 or getattr(self.state, "kimi_recovery_token", "")
                 or getattr(self.state, "kimi_terminal_acquire_token", "")
             )
             # 队列里还有先到消息时新请求一律入队跟尾：轮刚结束的 worker 轮询
             # 窗口内若放行走直达，新消息会插队到旧排队消息之前，破坏按序承诺。
-            queue_ahead = queued_item is None and bool(self._kimi_chat_queue())
+            queue_ahead = not owns_reservation and queued_item is None and bool(self._kimi_chat_queue())
             if turn_busy or queue_ahead:
+                if reserved_token and self.state.kimi_prepare_token == reserved_token:
+                    self.state.kimi_prepare_token = ""
+                    self.state.kimi_prepare_user_ts = ""
+                    self.state.kimi_prepare_cancel_event = None
                 enqueue_busy("kimi_turn_active" if turn_busy else "kimi_queue_ahead")
                 return
-            prepare_token = secrets.token_hex(16)
+            prepare_token = reserved_token if owns_reservation else secrets.token_hex(16)
             self.state.kimi_prepare_token = prepare_token
+            prepare_cancel_event = (
+                getattr(self.state, "kimi_prepare_cancel_event", None) if owns_reservation else None
+            )
+        session_status: dict[str, dict[str, Any]] = {}
         try:
-            handed_off = self._handoff_kimi_terminal_to_writer(prepare_token)
+            handed_off = self._handoff_kimi_terminal_to_writer(prepare_token, status_snapshot=session_status)
         except KimiTerminalBusy:
             self._release_kimi_control(prepare_token)
             enqueue_busy("kimi_terminal_busy")
@@ -13995,10 +14186,56 @@ class PushHandler(BaseHTTPRequestHandler):
                 previous_session_id = str(load_pointer() or "")
             except Exception:
                 logger.warning("Kimi Web active-session pointer read failed before send")
+        lifecycle = body.get("_kimi_recall_lifecycle")
+        if not isinstance(lifecycle, dict):
+            lifecycle = None
+        if lifecycle is not None and precommitted_record is not None:
+            recall_chat = self._chat_for_contact(contact_id)
+            recall_user_ts = str(precommitted_record.get("ts") or "")
+
+            def recall_worker() -> None:
+                try:
+                    # 有现有指针时立即检索，与 handoff 后的 ensure/forge/WS 并行；
+                    # 换会话则按新 session 的 seen ledger 重查，避免跨会话去重错位。
+                    if not previous_session_id:
+                        lifecycle["session_ready"].wait()
+                    if lifecycle.get("abandoned"):
+                        return
+                    initial_session = previous_session_id or str(lifecycle.get("session_id") or "")
+                    result = self._kimi_semantic_recall(text, session_id=initial_session or None)
+                    if previous_session_id:
+                        lifecycle["session_ready"].wait()
+                    if lifecycle.get("abandoned"):
+                        return
+                    session_id = str(lifecycle.get("session_id") or "")
+                    if session_id != initial_session:
+                        result = self._kimi_semantic_recall(text, session_id=session_id or None)
+                    lifecycle["accept_ready"].wait()
+                    if not lifecycle.get("accepted"):
+                        return
+                    lifecycle["result"] = result
+                    if result is not None:
+                        self._append_kimi_recall_card(
+                            recall_chat, result, user_ts=recall_user_ts, session_id=session_id,
+                        )
+                except Exception:
+                    logger.warning("Kimi Web parallel recall failed", exc_info=True)
+                finally:
+                    lifecycle["recall_done"].set()
+
+            try:
+                threading.Thread(target=recall_worker, name="kimi-web-recall", daemon=True).start()
+            except Exception:
+                logger.warning("Kimi Web parallel recall start failed", exc_info=True)
+                lifecycle["recall_done"].set()
+        elif lifecycle is not None:
+            lifecycle["recall_done"].set()
         session_recovery: tuple[str, str] | None = None
         try:
             model, effort = self._kimi_selection()
-            session_id = web.ensure_active_session(model=model, thinking=effort, status_timeout=0.75)
+            session_id = web.ensure_active_session(
+                model=model, thinking=effort, status_timeout=0.75, status_snapshot=session_status,
+            )
         except KimiWebSessionBusy as exc:
             recovery, recovered_lease = self._recover_orphaned_kimi_web_prompt(web, exc.session_id, prepare_token)
             if recovery == "recovered":
@@ -14110,17 +14347,21 @@ class PushHandler(BaseHTTPRequestHandler):
 
         # 上下文到 300k tokens 自动 forge（小窗口按实际上限）：与手动 forge
         # 共用移交管线。失败或 Kimi 正忙时沿用旧会话，不影响本条消息发送。
+        prepared_status = session_status.get(session_id)
         try:
-            session_id, _forged = self._maybe_forge_kimi_session(session_id)
+            session_id, _forged = self._maybe_forge_kimi_session(session_id, status=prepared_status)
         except Exception:
             _forged = False
             logger.warning("Kimi auto-forge failed, continuing with existing session", exc_info=True)
+        if lifecycle is not None:
+            lifecycle["session_id"] = session_id
+            lifecycle["session_ready"].set()
         # forge 预警（默认 240k）：未 forge 且达预警线时，本轮 prompt 附一次性
         # 系统提示，Kimi 可用 [[CCC_KIMI_FORGE_DEFER]] 自助延期。
         forge_warn_context = ""
         if not _forged:
             try:
-                forge_warn_context = self._kimi_forge_warn_context(session_id)
+                forge_warn_context = self._kimi_forge_warn_context(session_id, status=prepared_status)
             except Exception:
                 logger.debug("Kimi forge warn context failed", exc_info=True)
 
@@ -14155,7 +14396,16 @@ class PushHandler(BaseHTTPRequestHandler):
                     return
                 attachments_committed = True
                 self._reading_ai_grant_after_user_append(contact_id, rec)
-            cancel_event = threading.Event()
+            if prepare_cancel_event is not None and prepare_cancel_event.is_set():
+                self.state.kimi_prepare_token = ""
+                self.state.kimi_prepare_user_ts = ""
+                self.state.kimi_prepare_cancel_event = None
+                self._set_chat_interrupted(
+                    contact_id, user_ts=str(rec.get("ts") or ""), source="kimi-web:prepare-stop",
+                )
+                self._send_json(200, {"ok": True, "stopped": True, "record": rec})
+                return
+            cancel_event = prepare_cancel_event or threading.Event()
             self.state.kimi_active_turn = {
                 "user_ts": str(rec.get("ts") or ""),
                 "cancel_event": cancel_event,
@@ -14166,6 +14416,8 @@ class PushHandler(BaseHTTPRequestHandler):
                 "transport": "kimi-web",
             }
             self.state.kimi_prepare_token = ""
+            self.state.kimi_prepare_user_ts = ""
+            self.state.kimi_prepare_cancel_event = None
             self._set_typing_for_contact(contact_id, {
                 "is_typing": True,
                 "since": rec["ts"],
@@ -14179,24 +14431,10 @@ class PushHandler(BaseHTTPRequestHandler):
                 session_id=session_id,
             )
 
+        if lifecycle is not None:
+            lifecycle["accepted"] = True
+            lifecycle["accept_ready"].set()
         prompt_text = text or "[用户发送了附件]"
-        recall_result = self._kimi_semantic_recall(text, session_id=session_id)
-        if recall_result is not None:
-            self._append_kimi_recall_card(chat, recall_result, user_ts=str(rec.get("ts") or ""), session_id=session_id)
-        prompt = self._kimi_prompt(
-            prompt_text,
-            link_context=link_bundle.prompt_context,
-            recall_context="\n\n".join(value for value in (
-                self._kimi_web_handoff_context(chat, session_id, str(rec.get("ts") or "")),
-                str(getattr(recall_result, "context", "") or "").strip(),
-            ) if value),
-            forge_warn_context=forge_warn_context,
-            xhs_login_card_allowed=xhs_login_card_allowed,
-            netease_login_card_allowed=netease_login_card_allowed,
-            jd_login_card_allowed=jd_login_card_allowed,
-            meituan_login_card_allowed=meituan_login_card_allowed,
-            mt_waimai_login_card_allowed=mt_waimai_login_card_allowed,
-        )
         prompt_id = ""
         stream_ready = threading.Event()
         submitted_event = threading.Event()
@@ -14821,6 +15059,29 @@ class PushHandler(BaseHTTPRequestHandler):
             self._set_chat_failed(contact_id, user_ts=rec["ts"], source="kimi-web:stream", session_id=session_id)
             self._send_json(503, {"ok": False, "error": "kimi_web_unavailable"})
             return
+        if lifecycle is not None:
+            lifecycle["recall_done"].wait()
+            recall_result = lifecycle.get("result")
+        else:
+            recall_result = self._kimi_semantic_recall(text, session_id=session_id)
+            if recall_result is not None:
+                self._append_kimi_recall_card(
+                    chat, recall_result, user_ts=str(rec.get("ts") or ""), session_id=session_id,
+                )
+        prompt = self._kimi_prompt(
+            prompt_text,
+            link_context=link_bundle.prompt_context,
+            recall_context="\n\n".join(value for value in (
+                self._kimi_web_handoff_context(chat, session_id, str(rec.get("ts") or "")),
+                str(getattr(recall_result, "context", "") or "").strip(),
+            ) if value),
+            forge_warn_context=forge_warn_context,
+            xhs_login_card_allowed=xhs_login_card_allowed,
+            netease_login_card_allowed=netease_login_card_allowed,
+            jd_login_card_allowed=jd_login_card_allowed,
+            meituan_login_card_allowed=meituan_login_card_allowed,
+            mt_waimai_login_card_allowed=mt_waimai_login_card_allowed,
+        )
         try:
             submitted = web.submit_prompt(
                 session_id,
@@ -17041,21 +17302,29 @@ class PushHandler(BaseHTTPRequestHandler):
             return float(usage)
         return 0.0
 
-    def _kimi_context_usage(self, session_id: str) -> float:
+    def _kimi_context_usage(self, session_id: str, *, status: dict[str, Any] | None = None) -> float:
         """Return usage against min(300k, model window), or 0.0 if unavailable."""
+        if status is not None:
+            return self._kimi_context_usage_from_status(status)
         try:
             self.state.kimi_web.start()
-            status = self.state.kimi_web.get_session_status(session_id)
+            try:
+                status = self.state.kimi_web.get_session_status(session_id, timeout=0.75)
+            except TypeError:
+                status = self.state.kimi_web.get_session_status(session_id)
         except KimiWebError as exc:
             logger.warning("Kimi web context query failed: %s", exc)
             return 0.0
         return self._kimi_context_usage_from_status(status)
 
-    def _kimi_forge_defer_hard_cap(self, session_id: str, threshold: float) -> float:
+    def _kimi_forge_defer_hard_cap(
+        self, session_id: str, threshold: float, *, status: dict[str, Any] | None = None,
+    ) -> float:
         """Keep deferral below 92% of the real model window when headroom exists."""
         try:
-            self.state.kimi_web.start()
-            status = self.state.kimi_web.get_session_status(session_id)
+            if status is None:
+                self.state.kimi_web.start()
+                status = self.state.kimi_web.get_session_status(session_id, timeout=0.75)
             model_window = float(status.get("max_context_tokens"))
             window = self._kimi_forge_window_tokens(status)
         except (KimiWebError, TypeError, ValueError) as exc:
@@ -17213,7 +17482,9 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.warning("Kimi web quota query failed: %s", exc)
             return {}
 
-    def _maybe_forge_kimi_session(self, session_id: str) -> tuple[str, bool]:
+    def _maybe_forge_kimi_session(
+        self, session_id: str, *, status: dict[str, Any] | None = None,
+    ) -> tuple[str, bool]:
         """Threshold auto-forge on the live Web channel.
 
         Runs the exact same handoff pipeline as POST /kimi/forge
@@ -17227,7 +17498,7 @@ class PushHandler(BaseHTTPRequestHandler):
         threshold = self.state.kimi_auto_forge_context_threshold
         if threshold <= 0 or threshold > 1:
             return session_id, False
-        usage = self._kimi_context_usage(session_id)
+        usage = self._kimi_context_usage(session_id, status=status) if status is not None else self._kimi_context_usage(session_id)
         deferred = bool(getattr(self.state, "kimi_forge_deferred", False))
         if deferred and usage < threshold:
             # 延期只在「仍超阈值」的窗口内有意义；usage 回落（如 Kimi 自动
@@ -17238,7 +17509,10 @@ class PushHandler(BaseHTTPRequestHandler):
             return session_id, False
         defer_hard_cap = KIMI_FORGE_DEFER_HARD_CAP
         if deferred and threshold >= defer_hard_cap:
-            defer_hard_cap = self._kimi_forge_defer_hard_cap(session_id, threshold)
+            defer_hard_cap = (
+                self._kimi_forge_defer_hard_cap(session_id, threshold, status=status)
+                if status is not None else self._kimi_forge_defer_hard_cap(session_id, threshold)
+            )
         if deferred and usage < defer_hard_cap:
             logger.info(
                 "Kimi context usage %.2f%% exceeds threshold %.2f%% but the session deferred auto-forge",
@@ -17272,7 +17546,7 @@ class PushHandler(BaseHTTPRequestHandler):
         logger.info("Kimi auto-forged new session %s", new_session_id)
         return new_session_id, True
 
-    def _kimi_forge_warn_context(self, session_id: str) -> str:
+    def _kimi_forge_warn_context(self, session_id: str, *, status: dict[str, Any] | None = None) -> str:
         """forge 预警块：达预警线但未达 forge 阈值时，投递 prompt 附一次性提示。
 
         同一会话同一预警档位只注入一次；usage 回落到预警线下（如自动
@@ -17285,7 +17559,7 @@ class PushHandler(BaseHTTPRequestHandler):
         warn = float(getattr(self.state, "kimi_auto_forge_warn_threshold", 0.0) or 0.0)
         if warn <= 0 or warn >= 1 or warn >= forge_threshold:
             return ""
-        usage = self._kimi_context_usage(session_id)
+        usage = self._kimi_context_usage(session_id, status=status) if status is not None else self._kimi_context_usage(session_id)
         warn_state = getattr(self.state, "kimi_forge_warn_state", None)
         if not isinstance(warn_state, dict):
             warn_state = {}
@@ -17620,11 +17894,32 @@ class PushHandler(BaseHTTPRequestHandler):
                 "reason": "缺少本轮 Kimi 消息标识，未发送停止指令。",
             })
             return
+        prepare_stop = False
         with self.state.kimi_turn_lock:
             active = dict(self.state.kimi_active_turn)
             active_ts = str(active.get("user_ts") or "")
             if not active:
                 active_ts = ""
+                prepare_ts = str(getattr(self.state, "kimi_prepare_user_ts", "") or "")
+                if self.state.kimi_prepare_token and prepare_ts:
+                    if prepare_ts != user_ts:
+                        self._send_json(409, {
+                            "ok": False,
+                            "error": "stale_turn",
+                            "reason": "当前 Kimi 轮次与停止目标不一致，未发送停止指令。",
+                        })
+                        return
+                    prepare_cancel = getattr(self.state, "kimi_prepare_cancel_event", None)
+                    if prepare_cancel is not None:
+                        prepare_cancel.set()
+                        prepare_stop = True
+                elif self.state.kimi_prepare_token:
+                    self._send_json(409, {
+                        "ok": False,
+                        "error": "kimi_turn_preparing",
+                        "reason": "Kimi 正在准备本轮，请稍后再停止。",
+                    })
+                    return
             else:
                 if not active_ts or user_ts != active_ts:
                     self._send_json(409, {
@@ -17644,6 +17939,14 @@ class PushHandler(BaseHTTPRequestHandler):
                 transport = str(active.get("transport") or "")
                 prompt_id = str(active.get("prompt_id") or "")
                 cancel_event = active.get("cancel_event")
+        if prepare_stop:
+            self._set_chat_interrupted("kimi", user_ts=user_ts, source="kimi-web:prepare-stop")
+            self._send_json(200, {
+                "ok": True, "stopped": True, "user_ts": user_ts,
+                "message": "已停止 Kimi 本轮发送。",
+                **({"cleared_queued": cleared_queued} if clear_queued else {}),
+            })
+            return
         if not active:
             stopped, outcome = self._stop_orphaned_kimi_web_turn(user_ts)
             if stopped:
@@ -18774,6 +19077,8 @@ class PushHandler(BaseHTTPRequestHandler):
         with self.state.kimi_turn_lock:
             if self.state.kimi_prepare_token == token:
                 self.state.kimi_prepare_token = ""
+                self.state.kimi_prepare_user_ts = ""
+                self.state.kimi_prepare_cancel_event = None
 
     # ---------- 私聊消息排队核心（Kimi 与 Kiro 共用；忙时不 409，轮结束自动发送） ----------
     # kiro r4 (2026-09-26)：原 Kimi 队列实现参数化为 _ChatQueueSpec 驱动的共享
@@ -19153,7 +19458,9 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         self._send_json(200, {"ok": True, "session": KAIROS_TERMINAL_ALIAS, "direct": True})
 
-    def _handoff_kimi_terminal_to_writer(self, prepare_token: str) -> bool:
+    def _handoff_kimi_terminal_to_writer(
+        self, prepare_token: str, *, status_snapshot: dict[str, dict[str, Any]] | None = None,
+    ) -> bool:
         """Release an idle TUI after reserving a Web/ACP writer, without lock inversion.
 
         The caller first publishes ``kimi_prepare_token`` under
@@ -19193,6 +19500,8 @@ class PushHandler(BaseHTTPRequestHandler):
                         busy = status.get("busy") if isinstance(status, dict) else None
                         if not isinstance(busy, bool):
                             break
+                        if status_snapshot is not None:
+                            status_snapshot[session_id] = status
                         observe_status(session_id, busy)
                         samples.append(busy)
                         if busy:

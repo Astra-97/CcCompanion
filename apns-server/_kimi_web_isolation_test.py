@@ -485,6 +485,35 @@ class KimiWebIsolationTest(unittest.TestCase):
                         client.reset_stuck_busy_session("session-old", settle_timeout=0.3)
                 self.assertEqual("session-old", client.load_active_session_id())
 
+    def test_ensure_active_session_reuses_and_exports_status_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pointer = os.path.join(directory, "kimi_web_session.json")
+            client = KimiWebClient(command="/unused/kimi", state_path=pointer, cwd="/tmp/kimi-cwd")
+            client.save_active_session_id("session-old")
+            client.start = lambda: None
+            client.note_session_idle = lambda _session_id: None
+            calls = []
+
+            def fake_request(method, path, *, data=None, timeout=10.0):
+                calls.append((method, path, timeout))
+                return {"busy": False, "context_tokens": 42}
+
+            client._request = fake_request
+            snapshot = {}
+            self.assertEqual(
+                "session-old",
+                client.ensure_active_session(status_timeout=0.75, status_snapshot=snapshot),
+            )
+            self.assertEqual(1, len(calls))
+            self.assertEqual(0.75, calls[0][2])
+            self.assertEqual(42, snapshot["session-old"]["context_tokens"])
+
+            self.assertEqual(
+                "session-old",
+                client.ensure_active_session(status_timeout=0.75, status_snapshot=snapshot),
+            )
+            self.assertEqual(1, len(calls), "prepared status must be reused without another HTTP request")
+
     def test_ensure_active_session_submits_through_background_only_busy(self):
         """后台子代理任务也会把会话级 busy 顶起来，但主会话没有 prompt 工作
         时 POST /prompts 仍会立即受理——这种忙不再让 App 消息排队。"""
