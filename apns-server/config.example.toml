@@ -388,6 +388,8 @@ import_command = ["ssh", "memory-sg", "/home/ubuntu/xhs-login-bridge/import_cook
 # status_command = ["ssh", "memory-sg", "/home/ubuntu/.local/bin/xhs", "status", "--json"]
 
 [jd_login]
+# 2026-10-25 已下线（SG+杭州远端服务删除）：默认 enabled=false，不构建 manager、不挂卡、端点回 410。
+# enabled = false
 # Android 专用 WebView 登录能力；nonce 最长十分钟且只可使用一次。
 ttl_seconds = 300
 allowed_contacts = ["kairos", "kimi"]
@@ -397,6 +399,8 @@ allowed_contacts = ["kairos", "kimi"]
 # status_command = ["ssh", "memory-sg", "cat", "/home/ubuntu/static-assets/jd/status.json"]
 
 [meituan_login]
+# 2026-10-25 已下线（SG+杭州远端服务删除）：默认 enabled=false，不构建 manager、不挂卡、端点回 410。
+# enabled = false
 # 美团主站卡（i.meituan.com）：Android 专用 WebView 登录能力；nonce 最长十分钟且只可使用一次。
 ttl_seconds = 300
 allowed_contacts = ["kairos", "kimi"]
@@ -407,6 +411,8 @@ allowed_contacts = ["kairos", "kimi"]
 # status_command = ["ssh", "memory-sg", "/home/ubuntu/taobao-login/.venv/bin/python", "/home/ubuntu/meituan-mcp/meituan_tools.py", "status_main"]
 
 [mt_waimai_login]
+# 2026-10-25 已下线（SG+杭州远端服务删除）：默认 enabled=false，不构建 manager、不挂卡、端点回 410。
+# enabled = false
 # 美团外卖卡（h5.waimai.meituan.com）：Android 专用 WebView 登录能力；nonce 最长十分钟且只可使用一次。
 ttl_seconds = 300
 allowed_contacts = ["kairos", "kimi"]

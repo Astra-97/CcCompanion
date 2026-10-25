@@ -4593,6 +4593,10 @@ class ServerState:
             allowed_contacts=netease_allowed_contacts,
         )
 
+        # 2026-10-25 京东/美团 MCP 已在 SG+杭州下线删除（方小南：用不了）。
+        # 三个登录卡默认关闭：manager 不构建 -> 闸门恒 False（不再 ssh 探针、
+        # 不挂卡），/jd-login|/meituan-login|/mt-waimai-login 返回 410。
+        # 想恢复需在 config.toml 对应段写 enabled = true 并把远端服务建回来。
         jd_login_cfg = config.get("jd_login", {})
         raw_jd_import_command = jd_login_cfg.get("import_command")
         jd_import_command = raw_jd_import_command if isinstance(raw_jd_import_command, list) else None
@@ -4608,7 +4612,7 @@ class ServerState:
             status_command=jd_status_command,
             ttl_seconds=int(jd_login_cfg.get("ttl_seconds", 300)),
             allowed_contacts=jd_allowed_contacts,
-        )
+        ) if bool(jd_login_cfg.get("enabled", False)) else None
 
         meituan_login_cfg = config.get("meituan_login", {})
         raw_mt_import_command = meituan_login_cfg.get("import_command")
@@ -4625,7 +4629,7 @@ class ServerState:
             status_command=mt_status_command,
             ttl_seconds=int(meituan_login_cfg.get("ttl_seconds", 300)),
             allowed_contacts=mt_allowed_contacts,
-        )
+        ) if bool(meituan_login_cfg.get("enabled", False)) else None
 
         mt_waimai_login_cfg = config.get("mt_waimai_login", {})
         raw_mtw_import_command = mt_waimai_login_cfg.get("import_command")
@@ -4642,7 +4646,7 @@ class ServerState:
             status_command=mtw_status_command,
             ttl_seconds=int(mt_waimai_login_cfg.get("ttl_seconds", 300)),
             allowed_contacts=mtw_allowed_contacts,
-        )
+        ) if bool(mt_waimai_login_cfg.get("enabled", False)) else None
 
         if self.apns_enabled:
             self.jwt = APNsJWT(
@@ -9329,6 +9333,9 @@ class PushHandler(BaseHTTPRequestHandler):
         if self._source_for_request() != "android-app":
             self._send_json(403, {"ok": False, "error": "android client required"})
             return
+        if getattr(self.state, "jd_login", None) is None:
+            self._send_json(410, {"ok": False, "error": "retired"})
+            return
         try:
             result = self.state.jd_login.start(
                 contact_id=body.get("contact_id"),
@@ -9343,6 +9350,9 @@ class PushHandler(BaseHTTPRequestHandler):
     def _handle_jd_login_import(self, body: dict[str, Any]):
         if self._source_for_request() != "android-app":
             self._send_json(403, {"ok": False, "error": "android client required"})
+            return
+        if getattr(self.state, "jd_login", None) is None:
+            self._send_json(410, {"ok": False, "error": "retired"})
             return
         try:
             result = self.state.jd_login.import_cookies(
@@ -9361,6 +9371,9 @@ class PushHandler(BaseHTTPRequestHandler):
         if self._source_for_request() != "android-app":
             self._send_json(403, {"ok": False, "error": "android client required"})
             return
+        if getattr(self.state, "meituan_login", None) is None:
+            self._send_json(410, {"ok": False, "error": "retired"})
+            return
         try:
             result = self.state.meituan_login.start(
                 contact_id=body.get("contact_id"),
@@ -9375,6 +9388,9 @@ class PushHandler(BaseHTTPRequestHandler):
     def _handle_meituan_login_import(self, body: dict[str, Any]):
         if self._source_for_request() != "android-app":
             self._send_json(403, {"ok": False, "error": "android client required"})
+            return
+        if getattr(self.state, "meituan_login", None) is None:
+            self._send_json(410, {"ok": False, "error": "retired"})
             return
         try:
             result = self.state.meituan_login.import_cookies(
@@ -9393,6 +9409,9 @@ class PushHandler(BaseHTTPRequestHandler):
         if self._source_for_request() != "android-app":
             self._send_json(403, {"ok": False, "error": "android client required"})
             return
+        if getattr(self.state, "mt_waimai_login", None) is None:
+            self._send_json(410, {"ok": False, "error": "retired"})
+            return
         try:
             result = self.state.mt_waimai_login.start(
                 contact_id=body.get("contact_id"),
@@ -9407,6 +9426,9 @@ class PushHandler(BaseHTTPRequestHandler):
     def _handle_mt_waimai_login_import(self, body: dict[str, Any]):
         if self._source_for_request() != "android-app":
             self._send_json(403, {"ok": False, "error": "android client required"})
+            return
+        if getattr(self.state, "mt_waimai_login", None) is None:
+            self._send_json(410, {"ok": False, "error": "retired"})
             return
         try:
             result = self.state.mt_waimai_login.import_cookies(
