@@ -4,7 +4,8 @@
 companion 路由的消息 POST 到本服务 ``/wecom/inbound``（X-Wecom-Webhook-Secret，
 0600 文件，fail-closed）。本服务把它当成方小南在 app 里给该联系人发了一条
 ``［💬微信］原文``：同入历史、同走该联系人的发送管线，metadata 带
-``source=wecom`` + ``wecom={msg_id, agent_id, msg_type}``。
+``source=wecom`` + ``wecom={msg_id, agent_id, msg_type}``。卡拉米的图片由回调
+服务下载到私有 media 目录，本服务校验并复制到附件库后复用 Kimi 图片附件输入。
 
 出站：联系人这一轮的最终回复落历史时，*只有*它回答的那条用户消息带 wecom
 标记，才写一个 outbox 文件到 wecom-channel 的 state/outbox/；由回调服务用
@@ -38,10 +39,13 @@ SECRET_FILE_ENV = "CC_COMPANION_WECOM_WEBHOOK_SECRET_FILE"
 DEFAULT_SECRET_FILE = Path("/root/.secrets/wecom_companion_webhook_secret")
 OUTBOX_DIR_ENV = "CC_COMPANION_WECOM_OUTBOX_DIR"
 DEFAULT_OUTBOX_DIR = Path("/root/wecom-channel/state/outbox")
+MEDIA_DIR_ENV = "CC_COMPANION_WECOM_MEDIA_DIR"
+DEFAULT_MEDIA_DIR = Path("/root/wecom-channel/state/media")
 
 REQUEST_LIMIT = 16 * 1024
 TEXT_LIMIT = 4000
 OUTBOX_TEXT_LIMIT = 20000
+IMAGE_MAX_BYTES = 30 * 1024 * 1024
 
 _AGENT_RE = re.compile(r"^\d{1,12}$")
 _MSG_TYPE_RE = re.compile(r"^[a-z_]{1,24}$")
@@ -82,6 +86,11 @@ def outbox_dir() -> Path:
     return Path(raw).expanduser() if raw else DEFAULT_OUTBOX_DIR
 
 
+def media_dir() -> Path:
+    raw = os.environ.get(MEDIA_DIR_ENV, "").strip()
+    return Path(raw).expanduser() if raw else DEFAULT_MEDIA_DIR
+
+
 def parse_inbound(payload: Any) -> tuple[dict[str, Any] | None, str]:
     """Validate a /wecom/inbound body -> (clean, "") or (None, error)."""
     if not isinstance(payload, dict):
@@ -95,24 +104,114 @@ def parse_inbound(payload: Any) -> tuple[dict[str, Any] | None, str]:
     raw_id = payload.get("id")
     if isinstance(raw_id, bool) or not isinstance(raw_id, (str, int)) or not str(raw_id).strip():
         return None, "id required"
-    text = payload.get("text")
-    if not isinstance(text, str) or not text.strip():
-        return None, "text required"
     msg_type = str(payload.get("msg_type") or "text").strip().lower()
     if not _MSG_TYPE_RE.match(msg_type):
         msg_type = "unknown"
-    return {
+    media = payload.get("media")
+    clean_media = None
+    if contact_id == "kimi" and msg_type == "image" and isinstance(media, dict) and media.get("status") == "ok":
+        raw_path = media.get("path")
+        if not isinstance(raw_path, str) or not raw_path or len(raw_path) > 4096 or "\0" in raw_path:
+            return None, "invalid media path"
+        clean_media = {"path": raw_path}
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        if clean_media is None:
+            return None, "text required"
+        text = "（发来一张图片）"
+    clean = {
         "contact_id": contact_id,
         "agent_id": agent_id,
         "msg_id": str(raw_id).strip()[:128],
         "msg_type": msg_type,
         "text": text.strip()[:TEXT_LIMIT],
-    }, ""
+    }
+    if clean_media is not None:
+        clean["media"] = clean_media
+    return clean, ""
 
 
-def inbound_body(clean: dict[str, Any]) -> dict[str, Any]:
-    """The internal send body handed to the contact's pipeline."""
+def stage_image(clean: dict[str, Any], destination: Path) -> dict[str, Any]:
+    """Copy one callback-downloaded image into the private attachment store."""
+    media = clean.get("media")
+    if clean.get("contact_id") != "kimi" or clean.get("msg_type") != "image" or not isinstance(media, dict):
+        raise ValueError("not a Kimi image message")
+    source = Path(str(media.get("path") or ""))
+    if not source.is_absolute():
+        raise ValueError("media path must be absolute")
+    source_info = source.lstat()
+    root = media_dir().resolve(strict=True)
+    resolved = source.resolve(strict=True)
+    if resolved.parent != root or stat.S_ISLNK(source_info.st_mode) or not stat.S_ISREG(source_info.st_mode):
+        raise ValueError("media path is outside the WeCom image store")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    source_fd = os.open(source, flags)
+    tmp: Path | None = None
+    try:
+        opened = os.fstat(source_fd)
+        if (
+            opened.st_dev != source_info.st_dev
+            or opened.st_ino != source_info.st_ino
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_size <= 0
+            or opened.st_size > IMAGE_MAX_BYTES
+        ):
+            raise ValueError("invalid image size or file type")
+        header = os.read(source_fd, 12)
+        if header.startswith(b"\xff\xd8\xff"):
+            extension, media_type = ".jpg", "image/jpeg"
+        elif header.startswith(b"\x89PNG\r\n\x1a\n"):
+            extension, media_type = ".png", "image/png"
+        elif header.startswith((b"GIF87a", b"GIF89a")):
+            extension, media_type = ".gif", "image/gif"
+        elif header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+            extension, media_type = ".webp", "image/webp"
+        else:
+            raise ValueError("unsupported image bytes")
+        target_dir = destination.resolve(strict=True)
+        stored_name = f"wecom-{secrets.token_hex(16)}{extension}"
+        final = target_dir / stored_name
+        tmp = target_dir / f".{stored_name}.tmp-{os.getpid()}"
+        target_fd = os.open(
+            tmp,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        with os.fdopen(target_fd, "wb") as handle:
+            handle.write(header)
+            remaining = opened.st_size - len(header)
+            while remaining:
+                chunk = os.read(source_fd, min(remaining, 1024 * 1024))
+                if not chunk:
+                    raise OSError("image changed while being copied")
+                handle.write(chunk)
+                remaining -= len(chunk)
+            if os.read(source_fd, 1):
+                raise OSError("image changed while being copied")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, final)
+        tmp = None
+    finally:
+        os.close(source_fd)
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
     return {
+        "attachment_url": f"/attachments/{stored_name}",
+        "filename": f"wecom-image{extension}",
+        "type": "image",
+        "media_type": media_type,
+        "size": opened.st_size,
+        "stored_path": str(final),
+    }
+
+
+def inbound_body(clean: dict[str, Any], attachments: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """The internal send body handed to the contact's pipeline."""
+    body = {
         "text": f"{USER_PREFIX}{clean['text']}",
         "metadata": {
             "source": META_SOURCE,
@@ -123,6 +222,9 @@ def inbound_body(clean: dict[str, Any]) -> dict[str, Any]:
             },
         },
     }
+    if attachments:
+        body["_pwa_staged_attachments"] = attachments
+    return body
 
 
 def origin(record: Any) -> dict[str, Any] | None:
