@@ -198,6 +198,7 @@ from device_notice import (
 from xhs_login import XhsLoginError, XhsLoginManager
 from netease_login import NeteaseLoginError, NeteaseLoginManager
 from jd_login import JdLoginError, JdLoginManager
+from x_login import XLoginError, XLoginManager
 from meituan_login import MeituanLoginError, MeituanLoginManager
 from mt_waimai_login import MtWaimaiLoginError, MtWaimaiLoginManager
 from mcp_services import McpServiceError, McpServiceStore
@@ -4649,6 +4650,27 @@ class ServerState:
             allowed_contacts=mtw_allowed_contacts,
         ) if bool(mt_waimai_login_cfg.get("enabled", False)) else None
 
+        # 2026-10-26 X(Twitter) 登录卡：小克自己的 X 号 @ggg1446850，cookie 落东京
+        # twitter-cli（x-login-bridge）。enabled=false 时不构建 manager、闸门恒 False、
+        # /x-login/* 返回 410。
+        x_login_cfg = config.get("x_login", {})
+        raw_x_import_command = x_login_cfg.get("import_command")
+        x_import_command = raw_x_import_command if isinstance(raw_x_import_command, list) else None
+        raw_x_status_command = x_login_cfg.get("status_command")
+        x_status_command = raw_x_status_command if isinstance(raw_x_status_command, list) else None
+        x_allowed_contacts = {
+            str(item).strip().lower()
+            for item in (x_login_cfg.get("allowed_contacts", ["xiaoke"]) or [])
+            if str(item).strip()
+        }
+        self.x_login = XLoginManager(
+            import_command=x_import_command,
+            status_command=x_status_command,
+            ttl_seconds=int(x_login_cfg.get("ttl_seconds", 300)),
+            allowed_contacts=x_allowed_contacts,
+            status_cache_seconds=int(x_login_cfg.get("status_cache_seconds", 600)),
+        ) if bool(x_login_cfg.get("enabled", False)) else None
+
         if self.apns_enabled:
             self.jwt = APNsJWT(
                 p8_path=self.p8_path,
@@ -8877,6 +8899,8 @@ class PushHandler(BaseHTTPRequestHandler):
             "/meituan-login/import": 24 * 1024,
             "/mt-waimai-login/start": 4 * 1024,
             "/mt-waimai-login/import": 24 * 1024,
+            "/x-login/start": 4 * 1024,
+            "/x-login/import": 16 * 1024,
         }
         if request_path == "/mcp-services":
             # Tokens are sensitive; reject oversized requests before reading
@@ -9013,6 +9037,12 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         elif self.path == "/mt-waimai-login/import":
             self._handle_mt_waimai_login_import(body)
+            return
+        elif self.path == "/x-login/start":
+            self._handle_x_login_start(body)
+            return
+        elif self.path == "/x-login/import":
+            self._handle_x_login_import(body)
             return
         elif self.path == "/chat/stop":
             # XiaoKe Stop emits literal tmux Ctrl-C and remains under the
@@ -9448,6 +9478,44 @@ class PushHandler(BaseHTTPRequestHandler):
                 cookie_header=body.get("cookies"),
             )
         except MtWaimaiLoginError as exc:
+            self._send_json(exc.status, {"ok": False, "error": exc.code})
+            return
+        self._send_json(200, result)
+
+    def _handle_x_login_start(self, body: dict[str, Any]):
+        if self._source_for_request() != "android-app":
+            self._send_json(403, {"ok": False, "error": "android client required"})
+            return
+        if getattr(self.state, "x_login", None) is None:
+            self._send_json(410, {"ok": False, "error": "retired"})
+            return
+        try:
+            result = self.state.x_login.start(
+                contact_id=body.get("contact_id"),
+                device_id=body.get("device_id"),
+                origin=body.get("origin"),
+            )
+        except XLoginError as exc:
+            self._send_json(exc.status, {"ok": False, "error": exc.code})
+            return
+        self._send_json(200, result)
+
+    def _handle_x_login_import(self, body: dict[str, Any]):
+        if self._source_for_request() != "android-app":
+            self._send_json(403, {"ok": False, "error": "android client required"})
+            return
+        if getattr(self.state, "x_login", None) is None:
+            self._send_json(410, {"ok": False, "error": "retired"})
+            return
+        try:
+            result = self.state.x_login.import_cookies(
+                nonce=body.get("nonce"),
+                contact_id=body.get("contact_id"),
+                device_id=body.get("device_id"),
+                origin=body.get("origin"),
+                cookie_header=body.get("cookies"),
+            )
+        except XLoginError as exc:
             self._send_json(exc.status, {"ok": False, "error": exc.code})
             return
         self._send_json(200, result)
@@ -12623,6 +12691,12 @@ class PushHandler(BaseHTTPRequestHandler):
         link_bundle = self._enrich_user_links(text)
         metadata = merge_preview_metadata(metadata, link_bundle)
         link_context = link_bundle.prompt_context
+        try:
+            x_login_hint = self._xiaoke_x_login_hint(text)
+        except Exception:
+            x_login_hint = ""
+        if x_login_hint:
+            link_context = "\n\n".join(part for part in (link_context, x_login_hint) if part)
         # Second gate: only an explicit health-app share may spend prompt
         # budget on the period block, even if some other path re-attached
         # health_context to this body's metadata.
@@ -12973,6 +13047,7 @@ class PushHandler(BaseHTTPRequestHandler):
             ("jd_login_card", self._kimi_jd_login_card_allowed),
             ("meituan_login_card", self._kimi_meituan_login_card_allowed),
             ("mt_waimai_login_card", self._kimi_mt_waimai_login_card_allowed),
+            ("x_login_card", lambda: self._x_login_card_allowed(contact_id)),
         )
         cleaned = dict(metadata)
         for key, gate in gates:
@@ -13172,6 +13247,65 @@ class PushHandler(BaseHTTPRequestHandler):
         visible = "\n".join(line for line in lines if line.strip() != marker).strip()
         return visible or "美团外卖还没登录，点下方卡片登录。", True
 
+    def _x_login_card_allowed(self, contact_id: str) -> bool:
+        """Permit the X login card only for allowed contacts while Tokyo reports no session.
+
+        Server-owned probe only (``xcli status --json`` on Tokyo via the
+        login manager); client metadata and model text are never consulted,
+        so a forged marker or card-shaped payload cannot create the card.
+        """
+        manager = getattr(self.state, "x_login", None)
+        needs_login = getattr(manager, "needs_login", None)
+        if not callable(needs_login):
+            return False
+        if str(contact_id or "").strip().lower() not in getattr(manager, "allowed_contacts", ()):
+            return False
+        try:
+            return bool(needs_login())
+        except Exception:
+            return False
+
+    def _kimi_x_login_card_allowed(self) -> bool:
+        return self._x_login_card_allowed("kimi")
+
+    # Cheap textual trigger for the xiaoke tmux path: only turns that talk
+    # about X spend a (cached) Tokyo probe in the send path.
+    _X_TOPIC_RE = re.compile(r"(推特|twitter|x\.com|(?<![A-Za-z0-9])[Xx](?![A-Za-z0-9]))", re.IGNORECASE)
+
+    def _xiaoke_x_login_hint(self, text: str) -> str:
+        if not text or not self._X_TOPIC_RE.search(text):
+            return ""
+        if not self._x_login_card_allowed("xiaoke"):
+            return ""
+        return (
+            "[X登录卡片] 服务端探针确认小克的 X 号（@ggg1446850）当前未登录/cookie 失效，xcli 不可用。"
+            "如需让方小南登录，在正文最后单独一行输出 [[CCC_X_LOGIN_CARD:v1]]（不能走 reply 工具）。"
+        )
+
+    @staticmethod
+    def _kimi_extract_x_login_card(
+        message: str,
+        *,
+        allowed: bool,
+    ) -> tuple[str, bool]:
+        """Extract exactly one standalone, server-authorized X card marker.
+
+        Same narrow grammar as the XHS card: near matches, inline uses,
+        repeated markers, and a marker that is not the last non-empty line
+        remain ordinary assistant text.
+        """
+        raw = str(message or "")
+        if not allowed:
+            return raw, False
+        marker = "[[CCC_X_LOGIN_CARD:v1]]"
+        lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        marker_count = sum(line.strip() == marker for line in lines)
+        nonempty = [line.strip() for line in lines if line.strip()]
+        if marker_count != 1 or not nonempty or nonempty[-1] != marker:
+            return raw, False
+        visible = "\n".join(line for line in lines if line.strip() != marker).strip()
+        return visible or "X 登录已失效，点下方卡片重新登录。", True
+
     def _kimi_bqb_protocol(self) -> str:
         """Return bounded, catalog-backed token instructions with no image URLs."""
         names: list[str] = []
@@ -13209,6 +13343,7 @@ class PushHandler(BaseHTTPRequestHandler):
         jd_login_card_allowed: bool = False,
         meituan_login_card_allowed: bool = False,
         mt_waimai_login_card_allowed: bool = False,
+        x_login_card_allowed: bool = False,
         wecom_entry: bool = False,
         wecom_image: bool = False,
     ) -> str:
@@ -13282,6 +13417,15 @@ class PushHandler(BaseHTTPRequestHandler):
                 "当本轮对话涉及美团外卖功能或 Astra 提到登录美团外卖时，请简短提醒她；"
                 "如需展示登录卡片，只能在回复末尾单独一行、且只输出一次"
                 " [[CCC_MT_WAIMAI_LOGIN_CARD:v1]]。其他任何情况都不要输出或复述这个标记。",
+            ])
+        if x_login_card_allowed:
+            sections.extend([
+                "",
+                "[X登录卡片]",
+                "本轮服务端确认 X（Twitter）尚未登录（东京 twitter-cli 的 cookie 缺失或失效，X 工具不可用）。"
+                "当本轮对话涉及 X/推特功能或 Astra 提到登录 X 时，请简短提醒她；"
+                "如需展示登录卡片，只能在回复末尾单独一行、且只输出一次"
+                " [[CCC_X_LOGIN_CARD:v1]]。其他任何情况都不要输出或复述这个标记。",
             ])
         return "\n".join(sections) + self._kimi_bqb_protocol()
 
@@ -14009,6 +14153,7 @@ class PushHandler(BaseHTTPRequestHandler):
         jd_login_card_allowed = self._kimi_jd_login_card_allowed()
         meituan_login_card_allowed = self._kimi_meituan_login_card_allowed()
         mt_waimai_login_card_allowed = self._kimi_mt_waimai_login_card_allowed()
+        x_login_card_allowed = self._kimi_x_login_card_allowed()
         metadata = merge_preview_metadata(body.get("metadata"), link_bundle)
         prepare_cancel_event = None
 
@@ -15035,6 +15180,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 visible, jd_card = self._kimi_extract_jd_login_card(visible, allowed=jd_login_card_allowed)
                 visible, meituan_card = self._kimi_extract_meituan_login_card(visible, allowed=meituan_login_card_allowed)
                 visible, mt_waimai_card = self._kimi_extract_mt_waimai_login_card(visible, allowed=mt_waimai_login_card_allowed)
+                visible, x_card = self._kimi_extract_x_login_card(visible, allowed=x_login_card_allowed)
                 final = chat.append(
                     role="assistant",
                     text=visible,
@@ -15048,6 +15194,7 @@ class PushHandler(BaseHTTPRequestHandler):
                         **({"jd_login_card": True} if jd_card else {}),
                         **({"meituan_login_card": True} if meituan_card else {}),
                         **({"mt_waimai_login_card": True} if mt_waimai_card else {}),
+                        **({"x_login_card": True} if x_card else {}),
                     },
                 )
                 final_ts = str(final.get("ts") or "")
@@ -15107,6 +15254,7 @@ class PushHandler(BaseHTTPRequestHandler):
             jd_login_card_allowed=jd_login_card_allowed,
             meituan_login_card_allowed=meituan_login_card_allowed,
             mt_waimai_login_card_allowed=mt_waimai_login_card_allowed,
+            x_login_card_allowed=x_login_card_allowed,
             wecom_entry=wecom_bridge.origin(rec) is not None,
             wecom_image=wecom_bridge.origin(rec) is not None and any(
                 isinstance(item, dict) and item.get("type") == "image" for item in staged_attachments
@@ -15200,6 +15348,7 @@ class PushHandler(BaseHTTPRequestHandler):
         jd_login_card_allowed = self._kimi_jd_login_card_allowed()
         meituan_login_card_allowed = self._kimi_meituan_login_card_allowed()
         mt_waimai_login_card_allowed = self._kimi_mt_waimai_login_card_allowed()
+        x_login_card_allowed = self._kimi_x_login_card_allowed()
         # User-supplied metadata is deliberately discarded. Only the server's
         # bounded link preview schema is stored alongside the Kimi message.
         metadata = merge_preview_metadata(None, link_bundle)
@@ -15381,6 +15530,7 @@ class PushHandler(BaseHTTPRequestHandler):
             jd_login_card_allowed=jd_login_card_allowed,
             meituan_login_card_allowed=meituan_login_card_allowed,
             mt_waimai_login_card_allowed=mt_waimai_login_card_allowed,
+            x_login_card_allowed=x_login_card_allowed,
         )
         kimi_observer = getattr(self.state, "kimi_terminal_observer", None)
         observer_begin = getattr(kimi_observer, "begin", None)
@@ -15456,6 +15606,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 allow_jd_login_card: bool = False,
                 allow_meituan_login_card: bool = False,
                 allow_mt_waimai_login_card: bool = False,
+                allow_x_login_card: bool = False,
             ) -> str:
                 try:
                     visible_message, xhs_login_card = self._kimi_extract_xhs_login_card(
@@ -15478,6 +15629,10 @@ class PushHandler(BaseHTTPRequestHandler):
                         visible_message,
                         allowed=allow_mt_waimai_login_card,
                     )
+                    visible_message, x_login_card = self._kimi_extract_x_login_card(
+                        visible_message,
+                        allowed=allow_x_login_card,
+                    )
                     assistant_metadata = {
                         "kimi_user_ts": str(rec.get("ts") or ""),
                         "turn_terminal": True,
@@ -15493,6 +15648,8 @@ class PushHandler(BaseHTTPRequestHandler):
                         assistant_metadata["meituan_login_card"] = True
                     if mt_waimai_login_card:
                         assistant_metadata["mt_waimai_login_card"] = True
+                    if x_login_card:
+                        assistant_metadata["x_login_card"] = True
                     final = chat.append(
                         role="assistant",
                         text=visible_message,
@@ -15515,6 +15672,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 allow_jd_login_card: bool = False,
                 allow_meituan_login_card: bool = False,
                 allow_mt_waimai_login_card: bool = False,
+                allow_x_login_card: bool = False,
             ) -> None:
                 nonlocal terminalized
                 finish_observer(status)
@@ -15529,6 +15687,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     allow_jd_login_card=allow_jd_login_card,
                     allow_meituan_login_card=allow_meituan_login_card,
                     allow_mt_waimai_login_card=allow_mt_waimai_login_card,
+                    allow_x_login_card=allow_x_login_card,
                 )
                 self._set_chat_completed(
                     contact_id,
@@ -15670,6 +15829,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     allow_jd_login_card=jd_login_card_allowed,
                     allow_meituan_login_card=meituan_login_card_allowed,
                     allow_mt_waimai_login_card=mt_waimai_login_card_allowed,
+                    allow_x_login_card=x_login_card_allowed,
                 )
             except KimiACPCancelled:
                 finish_observer("interrupted")

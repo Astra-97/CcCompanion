@@ -268,6 +268,7 @@ markers = [
     ("[[CCC_JD_LOGIN_CARD:v1]]", "jd", "京东登录已失效，点下方卡片重新登录。"),
     ("[[CCC_MEITUAN_LOGIN_CARD:v1]]", "meituan", "美团主站还没登录，点下方卡片登录。"),
     ("[[CCC_MT_WAIMAI_LOGIN_CARD:v1]]", "mt_waimai", "美团外卖还没登录，点下方卡片登录。"),
+    ("[[CCC_X_LOGIN_CARD:v1]]", "x", "X 登录已失效，点下方卡片重新登录。"),
 ]
 lines = sys.stdin.read().replace("\r\n", "\n").splitlines()
 stripped = {line.strip() for line in lines}
@@ -305,7 +306,7 @@ if session:
         "xiaoke_session_id": session,
     }
 for key in os.environ.get("LOGIN_CARDS", "").split():
-    if key in ("xhs", "netease", "jd", "meituan", "mt_waimai"):
+    if key in ("xhs", "netease", "jd", "meituan", "mt_waimai", "x"):
         payload.setdefault("metadata", {})[f"{key}_login_card"] = True
 print(json.dumps(payload))
 ')

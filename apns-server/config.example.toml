@@ -420,3 +420,15 @@ allowed_contacts = ["kairos", "kimi"]
 # import_command = ["ssh", "memory-sg", "/home/ubuntu/taobao-login/.venv/bin/python", "/home/ubuntu/meituan-login/import_cookies.py"]
 # 挂卡闸门探针：meituan-mcp 自带 status（login_status 工具同一判据，默认即下值）。
 # status_command = ["ssh", "memory-sg", "/home/ubuntu/taobao-login/.venv/bin/python", "/home/ubuntu/meituan-mcp/meituan_tools.py", "status"]
+
+[x_login]
+# X(Twitter) 登录卡（2026-10-26）：小克自己的 X 号 @ggg1446850，cookie 落东京 twitter-cli
+# （Astra-97/x-login-bridge，tokyo:/home/ubuntu/x-login-bridge）。默认 enabled=false。
+enabled = true
+ttl_seconds = 300
+allowed_contacts = ["xiaoke"]
+# 闸门探针只在 needs_login 时授权卡片；X 反爬严，缓存默认 600s，import 成功会重置。
+status_cache_seconds = 600
+# 固定 argv，cookie JSON 只经 subprocess stdin 传入，不得改成 shell 字符串。
+# import_command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "tokyo", "/home/ubuntu/x-login-bridge/import_cookies.py"]
+# status_command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "tokyo", "/home/ubuntu/x-login-bridge/xcli", "status", "--json"]
