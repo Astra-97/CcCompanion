@@ -15,8 +15,10 @@ import io
 import json
 import os
 import tempfile
+import threading
 import types
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -329,6 +331,80 @@ class WecomKairosTaskTest(WecomBase):
         h, _chat = self.make()
         h._handle_kairos_chat_send({"text": "hi"}, "kairos")
         self.assertNotIn("wecom", h.tasks[0])
+
+
+class WecomBellTest(WecomBase):
+    """send_bell: thin client of the callback service's /wecom/bell."""
+
+    def make_server(self, status=200, payload=None):
+        captured = []
+        payload = payload if payload is not None else {"ok": True, "contact": "kimi", "user_id": "FangXiaoNan", "sent": 1, "bubbles": 1}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                captured.append({
+                    "path": self.path,
+                    "secret": self.headers.get("X-Wecom-Webhook-Secret"),
+                    "body": json.loads(self.rfile.read(length).decode("utf-8")),
+                })
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        old = os.environ.get(wecom_bridge.BELL_URL_ENV)
+        os.environ[wecom_bridge.BELL_URL_ENV] = f"http://127.0.0.1:{server.server_port}/wecom/bell"
+        self.addCleanup(self._restore_env, wecom_bridge.BELL_URL_ENV, old)
+        return captured
+
+    def test_success_posts_secret_and_body(self) -> None:
+        captured = self.make_server()
+        result = wecom_bridge.send_bell("kimi", "  铃铛响了  ")
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(captured), 1)
+        call = captured[0]
+        self.assertEqual(call["path"], "/wecom/bell")
+        self.assertEqual(call["secret"], SECRET)
+        self.assertEqual(call["body"], {"contact": "kimi", "text": "铃铛响了"})
+
+    def test_unsupported_contact_and_empty_text_never_call_http(self) -> None:
+        captured = self.make_server()
+        with self.assertRaises(ValueError):
+            wecom_bridge.send_bell("xiaoke", "x")
+        with self.assertRaises(ValueError):
+            wecom_bridge.send_bell("kimi", "   ")
+        self.assertEqual(captured, [])
+
+    def test_missing_or_loose_secret_fails_closed(self) -> None:
+        captured = self.make_server()
+        os.chmod(self.secret_file, 0o644)
+        with self.assertRaises(RuntimeError):
+            wecom_bridge.send_bell("kimi", "x")
+        self.assertEqual(captured, [])
+
+    def test_http_error_raises_without_secret(self) -> None:
+        captured = self.make_server(status=403, payload={"ok": False, "error": "forbidden"})
+        with self.assertRaisesRegex(RuntimeError, "403"):
+            wecom_bridge.send_bell("kimi", "x")
+        self.assertEqual(len(captured), 1)
+
+    def test_unreachable_raises(self) -> None:
+        old = os.environ.get(wecom_bridge.BELL_URL_ENV)
+        os.environ[wecom_bridge.BELL_URL_ENV] = "http://127.0.0.1:1/wecom/bell"
+        self.addCleanup(self._restore_env, wecom_bridge.BELL_URL_ENV, old)
+        with self.assertRaises(RuntimeError):
+            wecom_bridge.send_bell("kimi", "x", timeout=2)
 
 
 class WecomPromptTest(unittest.TestCase):

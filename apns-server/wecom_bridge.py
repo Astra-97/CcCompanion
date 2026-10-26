@@ -12,6 +12,10 @@ companion 路由的消息 POST 到本服务 ``/wecom/inbound``（X-Wecom-Webhook
 该联系人自己的应用（AgentID + Secret）发回微信。判定只看「这一轮回答的是哪条
 用户消息」，与模型自觉无关；app 里正常聊的消息没有标记，永远只回 app。
 
+小铃铛（主动推送，2026-10-26）：``send_bell(contact_id, text)`` 读同一个共享
+密钥 POST 到回调服务的 ``/wecom/bell``，不等方小南先发消息就往她微信推文字。
+收件人永远是白名单第一个 UserID（不能指定别人、不能批量），鉴权失败 fail-closed。
+
 本模块只放纯函数与文件 I/O，便于单测；路由与管线接线在 push.py。
 """
 from __future__ import annotations
@@ -22,6 +26,8 @@ import re
 import secrets
 import stat
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -41,6 +47,8 @@ OUTBOX_DIR_ENV = "CC_COMPANION_WECOM_OUTBOX_DIR"
 DEFAULT_OUTBOX_DIR = Path("/root/wecom-channel/state/outbox")
 MEDIA_DIR_ENV = "CC_COMPANION_WECOM_MEDIA_DIR"
 DEFAULT_MEDIA_DIR = Path("/root/wecom-channel/state/media")
+BELL_URL_ENV = "CC_COMPANION_WECOM_BELL_URL"
+DEFAULT_BELL_URL = "http://127.0.0.1:8792/wecom/bell"
 
 REQUEST_LIMIT = 16 * 1024
 TEXT_LIMIT = 4000
@@ -89,6 +97,53 @@ def outbox_dir() -> Path:
 def media_dir() -> Path:
     raw = os.environ.get(MEDIA_DIR_ENV, "").strip()
     return Path(raw).expanduser() if raw else DEFAULT_MEDIA_DIR
+
+
+def bell_url() -> str:
+    raw = os.environ.get(BELL_URL_ENV, "").strip()
+    return raw if raw else DEFAULT_BELL_URL
+
+
+def send_bell(contact_id: str, text: str, *, timeout: float = 20.0) -> dict[str, Any]:
+    """小铃铛：主动推一条文字到方小南的微信（经 wecom-channel /wecom/bell）。
+
+    只发文字、只能发给有 companion 路由的联系人，收件人由回调服务固定为白名单
+    第一个 UserID。共享密钥文件缺失或不是 0600 时 fail-closed（不发、抛错）。
+    返回回调服务的 JSON；任何失败都抛 RuntimeError（消息里不含密钥）。
+    """
+    contact = str(contact_id or "").strip()
+    if contact not in INBOUND_CONTACTS:
+        raise ValueError(f"contact_not_supported: {contact or '(empty)'}")
+    body_text = str(text or "").strip()
+    if not body_text:
+        raise ValueError("empty bell text")
+    # 注意：超时 / 连接错误只代表「结果未知」——回调服务可能仍在排队发送，
+    # 消息也许已经送达。失败后不要盲目重试，先确认微信侧再决定。
+    secret = webhook_secret()
+    if not secret:
+        raise RuntimeError("wecom webhook secret file missing or not 0600; bell refused")
+    payload = json.dumps({"contact": contact, "text": body_text[:OUTBOX_TEXT_LIMIT]}, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        bell_url(),
+        data=payload,
+        headers={"Content-Type": "application/json", "X-Wecom-Webhook-Secret": secret},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = str(json.loads(exc.read().decode("utf-8")).get("error") or "")
+        except (OSError, ValueError, AttributeError):
+            pass
+        raise RuntimeError(f"bell HTTP {exc.code}: {detail or 'rejected'}") from None
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"bell request failed: {type(exc).__name__}") from None
+    if not isinstance(result, dict) or not result.get("ok"):
+        raise RuntimeError("bell rejected: unexpected response")
+    return result
 
 
 def parse_inbound(payload: Any) -> tuple[dict[str, Any] | None, str]:
