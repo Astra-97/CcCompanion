@@ -1,0 +1,198 @@
+"""企业微信 ↔ CC Companion 联系人桥（2026-10-26：卡拉米 kimi、kairos）。
+
+入站：/root/wecom-channel 的回调服务按解密后的 AgentID 分流（WECOM_ROUTES），
+companion 路由的消息 POST 到本服务 ``/wecom/inbound``（X-Wecom-Webhook-Secret，
+0600 文件，fail-closed）。本服务把它当成方小南在 app 里给该联系人发了一条
+``［💬微信］原文``：同入历史、同走该联系人的发送管线，metadata 带
+``source=wecom`` + ``wecom={msg_id, agent_id, msg_type}``。
+
+出站：联系人这一轮的最终回复落历史时，*只有*它回答的那条用户消息带 wecom
+标记，才写一个 outbox 文件到 wecom-channel 的 state/outbox/；由回调服务用
+该联系人自己的应用（AgentID + Secret）发回微信。判定只看「这一轮回答的是哪条
+用户消息」，与模型自觉无关；app 里正常聊的消息没有标记，永远只回 app。
+
+本模块只放纯函数与文件 I/O，便于单测；路由与管线接线在 push.py。
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import secrets
+import stat
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+USER_PREFIX = "［💬微信］"
+META_KEY = "wecom"
+META_SOURCE = "wecom"
+
+# 已接好「微信入站 + 最终回复回微信」的联系人。新增联系人要先在它自己的
+# 发送管线里接上 outbox 钩子（push.py 的 _mirror_reply_to_wecom），再加进来。
+INBOUND_CONTACTS = frozenset({"kimi", "kairos"})
+_APP_LABEL = {"kimi": ("wecom_karami_app", "卡拉米"), "kairos": ("wecom_kairos_app", "kairos")}
+
+SECRET_FILE_ENV = "CC_COMPANION_WECOM_WEBHOOK_SECRET_FILE"
+DEFAULT_SECRET_FILE = Path("/root/.secrets/wecom_companion_webhook_secret")
+OUTBOX_DIR_ENV = "CC_COMPANION_WECOM_OUTBOX_DIR"
+DEFAULT_OUTBOX_DIR = Path("/root/wecom-channel/state/outbox")
+
+REQUEST_LIMIT = 16 * 1024
+TEXT_LIMIT = 4000
+OUTBOX_TEXT_LIMIT = 20000
+
+_AGENT_RE = re.compile(r"^\d{1,12}$")
+_MSG_TYPE_RE = re.compile(r"^[a-z_]{1,24}$")
+
+
+def read_secret_file(path: Path) -> str:
+    """Owner-only regular file, no symlink, bounded size; '' otherwise."""
+    try:
+        info = path.lstat()
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            return ""
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            raw = os.read(fd, 4096 + 1)
+        finally:
+            os.close(fd)
+        if len(raw) > 4096:
+            return ""
+        value = raw.decode("utf-8").strip()
+        return value if 16 <= len(value) <= 4096 else ""
+    except (OSError, UnicodeError):
+        return ""
+
+
+def webhook_secret() -> str:
+    raw = os.environ.get(SECRET_FILE_ENV, "").strip()
+    return read_secret_file(Path(raw).expanduser() if raw else DEFAULT_SECRET_FILE)
+
+
+def outbox_dir() -> Path:
+    raw = os.environ.get(OUTBOX_DIR_ENV, "").strip()
+    return Path(raw).expanduser() if raw else DEFAULT_OUTBOX_DIR
+
+
+def parse_inbound(payload: Any) -> tuple[dict[str, Any] | None, str]:
+    """Validate a /wecom/inbound body -> (clean, "") or (None, error)."""
+    if not isinstance(payload, dict):
+        return None, "json object required"
+    contact_id = str(payload.get("contact_id") or "").strip()
+    if contact_id not in INBOUND_CONTACTS:
+        return None, "contact_not_supported"
+    agent_id = str(payload.get("agent_id") or "").strip()
+    if not _AGENT_RE.match(agent_id):
+        return None, "agent_id required"
+    raw_id = payload.get("id")
+    if isinstance(raw_id, bool) or not isinstance(raw_id, (str, int)) or not str(raw_id).strip():
+        return None, "id required"
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None, "text required"
+    msg_type = str(payload.get("msg_type") or "text").strip().lower()
+    if not _MSG_TYPE_RE.match(msg_type):
+        msg_type = "unknown"
+    return {
+        "contact_id": contact_id,
+        "agent_id": agent_id,
+        "msg_id": str(raw_id).strip()[:128],
+        "msg_type": msg_type,
+        "text": text.strip()[:TEXT_LIMIT],
+    }, ""
+
+
+def inbound_body(clean: dict[str, Any]) -> dict[str, Any]:
+    """The internal send body handed to the contact's pipeline."""
+    return {
+        "text": f"{USER_PREFIX}{clean['text']}",
+        "metadata": {
+            "source": META_SOURCE,
+            META_KEY: {
+                "msg_id": clean["msg_id"],
+                "agent_id": clean["agent_id"],
+                "msg_type": clean["msg_type"],
+            },
+        },
+    }
+
+
+def origin(record: Any) -> dict[str, Any] | None:
+    """The wecom marker of a *user* history record, or None (= app message)."""
+    if not isinstance(record, dict):
+        return None
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict) or metadata.get("source") != META_SOURCE:
+        return None
+    marker = metadata.get(META_KEY)
+    if not isinstance(marker, dict) or not _AGENT_RE.match(str(marker.get("agent_id") or "")):
+        return None
+    return marker
+
+
+def prompt_entry_lines(contact_id: str) -> list[str]:
+    """Replaces the app-entry lines of a contact's prompt for a WeChat turn."""
+    entry, label = _APP_LABEL.get(contact_id, (f"wecom_{contact_id}_app", contact_id))
+    return [
+        f"入口: {entry}（个人微信 → 企业微信「{label}」应用）",
+        f"contact_id: {contact_id}",
+        "",
+        "Astra 这条是在个人微信里通过企业微信插件发给你的（消息开头的［💬微信］是来源标记，不是她打的字）。"
+        "你的回复会同时进 app 和她的微信：微信只显示纯文本，不要用 Markdown（不要 **加粗**、标题、表格、代码块）；"
+        "空一行 = 微信里另起一个气泡，通常 1-4 个气泡。请直接回复她，不要提到后台路由。",
+    ]
+
+
+def write_outbox(
+    *,
+    contact_id: str,
+    marker: dict[str, Any],
+    text: str,
+    user_ts: str = "",
+    reply_ts: str = "",
+    directory: Path | None = None,
+) -> Path:
+    """Atomically drop one reply item for the wecom-channel callback service."""
+    body = str(text or "").strip()
+    if not body:
+        raise ValueError("empty reply")
+    target = directory or outbox_dir()
+    if not target.is_dir():
+        raise FileNotFoundError(f"wecom outbox directory missing: {target}")
+    now = time.time()
+    item = {
+        "kind": "reply",
+        "contact_id": contact_id,
+        "agent_id": str(marker.get("agent_id") or ""),
+        "in_reply_to": str(marker.get("msg_id") or ""),
+        "user_ts": str(user_ts or ""),
+        "reply_ts": str(reply_ts or ""),
+        "text": body[:OUTBOX_TEXT_LIMIT],
+        "created_at": datetime.fromtimestamp(now, timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    name = f"{int(now * 1000):014d}-{secrets.token_hex(4)}.json"
+    final = target / name
+    tmp = target / f"{name}.tmp-{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600)
+    try:
+        os.write(fd, (json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        os.replace(tmp, final)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    return final

@@ -79,6 +79,7 @@ from chat_history import ChatHistory, ChatStreamBus, EphemeralTaskBuffer
 from sticker_catalog import StickerCatalogService, is_valid_category_id, is_valid_sticker_name
 from diary_stream import DiaryStream
 from group_chat import GroupChatStore
+import wecom_bridge
 from apples_unread import ApplesCursorStore, format_unread_lines, split_unread
 from plugins_store import MAX_DOC_BODY_BYTES, PluginStore
 from calendar_store import CalendarStore, CATEGORIES, CATEGORY_LABELS
@@ -5776,6 +5777,8 @@ class _RecentIdSet:
 
 # 双猫花园 webhook 去重（进程内足够：Cloudflare 重试在秒~分钟级）。
 _GARDEN_WEBHOOK_SEEN = _RecentIdSet()
+# 企业微信入站去重（wecom-channel 回调侧已按 MsgId 去重；这里兜住转发重试）。
+_WECOM_INBOUND_SEEN = _RecentIdSet()
 
 
 class _NfcTapGate:
@@ -8801,6 +8804,12 @@ class PushHandler(BaseHTTPRequestHandler):
         # 鉴权（0600 文件，fail-closed），所以必须排在 _require_write_auth 前。
         if request_path == "/garden/webhook":
             self._handle_garden_webhook()
+            return
+        # 企业微信 → 卡拉米等联系人 (2026-10-26)：wecom-channel 回调服务按
+        # AgentID 分流后转发到这里，用独立的 X-Wecom-Webhook-Secret 鉴权
+        # （0600 文件，fail-closed），同样排在 _require_write_auth 前。
+        if request_path == "/wecom/inbound":
+            self._handle_wecom_inbound()
             return
         # Keep this before generic JSON parsing: imports are intentionally much
         # larger than ordinary App mutations, and the reading proxy owns its
@@ -12414,6 +12423,9 @@ class PushHandler(BaseHTTPRequestHandler):
                 # 的旧 App（v1.9.209）仍会在每条消息带 metadata.device（电量
                 # 快照）——按隐私红线只当下用、绝不落聊天历史，这里一并洗掉。
                 "device",
+                # 企业微信来源标记只由 /wecom/inbound 写；app 客户端不能伪造
+                # 它来触发「回复同时发微信」。
+                wecom_bridge.META_KEY,
             ):
                 raw_metadata.pop(reserved_key, None)
             if raw_metadata:
@@ -13197,15 +13209,19 @@ class PushHandler(BaseHTTPRequestHandler):
         jd_login_card_allowed: bool = False,
         meituan_login_card_allowed: bool = False,
         mt_waimai_login_card_allowed: bool = False,
+        wecom_entry: bool = False,
     ) -> str:
-        sections = [
-            "[消息来源]",
-            "入口: cc_companion_kimi_private",
-            "contact_id: kimi",
-            "",
-            "Astra 正在通过 CcCompanion app 和 Kimi 对话。请直接回复她，不要提到后台路由。",
-            f"对方说：{text}",
-        ]
+        if wecom_entry:
+            sections = ["[消息来源]", *wecom_bridge.prompt_entry_lines("kimi"), f"对方说：{text}"]
+        else:
+            sections = [
+                "[消息来源]",
+                "入口: cc_companion_kimi_private",
+                "contact_id: kimi",
+                "",
+                "Astra 正在通过 CcCompanion app 和 Kimi 对话。请直接回复她，不要提到后台路由。",
+                f"对方说：{text}",
+            ]
         if link_context:
             sections.extend(["", link_context])
         if recall_context:
@@ -15032,6 +15048,10 @@ class PushHandler(BaseHTTPRequestHandler):
             except Exception:
                 logger.exception("Kimi Web assistant history append failed")
                 final_ts = ""
+            else:
+                # 只有这一轮回答的用户消息来自企业微信，才把同一份可见回复
+                # 交给 wecom-channel 发回微信；app 里发的消息没有标记。
+                self._mirror_reply_to_wecom(contact_id, rec, visible, reply_ts=final_ts)
             try:
                 if terminal_reason == "completed":
                     self._set_chat_completed(contact_id, user_ts=rec["ts"], final_ts=final_ts, source=source, session_id=session_id)
@@ -15081,6 +15101,7 @@ class PushHandler(BaseHTTPRequestHandler):
             jd_login_card_allowed=jd_login_card_allowed,
             meituan_login_card_allowed=meituan_login_card_allowed,
             mt_waimai_login_card_allowed=mt_waimai_login_card_allowed,
+            wecom_entry=wecom_bridge.origin(rec) is not None,
         )
         try:
             submitted = web.submit_prompt(
@@ -21086,10 +21107,16 @@ class PushHandler(BaseHTTPRequestHandler):
             attachment_text = "\n\n随附图片：\n" + "\n".join(attachment_lines)
         link_context = str(task.get("link_context") or "").strip()
         link_text = f"\n\n{link_context}" if link_context else ""
+        if isinstance(task.get("wecom"), dict):
+            entry = "\n".join(wecom_bridge.prompt_entry_lines("kairos")) + "\n"
+        else:
+            entry = (
+                "入口: cc_companion_kairos_private\ncontact_id: kairos\n\n"
+                "Astra 正在通过 CcCompanion app 和 Kairos 对话。请直接回复她，不要提到后台路由。\n"
+            )
         return (
             "当前时间：" + datetime.now().astimezone().strftime("%Y-%m-%d %H:%M") + "\n"
-            "[消息来源]\n入口: cc_companion_kairos_private\ncontact_id: kairos\n\n"
-            "Astra 正在通过 CcCompanion app 和 Kairos 对话。请直接回复她，不要提到后台路由。\n"
+            "[消息来源]\n" + entry +
             f"对方说：{text or '[发来了一张图片]'}"
             f"{attachment_text}{link_text}"
         )
@@ -21121,6 +21148,18 @@ class PushHandler(BaseHTTPRequestHandler):
         max_queue_wait_sec = 900.0
         if user_ts:
             self.state.mark_kairos_pending_run(contact_id, user_ts, text)
+        wecom_marker = task.get("wecom") if isinstance(task.get("wecom"), dict) else None
+
+        def _mirror_wecom(message: str, final_rec: Any) -> None:
+            # 只有来自企业微信的这一轮才回微信（标记由 /wecom/inbound 写入）。
+            if wecom_marker is None:
+                return
+            self._mirror_reply_to_wecom(
+                contact_id,
+                {"ts": user_ts, "metadata": {"source": wecom_bridge.META_SOURCE, wecom_bridge.META_KEY: wecom_marker}},
+                message,
+                reply_ts=str((final_rec or {}).get("ts") or "") if isinstance(final_rec, dict) else "",
+            )
 
         def _append_activity_card() -> None:
             if task.get("activity_appended"):
@@ -21211,6 +21250,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 raise
             self._publish_persisted_assistant_completion(contact_id, assistant_rec)
             assistant_appended = True
+            _mirror_wecom(message, assistant_rec)
             terminal_setter = (
                 self._set_chat_failed
                 if worker_terminal_status == "failed"
@@ -21255,6 +21295,7 @@ class PushHandler(BaseHTTPRequestHandler):
             )
             self._publish_persisted_assistant_completion(contact_id, interrupted_rec)
             assistant_appended = True
+            _mirror_wecom(message, interrupted_rec)
             self._set_chat_interrupted(
                 contact_id,
                 user_ts=user_ts,
@@ -21286,6 +21327,7 @@ class PushHandler(BaseHTTPRequestHandler):
             )
             self._publish_persisted_assistant_completion(contact_id, uncertain_rec)
             assistant_appended = True
+            _mirror_wecom(message, uncertain_rec)
             self._set_chat_interrupted(
                 contact_id,
                 user_ts=user_ts,
@@ -21802,6 +21844,8 @@ class PushHandler(BaseHTTPRequestHandler):
                 if item.get("type") == "image" and item.get("stored_path")
             ],
             "link_context": link_bundle.prompt_context,
+            # 企业微信来源（仅 /wecom/inbound 写入）：最终回复据此才回微信。
+            **({"wecom": dict(wecom_bridge.origin(rec))} if wecom_bridge.origin(rec) is not None else {}),
         })
         self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec, "queued": True})
 
@@ -27457,6 +27501,97 @@ class PushHandler(BaseHTTPRequestHandler):
         # 已写入历史（含 502 注入失败）则保留，避免重复气泡。
         if not (200 <= status < 300) and not (isinstance(payload, dict) and payload.get("record")):
             _GARDEN_WEBHOOK_SEEN.release(message_id)
+
+    # ── 企业微信 → 联系人 (2026-10-26，首个：卡拉米 kimi) ─────────────────
+    def _wecom_inbound_auth_status(self) -> int:
+        """0 = ok, 401 = missing credential, 403 = wrong credential."""
+        expected = wecom_bridge.webhook_secret()
+        supplied = str(self.headers.get("X-Wecom-Webhook-Secret", "") or "").strip()
+        if not expected or not supplied:
+            return 401
+        try:
+            ok = hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+        except UnicodeError:
+            ok = False
+        return 0 if ok else 403
+
+    def _handle_wecom_inbound(self) -> None:
+        """POST /wecom/inbound — 方小南在个人微信里给某联系人的企业微信应用发消息。
+
+        body: {"contact_id", "agent_id", "id", "msg_type", "text"}（由
+        wecom-channel 回调服务按 WECOM_ROUTES 分流后发出）。效果等同她在 app
+        里给该联系人发了一条 ``［💬微信］原文``：整体委托该联系人的发送管线
+        （同入历史 + 忙时排队），metadata 带 source=wecom 标记，最终回复据此
+        才回微信。按 id 去重（转发重试）。
+        """
+        auth = self._wecom_inbound_auth_status()
+        if auth:
+            self.close_connection = True
+            self._send_json(auth, {"ok": False, "error": "unauthorized" if auth == 401 else "forbidden"})
+            return
+        incoming = self._reading_read_body(wecom_bridge.REQUEST_LIMIT)
+        if incoming is None:
+            return
+        clean, error = wecom_bridge.parse_inbound(incoming)
+        if clean is None:
+            self._send_json(400, {"ok": False, "error": error})
+            return
+        dedupe_key = f"{clean['agent_id']}:{clean['msg_id']}"
+        if not _WECOM_INBOUND_SEEN.reserve(dedupe_key):
+            self._send_json(200, {"ok": True, "duplicate": True, "id": clean["msg_id"]})
+            return
+        forward = wecom_bridge.inbound_body(clean)
+        outcome: list[tuple[int, Any]] = []
+        original_send_json = self._send_json
+
+        def capture(status: int, payload: Any, **kwargs: Any) -> Any:
+            outcome.append((status, payload))
+            return original_send_json(status, payload, **kwargs)
+
+        self._send_json = capture  # type: ignore[method-assign]
+        try:
+            # 只放行 INBOUND_CONTACTS（已接好出站钩子的联系人），走它在 app
+            # 里的同一条发送管线（kimi → Kimi Web，kairos → Codex 队列）。
+            if not dispatch_contact_send(self, clean["contact_id"], forward):
+                original_send_json(501, {"ok": False, "error": "contact not wired"})
+                outcome.append((501, {}))
+        except Exception:
+            logger.exception("wecom inbound delivery failed")
+            if not outcome:
+                original_send_json(500, {"ok": False, "error": "delivery failed"})
+                outcome.append((500, {}))
+        finally:
+            self._send_json = original_send_json  # type: ignore[method-assign]
+        status, payload = outcome[-1] if outcome else (500, {})
+        if not (200 <= status < 300) and not (isinstance(payload, dict) and payload.get("record")):
+            _WECOM_INBOUND_SEEN.release(dedupe_key)
+        logger.info(
+            "wecom inbound %s msg=%s… -> %s: HTTP %s",
+            clean["msg_type"], clean["msg_id"][:6], clean["contact_id"], status,
+        )
+
+    def _mirror_reply_to_wecom(self, contact_id: str, user_record: Any, text: str, *, reply_ts: str = "") -> bool:
+        """Final reply of a WeChat-originated turn -> wecom-channel outbox.
+
+        No-op (False) unless *user_record* carries the server-written wecom
+        marker.  Never raises: a failure is logged and the App reply stands.
+        """
+        marker = wecom_bridge.origin(user_record)
+        if marker is None:
+            return False
+        try:
+            path = wecom_bridge.write_outbox(
+                contact_id=contact_id,
+                marker=marker,
+                text=text,
+                user_ts=str((user_record or {}).get("ts") or ""),
+                reply_ts=reply_ts,
+            )
+        except Exception as exc:
+            logger.warning("wecom mirror of %s reply failed: %s", contact_id, exc)
+            return False
+        logger.info("wecom mirror: %s reply queued for agent %s (%s)", contact_id, marker.get("agent_id"), path.name)
+        return True
 
 
     # ── NFC 螃蟹挂件 "碰一下召唤小克" (2026-10-21) ─────────────────────────
