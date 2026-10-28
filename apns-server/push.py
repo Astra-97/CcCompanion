@@ -230,6 +230,8 @@ from kiro_terminal import (
     KiroTerminalNoActiveSession,
     KiroTerminalUnavailable,
 )
+# kiro 搬东京 (2026-10-28): ssh transport for remote stdio agents.
+from remote_stdio import RemoteStdio, RemoteStdioTarget
 # kiro 桥接 (2026-09-09): ACP 文本聊天联系人，Phase 1。
 from kiro_acp import (
     DEFAULT_KIRO_CWD,
@@ -3009,6 +3011,41 @@ def _kiro_delegate_pid_alive(pid: Any) -> bool:
     return True
 
 
+def _kiro_remote_from_config(server_cfg: dict[str, Any]) -> tuple[RemoteStdio | None, str, str, str]:
+    """kiro 搬东京 (2026-10-28): (remote transport, kiro_bin, kiro_cwd, home).
+
+    ``kiro_ssh_host`` set: Kiro runs on that host as ``kiro_remote_user``
+    (ssh login as that user; key in its authorized_keys), ``kiro_bin`` /
+    ``kiro_cwd`` are paths *there* (defaults under ``kiro_remote_home``).
+    Unset: ``(None, ...)`` with the old local defaults — the rollback.
+    """
+    host = str(server_cfg.get("kiro_ssh_host", "") or "").strip()
+    if not host:
+        return (
+            None,
+            str(server_cfg.get("kiro_bin", str(Path.home() / ".local" / "bin" / "kiro-cli"))),
+            str(server_cfg.get("kiro_cwd", DEFAULT_KIRO_CWD)),
+            str(Path.home()),
+        )
+    user = str(server_cfg.get("kiro_remote_user", "kiro") or "kiro").strip()
+    home = str(server_cfg.get("kiro_remote_home", "") or f"/home/{user}").rstrip("/")
+    kiro_bin = str(server_cfg.get("kiro_bin", "") or f"{home}/.local/bin/kiro-cli")
+    kiro_cwd = str(server_cfg.get("kiro_cwd", "") or f"{home}/Kiro-Workspace")
+    remote = RemoteStdio(RemoteStdioTarget(
+        host=host,
+        user=user,
+        cwd=kiro_cwd,
+        env={
+            "HOME": home,
+            "LANG": "C.UTF-8",
+            "PATH": f"{home}/.local/bin:/usr/local/bin:/usr/bin:/bin",
+        },
+        pidfile=f"{home}/.cache/ccc/kiro-acp.pid",
+        control_path=str(Path.home() / ".ssh" / "ccc-kiro-%C"),
+    ))
+    return remote, kiro_bin, kiro_cwd, home
+
+
 def _kiro_cli_data_dir() -> Path:
     """kiro-cli 的数据目录（与 dirs::data_dir 同款推断，不硬编码 /root）。
 
@@ -3026,6 +3063,8 @@ def _classify_kiro_delegate_files(
     task_files: list[tuple[Path, bool]],
     *,
     workspace: Path,
+    reader: Callable[[Path], tuple[float, int, str] | None] | None = None,
+    pid_alive: Callable[[Any], bool] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Classify kiro delegate execution JSON files into finished/pending.
 
@@ -3041,15 +3080,28 @@ def _classify_kiro_delegate_files(
     except OSError:
         workspace_resolved = workspace
     # 先按 agent 去重（mtime 新者胜），再统一分类，保证输出确定性。
+    # kiro 搬东京: ``reader``/``pid_alive`` serve files and pids that live on
+    # the remote host (one prefetch); local mode reads the disk directly.
+    alive = pid_alive or _kiro_delegate_pid_alive
     records: dict[str, tuple[float, Path, bool, dict[str, Any]]] = {}
     for task_file, is_global in task_files[:256]:
         try:
-            if not task_file.is_file():
-                continue
-            stat = task_file.stat()
-            if stat.st_size > 256 * 1024:
-                continue
-            raw = json.loads(task_file.read_text(encoding="utf-8"))
+            if reader is None:
+                if not task_file.is_file():
+                    continue
+                stat = task_file.stat()
+                mtime, size = stat.st_mtime, stat.st_size
+                if size > 256 * 1024:
+                    continue
+                text = task_file.read_text(encoding="utf-8")
+            else:
+                fetched = reader(task_file)
+                if fetched is None:
+                    continue
+                mtime, size, text = fetched
+                if size > 256 * 1024:
+                    continue
+            raw = json.loads(text)
         except (OSError, ValueError):
             logger.warning("Kiro delegate task file unreadable, skipped: %s", task_file)
             continue
@@ -3064,14 +3116,14 @@ def _classify_kiro_delegate_files(
         ):
             continue
         existing = records.get(task_id)
-        if existing is not None and existing[0] >= stat.st_mtime:
+        if existing is not None and existing[0] >= mtime:
             continue
-        records[task_id] = (stat.st_mtime, task_file, is_global, raw)
+        records[task_id] = (mtime, task_file, is_global, raw)
     result: dict[str, list[dict[str, Any]]] = {"finished": [], "pending": []}
     for task_id in sorted(records):
         _mtime, task_file, is_global, raw = records[task_id]
         status = str(raw.get("status") or "unknown").strip().lower()[:40]
-        if status == "running" and not _kiro_delegate_pid_alive(raw.get("pid")):
+        if status == "running" and not alive(raw.get("pid")):
             status = "failed"
         description = str(raw.get("task") or "")
         if is_global:
@@ -3136,6 +3188,99 @@ def _scan_kiro_session_tasks(
     except OSError:
         return empty
     return _classify_kiro_delegate_files(candidates, workspace=root)
+
+
+# kiro 搬东京 (2026-10-28): the same inventory, read on Kiro's host in one
+# call: both .subagents directories, file text (<= 256 KB) and whether each
+# recorded pid is alive *there*.
+_KIRO_REMOTE_SUBAGENTS_PY = r"""
+import json, os, sys
+out = []
+for d, is_global in ((os.path.join(sys.argv[1], ".subagents"), True),
+                     (os.path.join(sys.argv[2], ".kiro", ".subagents"), False)):
+    try:
+        names = sorted(n for n in os.listdir(d) if n.endswith(".json") and not n.startswith("."))
+    except OSError:
+        continue
+    for name in names[:256]:
+        path = os.path.join(d, name)
+        try:
+            if not os.path.isfile(path):
+                continue
+            st = os.stat(path)
+            text = ""
+            if st.st_size <= 262144:
+                with open(path, encoding="utf-8") as f:
+                    text = f.read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        alive = None
+        try:
+            pid = json.loads(text).get("pid")
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                try:
+                    os.kill(pid, 0)
+                    alive = True
+                except ProcessLookupError:
+                    alive = False
+                except OSError:
+                    alive = True
+        except Exception:
+            pass
+        out.append({"path": path, "global": is_global, "mtime": st.st_mtime,
+                    "size": st.st_size, "text": text, "pid": pid if alive is not None else None,
+                    "alive": alive})
+print(json.dumps(out))
+"""
+
+
+def _scan_kiro_session_tasks_remote(
+    remote: Any,
+    session_id: str,
+    *,
+    workspace: str | Path,
+    data_dir: str,
+) -> dict[str, list[dict[str, Any]]]:
+    """Remote twin of ``_scan_kiro_session_tasks``; any failure = empty list."""
+    clean = str(session_id or "").strip()
+    empty: dict[str, list[dict[str, Any]]] = {"finished": [], "pending": []}
+    if not clean or not all(char.isalnum() or char in {"-", "_"} for char in clean):
+        return empty
+    try:
+        result = remote.run(
+            ["python3", "-c", _KIRO_REMOTE_SUBAGENTS_PY, str(data_dir), str(workspace)],
+            timeout=20,
+        )
+        entries = json.loads(str(result.stdout or "").strip() or "[]") if result.returncode == 0 else None
+    except Exception:
+        entries = None
+    if not isinstance(entries, list):
+        logger.warning("Kiro remote delegate task inventory unavailable")
+        return empty
+    files: dict[Path, tuple[float, int, str]] = {}
+    task_files: list[tuple[Path, bool]] = []
+    alive_by_pid: dict[int, bool] = {}
+    for entry in entries[:512]:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            path = Path(str(entry["path"]))
+            files[path] = (float(entry["mtime"]), int(entry["size"]), str(entry.get("text") or ""))
+        except (KeyError, TypeError, ValueError):
+            continue
+        task_files.append((path, bool(entry.get("global"))))
+        pid = entry.get("pid")
+        if isinstance(pid, int) and not isinstance(pid, bool) and isinstance(entry.get("alive"), bool):
+            alive_by_pid[pid] = entry["alive"]
+
+    def pid_alive(pid: Any) -> bool:
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return True
+        return alive_by_pid.get(pid, True)
+
+    return _classify_kiro_delegate_files(
+        task_files, workspace=Path(str(workspace)), reader=files.get, pid_alive=pid_alive,
+    )
 
 
 def _load_kiro_recent_messages(
@@ -5172,13 +5317,25 @@ class ServerState:
         self.kiro_turn_lock = threading.RLock()
         self.kiro_active_turn: dict[str, Any] = {}
         self.kiro_prepare_token = ""
+        # kiro 搬东京 (2026-10-28): kiro_ssh_host = "tokyo" runs kiro-cli (ACP
+        # + terminal TUI) on that host as kiro_remote_user; kiro_bin/kiro_cwd
+        # are then remote paths.  Unset = the old local Kiro.
+        (
+            self.kiro_remote,
+            kiro_bin,
+            kiro_cwd,
+            self.kiro_remote_home,
+        ) = _kiro_remote_from_config(server_cfg)
         self.kiro_acp = KiroACPClient(
-            command=server_cfg.get("kiro_bin", str(Path.home() / ".local" / "bin" / "kiro-cli")),
-            cwd=server_cfg.get("kiro_cwd", DEFAULT_KIRO_CWD),
+            command=kiro_bin,
+            cwd=kiro_cwd,
             state_path=contact_history_dir / "kiro_acp_session.json",
             logger=logger,
-            request_timeout=float(server_cfg.get("kiro_acp_request_timeout_seconds", 30)),
+            request_timeout=float(server_cfg.get(
+                "kiro_acp_request_timeout_seconds", 60 if self.kiro_remote is not None else 30,
+            )),
             prompt_timeout=float(server_cfg.get("kiro_acp_prompt_timeout_seconds", 900)),
+            remote=self.kiro_remote,
         )
         # kiro 切模型 (2026-09-10)：选择持久化在 kiro_preferences.json，allowlist
         # 动态取自 kiro_acp 的模型目录（session/new|load 捕获 + 磁盘缓存）。
@@ -5189,9 +5346,20 @@ class ServerState:
         # kiro 对齐 CC r3 (2026-09-26): the terminal tab's leased TUI and the
         # read-only observer for App (ACP) turns.  ACP and TUI alternate as
         # the session's single writer through the handler handoff.
+        kiro_terminal_remote_kwargs: dict[str, Any] = {}
+        if self.kiro_remote is not None:
+            kiro_terminal_remote_kwargs = {
+                "remote": self.kiro_remote,
+                "sessions_dir": Path(self.kiro_remote_home) / ".kiro" / "sessions" / "cli",
+                # Each lock/ancestry check is an ssh round trip; a remote TUI
+                # also needs longer to take the session lock.
+                "resume_wait_seconds": 30.0,
+                "lock_release_wait_seconds": 15.0,
+            }
         self.kiro_terminal = KiroTerminalBridge(
-            command=server_cfg.get("kiro_bin", str(Path.home() / ".local" / "bin" / "kiro-cli")),
-            cwd=server_cfg.get("kiro_cwd", DEFAULT_KIRO_CWD),
+            command=kiro_bin,
+            cwd=kiro_cwd,
+            **kiro_terminal_remote_kwargs,
         )
         self.kiro_terminal_observer = KiroTerminalObserver()
         self.kiro_terminal_acquire_token = ""
@@ -16244,7 +16412,23 @@ class PushHandler(BaseHTTPRequestHandler):
                 continue
             kind = "图片" if item.get("type") == "image" else "文件"
             stored_path = str(item.get("stored_path") or "")
-            hints.append(f"[用户发了{kind}: {item.get('filename')}]\n本地路径: {stored_path}")
+            if getattr(self.state, "kiro_remote", None) is None:
+                hints.append(f"[用户发了{kind}: {item.get('filename')}]\n本地路径: {stored_path}")
+            else:
+                # kiro 搬东京: Kiro only sees files on his own host.
+                hint_path = ""
+                if root is not None and stored_path:
+                    try:
+                        if Path(stored_path).resolve(strict=True).parent == root:
+                            hint_path = self._kiro_remote_copy(
+                                stored_path, f"attachments/{Path(stored_path).name}",
+                            )
+                    except OSError:
+                        hint_path = ""
+                if hint_path:
+                    hints.append(f"[用户发了{kind}: {item.get('filename')}]\n本地路径: {hint_path}")
+                else:
+                    hints.append(f"[用户发了{kind}: {item.get('filename')}]\n（文件没能同步到 Kiro 所在的服务器）")
             if item.get("type") != "image" or root is None or not stored_path:
                 continue
             mime_type = str(item.get("media_type") or "").lower()
@@ -16265,6 +16449,32 @@ class PushHandler(BaseHTTPRequestHandler):
             except OSError:
                 continue
         return "\n".join(hints), images
+
+    def _kiro_remote_copy(self, local_path: str, relative_name: str) -> str:
+        """kiro 搬东京: the path Kiro can read for ``local_path`` ("" = none).
+
+        Local Kiro reads 216's file directly; remote Kiro gets a 0600 copy
+        under ``<home>/.cache/ccc/`` (attachments older than 30 days pruned).
+        """
+        remote = getattr(self.state, "kiro_remote", None)
+        if remote is None:
+            return local_path
+        home = str(getattr(self.state, "kiro_remote_home", "") or "").rstrip("/")
+        if not home or not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", relative_name) or ".." in relative_name:
+            return ""
+        target = f"{home}/.cache/ccc/{relative_name}"
+        if not remote.put_file(local_path, target):
+            logger.warning("Kiro remote copy failed: %s", relative_name)
+            return ""
+        if relative_name.startswith("attachments/"):
+            try:
+                remote.run(
+                    ["find", f"{home}/.cache/ccc/attachments", "-type", "f", "-mtime", "+30", "-delete"],
+                    timeout=10,
+                )
+            except Exception:
+                pass
+        return target
 
     def _handle_kiro_chat_send(
         self, body: dict[str, Any], contact_id: str, *, queue_item: dict[str, Any] | None = None,
@@ -17191,7 +17401,15 @@ class PushHandler(BaseHTTPRequestHandler):
             if getattr(acp, "busy", False):
                 return {"ok": False, "error": "kiro_busy",
                         "reason": "Kiro 正在回复中，等这一轮结束后再 forge。"}, None
-            tasks = _scan_kiro_session_tasks(old_session_id, workspace=getattr(acp, "cwd", None))
+            remote = getattr(self.state, "kiro_remote", None)
+            if remote is not None:
+                tasks = _scan_kiro_session_tasks_remote(
+                    remote, old_session_id,
+                    workspace=getattr(acp, "cwd", ""),
+                    data_dir=f"{self.state.kiro_remote_home}/.local/share/kiro-cli",
+                )
+            else:
+                tasks = _scan_kiro_session_tasks(old_session_id, workspace=getattr(acp, "cwd", None))
             usage_percent = self._kiro_context_usage_percent()
             model = self._kiro_model_selection()
             effort = self._kiro_effort_selection() or None
@@ -17368,7 +17586,9 @@ class PushHandler(BaseHTTPRequestHandler):
             for entry in finished_with_reports[:KIMI_FORGE_TASK_LIST_LIMIT]:
                 lines.append(f"· {entry['task_id']}：{entry.get('report_path')}")
         if handoff_path:
-            lines.append(f"本次交接的机器可读登记在 {handoff_path}。")
+            seed_handoff_path = self._kiro_remote_copy(handoff_path, "kiro_forge_handoff.json")
+            if seed_handoff_path:
+                lines.append(f"本次交接的机器可读登记在 {seed_handoff_path}。")
         retained_messages = 0
         retain = _clamp_kimi_forge_seed_retain(
             getattr(self.state, "kiro_auto_forge_retain_messages", KIMI_FORGE_SEED_RETAIN_DEFAULT)

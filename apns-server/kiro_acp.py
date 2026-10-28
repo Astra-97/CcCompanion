@@ -19,6 +19,13 @@ caller submits it as an ordinary follow-up prompt.  On any failure the
 durable pointer still names the old session and the next prepare
 session/load's it back.
 
+kiro 搬东京 (2026-10-28): ``remote`` (a ``remote_stdio.RemoteStdio``) runs
+the agent on another host through ``ssh -T``; the pipes are the agent's, so
+the wire code is unchanged.  ``cwd`` is then the *remote* workspace (sent in
+session/new|load, never resolved locally), ``argv`` the remote command, and
+``close()`` also stops the remote process group so a dropped connection can
+never leave a second writer holding the session lock.
+
 kiro 会话失效自愈 (2026-10-09): 换账号后旧会话指针的 session/load 恒返回
 -32603（会话不可达），fail-closed 会让 kiro 对用户永久沉默。
 ``_new_or_load_session`` 对白名单错误码（-32603 internal error、-32002
@@ -73,6 +80,8 @@ import subprocess
 import threading
 import time
 from typing import Any, Callable, Sequence
+
+from remote_stdio import RemoteStdio
 
 KIRO_DEFAULT_COMMAND = str(Path.home() / ".local" / "bin" / "kiro-cli")
 DEFAULT_KIRO_CWD = "/root/Karami-Workspace"
@@ -322,9 +331,18 @@ class KiroACPClient:
         cancel_grace_seconds: float = 10.0,
         popen_factory: Callable[..., subprocess.Popen[str]] = subprocess.Popen,
         catalog_path: str | Path | None = None,
+        argv: Sequence[str] | None = None,
+        remote: RemoteStdio | None = None,
     ):
-        self.command = str(Path(command).expanduser())
-        self.cwd = Path(cwd).expanduser().resolve()
+        self.remote = remote
+        if remote is not None:
+            # Remote paths: no local ~ expansion or symlink resolution.
+            self.command = str(command)
+            self.cwd = Path(os.path.normpath(str(cwd)))
+        else:
+            self.command = str(Path(command).expanduser())
+            self.cwd = Path(cwd).expanduser().resolve()
+        self.argv = [str(part) for part in argv] if argv else [self.command, "acp"]
         self.state_path = Path(state_path).expanduser()
         # kiro 切模型 (2026-09-10): sanitized copy of the last models block
         # seen on the wire; the cache lets /kiro/preferences answer while the
@@ -394,7 +412,11 @@ class KiroACPClient:
             if not session_id or not saved_cwd:
                 return ""
             try:
-                canonical_saved_cwd = str(Path(saved_cwd).expanduser().resolve())
+                canonical_saved_cwd = (
+                    os.path.normpath(saved_cwd)
+                    if self.remote is not None
+                    else str(Path(saved_cwd).expanduser().resolve())
+                )
             except (OSError, RuntimeError):
                 return ""
             return self._valid_session_id(session_id) if canonical_saved_cwd == str(self.cwd) else ""
@@ -645,9 +667,10 @@ class KiroACPClient:
             if self._process_alive() and self._initialized:
                 return
             self.close()
+            factory = self.remote.popen if self.remote is not None else self._popen_factory
             try:
-                process = self._popen_factory(
-                    [self.command, "acp"],
+                process = factory(
+                    list(self.argv),
                     cwd=str(self.cwd),
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
@@ -1213,13 +1236,20 @@ class KiroACPClient:
         self._process = None
         self._initialized = False
         self._loaded_session_id = ""
-        if process is None or process.poll() is not None:
+        if process is None:
             return
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=2)
-        except Exception:
+        if process.poll() is None:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=2)
             except Exception:
-                pass
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except Exception:
+                    pass
+        if self.remote is not None:
+            # The local pid is only ssh.  Stop the remote group too (bounded)
+            # so its session lock is gone before the next writer starts; the
+            # launch script repeats this check before any new instance.
+            if not self.remote.stop():
+                self.logger.warning("Kiro remote ACP stop was not confirmed")

@@ -203,6 +203,18 @@ allowed_ips = []
 # kiro_cwd = "/root/Karami-Workspace"
 # kiro_acp_request_timeout_seconds = 30
 # kiro_acp_prompt_timeout_seconds = 900
+# kiro 搬东京 (2026-10-28)：Kiro 跑在东京，用户 kiro（无 sudo，碰不到 /root）。
+#   kiro_ssh_host = "tokyo"            # ssh 主机别名；设了就整套远程
+#   kiro_remote_user = "kiro"          # ssh 直接以该用户登录（其 authorized_keys 里有本机 root 公钥，restrict）
+#   kiro_remote_home = "/home/kiro"    # 缺省 /home/<user>
+#   kiro_bin = "/home/kiro/.local/bin/kiro-cli"   # 远程路径（缺省 <home>/.local/bin/kiro-cli）
+#   kiro_cwd = "/home/kiro/Kiro-Workspace"        # 远程工作区（缺省 <home>/Kiro-Workspace）
+# ACP = `ssh -T -l kiro tokyo sh -c <launch> ... kiro-cli acp`（remote_stdio.py），
+# 远程进程组记在 <home>/.cache/ccc/kiro-acp.pid，close 和下次启动前都会按
+# pid+starttime 精确停掉；终端页 tmux/会话文件/pid 检查都经 ControlMaster
+# /root/.ssh/ccc-kiro-* 在东京执行；附件和 forge 交接登记复制到
+# <home>/.cache/ccc/。远程模式下 request timeout 缺省 60。
+# 回滚：删掉 kiro_ssh_host（及上面几项），本机 kiro-cli 数据恢复原位即可。
 # kiro 切模型 (2026-09-10)：模型选择由 App 端 /kiro/preferences 管理，持久化在
 # tokens/kiro_preferences.json；可选目录来自 ACP 动态上报，缓存在
 # tokens/kiro_models_cache.json。无配置项，默认 auto（Kiro 自动路由）。

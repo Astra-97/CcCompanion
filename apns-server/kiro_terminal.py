@@ -24,6 +24,15 @@ interruptions).  More prompts than finished turns means a turn is running.
 
 Pane/session identities never leave this module except the public alias; the
 App only receives an opaque lease bound to the exact owned pane.
+
+kiro 搬东京 (2026-10-28): with ``remote`` (a ``remote_stdio.RemoteStdio``) the
+tmux server, the TUI, kiro-cli's session files and every pid live on that
+host.  Each tmux command runs over the shared ssh connection; session-file
+reads, ``/proc`` ancestry/liveness and signals go through one small remote
+helper per question; a local ``os.kill`` of a remote pid can never happen.
+The owner/binding/pane facts come from one ``display-message`` (exact
+session_name check: tmux 3.6 resolves an unknown ``-t`` to another session),
+cached briefly and dropped on any mutating tmux command or wait loop.
 """
 from __future__ import annotations
 
@@ -39,7 +48,10 @@ import signal
 import subprocess
 import threading
 import time
+import types
 from typing import Any, Callable
+
+from remote_stdio import RemoteStdio
 
 KIRO_TERMINAL_ALIAS = "kiro"
 KIRO_TERMINAL_TMUX_SESSION = "ccc-kiro-terminal"
@@ -58,6 +70,99 @@ _EFFORT_VALUES = frozenset({"low", "medium", "high", "xhigh", "max"})
 KIRO_TERMINAL_SUBMIT_GRACE_SECONDS = 30.0
 # 2.21.2 TUI footer while a turn runs ("Kiro is working · Type to steer").
 _TUI_WORKING_RE = re.compile(r"Kiro is working", re.IGNORECASE)
+# tmux commands that cannot change which pane/session the bridge owns.
+_IDENTITY_NEUTRAL_TMUX = frozenset({"display-message", "show-options", "has-session", "capture-pane"})
+
+# Remote helper (kiro 搬东京): one python3 call per question, JSON on stdout.
+#   probe <sessions_dir> <id> <inode> <offset> <prompts>  -> incremental counts
+#   lock  <sessions_dir> <id>                              -> lock owner pid
+#   proc  <pid>                                            -> liveness + ancestry
+#   paths <command> <cwd>                                  -> both usable
+_REMOTE_HELPER = r"""
+import json, os, sys
+def stat_fields(pid):
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return f.read().rsplit(")", 1)[1].split()
+    except FileNotFoundError:
+        return None
+cmd = sys.argv[1]
+out = {}
+if cmd == "probe":
+    d, sid, ino, off, cnt = sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
+    path = os.path.join(d, sid + ".jsonl")
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        st = None
+    if st is None:
+        out["jsonl"] = [0, 0, 0]
+    else:
+        if st.st_ino != ino or st.st_size < off:
+            ino, off, cnt = st.st_ino, 0, 0
+        with open(path, "rb") as f:
+            f.seek(off)
+            data = f.read()
+        end = data.rfind(b"\n") + 1
+        for raw in data[:end].splitlines():
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("kind") == "Prompt":
+                cnt += 1
+        out["jsonl"] = [st.st_ino, off + end, cnt]
+    try:
+        with open(os.path.join(d, sid + ".json"), encoding="utf-8") as f:
+            payload = json.load(f)
+        try:
+            turns = payload["session_state"]["conversation_metadata"]["user_turn_metadatas"]
+            out["finished"] = len(turns) if isinstance(turns, list) else None
+        except (KeyError, TypeError):
+            out["finished"] = 0
+    except FileNotFoundError:
+        out["finished"] = 0
+    except (OSError, ValueError):
+        out["finished"] = None
+elif cmd == "lock":
+    try:
+        with open(os.path.join(sys.argv[2], sys.argv[3] + ".lock"), encoding="utf-8") as f:
+            out["pid"] = int(json.load(f).get("pid") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        out["pid"] = 0
+elif cmd == "proc":
+    pid = int(sys.argv[2])
+    fields = stat_fields(pid)
+    out["alive"] = fields is not None and fields[0] not in ("Z", "X")
+    chain = []
+    current = pid
+    for _ in range(8):
+        chain.append(current)
+        if current <= 1:
+            break
+        fields = stat_fields(current)
+        if fields is None:
+            break
+        current = int(fields[1])
+    out["chain"] = chain
+elif cmd == "paths":
+    out["ok"] = os.path.isfile(sys.argv[2]) and os.access(sys.argv[2], os.X_OK) and os.path.isdir(sys.argv[3])
+print(json.dumps(out))
+"""
+
+
+def _remote_helper(remote: RemoteStdio, *args: Any, timeout: float = 10.0) -> dict[str, Any]:
+    """Run one helper question remotely; any transport failure raises."""
+    result = remote.run(["python3", "-c", _REMOTE_HELPER, *(str(arg) for arg in args)], timeout=timeout)
+    if result.returncode != 0:
+        raise KiroTerminalUnavailable("东京 Kiro 终端连接失败")
+    try:
+        payload = json.loads(str(result.stdout or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise KiroTerminalUnavailable("东京 Kiro 终端连接失败") from None
+    if not isinstance(payload, dict):
+        raise KiroTerminalUnavailable("东京 Kiro 终端连接失败")
+    return payload
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +256,40 @@ class KiroSessionTurnProbe:
         return None if counts is None else counts[0] > counts[1]
 
 
+class RemoteKiroSessionTurnProbe(KiroSessionTurnProbe):
+    """Same counts as KiroSessionTurnProbe, read on the remote host.
+
+    The incremental ``(inode, offset, prompts)`` cache stays here; the remote
+    helper only parses the bytes after ``offset``.  Any transport failure is
+    "unreadable" (None), which every caller treats as busy.
+    """
+
+    def __init__(self, remote: RemoteStdio, sessions_dir: str | Path) -> None:
+        super().__init__(Path(str(sessions_dir)))
+        self.remote = remote
+
+    def counts(self, session_id: str) -> tuple[int, int] | None:
+        if not _SESSION_ID_RE.fullmatch(str(session_id or "")):
+            return None
+        with self._lock:
+            inode, offset, count = self._cache.get(session_id, (0, 0, 0))
+        try:
+            payload = _remote_helper(
+                self.remote, "probe", str(self.sessions_dir), session_id, inode, offset, count,
+            )
+            new_inode, new_offset, prompts = (int(value) for value in payload.get("jsonl"))
+            finished = payload.get("finished")
+        except Exception:
+            return None
+        if not isinstance(finished, int) or isinstance(finished, bool) or finished < 0 or prompts < 0:
+            return None
+        with self._lock:
+            self._cache[session_id] = (new_inode, new_offset, prompts)
+            while len(self._cache) > 16:
+                self._cache.pop(next(iter(self._cache)))
+        return prompts, finished
+
+
 class KiroTerminalBridge:
     """Own at most one ``kiro-cli chat --resume-id`` TUI in a private tmux pane."""
 
@@ -170,20 +309,40 @@ class KiroTerminalBridge:
         turn_probe: KiroSessionTurnProbe | None = None,
         sleep: Callable[[float], None] = time.sleep,
         pid_alive: Callable[[int], bool] | None = None,
+        remote: RemoteStdio | None = None,
+        identity_cache_seconds: float = 1.5,
     ) -> None:
-        self.command = Path(command).expanduser()
-        self.cwd = Path(cwd).expanduser()
+        self.remote = remote
+        if remote is not None:
+            # Remote paths are used verbatim: no local ~ expansion.
+            self.command = Path(str(command))
+            self.cwd = Path(str(cwd))
+        else:
+            self.command = Path(command).expanduser()
+            self.cwd = Path(cwd).expanduser()
         self.tmux_session = tmux_session
         self.idle_seconds = max(5.0, float(idle_seconds))
         self.sessions_dir = Path(sessions_dir)
         self._run = runner
+        if remote is not None and process_killer is os.kill:
+            process_killer = self._remote_kill
         self._process_killer = process_killer
         self.shutdown_wait_seconds = max(0.05, min(float(shutdown_wait_seconds), 5.0))
         self.resume_wait_seconds = max(0.5, float(resume_wait_seconds))
         self.lock_release_wait_seconds = max(0.2, float(lock_release_wait_seconds))
-        self.turn_probe = turn_probe or KiroSessionTurnProbe(self.sessions_dir)
+        if turn_probe is None:
+            turn_probe = (
+                RemoteKiroSessionTurnProbe(remote, self.sessions_dir)
+                if remote is not None
+                else KiroSessionTurnProbe(self.sessions_dir)
+            )
+        self.turn_probe = turn_probe
         self._sleep = sleep
+        if pid_alive is None and remote is not None:
+            pid_alive = self._remote_pid_alive
         self._pid_alive_check = pid_alive or self._pid_alive
+        self.identity_cache_seconds = max(0.0, min(float(identity_cache_seconds), 5.0))
+        self._identity_cache: tuple[float, tuple[str, str, str, str, str] | None] | None = None
         self._lock = threading.RLock()
         # Serializes every App terminal operation (capture/paste/keys/release)
         # with the reaper and the chat handoff, so a pane is never killed
@@ -203,12 +362,84 @@ class KiroTerminalBridge:
         return self._input_lock
 
     def _run_tmux(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
-        return self._run(argv, capture_output=True, text=True, timeout=5)
+        if self.remote is None:
+            return self._run(argv, capture_output=True, text=True, timeout=5)
+        if len(argv) < 2 or argv[1] not in _IDENTITY_NEUTRAL_TMUX:
+            self._identity_cache = None
+        return self.remote.run(argv, timeout=10)
+
+    # ---------- remote host primitives (kiro 搬东京) ----------
+
+    def _remote_identity_locked(self) -> tuple[str, str, str, str, str] | None:
+        """(owner, binding, pane_id, pane_dead, pane_pid) of the exact remote session.
+
+        None means the session does not exist.  Transport failures raise
+        instead of looking like an absent session.
+        """
+        cached = self._identity_cache
+        if cached is not None and time.monotonic() - cached[0] < self.identity_cache_seconds:
+            return cached[1]
+        fmt = "\t".join((
+            "#{session_name}",
+            "#{" + KIRO_TERMINAL_OWNER_OPTION + "}",
+            "#{" + KIRO_TERMINAL_SESSION_OPTION + "}",
+            "#{pane_id}", "#{pane_dead}", "#{pane_pid}",
+        ))
+        result = self._run_tmux(["tmux", "display-message", "-p", "-t", self.tmux_session, fmt])
+        identity: tuple[str, str, str, str, str] | None = None
+        if result.returncode == 0:
+            fields = str(result.stdout or "").rstrip("\r\n").split("\t")
+            if len(fields) == 6 and fields[0] == self.tmux_session:
+                identity = (fields[1], fields[2], fields[3], fields[4], fields[5])
+        elif not any(marker in str(result.stderr or "") for marker in (
+            "no server running", "can't find", "error connecting",
+        )):
+            raise KiroTerminalUnavailable("东京 Kiro 终端连接失败")
+        self._identity_cache = (time.monotonic(), identity)
+        return identity
+
+    def _remote_kill(self, pid: int, sig: int) -> None:
+        self._identity_cache = None
+        result = self.remote.run(["kill", f"-{int(sig)}", "--", str(int(pid))], timeout=10)
+        if result.returncode != 0:
+            if "No such process" in str(result.stderr or ""):
+                raise ProcessLookupError(pid)
+            raise OSError("remote kill failed")
+
+    def _remote_pid_alive(self, pid: int) -> bool:
+        try:
+            return bool(_remote_helper(self.remote, "proc", int(pid)).get("alive"))
+        except KiroTerminalUnavailable:
+            return True  # unknown: fail closed, like an unreadable /proc
+
+    def _owner_in_pane(self, pid: int, pane_pid: int) -> bool:
+        if self.remote is None:
+            return self._belongs_to_pane(pid, pane_pid)
+        try:
+            chain = _remote_helper(self.remote, "proc", int(pid)).get("chain")
+        except KiroTerminalUnavailable:
+            return False
+        return isinstance(chain, list) and int(pane_pid) in chain
+
+    def _paths_usable_locked(self) -> None:
+        if self.remote is None:
+            if not self.command.is_file() or not os.access(self.command, os.X_OK):
+                raise KiroTerminalUnavailable("kiro-cli 未安装")
+            if not self.cwd.is_dir():
+                raise KiroTerminalUnavailable("Kiro 终端工作区不可用")
+            return
+        if not _remote_helper(self.remote, "paths", str(self.command), str(self.cwd)).get("ok"):
+            raise KiroTerminalUnavailable("东京 Kiro 终端入口或工作区不可用")
 
     def _has_session_locked(self) -> bool:
+        if self.remote is not None:
+            return self._remote_identity_locked() is not None
         return self._run_tmux(["tmux", "has-session", "-t", f"={self.tmux_session}"]).returncode == 0
 
     def _owns_session_locked(self) -> bool:
+        if self.remote is not None:
+            identity = self._remote_identity_locked()
+            return identity is not None and identity[0] == KIRO_TERMINAL_OWNER_VALUE
         result = self._run_tmux([
             "tmux", "show-options", "-v", "-t", self.tmux_session, KIRO_TERMINAL_OWNER_OPTION,
         ])
@@ -219,6 +450,10 @@ class KiroTerminalBridge:
         return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
 
     def _bound_fingerprint_locked(self) -> str:
+        if self.remote is not None:
+            identity = self._remote_identity_locked()
+            value = identity[1] if identity is not None else ""
+            return value if re.fullmatch(r"[0-9a-f]{64}", value) else ""
         result = self._run_tmux([
             "tmux", "show-options", "-v", "-t", self.tmux_session, KIRO_TERMINAL_SESSION_OPTION,
         ])
@@ -226,11 +461,18 @@ class KiroTerminalBridge:
         return value if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{64}", value) else ""
 
     def _pane_status_locked(self) -> tuple[str, bool, int]:
-        result = self._run_tmux([
-            "tmux", "display-message", "-p", "-t", self.tmux_session,
-            "#{pane_id}|#{pane_dead}|#{pane_pid}",
-        ])
-        fields = result.stdout.rstrip("\r\n").split("|")
+        if self.remote is not None:
+            identity = self._remote_identity_locked()
+            if identity is None:
+                raise KiroTerminalUnavailable("Kiro 终端 pane 状态异常")
+            result: Any = types.SimpleNamespace(returncode=0)
+            fields = list(identity[2:])
+        else:
+            result = self._run_tmux([
+                "tmux", "display-message", "-p", "-t", self.tmux_session,
+                "#{pane_id}|#{pane_dead}|#{pane_pid}",
+            ])
+            fields = result.stdout.rstrip("\r\n").split("|")
         if (
             result.returncode != 0
             or len(fields) != 3
@@ -294,6 +536,7 @@ class KiroTerminalBridge:
             deadline = time.monotonic() + self.shutdown_wait_seconds
             while time.monotonic() < deadline:
                 self._sleep(0.05)
+                self._identity_cache = None
                 try:
                     current = self._owned_pane_locked()
                 except KiroTerminalUnavailable:
@@ -366,6 +609,12 @@ class KiroTerminalBridge:
             return pane is not None and self._tui_busy_locked(self._session_id, pane)
 
     def _lock_owner_pid(self, session_id: str) -> int:
+        if self.remote is not None:
+            try:
+                pid = int(_remote_helper(self.remote, "lock", str(self.sessions_dir), session_id).get("pid") or 0)
+            except (KiroTerminalUnavailable, TypeError, ValueError):
+                return 0
+            return pid if pid > 1 else 0
         try:
             payload = json.loads((self.sessions_dir / f"{session_id}.lock").read_text(encoding="utf-8"))
             pid = int(payload.get("pid") or 0)
@@ -455,8 +704,9 @@ class KiroTerminalBridge:
         deadline = time.monotonic() + self.resume_wait_seconds
         while time.monotonic() < deadline:
             owner = self._lock_owner_pid(session_id)
-            if owner and self._belongs_to_pane(owner, pane_pid):
+            if owner and self._owner_in_pane(owner, pane_pid):
                 return True
+            self._identity_cache = None
             try:
                 current = self._owned_pane_locked()
             except KiroTerminalUnavailable:
@@ -467,7 +717,12 @@ class KiroTerminalBridge:
         return False
 
     def _launch_argv(self, session_id: str, model: str | None, effort: str | None) -> list[str]:
-        argv = [str(self.command), "chat", "--resume-id", session_id]
+        argv = ["/usr/bin/env", "CCC_KIRO_TERMINAL_BRIDGE=1"]
+        if self.remote is not None:
+            # The remote tmux server's environment is whatever ssh gave it;
+            # pin the same env the ACP process gets.
+            argv += [f"{key}={value}" for key, value in self.remote.target.env.items()]
+        argv += [str(self.command), "chat", "--resume-id", session_id]
         # Same model/effort as the App's Kiro preferences; never changes them.
         if model and _MODEL_RE.fullmatch(model):
             argv += ["--model", model]
@@ -512,10 +767,7 @@ class KiroTerminalBridge:
                     raise KiroTerminalBusy("Kiro 终端里还有一轮在进行")
                 self._shutdown_exact_pane_locked(pane_id, pane_pid, pane_dead)
                 self._clear_lease_locked()
-            if not self.command.is_file() or not os.access(self.command, os.X_OK):
-                raise KiroTerminalUnavailable("kiro-cli 未安装")
-            if not self.cwd.is_dir():
-                raise KiroTerminalUnavailable("Kiro 终端工作区不可用")
+            self._paths_usable_locked()
             # A harmless staging pane is created and marked before respawn, so
             # this bridge never adopts or kills a foreign tmux session.
             created = self._run_tmux([
@@ -542,7 +794,6 @@ class KiroTerminalBridge:
                 raise KiroTerminalUnavailable("Kiro 终端归属标记失败")
             launched = self._run_tmux([
                 "tmux", "respawn-pane", "-k", "-t", self.tmux_session, "-c", str(self.cwd),
-                "/usr/bin/env", "CCC_KIRO_TERMINAL_BRIDGE=1",
                 *self._launch_argv(session_id, model, effort),
             ])
             if launched.returncode != 0:
@@ -727,7 +978,7 @@ class KiroTerminalBridge:
             # teardown, while its ancestry still proves it belongs to the pane.
             lock_owner = self._lock_owner_pid(session_id) if session_id else 0
             our_lock_owner = (
-                lock_owner if lock_owner and not pane_dead and self._belongs_to_pane(lock_owner, pane_pid) else 0
+                lock_owner if lock_owner and not pane_dead and self._owner_in_pane(lock_owner, pane_pid) else 0
             )
             released = self._shutdown_exact_pane_locked(pane_id, pane_pid, pane_dead)
             if released:
