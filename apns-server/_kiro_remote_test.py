@@ -157,6 +157,33 @@ class RemoteStdioTest(unittest.TestCase):
         self.assertFalse(remote.put_file(str(tmp / "missing"), str(dest)))
 
 
+    def test_get_file_reads_only_regular_files_under_the_roots(self):
+        """Run the get script locally (no ssh) against real files and symlinks."""
+        tmp = Path(tempfile.mkdtemp(prefix="remote-stdio-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = tmp / "home"
+        (home / "pics").mkdir(parents=True)
+        pic = home / "pics" / "a b.png"
+        pic.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 20)
+        outside = tmp / "secret.png"
+        outside.write_bytes(b"\x89PNG\r\n\x1a\nsecret")
+        (home / "link.png").symlink_to(outside)
+        remote = RemoteStdio(_target(), runner=lambda argv, **kw: subprocess.run(_remote_words(argv), **kw))
+        data, why = remote.get_file(str(pic), max_bytes=1000, roots=[str(home)])
+        self.assertEqual(("", pic.read_bytes()), (why, data))
+        self.assertEqual((None, "outside"), remote.get_file(str(outside), max_bytes=1000, roots=[str(home)]))
+        self.assertEqual((None, "outside"), remote.get_file(str(home / "link.png"), max_bytes=1000, roots=[str(home)]))
+        self.assertEqual((None, "outside"), remote.get_file(str(home / ".." / "secret.png"), max_bytes=1000, roots=[str(home)]))
+        self.assertEqual((None, "missing"), remote.get_file(str(home / "nope.png"), max_bytes=1000, roots=[str(home)]))
+        self.assertEqual((None, "missing"), remote.get_file(str(home / "pics"), max_bytes=1000, roots=[str(home)]))
+        self.assertEqual((None, "too_large"), remote.get_file(str(pic), max_bytes=10, roots=[str(home)]))
+        self.assertEqual((None, "outside"), remote.get_file(str(pic), max_bytes=1000, roots=[]))
+        with self.assertRaises(ValueError):
+            remote.get_file("relative.png", max_bytes=10, roots=[str(home)])
+        broken = RemoteStdio(_target(), runner=lambda argv, **kw: _done(returncode=255))
+        self.assertEqual((None, "failed"), broken.get_file(str(pic), max_bytes=1000, roots=[str(home)]))
+
+
 class _FakeProc:
     def __init__(self):
         self.stdin = None
@@ -474,6 +501,99 @@ class PushKiroRemoteAttachmentTest(unittest.TestCase):
         hint, _images = self._handler(None)._kiro_attachment_prompt(
             [{"type": "file", "filename": "x.pdf", "stored_path": str(self.file)}])
         self.assertIn(f"本地路径: {self.file}", hint)
+
+
+
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
+
+
+class PushKiroOutboundImageTest(unittest.TestCase):
+    """发图 (2026-10-28): [[CCC_IMAGE:<path>]] -> fetched, sniffed, stored."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="kiro-outimg-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.attachments = self.tmp / "attachments"
+        self.attachments.mkdir()
+
+    def _handler(self, remote, **extra):
+        handler = push.PushHandler.__new__(push.PushHandler)
+        handler.state = types.SimpleNamespace(
+            attachments_dir=str(self.attachments), kiro_remote=remote, kiro_remote_home="/home/kiro", **extra)
+        return handler
+
+    def test_remote_marker_becomes_a_stored_image(self):
+        remote = mock.Mock()
+        remote.get_file.return_value = (PNG_BYTES, "")
+        text, stored = self._handler(remote)._kiro_outbound_images(
+            "给你画好了\n\n[[CCC_IMAGE:/home/kiro/out/猫 猫.png]]\n\n喜欢吗")
+        self.assertEqual("给你画好了\n\n喜欢吗", text)
+        remote.get_file.assert_called_once_with(
+            "/home/kiro/out/猫 猫.png", max_bytes=10 * 1024 * 1024, roots=["/home/kiro", "/tmp"])
+        self.assertEqual(1, len(stored))
+        item = stored[0]
+        path = Path(item["stored_path"])
+        self.assertEqual(self.attachments.resolve(), path.parent)
+        self.assertTrue(path.name.startswith("kiro-") and path.name.endswith(".png"))
+        self.assertEqual(PNG_BYTES, path.read_bytes())
+        self.assertEqual(0o600, path.stat().st_mode & 0o777)
+        self.assertEqual(("image", "image/png", f"/attachments/{path.name}"),
+                         (item["type"], item["media_type"], item["attachment_url"]))
+        self.assertTrue(item["filename"].endswith(".png"))
+
+    def test_failures_become_notes_and_the_text_survives(self):
+        remote = mock.Mock()
+        remote.get_file.side_effect = [(None, "missing"), (b"not an image at all", ""), (None, "outside")]
+        text, stored = self._handler(remote)._kiro_outbound_images(
+            "看\n[[CCC_IMAGE:/home/kiro/a.png]]\n[[CCC_IMAGE:/home/kiro/b.png]]\n`[[CCC_IMAGE:/etc/c.png]]`\n"
+            "[[CCC_IMAGE:relative.png]]")
+        self.assertEqual([], stored)
+        self.assertEqual([], list(self.attachments.iterdir()))
+        self.assertTrue(text.startswith("看\n\n"))
+        self.assertIn("a.png 没发出去：找不到这个文件", text)
+        self.assertIn("b.png 没发出去：不是 jpg/png/gif/webp 图片", text)
+        self.assertIn("c.png 没发出去：只能发家目录或 /tmp 下的文件", text)
+        self.assertIn("relative.png 没发出去：路径必须是绝对路径", text)
+        self.assertNotIn("[[CCC_IMAGE", text)
+        self.assertEqual(3, remote.get_file.call_count)  # the relative path never reaches ssh
+
+    def test_at_most_four_images_and_duplicates_once(self):
+        remote = mock.Mock()
+        remote.get_file.return_value = (PNG_BYTES, "")
+        markers = "".join(f"[[CCC_IMAGE:/tmp/{i}.png]]\n" for i in (1, 1, 2, 3, 4, 5, 6))
+        text, stored = self._handler(remote)._kiro_outbound_images(markers)
+        self.assertEqual(4, len(stored))
+        self.assertIn("一次最多发 4 张图，另外 2 张没发", text)
+
+    def test_local_kiro_reads_only_its_workspace_or_tmp(self):
+        workspace = self.tmp / "ws"
+        workspace.mkdir()
+        good = workspace / "ok.png"
+        good.write_bytes(PNG_BYTES)
+        elsewhere = Path("/etc/passwd")  # outside both workspace and /tmp
+        handler = self._handler(None, kiro_acp=types.SimpleNamespace(cwd=workspace))
+        text, stored = handler._kiro_outbound_images(f"[[CCC_IMAGE:{good}]]\n[[CCC_IMAGE:{elsewhere}]]")
+        self.assertEqual(1, len(stored))
+        self.assertIn("passwd 没发出去：只能发家目录或 /tmp 下的文件", text)
+
+    def test_no_marker_is_untouched(self):
+        remote = mock.Mock()
+        self.assertEqual(("普通回复 [bqb:摸摸头]", []),
+                         self._handler(remote)._kiro_outbound_images("普通回复 [bqb:摸摸头]"))
+        remote.get_file.assert_not_called()
+
+    def test_marker_helpers(self):
+        import agent_images
+
+        self.assertEqual("写到一半", agent_images.strip_markers("写到一半[[CCC_IMA"))
+        self.assertEqual("写到一半", agent_images.strip_markers("写到一半[[CCC_IMAGE:/home/kiro/x"))
+        self.assertEqual("a\nb", agent_images.strip_markers("a\n[[CCC_IMAGE:/tmp/x.png]]b"))
+        self.assertEqual("[bqb:摸摸头]", agent_images.strip_markers("[bqb:摸摸头]"))
+        self.assertEqual(("", ["/tmp/x.png"], 0), agent_images.extract_markers("[[CCC_IMAGE: /tmp/x.png ]]"))
+        for header, ext in ((b"\xff\xd8\xff\xe0", ".jpg"), (PNG_BYTES, ".png"), (b"GIF89a", ".gif"),
+                            (b"RIFF\x00\x00\x00\x00WEBP", ".webp")):
+            self.assertEqual(ext, agent_images.sniff(header)[0])
+        self.assertIsNone(agent_images.sniff(b"<svg"))
 
 
 if __name__ == "__main__":

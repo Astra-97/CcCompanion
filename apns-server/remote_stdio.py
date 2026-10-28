@@ -206,6 +206,49 @@ class RemoteStdio:
             return False
         return getattr(result, "returncode", 1) == 0
 
+    # $1 = path, $2 = byte cap, $3.. = allowed roots.  The path is resolved
+    # remotely (symlinks followed) and must then sit under one of the roots
+    # and be a regular file; at most cap bytes are written to stdout.
+    _GET_SCRIPT = (
+        'p=$(readlink -f -- "$1") || exit 3; max=$2; shift 2; ok=1; '
+        'for r in "$@"; do case "$p" in "$r"/*) ok=0;; esac; done; '
+        '[ "$ok" = 0 ] || exit 4; [ -f "$p" ] || exit 3; '
+        'exec head -c "$max" -- "$p"'
+    )
+
+    def get_file(
+        self, remote_path: str, *, max_bytes: int, roots: Sequence[str], timeout: float = 60.0,
+    ) -> tuple[bytes | None, str]:
+        """Read one remote file -> (bytes, "") or (None, reason).
+
+        reason: "missing" (no such regular file), "outside" (not under any of
+        ``roots`` after resolving), "too_large" (more than ``max_bytes``) or
+        "failed" (ssh/transport).  Reads at most ``max_bytes + 1`` bytes.
+        """
+        if not remote_path.startswith("/") or "\0" in remote_path:
+            raise ValueError("remote paths must be absolute")
+        clean_roots = [str(r).rstrip("/") for r in roots if str(r).startswith("/") and str(r).rstrip("/")]
+        if not clean_roots:
+            return None, "outside"
+        try:
+            result = self.run(
+                ["sh", "-c", self._GET_SCRIPT, "ccc-get", remote_path, str(int(max_bytes) + 1), *clean_roots],
+                timeout=timeout, binary=True,
+            )
+        except Exception:
+            return None, "failed"
+        code = getattr(result, "returncode", 1)
+        if code == 3:
+            return None, "missing"
+        if code == 4:
+            return None, "outside"
+        if code != 0:
+            return None, "failed"
+        data = bytes(getattr(result, "stdout", b"") or b"")
+        if len(data) > max_bytes:
+            return None, "too_large"
+        return data, ""
+
     def stop(self, *, timeout: float = 15.0) -> bool:
         """Stop the recorded remote agent group; True once it is gone."""
         if not self.target.pidfile:

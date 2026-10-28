@@ -4,12 +4,14 @@
 companion 路由的消息 POST 到本服务 ``/wecom/inbound``（X-Wecom-Webhook-Secret，
 0600 文件，fail-closed）。本服务把它当成方小南在 app 里给该联系人发了一条
 ``［💬微信］原文``：同入历史、同走该联系人的发送管线，metadata 带
-``source=wecom`` + ``wecom={msg_id, agent_id, msg_type}``。卡拉米的图片由回调
-服务下载到私有 media 目录，本服务校验并复制到附件库后复用 Kimi 图片附件输入。
+``source=wecom`` + ``wecom={msg_id, agent_id, msg_type}``。卡拉米、Kiro
+（IMAGE_CONTACTS）的图片由回调服务下载到私有 media 目录，本服务校验并复制到
+附件库，作为普通图片附件交给该联系人（同 app 里上传的图片）。
 
 出站：联系人这一轮的最终回复落历史时，*只有*它回答的那条用户消息带 wecom
 标记，才写一个 outbox 文件到 wecom-channel 的 state/outbox/；由回调服务用
-该联系人自己的应用（AgentID + Secret）发回微信。判定只看「这一轮回答的是哪条
+该联系人自己的应用（AgentID + Secret）发回微信。outbox 可带 ``files``（附件库里的
+图片绝对路径，Kiro 的 [[CCC_IMAGE:...]] 发图），回调服务把它们发成微信图片消息。判定只看「这一轮回答的是哪条
 用户消息」，与模型自觉无关；app 里正常聊的消息没有标记，永远只回 app。
 
 小铃铛（主动推送，2026-10-26）：``send_bell(contact_id, text)`` 读同一个共享
@@ -38,8 +40,11 @@ META_SOURCE = "wecom"
 
 # 已接好「微信入站 + 最终回复回微信」的联系人。新增联系人要先在它自己的
 # 发送管线里接上 outbox 钩子（push.py 的 _mirror_reply_to_wecom），再加进来。
-# Kiro（2026-10-28）：只收文字，钩子在 _handle_kiro_chat_send 的最终回复落历史处。
+# Kiro（2026-10-28）：钩子在 _handle_kiro_chat_send 的最终回复落历史处。
 INBOUND_CONTACTS = frozenset({"kimi", "kairos", "kiro"})
+# 微信图片作为真图片附件交给联系人的（其余联系人只收回调给的一句文字说明）。
+# 回调服务 lib/companion.mjs 的 IMAGE_CONTACTS 必须与此一致。
+IMAGE_CONTACTS = frozenset({"kimi", "kiro"})
 _APP_LABEL = {
     "kimi": ("wecom_karami_app", "卡拉米"),
     "kairos": ("wecom_kairos_app", "kairos"),
@@ -58,6 +63,7 @@ DEFAULT_BELL_URL = "http://127.0.0.1:8792/wecom/bell"
 REQUEST_LIMIT = 16 * 1024
 TEXT_LIMIT = 4000
 OUTBOX_TEXT_LIMIT = 20000
+OUTBOX_FILES_LIMIT = 4
 IMAGE_MAX_BYTES = 30 * 1024 * 1024
 
 _AGENT_RE = re.compile(r"^\d{1,12}$")
@@ -169,7 +175,7 @@ def parse_inbound(payload: Any) -> tuple[dict[str, Any] | None, str]:
         msg_type = "unknown"
     media = payload.get("media")
     clean_media = None
-    if contact_id == "kimi" and msg_type == "image" and isinstance(media, dict) and media.get("status") == "ok":
+    if contact_id in IMAGE_CONTACTS and msg_type == "image" and isinstance(media, dict) and media.get("status") == "ok":
         raw_path = media.get("path")
         if not isinstance(raw_path, str) or not raw_path or len(raw_path) > 4096 or "\0" in raw_path:
             return None, "invalid media path"
@@ -194,8 +200,8 @@ def parse_inbound(payload: Any) -> tuple[dict[str, Any] | None, str]:
 def stage_image(clean: dict[str, Any], destination: Path) -> dict[str, Any]:
     """Copy one callback-downloaded image into the private attachment store."""
     media = clean.get("media")
-    if clean.get("contact_id") != "kimi" or clean.get("msg_type") != "image" or not isinstance(media, dict):
-        raise ValueError("not a Kimi image message")
+    if clean.get("contact_id") not in IMAGE_CONTACTS or clean.get("msg_type") != "image" or not isinstance(media, dict):
+        raise ValueError("not an image message for an image contact")
     source = Path(str(media.get("path") or ""))
     if not source.is_absolute():
         raise ValueError("media path must be absolute")
@@ -303,7 +309,7 @@ def origin(record: Any) -> dict[str, Any] | None:
 def prompt_entry_lines(contact_id: str) -> list[str]:
     """Replaces the app-entry lines of a contact's prompt for a WeChat turn."""
     entry, label = _APP_LABEL.get(contact_id, (f"wecom_{contact_id}_app", contact_id))
-    return [
+    lines = [
         f"入口: {entry}（个人微信 → 企业微信「{label}」应用）",
         f"contact_id: {contact_id}",
         "",
@@ -311,6 +317,12 @@ def prompt_entry_lines(contact_id: str) -> list[str]:
         "你的回复会同时进 app 和她的微信：微信只显示纯文本，不要用 Markdown（不要 **加粗**、标题、表格、代码块）；"
         "空一行 = 微信里另起一个气泡，通常 1-4 个气泡。请直接回复她，不要提到后台路由。",
     ]
+    if contact_id == "kiro":
+        lines.append(
+            "要给她发图片：把图片存成文件（家目录或 /tmp 下，png/jpg，≤10 MB），在回复里单独一行写 "
+            "[[CCC_IMAGE:/绝对路径.png]]（最多 4 张）；表情包照常用 [bqb:名字]，微信里会变成表情图片。"
+        )
+    return lines
 
 
 def write_outbox(
@@ -321,10 +333,16 @@ def write_outbox(
     user_ts: str = "",
     reply_ts: str = "",
     directory: Path | None = None,
+    files: list[str] | None = None,
 ) -> Path:
-    """Atomically drop one reply item for the wecom-channel callback service."""
+    """Atomically drop one reply item for the wecom-channel callback service.
+
+    ``files``: absolute paths of images in the app attachment store (the
+    callback service only accepts files inside WECOM_OUTBOX_FILE_DIRS).
+    """
     body = str(text or "").strip()
-    if not body:
+    clean_files = [str(f) for f in (files or []) if isinstance(f, str) and f.startswith("/")][:OUTBOX_FILES_LIMIT]
+    if not body and not clean_files:
         raise ValueError("empty reply")
     target = directory or outbox_dir()
     if not target.is_dir():
@@ -338,6 +356,7 @@ def write_outbox(
         "user_ts": str(user_ts or ""),
         "reply_ts": str(reply_ts or ""),
         "text": body[:OUTBOX_TEXT_LIMIT],
+        **({"files": clean_files} if clean_files else {}),
         "created_at": datetime.fromtimestamp(now, timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     name = f"{int(now * 1000):014d}-{secrets.token_hex(4)}.json"
