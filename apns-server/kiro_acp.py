@@ -662,6 +662,15 @@ class KiroACPClient:
     def _process_alive(self) -> bool:
         return self._process is not None and self._process.poll() is None
 
+    def is_warm(self, session_id: str) -> bool:
+        """kiro_keep_warm: process up, initialized, ``session_id`` loaded."""
+        return bool(
+            session_id
+            and self._initialized
+            and self._process_alive()
+            and self._loaded_session_id == session_id
+        )
+
     def _start(self) -> None:
         with self._start_lock:
             if self._process_alive() and self._initialized:

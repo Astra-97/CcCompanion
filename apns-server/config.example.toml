@@ -209,6 +209,7 @@ allowed_ips = []
 #   kiro_remote_home = "/home/kiro"    # 缺省 /home/<user>
 #   kiro_bin = "/home/kiro/.local/bin/kiro-cli"   # 远程路径（缺省 <home>/.local/bin/kiro-cli）
 #   kiro_cwd = "/home/kiro/Kiro-Workspace"        # 远程工作区（缺省 <home>/Kiro-Workspace）
+#   kiro_keep_warm = true            # 常驻：开机预热 ACP+会话，被关后（终端页交还/出错）自动重新预热；缺省 false
 # ACP = `ssh -T -l kiro tokyo sh -c <launch> ... kiro-cli acp`（remote_stdio.py），
 # 远程进程组记在 <home>/.cache/ccc/kiro-acp.pid，close 和下次启动前都会按
 # pid+starttime 精确停掉；终端页 tmux/会话文件/pid 检查都经 ControlMaster

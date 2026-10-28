@@ -232,6 +232,8 @@ from kiro_terminal import (
 )
 # kiro 搬东京 (2026-10-28): ssh transport for remote stdio agents.
 from remote_stdio import RemoteStdio, RemoteStdioTarget
+# kiro 常驻 (2026-10-28): optional keep-warm loop for the ACP connection.
+from kiro_keep_warm import KiroKeepWarm
 # kiro 桥接 (2026-09-09): ACP 文本聊天联系人，Phase 1。
 from kiro_acp import (
     DEFAULT_KIRO_CWD,
@@ -3046,6 +3048,90 @@ def _kiro_remote_from_config(server_cfg: dict[str, Any]) -> tuple[RemoteStdio | 
     return remote, kiro_bin, kiro_cwd, home
 
 
+def _kiro_model_selection_for(state: Any) -> str:
+    store = getattr(state, "kiro_preferences", None)
+    snapshot_model = getattr(store, "snapshot_model", None)
+    if callable(snapshot_model):
+        return str(snapshot_model() or KIRO_APP_DEFAULT_MODEL)
+    # Compatibility for minimal in-process test doubles only. The real
+    # ServerState always constructs KiroPreferenceStore.
+    return KIRO_APP_DEFAULT_MODEL
+
+
+def _kiro_effort_selection_for(state: Any) -> str:
+    store = getattr(state, "kiro_preferences", None)
+    snapshot_effort = getattr(store, "snapshot_effort", None)
+    if callable(snapshot_effort):
+        return str(snapshot_effort() or KIRO_APP_DEFAULT_EFFORT)
+    return KIRO_APP_DEFAULT_EFFORT
+
+
+def _kiro_keep_warm_attempt(state: Any) -> str:
+    """kiro 常驻 (2026-10-28): one keep-warm check; returns a kiro_keep_warm outcome.
+
+    Warming is the chat path's prepare without the prompt: spawn +
+    initialize + session/load of the persisted pointer + model/effort pin
+    replay.  No chat turn, no prompt, no history row, no notification.
+    Safety gates, in the chat-send lock order (terminal input transaction,
+    then kiro_turn_lock):
+
+    * no session pointer -> nothing to resume (never session/new here);
+    * already warm, or a prompt (forge seed included) running -> no-op;
+    * App turn / prepare / forge / terminal acquire / queued send -> skip;
+    * the terminal tab's TUI owns a live pane (single-writer) -> skip;
+    * otherwise reserve Kiro with a prepare token (so a terminal acquire
+      or chat send waits/queues instead of racing the session/load).
+
+    Raises on a failed warm (after closing the half-started process) so
+    KiroKeepWarm backs off.
+    """
+    acp = state.kiro_acp
+    session_id = str(acp.load_session_id() or "")
+    if not session_id:
+        return "no_session"
+    if acp.is_warm(session_id):
+        return "warm"
+    if acp.busy:
+        return "busy"
+
+    def turn_idle_locked() -> bool:
+        return not (
+            state.kiro_active_turn
+            or state.kiro_prepare_token
+            or getattr(state, "kiro_terminal_acquire_token", "")
+            or getattr(state, "kiro_chat_queue", None)
+        )
+
+    with state.kiro_turn_lock:
+        if not turn_idle_locked():
+            return "busy"
+    terminal = getattr(state, "kiro_terminal", None)
+    prepare_token = secrets.token_hex(16)
+    # Holding the input transaction means no terminal acquire can launch a
+    # TUI between the pane check and the reservation.
+    input_transaction = getattr(terminal, "input_transaction", None)
+    with input_transaction() if callable(input_transaction) else nullcontext():
+        if terminal is not None and terminal.has_live_pane():  # fails closed when unknown
+            return "terminal"
+        with state.kiro_turn_lock:
+            if not turn_idle_locked():
+                return "busy"
+            state.kiro_prepare_token = prepare_token
+    try:
+        acp.prepare_session(
+            model=_kiro_model_selection_for(state),
+            effort=_kiro_effort_selection_for(state) or None,
+        )
+    except BaseException:
+        acp.close()
+        raise
+    finally:
+        with state.kiro_turn_lock:
+            if state.kiro_prepare_token == prepare_token:
+                state.kiro_prepare_token = ""
+    return "warmed"
+
+
 def _kiro_cli_data_dir() -> Path:
     """kiro-cli 的数据目录（与 dirs::data_dir 同款推断，不硬编码 /root）。
 
@@ -5380,6 +5466,11 @@ class ServerState:
         self.kiro_auto_forge_enabled: bool = bool(
             server_cfg.get("kiro_auto_forge_enabled", True)
         )
+        # kiro 常驻 (2026-10-28): kiro_keep_warm = true keeps the ACP process
+        # + session loaded (boot warm, re-warm after any close that leaves
+        # Kiro stopped); see _kiro_keep_warm_attempt for the safety gates.
+        self.kiro_keep_warm_enabled: bool = bool(server_cfg.get("kiro_keep_warm", False))
+        self.kiro_keep_warm: KiroKeepWarm | None = None
         self.kiro_auto_forge_threshold_percent = _parse_kiro_auto_forge_threshold(
             server_cfg.get("kiro_auto_forge_threshold_percent", 80.0)
         )
@@ -17640,20 +17731,10 @@ class PushHandler(BaseHTTPRequestHandler):
     # 当前模型不支持时应用失败只降级不阻断。
 
     def _kiro_model_selection(self) -> str:
-        store = getattr(self.state, "kiro_preferences", None)
-        snapshot_model = getattr(store, "snapshot_model", None)
-        if callable(snapshot_model):
-            return str(snapshot_model() or KIRO_APP_DEFAULT_MODEL)
-        # Compatibility for minimal in-process test doubles only. The real
-        # ServerState always constructs KiroPreferenceStore above.
-        return KIRO_APP_DEFAULT_MODEL
+        return _kiro_model_selection_for(self.state)
 
     def _kiro_effort_selection(self) -> str:
-        store = getattr(self.state, "kiro_preferences", None)
-        snapshot_effort = getattr(store, "snapshot_effort", None)
-        if callable(snapshot_effort):
-            return str(snapshot_effort() or KIRO_APP_DEFAULT_EFFORT)
-        return KIRO_APP_DEFAULT_EFFORT
+        return _kiro_effort_selection_for(self.state)
 
     def _kiro_busy(self) -> bool:
         acp = getattr(self.state, "kiro_acp", None)
@@ -33614,6 +33695,14 @@ def run_server(state: ServerState):
         daemon=True,
         name="kimi-boot-orphan-reconcile",
     ).start()
+    # kiro 常驻 (2026-10-28): keep Kiro's ACP process + session warm.
+    if getattr(state, "kiro_keep_warm_enabled", False) and getattr(state, "kiro_acp", None) is not None:
+        state.kiro_keep_warm = KiroKeepWarm(
+            attempt=lambda: _kiro_keep_warm_attempt(state),
+            logger=logger,
+        )
+        state.kiro_keep_warm.start()
+        logger.info("Kiro keep-warm enabled")
     # 小克·工具版 dispatcher — rule-driven scheduler injecting triggers into the
     # main session at scheduled times (no AI here; the session does the thinking).
     if getattr(state, "tool_schedule_enabled", False):
