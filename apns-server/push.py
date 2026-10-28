@@ -1751,7 +1751,9 @@ class KimiTerminalBridge:
         runner: Any = subprocess.run,
         process_killer: Any = os.kill,
         shutdown_wait_seconds: float = 1.0,
+        enabled: bool = True,
     ) -> None:
+        self.enabled = bool(enabled)
         self.command = command
         self.cwd = cwd
         self.tmux_session = tmux_session
@@ -2222,6 +2224,8 @@ class KimiTerminalBridge:
         return self._kill_exact_pane_locked(expected_pane)
 
     def _ensure_locked(self, session_id: str) -> str:
+        if not self.enabled:
+            raise KimiTerminalUnavailable("Kimi 已迁到东京服务器，App 内终端暂不可用")
         if not session_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", session_id):
             raise KimiTerminalNoActiveSession("Kimi 当前没有可恢复的活跃会话")
         expected_fingerprint = self._fingerprint_session(session_id)
@@ -4516,6 +4520,9 @@ class ServerState:
         self.kimi_terminal = KimiTerminalBridge(
             command=Path(server_cfg.get("kimi_bin", "/root/.kimi-code/bin/kimi")),
             cwd=Path(server_cfg.get("kimi_cwd", DEFAULT_KIMI_CWD)),
+            # false while 卡拉米 lives on Tokyo: a local TUI would run against
+            # the read-only sshfs view of a session owned by the remote server.
+            enabled=bool(server_cfg.get("kimi_terminal_enabled", True)),
         )
         self.channel_transport_enabled: bool = bool(server_cfg.get("channel_transport_enabled", False))
         self.channel_transport_url: str = str(
@@ -5064,6 +5071,12 @@ class ServerState:
             # ACP pointer intact as a rollback record.
             state_path=contact_history_dir / "kimi_web_session.json",
             cwd=server_cfg.get("kimi_cwd", DEFAULT_KIMI_CWD),
+            # 卡拉米 runs on Tokyo since 2026-10-28: kimi_web_host is its
+            # Tailscale IP and kimi_web_spawn_local = false stops push.py from
+            # ever starting a local `kimi web`.  Defaults keep the old
+            # loopback/spawn behaviour, which is also the rollback path.
+            spawn_local=bool(server_cfg.get("kimi_web_spawn_local", True)),
+            token_path=server_cfg.get("kimi_web_token_path") or None,
         )
         configured_kimi_web_permission_mode = str(
             server_cfg.get("kimi_web_permission_mode", KimiWebClient.APP_PERMISSION_MODE)

@@ -86,9 +86,18 @@ class KimiWebClient:
         state_path: str | Path | None = None,
         cwd: str | Path = DEFAULT_KIMI_CWD,
         started_at: float | None = None,
+        spawn_local: bool = True,
+        token_path: str | Path | None = None,
     ):
         self.command = str(Path(command).expanduser())
         self.kimi_code_home = Path(kimi_code_home).expanduser()
+        # Remote mode (2026-10-28, 卡拉米 moved to Tokyo): the Web server is a
+        # systemd unit on another host.  Never spawn a local `kimi web` then;
+        # an unreachable server is simply an error for the caller to queue on.
+        self.spawn_local = bool(spawn_local)
+        # Optional local copy of the server bearer token, so the chat path does
+        # not depend on the read-only sshfs view of the remote KIMI_CODE_HOME.
+        self.token_path = Path(token_path).expanduser() if token_path else None
         self.port = int(port)
         self.host = host
         self.base_url = f"http://{host}:{port}"
@@ -120,6 +129,8 @@ class KimiWebClient:
 
     @property
     def _server_token_path(self) -> Path:
+        if self.token_path is not None:
+            return self.token_path
         return self.kimi_code_home / "server.token"
 
     def _read_token(self) -> str:
@@ -361,6 +372,8 @@ class KimiWebClient:
             if self._try_reuse_existing_server():
                 self._owned_process = False
                 return
+            if not self.spawn_local:
+                raise KimiWebError(f"Remote Kimi web server at {self.base_url} is not reachable")
             self.logger.info("Starting Kimi web server at %s", self.base_url)
             env = os.environ.copy()
             env["KIMI_CODE_HOME"] = str(self.kimi_code_home)

@@ -43,7 +43,12 @@ NOTIFY_KINDS = {"agent"}
 
 DEFAULT_SESSIONS_ROOT = Path.home() / ".kimi-code" / "sessions"
 DEFAULT_REPORTS_DIR = Path.home() / ".kimi-code" / "task-reports"
-DEFAULT_STATE_DIR = Path.home() / ".kimi-code" / "agent-task-watch"
+# 2026-10-28: ~/.kimi-code is a read-only sshfs view of Tokyo on 216, so the
+# systemd unit points the writable state at /var/lib via this env var.
+DEFAULT_STATE_DIR = Path(
+    os.environ.get("KIMI_AGENT_TASK_WATCH_STATE_DIR")
+    or Path.home() / ".kimi-code" / "agent-task-watch"
+)
 DEFAULT_CONFIG = Path("/root/CcCompanion/apns-server/config.toml")
 DEFAULT_SECRET_FILE = Path.home() / ".ots" / "secret"
 DEFAULT_ENDPOINT = "http://127.0.0.1:8291/chat/append"
@@ -96,6 +101,22 @@ def load_active_session_ids(pointer_paths: list[Path]) -> set[str]:
         except (OSError, ValueError):
             continue
     return active
+
+
+def fetch_active_session_ids(url: str, secret: str, timeout: float = 15.0) -> set[str] | None:
+    """Remote mode (watcher on Tokyo): ask CcCompanion for the App's active Kimi
+    session (GET /kimi/status -> active_session_id). None = unknown; the caller
+    then defers pushes rather than mislabel live sessions as orphaned."""
+    req = urllib.request.Request(url, headers={"X-Auth-Token": secret}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read(65536))
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return None
+    sid = str(payload.get("active_session_id") or payload.get("session_id") or "").strip()
+    return {sid} if sid else set()
 
 
 def load_delivered(delivered_file: Path) -> dict:
@@ -259,6 +280,8 @@ def main() -> int:
     ap.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
     ap.add_argument("--pointer", type=Path, action="append", default=None,
                     help="活跃会话指针文件, 可重复; 默认读 CcCompanion 两个 kimi 指针")
+    ap.add_argument("--active-session-url", default="",
+                    help="远端模式: 用 CcCompanion GET /kimi/status 的 active_session_id 代替本地指针文件")
     ap.add_argument("--max-age-days", type=float, default=14.0,
                     help="只通知最近 N 天内结束的任务 (默认 14, 防首轮刷屏)")
     ap.add_argument("--max-pushes", type=int, default=5,
@@ -311,6 +334,13 @@ def main() -> int:
         # 无凭证: 不标记 delivered, 下轮重试
         log(state_dir, f"no shared_secret available; {len(pending)} pending deferred")
         return 0
+    if args.active_session_url:
+        remote_active = fetch_active_session_ids(
+            args.active_session_url, secret or load_secret(args.config, args.secret_file))
+        if remote_active is None:
+            log(state_dir, f"active session lookup failed; {len(pending)} pending deferred")
+            return 0
+        active_sessions = remote_active
 
     pushed, failed = 0, 0
     for task in pending[: max(args.max_pushes, 1)]:

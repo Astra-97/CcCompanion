@@ -156,6 +156,14 @@ allowed_ips = []
 # kimi_web_host = "127.0.0.1"
 # kimi_web_port = 58627
 # kimi_web_start_timeout_seconds = 30
+# Remote Kimi (since 2026-10-28 卡拉米 runs on Tokyo as kimi-web.service):
+#   kimi_web_host = "100.64.158.30"   # Tokyo Tailscale IP
+#   kimi_web_spawn_local = false      # never start a local `kimi web`
+#   kimi_web_token_path = "/root/.config/cc-companion/kimi-web.token"  # 0600 copy of Tokyo's server.token
+#   kimi_terminal_enabled = false     # App terminal tab would run a local TUI; disabled
+# ~/.kimi-code on this host is then a read-only sshfs view of Tokyo
+# (kimi-code-mount.service) for forge seeds / task reports / config.toml.
+# Rollback: delete these four keys (defaults = loopback + local spawn).
 # Kimi App/Web is deliberately fixed to fully autonomous `auto` mode. Any
 # other value is ignored at runtime. Static Bash denies in Kimi's config.toml
 # are best effort only, not a sandbox.

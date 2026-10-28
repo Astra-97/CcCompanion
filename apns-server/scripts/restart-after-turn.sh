@@ -29,8 +29,16 @@ from pathlib import Path
 from kimi_web_client import KimiWebClient, KimiWebError
 
 interval, timeout = float(sys.argv[1]), float(sys.argv[2])
+import re
+cfg = Path("/root/CcCompanion/apns-server/config.toml").read_text(encoding="utf-8")
+def cfg_str(key, default):
+    m = re.search(r'^\s*' + key + r'\s*=\s*"([^"]*)"', cfg, re.M)
+    return m.group(1) if m else default
 client = KimiWebClient(
-    state_path=Path("/root/CcCompanion/apns-server/tokens/kimi_web_session.json")
+    state_path=Path("/root/CcCompanion/apns-server/tokens/kimi_web_session.json"),
+    host=cfg_str("kimi_web_host", "127.0.0.1"),
+    token_path=cfg_str("kimi_web_token_path", "") or None,
+    spawn_local=False,
 )
 sid = None
 try:
@@ -59,7 +67,16 @@ PY
 wait_for_turn_end
 sleep "$GRACE_SECONDS"
 
-if [ "$TARGET" = "kimi-web" ]; then
+# Since 2026-10-28 卡拉米's kimi web runs on Tokyo as kimi-web.service.
+KIMI_HOST="$(sed -n 's/^[[:space:]]*kimi_web_host[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' /root/CcCompanion/apns-server/config.toml | head -1)"
+
+if [ "$TARGET" = "kimi-web" ] && [ -n "$KIMI_HOST" ] && [ "$KIMI_HOST" != "127.0.0.1" ]; then
+  if ssh -o BatchMode=yes -o ConnectTimeout=10 tokyo 'sudo systemctl restart kimi-web.service'; then
+    echo "$(date -Is) kimi web restarted on tokyo (kimi-web.service) after turn end (+${GRACE_SECONDS}s grace) [$TARGET]" >> "$LOG"
+  else
+    echo "$(date -Is) kimi web restart on tokyo FAILED [$TARGET]" >> "$LOG"
+  fi
+elif [ "$TARGET" = "kimi-web" ]; then
   pid="$(ss -tlnp 2>/dev/null | grep ':58627' | grep -oP 'pid=\K[0-9]+' | head -1)"
   if [ -n "$pid" ] && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q kimi; then
     kill "$pid"
