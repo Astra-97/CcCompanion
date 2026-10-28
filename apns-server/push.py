@@ -47,6 +47,7 @@ import selectors
 import shutil
 import signal
 import secrets
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -1738,8 +1739,44 @@ class KimiTerminalNoActiveSession(KimiTerminalUnavailable):
     """There is no validated durable Kimi Web session to resume."""
 
 
+KIMI_TERMINAL_REMOTE_SSH_OPTIONS = (
+    "-o", "BatchMode=yes",
+    "-o", "ConnectTimeout=5",
+    "-o", "ServerAliveInterval=15",
+    # One multiplexed connection: each tmux call costs ~2 RTT instead of a
+    # full ssh handshake.  The master lives in cc-companion's cgroup.
+    "-o", "ControlMaster=auto",
+    "-o", "ControlPath=/root/.ssh/ccc-kimi-terminal-%C",
+    "-o", "ControlPersist=10m",
+)
+# Remote pane process: same environment as Tokyo's kimi-web.service
+# (HOME/LANG/KIMI_CODE_HOME/PATH + /etc/kimi-web.env), then exec kimi so the
+# tmux pane_pid stays the kimi process.  $1=kimi binary, $2=cwd, $3=session.
+KIMI_TERMINAL_REMOTE_LAUNCH_SCRIPT = (
+    "set -a; [ -r /etc/kimi-web.env ] && . /etc/kimi-web.env; set +a; "
+    "cd \"$2\" || exit 1; "
+    "export HOME=/root LANG=C.UTF-8 KIMI_CODE_HOME=/root/.kimi-code CCC_KIMI_TERMINAL_BRIDGE=1 "
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; "
+    "exec \"$1\" --session \"$3\""
+)
+# tmux commands that cannot change which pane/session the bridge owns.
+_KIMI_TERMINAL_IDENTITY_NEUTRAL = frozenset({
+    "display-message", "show-options", "has-session", "capture-pane",
+})
+
+
 class KimiTerminalBridge:
-    """Own one TUI for the durable Kimi chat session, never a second session."""
+    """Own one TUI for the durable Kimi chat session, never a second session.
+
+    With ``remote_host`` set (卡拉米 on Tokyo since 2026-10-28) every tmux
+    call — and the SIGTERM of the pane process — runs on that host through
+    ``ssh <host> sudo -n tmux ...``.  Pane ids such as ``%3`` are scoped to a
+    tmux server, so they are only ever handed back to the same remote server.
+    The ownership/binding/pane facts are fetched in one ``display-message``
+    and reused for ``identity_cache_seconds`` (dropped on any mutating tmux
+    command) to keep a capture poll at a few round trips; every final action
+    still targets the exact pane id, which tmux never reuses within a server.
+    """
 
     def __init__(
         self,
@@ -1752,10 +1789,17 @@ class KimiTerminalBridge:
         process_killer: Any = os.kill,
         shutdown_wait_seconds: float = 1.0,
         enabled: bool = True,
+        remote_host: str = "",
+        identity_cache_seconds: float = 1.5,
     ) -> None:
         self.enabled = bool(enabled)
         self.command = command
         self.cwd = cwd
+        self.remote_host = str(remote_host or "").strip()
+        if self.remote_host and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,200}", self.remote_host):
+            raise ValueError("invalid kimi terminal ssh host")
+        self.identity_cache_seconds = max(0.0, min(float(identity_cache_seconds), 5.0))
+        self._identity_cache: tuple[float, tuple[str, str, str, str] | None] | None = None
         self.tmux_session = tmux_session
         self.idle_seconds = max(1.0, float(idle_seconds))
         self._run = runner
@@ -1794,13 +1838,94 @@ class KimiTerminalBridge:
         with self._lock:
             self._status_probe = probe
 
+    def _remote_argv(self, argv: list[str]) -> list[str]:
+        return [
+            "ssh", *KIMI_TERMINAL_REMOTE_SSH_OPTIONS, self.remote_host,
+            "sudo", "-n", "/usr/bin/env", "LANG=C.UTF-8",
+            *(shlex.quote(str(part)) for part in argv),
+        ]
+
+    def run_tmux(
+        self, argv: list[str], *, input: str | None = None, timeout: float = 5,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run one tmux command against the server that owns the Kimi pane."""
+        if not argv or argv[0] != "tmux":
+            raise ValueError("run_tmux only runs tmux")
+        if len(argv) < 2 or argv[1] not in _KIMI_TERMINAL_IDENTITY_NEUTRAL:
+            self._identity_cache = None
+        if not self.remote_host:
+            kwargs: dict[str, Any] = {"capture_output": True, "text": True, "timeout": timeout}
+            if input is not None:
+                kwargs["input"] = input
+            return self._run(argv, **kwargs)
+        return self._run(
+            self._remote_argv(argv), input=input, capture_output=True,
+            encoding="utf-8", errors="replace", timeout=timeout + 5,
+        )
+
     def _run_tmux(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
-        return self._run(argv, capture_output=True, text=True, timeout=5)
+        return self.run_tmux(argv, timeout=5)
+
+    def _remote_identity_locked(self) -> tuple[str, str, str, str] | None:
+        """(owner, binding, pane_id, pane_dead) of the exact remote session.
+
+        ``None`` means the session does not exist.  tmux 3.6 resolves an
+        unknown ``-t`` to some other session for display-message, so the
+        returned ``session_name`` must equal ours exactly.  Transport or sudo
+        failures raise instead of looking like an absent session.
+        """
+        cached = self._identity_cache
+        if cached is not None and time.monotonic() - cached[0] < self.identity_cache_seconds:
+            return cached[1]
+        fmt = "\t".join((
+            "#{session_name}",
+            "#{" + KIMI_TERMINAL_OWNER_OPTION + "}",
+            "#{" + KIMI_TERMINAL_SESSION_OPTION + "}",
+            "#{pane_id}",
+            "#{pane_dead}",
+        ))
+        result = self._run_tmux(["tmux", "display-message", "-p", "-t", self.tmux_session, fmt])
+        identity: tuple[str, str, str, str] | None = None
+        if result.returncode == 0:
+            fields = result.stdout.rstrip("\r\n").split("\t")
+            if len(fields) == 5 and fields[0] == self.tmux_session:
+                identity = (fields[1], fields[2], fields[3], fields[4])
+        else:
+            stderr = str(result.stderr or "")
+            if not any(marker in stderr for marker in (
+                "no server running", "can't find", "error connecting",
+            )):
+                raise KimiTerminalUnavailable("东京 Kimi 终端连接失败")
+        self._identity_cache = (time.monotonic(), identity)
+        return identity
+
+    def _remote_paths_ok_locked(self) -> bool:
+        result = self._run(
+            self._remote_argv(["test", "-x", str(self.command), "-a", "-d", str(self.cwd)]),
+            capture_output=True, encoding="utf-8", errors="replace", timeout=10,
+        )
+        return result.returncode == 0
+
+    def _remote_kill(self, pid: int, sig: int) -> None:
+        self._identity_cache = None
+        result = self._run(
+            self._remote_argv(["kill", f"-{int(sig)}", str(int(pid))]),
+            capture_output=True, encoding="utf-8", errors="replace", timeout=10,
+        )
+        if result.returncode != 0:
+            if "No such process" in str(result.stderr or ""):
+                raise ProcessLookupError(pid)
+            raise OSError("remote kill failed")
 
     def _has_session_locked(self) -> bool:
+        if self.remote_host:
+            return self._remote_identity_locked() is not None
         return self._run_tmux(["tmux", "has-session", "-t", self.tmux_session]).returncode == 0
 
     def _owns_session_locked(self) -> bool:
+        if self.remote_host:
+            identity = self._remote_identity_locked()
+            return identity is not None and identity[0] == KIMI_TERMINAL_OWNER_VALUE
         result = self._run_tmux([
             "tmux", "show-options", "-v", "-t", self.tmux_session,
             KIMI_TERMINAL_OWNER_OPTION,
@@ -1812,6 +1937,10 @@ class KimiTerminalBridge:
         return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
 
     def _bound_session_locked(self) -> str:
+        if self.remote_host:
+            identity = self._remote_identity_locked()
+            value = identity[1] if identity is not None else ""
+            return value if re.fullmatch(r"[0-9a-f]{64}", value) else ""
         result = self._run_tmux([
             "tmux", "show-options", "-v", "-t", self.tmux_session,
             KIMI_TERMINAL_SESSION_OPTION,
@@ -1820,11 +1949,18 @@ class KimiTerminalBridge:
         return value if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{64}", value) else ""
 
     def _pane_status_locked(self) -> tuple[str, bool]:
-        result = self._run_tmux([
-            "tmux", "display-message", "-p", "-t", self.tmux_session,
-            "#{pane_id}|#{pane_dead}",
-        ])
-        fields = result.stdout.rstrip("\r\n").split("|", 1)
+        if self.remote_host:
+            identity = self._remote_identity_locked()
+            if identity is None:
+                raise KimiTerminalUnavailable("Kimi 终端 pane 状态异常")
+            fields = [identity[2], identity[3]]
+            result = types.SimpleNamespace(returncode=0)
+        else:
+            result = self._run_tmux([
+                "tmux", "display-message", "-p", "-t", self.tmux_session,
+                "#{pane_id}|#{pane_dead}",
+            ])
+            fields = result.stdout.rstrip("\r\n").split("|", 1)
         if (
             result.returncode != 0
             or len(fields) != 2
@@ -2203,7 +2339,11 @@ class KimiTerminalBridge:
         if not pane_dead:
             pid = self._pane_pid_locked(expected_pane)
             try:
-                self._process_killer(pid, signal.SIGTERM)
+                # A remote pane pid lives on the remote host: never os.kill it here.
+                if self.remote_host:
+                    self._remote_kill(pid, signal.SIGTERM)
+                else:
+                    self._process_killer(pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
             except OSError as exc:
@@ -2211,6 +2351,7 @@ class KimiTerminalBridge:
             deadline = time.monotonic() + self.shutdown_wait_seconds
             while time.monotonic() < deadline:
                 time.sleep(0.05)
+                self._identity_cache = None
                 try:
                     current, dead = self._pane_status_locked()
                 except KimiTerminalUnavailable:
@@ -2271,9 +2412,16 @@ class KimiTerminalBridge:
             self._session_fingerprint = None
             self._session_id = None
             self._prompt_active_uncertain = False
-        if not self.command.is_file() or not os.access(self.command, os.X_OK):
+        if self.remote_host:
+            try:
+                paths_ok = self._remote_paths_ok_locked()
+            except Exception as exc:
+                raise KimiTerminalUnavailable("东京 Kimi 终端连接失败") from exc
+            if not paths_ok:
+                raise KimiTerminalUnavailable("东京 Kimi Code 终端入口或工作区不可用")
+        elif not self.command.is_file() or not os.access(self.command, os.X_OK):
             raise KimiTerminalUnavailable("Kimi Code 终端入口未安装")
-        if not self.cwd.is_dir():
+        elif not self.cwd.is_dir():
             raise KimiTerminalUnavailable("Kimi 终端工作区不可用")
         # Start a harmless staging pane first.  Marking it before respawn
         # prevents this API from ever owning or killing an arbitrary
@@ -2305,10 +2453,18 @@ class KimiTerminalBridge:
             raise KimiTerminalUnavailable("Kimi 终端会话绑定失败")
         # Resume the one validated durable chat session explicitly.  Never use
         # --continue (ambiguous) and never let a model flag create a new one.
+        if self.remote_host:
+            launch_argv = [
+                "/bin/sh", "-c", KIMI_TERMINAL_REMOTE_LAUNCH_SCRIPT, "ccc-kimi-terminal",
+                str(self.command), str(self.cwd), session_id,
+            ]
+        else:
+            launch_argv = [
+                "/usr/bin/env", "CCC_KIMI_TERMINAL_BRIDGE=1", str(self.command),
+                "--session", session_id,
+            ]
         launched = self._run_tmux([
-            "tmux", "respawn-pane", "-k", "-t", self.tmux_session,
-            "/usr/bin/env", "CCC_KIMI_TERMINAL_BRIDGE=1", str(self.command),
-            "--session", session_id,
+            "tmux", "respawn-pane", "-k", "-t", self.tmux_session, *launch_argv,
         ])
         if launched.returncode != 0:
             try:
@@ -4520,9 +4676,13 @@ class ServerState:
         self.kimi_terminal = KimiTerminalBridge(
             command=Path(server_cfg.get("kimi_bin", "/root/.kimi-code/bin/kimi")),
             cwd=Path(server_cfg.get("kimi_cwd", DEFAULT_KIMI_CWD)),
-            # false while 卡拉米 lives on Tokyo: a local TUI would run against
-            # the read-only sshfs view of a session owned by the remote server.
             enabled=bool(server_cfg.get("kimi_terminal_enabled", True)),
+            # 卡拉米 lives on Tokyo: kimi_terminal_ssh_host = "tokyo" runs the
+            # TUI's tmux there (ssh tokyo sudo tmux ...) against Tokyo's own
+            # workspace and session files.  Empty = the old local tmux.  Never
+            # enable a local TUI while kimi_web_spawn_local = false: it would
+            # write the read-only sshfs view of a remotely owned session.
+            remote_host=str(server_cfg.get("kimi_terminal_ssh_host", "") or ""),
         )
         self.channel_transport_enabled: bool = bool(server_cfg.get("channel_transport_enabled", False))
         self.channel_transport_url: str = str(
@@ -5078,6 +5238,10 @@ class ServerState:
             spawn_local=bool(server_cfg.get("kimi_web_spawn_local", True)),
             token_path=server_cfg.get("kimi_web_token_path") or None,
         )
+        if not self.kimi_web.spawn_local and not self.kimi_terminal.remote_host:
+            # Remote Kimi Web without a remote terminal host: a local TUI
+            # would fork the remote session through the read-only sshfs view.
+            self.kimi_terminal.enabled = False
         configured_kimi_web_permission_mode = str(
             server_cfg.get("kimi_web_permission_mode", KimiWebClient.APP_PERMISSION_MODE)
         ).strip().lower()
@@ -30608,6 +30772,27 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
         owned_name = str(getattr(terminal, "tmux_session", "") or "").strip().lower()
         return value in {KIRO_TERMINAL_TMUX_SESSION, owned_name} - {""}
 
+    def _remote_kimi_terminal(self) -> Any:
+        """The Kimi bridge when its tmux server is remote (Tokyo), else None.
+
+        Its pane ids (``%N``) belong to the remote tmux server; running them
+        against 216's local tmux would hit an unrelated local pane.
+        """
+        terminal = getattr(self.state, "kimi_terminal", None)
+        if getattr(terminal, "remote_host", "") and callable(getattr(terminal, "run_tmux", None)):
+            return terminal
+        return None
+
+    def _kimi_pane_tmux(self, argv: list[str], *, input: str | None = None, timeout: float = 3):
+        """Run a tmux command on a Kimi pane id, on whichever server owns it."""
+        remote = self._remote_kimi_terminal()
+        if remote is not None:
+            return remote.run_tmux(argv, input=input, timeout=timeout)
+        kwargs: dict[str, Any] = {"capture_output": True, "text": True, "timeout": timeout}
+        if input is not None:
+            kwargs["input"] = input
+        return subprocess.run(argv, **kwargs)
+
     def _is_reserved_kimi_physical_target(self, requested: Any) -> bool:
         """Keep the bridge's tmux name private; only ``kimi`` is routable."""
         value = str(requested or "").strip().lower()
@@ -31030,9 +31215,8 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
         lease = ""
         if pane:
             try:
-                result = subprocess.run(
+                result = self._kimi_pane_tmux(
                     ["tmux", "capture-pane", "-t", pane, "-p", "-S", str(-lines)],
-                    capture_output=True, text=True, timeout=3,
                 )
                 if result.returncode == 0:
                     content = _trim_terminal_capture(result.stdout)
@@ -31109,10 +31293,14 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
                 # Lease is opaque and only binds this capture to the exact
                 # current owned pane; pane/session identifiers never leave.
                 kimi_lease = self.state.kimi_terminal.lease_for_pane(session)
-            result = subprocess.run(
-                ["tmux", "capture-pane", "-t", session, "-p", "-S", str(-lines)],
-                capture_output=True, text=True, timeout=3
-            )
+                result = self._kimi_pane_tmux(
+                    ["tmux", "capture-pane", "-t", session, "-p", "-S", str(-lines)],
+                )
+            else:
+                result = subprocess.run(
+                    ["tmux", "capture-pane", "-t", session, "-p", "-S", str(-lines)],
+                    capture_output=True, text=True, timeout=3
+                )
             if result.returncode == 0 and public_session == KIMI_TERMINAL_ALIAS:
                 self.state.kimi_terminal.touch()
             if result.returncode != 0:
@@ -31252,9 +31440,8 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
                         pane = ""
                 if pane:
                     try:
-                        subprocess.run(
+                        self._kimi_pane_tmux(
                             ["tmux", "resize-window", "-t", pane, "-x", str(columns), "-y", str(rows)],
-                            capture_output=True, text=True, timeout=3,
                         )
                         self.state.kimi_terminal.touch()
                     except Exception:
@@ -31269,10 +31456,11 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
                 self._send_json(503, {"error": str(exc), "target": KIMI_TERMINAL_ALIAS})
                 return
             try:
-                result = subprocess.run(
-                    ["tmux", "resize-window", "-t", session, "-x", str(columns), "-y", str(rows)],
-                    capture_output=True, text=True, timeout=3,
-                )
+                resize_argv = ["tmux", "resize-window", "-t", session, "-x", str(columns), "-y", str(rows)]
+                if public_session == KIMI_TERMINAL_ALIAS:
+                    result = self._kimi_pane_tmux(resize_argv)
+                else:
+                    result = subprocess.run(resize_argv, capture_output=True, text=True, timeout=3)
             except Exception:
                 result = None
             if result is None or result.returncode != 0:
@@ -31336,10 +31524,13 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
             self._send_kimi_terminal_unavailable(exc)
             return
         try:
-            result = subprocess.run(
-                ["tmux", "send-keys", "-t", session, key_name],
-                capture_output=True, text=True, timeout=3
-            )
+            if public_session == KIMI_TERMINAL_ALIAS:
+                result = self._kimi_pane_tmux(["tmux", "send-keys", "-t", session, key_name])
+            else:
+                result = subprocess.run(
+                    ["tmux", "send-keys", "-t", session, key_name],
+                    capture_output=True, text=True, timeout=3
+                )
             if result.returncode != 0:
                 if is_kairos:
                     self._finish_kairos_terminal_failure(expected_pane=session)
@@ -31427,10 +31618,13 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
                 self._send_kimi_terminal_unavailable(exc)
                 return
             try:
-                result = subprocess.run(
-                    ["tmux", "send-keys", "-t", session, special_key],
-                    capture_output=True, text=True, timeout=3,
-                )
+                if public_session == KIMI_TERMINAL_ALIAS:
+                    result = self._kimi_pane_tmux(["tmux", "send-keys", "-t", session, special_key])
+                else:
+                    result = subprocess.run(
+                        ["tmux", "send-keys", "-t", session, special_key],
+                        capture_output=True, text=True, timeout=3,
+                    )
                 if result.returncode != 0:
                     if is_kairos:
                         self._finish_kairos_terminal_failure(expected_pane=session)
@@ -31480,6 +31674,10 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
             return
         buffer_name: str | None = None
         is_kimi = public_session == KIMI_TERMINAL_ALIAS
+        remote_kimi = self._remote_kimi_terminal() if is_kimi else None
+        if remote_kimi is not None:
+            self._tmux_send_remote_kimi(remote_kimi, session, keys, enter)
+            return
         try:
             if keys:
                 # 用 load-buffer + paste-buffer 安全注入 (避免 - 开头被当 flag)
@@ -31555,6 +31753,43 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
                 self._send_json(503, {"error": "Kimi 终端操作失败", "target": KIMI_TERMINAL_ALIAS})
             else:
                 self._send_json(500, {"error": str(e)})
+
+    def _tmux_send_remote_kimi(self, terminal: Any, pane: str, keys: Any, enter: bool) -> None:
+        """Ready-path Kimi input on the remote tmux server owning ``pane``.
+
+        Same transaction as the local branch: request-scoped buffer loaded
+        from stdin (never the shared default buffer), bracketed paste with
+        delete, then Enter; the buffer is dropped on any failure.
+        """
+        buffer_name: str | None = None
+        try:
+            if keys:
+                buffer_name = f"ccc-kimi-{secrets.token_hex(8)}"
+                load = terminal.run_tmux(
+                    ["tmux", "load-buffer", "-b", buffer_name, "-"], input=str(keys), timeout=3,
+                )
+                if load.returncode != 0:
+                    raise RuntimeError("tmux load-buffer failed")
+                paste = terminal.run_tmux(
+                    ["tmux", "paste-buffer", "-b", buffer_name, "-t", pane, "-p", "-d"], timeout=3,
+                )
+                if paste.returncode != 0:
+                    raise RuntimeError("tmux paste-buffer failed")
+            if enter:
+                submit = terminal.run_tmux(["tmux", "send-keys", "-t", pane, "Enter"], timeout=3)
+                if submit.returncode != 0:
+                    raise RuntimeError("tmux send-keys Enter failed")
+                terminal.mark_prompt_submitted()
+            terminal.touch()
+            self._send_json(200, {"ok": True, "session": KIMI_TERMINAL_ALIAS})
+        except Exception:
+            logger.warning("remote Kimi terminal input failed", exc_info=True)
+            if buffer_name:
+                try:
+                    terminal.run_tmux(["tmux", "delete-buffer", "-b", buffer_name], timeout=3)
+                except Exception:
+                    logger.exception("failed to clear Kimi terminal input buffer")
+            self._send_json(503, {"error": "Kimi 终端操作失败", "target": KIMI_TERMINAL_ALIAS})
 
     # ---------- reminder 端点 ----------
 
