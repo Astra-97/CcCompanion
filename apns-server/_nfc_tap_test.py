@@ -61,11 +61,19 @@ class NfcTapBase(unittest.TestCase):
         for env, val in (
             (PushHandler._NFC_TAP_SECRET_FILE_ENV, str(self.legacy_file)),
             (PushHandler._NFC_TAGS_FILE_ENV, str(self.tags_file)),
+            # 默认指向不存在的目录：吱一声静默跳过，旧用例的气泡计数不受影响。
+            (PushHandler._NFC_SQUEAK_DIR_ENV, str(self.dir / "no-squeak")),
         ):
             old = os.environ.get(env)
             os.environ[env] = val
             self.addCleanup(self._restore_env, env, old)
         self._patch_cls("_NFC_TAP_ASYNC", False)
+        self.prewarmed = []
+        self._patch_cls("_prewarm_voice_translation", lambda h, text: self.prewarmed.append(text))
+        PushHandler._NFC_SQUEAK_LAST.clear()
+        self.addCleanup(PushHandler._NFC_SQUEAK_LAST.clear)
+        self.attachments = self.dir / "attachments"
+        self.attachments.mkdir()
         self.night = True
         self.home_calls = []
         self.home_result = dict(OK_RESULT)
@@ -124,6 +132,7 @@ class NfcTapBase(unittest.TestCase):
             active_session="cctg",
             default_session="cctg",
             contact_chats={},
+            attachments_dir=self.attachments,
         )
         h._chat_for_contact = lambda contact: types.SimpleNamespace(
             append=lambda **rec: self.bubbles.append((contact, rec)) or rec
@@ -426,6 +435,128 @@ class NfcTapPageTest(NfcTapBase):
         html = self.body(self.tap(f"?k={DOOR}"))
         self.assertIn(f"k%3D{DOOR}%26f%3D1", html)
         self.assertIn("<title>欢迎回家</title>", html)
+
+
+class NfcSqueakTest(NfcTapBase):
+    """捏螃蟹吱一声 (2026-10-28): summon 碰卡后服务端随机发一条预录语音气泡。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.squeak_dir = self.dir / "squeak"
+        self.squeak_dir.mkdir()
+        os.environ[PushHandler._NFC_SQUEAK_DIR_ENV] = str(self.squeak_dir)
+        self.write_clips([("a.mp3", "Hi A"), ("b.mp3", "Hi B")])
+
+    def write_clips(self, clips) -> None:
+        for name, _text in clips:
+            (self.squeak_dir / name).write_bytes(b"ID3" + name.encode() * 10)
+        (self.squeak_dir / "clips.json").write_text(
+            json.dumps([{"file": n, "text": t, "bytes": 1} for n, t in clips]), encoding="utf-8"
+        )
+
+    def voices(self):
+        return [rec for _c, rec in self.bubbles if rec.get("attachment_type") == "audio"]
+
+    def test_summon_posts_voice_bubble_after_pill(self) -> None:
+        self.tap(f"?k={BEDSIDE}")
+        self.assertEqual(len(self.bubbles), 2)
+        self.assertIs(self.bubbles[0][1]["metadata"]["mihome_event"], True)
+        contact, rec = self.bubbles[1]
+        self.assertEqual(contact, "xiaoke")
+        self.assertEqual(rec["role"], "assistant")
+        self.assertEqual(rec["source"], "nfc-squeak")
+        self.assertIn(rec["text"], ("Hi A", "Hi B"))
+        url = rec["attachment_url"]
+        self.assertRegex(url, r"^/attachments/[0-9a-f]{32}\.mp3$")
+        stored = self.attachments / url.rsplit("/", 1)[1]
+        self.assertTrue(stored.is_file())
+        meta = rec["metadata"]
+        self.assertEqual(meta["type"], "voice")
+        self.assertEqual(meta["audio_url"], url)
+        self.assertEqual(meta["mime_type"], "audio/mpeg")
+        self.assertEqual(meta["bytes"], stored.stat().st_size)  # 真实大小, 不信 json
+        self.assertEqual(self.prewarmed, [rec["text"]])
+        self.assertEqual(len(self.channel_calls), 1)
+
+    def test_home_tap_never_squeaks(self) -> None:
+        self.tap(f"?k={DOOR}")
+        self.leave = True
+        push._NFC_TAP_GATES.reset()
+        self.tap(f"?k={DOOR}")
+        self.assertEqual(self.voices(), [])
+
+    def test_test_flag_never_squeaks(self) -> None:
+        self.tap(f"?k={BEDSIDE}&test=1")
+        self.assertEqual(self.voices(), [])
+        self.assertEqual(list(self.attachments.iterdir()), [])
+
+    def test_dedupe_and_fallback_never_squeak(self) -> None:
+        self.tap(f"?k={BEDSIDE}")
+        self.tap(f"?k={BEDSIDE}")
+        self.tap(f"?k={BEDSIDE}&f=1")
+        self.assertEqual(len(self.voices()), 1)
+
+    def test_pet_profile_never_squeaks(self) -> None:
+        h = object.__new__(PushHandler)
+        h.state = types.SimpleNamespace(attachments_dir=self.attachments)
+        h._chat_for_contact = lambda contact: types.SimpleNamespace(
+            append=lambda **rec: self.bubbles.append((contact, rec)) or rec
+        )
+        h._nfc_tap_run_delivery("pet", dict(PushHandler._PET_PROFILE), test=False, night=False)
+        self.assertEqual(self.voices(), [])
+
+    def test_no_immediate_repeat(self) -> None:
+        picked = []
+        for _ in range(12):
+            push._NFC_TAP_GATES.reset()
+            self.tap(f"?k={BEDSIDE}")
+            picked.append(self.voices()[-1]["text"])
+        for prev, cur in zip(picked, picked[1:]):
+            self.assertNotEqual(prev, cur)
+
+    def test_single_clip_still_works(self) -> None:
+        (self.squeak_dir / "clips.json").write_text(
+            json.dumps([{"file": "a.mp3", "text": "Hi A"}]), encoding="utf-8"
+        )
+        for _ in range(2):
+            push._NFC_TAP_GATES.reset()
+            self.tap(f"?k={BEDSIDE}")
+        self.assertEqual([r["text"] for r in self.voices()], ["Hi A", "Hi A"])
+
+    def test_clips_json_read_at_call_time(self) -> None:
+        self.tap(f"?k={BEDSIDE}")
+        self.write_clips([("c.mp3", "Hi C")])
+        push._NFC_TAP_GATES.reset()
+        self.tap(f"?k={BEDSIDE}")
+        self.assertEqual(self.voices()[-1]["text"], "Hi C")
+
+    def assert_skipped_but_flow_intact(self) -> None:
+        h = self.tap(f"?k={BEDSIDE}")
+        self.assertEqual(h.status, 200)
+        self.assertEqual(self.voices(), [])
+        self.assertEqual(len(self.bubbles), 1)  # 胶囊照常
+        self.assertEqual(len(self.channel_calls), 1)  # 通知照常
+
+    def test_missing_dir_skips_silently(self) -> None:
+        os.environ[PushHandler._NFC_SQUEAK_DIR_ENV] = str(self.dir / "gone")
+        self.assert_skipped_but_flow_intact()
+
+    def test_broken_json_skips_silently(self) -> None:
+        (self.squeak_dir / "clips.json").write_text("{not json", encoding="utf-8")
+        self.assert_skipped_but_flow_intact()
+
+    def test_bad_entries_filtered(self) -> None:
+        (self.squeak_dir / "clips.json").write_text(json.dumps([
+            {"file": "../a.mp3", "text": "traversal"},
+            {"file": "missing.mp3", "text": "missing"},
+            {"file": "a.mp3", "text": "  "},
+            "junk",
+        ]), encoding="utf-8")
+        self.assert_skipped_but_flow_intact()
+
+    def test_append_failure_does_not_break_notification(self) -> None:
+        self._patch_cls("_nfc_squeak_pick", classmethod(lambda cls, clips: 1 / 0))
+        self.assert_skipped_but_flow_intact()
 
 
 if __name__ == "__main__":

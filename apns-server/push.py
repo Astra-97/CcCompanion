@@ -28399,6 +28399,16 @@ class PushHandler(BaseHTTPRequestHandler):
     _NFC_HOME_CMD = ("/root/mihome/venv/bin/python", "/root/mihome/home_arrive.py")
     _NFC_HOME_TIMEOUT = 90
     _NFC_HINT = "（她手机正在打开 CC Companion，用 companion reply contact_id=xiaoke 跟她打招呼）"
+    # 捏螃蟹吱一声 (2026-10-28)：summon tag 碰卡通过 20s 门后，服务端直接从预录片段里
+    # 随机挑一条小克语音气泡发到私聊（不经模型、不调 ElevenLabs）。clips.json 每次现读，
+    # 加片段不用重启；目录/JSON 缺失或损坏就记日志跳过，绝不影响原有 NFC 流程。
+    _NFC_SQUEAK_DIR_ENV = "CC_COMPANION_NFC_SQUEAK_DIR"
+    _NFC_SQUEAK_DEFAULT_DIR = Path("/root/xiaoke-voice/nfc-squeak")
+    _NFC_SQUEAK_SOURCE = "nfc-squeak"
+    _NFC_SQUEAK_MAX_BYTES = 5 * 1024 * 1024
+    _NFC_SQUEAK_FILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.mp3")
+    _NFC_SQUEAK_LAST: dict[str, str] = {}  # {"file": 上一次发的片段} 进程内防连抽同一条
+    _NFC_SQUEAK_LOCK = threading.Lock()
     # 螃蟹桌宠 (2026-10-22)：App 悬浮螃蟹，tag "pet" 不进 nfc_tags.json；计数合并在 App 端。
     _PET_TAG_ID = "pet"
     _PET_MAX_COUNT = 999
@@ -28763,6 +28773,93 @@ class PushHandler(BaseHTTPRequestHandler):
         target = (getattr(state, "active_session", "") or getattr(state, "default_session", "") or "cctg").strip()
         return _inject_to_tmux_session(state, target, payload["text"])
 
+    @classmethod
+    def _nfc_squeak_dir(cls) -> Path:
+        raw = str(os.environ.get(cls._NFC_SQUEAK_DIR_ENV) or "").strip()
+        return Path(raw).expanduser() if raw else cls._NFC_SQUEAK_DEFAULT_DIR
+
+    @classmethod
+    def _nfc_squeak_load_clips(cls, clip_dir: Path) -> list[dict[str, Any]]:
+        """clips.json → [{file, text, path, bytes}]，只留文件真实存在的合法条目。"""
+        raw = json.loads((clip_dir / "clips.json").read_text(encoding="utf-8"))
+        if not isinstance(raw, list):
+            raise ValueError("clips.json must be a list")
+        clips: list[dict[str, Any]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("file")
+            text = item.get("text")
+            if not isinstance(name, str) or not cls._NFC_SQUEAK_FILE_RE.fullmatch(name):
+                continue
+            if not isinstance(text, str) or not text.strip():
+                continue
+            path = clip_dir / name
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= cls._NFC_SQUEAK_MAX_BYTES:
+                continue
+            clips.append({"file": name, "text": text.strip(), "path": path, "bytes": info.st_size})
+        return clips
+
+    @classmethod
+    def _nfc_squeak_pick(cls, clips: list[dict[str, Any]]) -> dict[str, Any]:
+        import random
+
+        with cls._NFC_SQUEAK_LOCK:
+            last = cls._NFC_SQUEAK_LAST.get("file")
+            pool = [c for c in clips if c["file"] != last] or clips
+            choice = random.choice(pool)
+            cls._NFC_SQUEAK_LAST["file"] = choice["file"]
+        return choice
+
+    def _nfc_post_squeak(self, tag_id: str) -> dict[str, Any] | None:
+        """捏螃蟹吱一声：随机预录片段 → 小克私聊语音气泡。任何失败只记日志。"""
+        try:
+            clip_dir = self._nfc_squeak_dir()
+            try:
+                clips = self._nfc_squeak_load_clips(clip_dir)
+            except Exception as exc:
+                logger.warning("nfc squeak skipped: clips unavailable dir=%s err=%s", clip_dir, exc)
+                return None
+            if not clips:
+                logger.warning("nfc squeak skipped: no usable clips dir=%s", clip_dir)
+                return None
+            clip = self._nfc_squeak_pick(clips)
+            import uuid as _uuid
+
+            stored_name = f"{_uuid.uuid4().hex}.mp3"
+            target = Path(self.state.attachments_dir) / stored_name
+            shutil.copyfile(clip["path"], target)
+            url = f"/attachments/{stored_name}"
+            text = clip["text"]
+            chat = self._chat_for_contact(self._NFC_TAP_CONTACT)
+            rec = chat.append(
+                role="assistant",
+                text=text,
+                source=self._NFC_SQUEAK_SOURCE,
+                attachment_url=url,
+                attachment_type="audio",
+                metadata={
+                    "type": "voice",
+                    "audio_url": url,
+                    "mime_type": "audio/mpeg",
+                    "bytes": int(clip["bytes"]),
+                    "nfc_squeak": True,
+                    "nfc_tag": tag_id,
+                    "clip": clip["file"],
+                },
+            )
+            self._prewarm_voice_translation(text)
+            self._publish_persisted_assistant_completion(self._NFC_TAP_CONTACT, rec)
+            logger.info("nfc squeak posted tag=%s clip=%s url=%s", tag_id, clip["file"], url)
+            return rec
+        except Exception:
+            logger.warning("nfc squeak post failed tag=%s", tag_id, exc_info=True)
+            return None
+
     def _nfc_tap_run_delivery(
         self,
         tag_id: str,
@@ -28781,6 +28878,9 @@ class PushHandler(BaseHTTPRequestHandler):
                     logger.info("nfc home devices tag=%s result=%s", tag_id, home_result)
                 if not test:
                     self._nfc_append_bubble(tag_id, profile, home_result)
+                    # 只有真实 NFC summon tag（不含门口 home、不含桌宠 pet）才吱一声。
+                    if profile.get("action") == "summon" and profile.get("kind") != "pet":
+                        self._nfc_post_squeak(tag_id)
                 payload = self._nfc_tap_notification(
                     now, test=test, tag_id=tag_id, profile=profile,
                     night=night, home_result=home_result,
