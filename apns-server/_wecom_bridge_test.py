@@ -2,12 +2,13 @@
 
 覆盖:
   1. /wecom/inbound 鉴权: 缺密钥 401 / 错密钥 403 / 密钥文件不是 0600 fail-closed
-  2. 入站: kimi / kairos 走各自 app 发送管线, 文本带［💬微信］前缀, metadata
+  2. 入站: kimi / kairos / kiro 走各自 app 发送管线, 文本带［💬微信］前缀, metadata
      source=wecom + wecom={msg_id, agent_id, msg_type}; 不支持的联系人 400
   3. 按 agent:msg_id 去重, 失败且未入历史时释放 id
   4. 出站: 只有回答的用户消息带 wecom 标记才写 outbox; app 消息不写
   5. outbox 文件格式 / 0600 / 原子落盘
-  6. Kimi / Kairos prompt 在微信来源时换成微信入口说明
+  6. Kimi / Kairos / Kiro prompt 在微信来源时换成微信入口说明
+  7. Kiro (2026-10-28): 真 _handle_kiro_chat_send + 假 ACP, 微信轮次才写 outbox
 
 全部直接调 handler, 不碰线上 8291 服务。
 """
@@ -181,8 +182,32 @@ class WecomInboundTest(WecomBase):
         self.assertEqual(captured[0][0], "kairos")
         self.assertEqual(captured[0][1]["metadata"]["wecom"]["agent_id"], "1000004")
 
+    def test_kiro_goes_to_kiro(self) -> None:
+        body = {**self.BODY, "contact_id": "kiro", "agent_id": "1000005", "id": "r1", "text": "Kiro 在吗"}
+        h, captured = self.run_inbound(body)
+        self.assertEqual(h.responses[-1][0], 200)
+        self.assertEqual(captured[0][0], "kiro")
+        self.assertEqual(captured[0][1]["text"], "［💬微信］Kiro 在吗")
+        self.assertEqual(captured[0][1]["metadata"], {
+            "source": "wecom",
+            "wecom": {"msg_id": "r1", "agent_id": "1000005", "msg_type": "text"},
+        })
+        self.assertNotIn("_pwa_staged_attachments", captured[0][1])
+
+    def test_kiro_image_is_text_only(self) -> None:
+        # Only 卡拉米 receives the downloaded picture; Kiro gets the text note.
+        body = {
+            **self.BODY, "contact_id": "kiro", "agent_id": "1000005", "id": "r2", "msg_type": "image",
+            "text": "（发来一张图片，这个通道暂时只转文字，看不到图片内容）",
+            "media": {"status": "ok", "path": str(self.media / "x.jpg")},
+        }
+        h, captured = self.run_inbound(body)
+        self.assertEqual(h.responses[-1][0], 200)
+        self.assertNotIn("_pwa_staged_attachments", captured[0][1])
+        self.assertEqual(list(self.attachments.iterdir()), [])
+
     def test_unsupported_contact_is_400(self) -> None:
-        for contact in ("xiaoke", "apples", "kiro", ""):
+        for contact in ("xiaoke", "apples", "garden", ""):
             push._WECOM_INBOUND_SEEN.clear()
             h, captured = self.run_inbound({**self.BODY, "contact_id": contact})
             self.assertEqual(h.responses[-1][0], 400, contact)
@@ -333,6 +358,89 @@ class WecomKairosTaskTest(WecomBase):
         self.assertNotIn("wecom", h.tasks[0])
 
 
+class WecomKiroPipelineTest(WecomBase):
+    """Real _handle_kiro_chat_send + fake ACP: outbox only for WeChat turns."""
+
+    def make(self, reply="Kiro 微信回复", failure=None):
+        from _kiro_acp_test import KiroChatHandlerTest
+
+        acp = KiroChatHandlerTest._acp(self, reply=reply, failure=failure)
+        acp.prompts = []
+
+        def prompt_existing(text, *, on_update=None, **_kwargs):
+            acp.prompts.append(text)
+            if reply and on_update is not None:
+                on_update(reply)
+            if failure is not None:
+                raise failure
+
+        acp.prompt_existing = prompt_existing
+        handler, chat, _xiaoke = KiroChatHandlerTest._handler(self, acp)
+        handler._kiro_recall_allowed = lambda _text: False
+        return handler, chat, acp
+
+    def send(self, handler, body):
+        from _kiro_acp_test import _immediate_thread
+
+        with patch("push.threading.Thread", _immediate_thread):
+            handler._handle_kiro_chat_send(body, "kiro")
+
+    def wecom_body(self, msg_id="r-1", text="在吗"):
+        return wecom_bridge.inbound_body({
+            "contact_id": "kiro", "agent_id": "1000005", "msg_id": msg_id, "msg_type": "text", "text": text,
+        })
+
+    def test_app_turn_replies_only_in_app(self) -> None:
+        handler, chat, acp = self.make("app 里的回复")
+        self.send(handler, {"text": "hello"})
+        self.assertEqual(chat.records[-1]["text"], "app 里的回复")
+        self.assertEqual(self.outbox_items(), [])
+        self.assertEqual(acp.prompts, ["hello"])
+
+    def test_wecom_turn_also_goes_to_wecom_outbox(self) -> None:
+        handler, chat, acp = self.make("微信那边的回复")
+        self.send(handler, self.wecom_body())
+        self.assertEqual(handler.responses[-1][0], 200)
+        user = chat.records[0]
+        self.assertEqual((user["role"], user["text"]), ("user", "［💬微信］在吗"))
+        self.assertEqual(user["metadata"]["source"], "wecom")
+        final = chat.records[-1]
+        self.assertEqual((final["role"], final["text"]), ("assistant", "微信那边的回复"))
+        items = self.outbox_items()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(
+            {k: items[0][k] for k in ("kind", "contact_id", "agent_id", "in_reply_to", "user_ts", "reply_ts", "text")},
+            {"kind": "reply", "contact_id": "kiro", "agent_id": "1000005", "in_reply_to": "r-1",
+             "user_ts": user["ts"], "reply_ts": final["ts"], "text": "微信那边的回复"},
+        )
+        self.assertIn("wecom_kiro_app", acp.prompts[0])
+        self.assertIn("contact_id: kiro", acp.prompts[0])
+        self.assertIn("对方说：［💬微信］在吗", acp.prompts[0])
+        # the next ordinary app turn is not mirrored and has no WeChat entry
+        self.send(handler, {"text": "app again"})
+        self.assertEqual(len(self.outbox_items()), 1)
+        self.assertEqual(acp.prompts[-1], "app again")
+
+    def test_wecom_turn_error_reply_also_reaches_wechat(self) -> None:
+        # Same as Kimi: the visible terminal answer goes back, failures included,
+        # so a WeChat message never silently disappears.
+        from kiro_acp import KiroACPError
+
+        handler, chat, _acp = self.make(reply="", failure=KiroACPError("boom"))
+        self.send(handler, self.wecom_body(msg_id="r-err"))
+        items = self.outbox_items()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["text"], chat.records[-1]["text"])
+        self.assertEqual(items[0]["in_reply_to"], "r-err")
+
+    def test_outbox_failure_does_not_break_the_app_reply(self) -> None:
+        os.environ[wecom_bridge.OUTBOX_DIR_ENV] = str(self.tmp / "missing")
+        handler, chat, _acp = self.make("照样进 app")
+        self.send(handler, self.wecom_body())
+        self.assertEqual(chat.records[-1]["text"], "照样进 app")
+        self.assertEqual(handler.state.chat_reply_states["kiro"]["reply_state"], "completed")
+
+
 class WecomBellTest(WecomBase):
     """send_bell: thin client of the callback service's /wecom/bell."""
 
@@ -377,6 +485,11 @@ class WecomBellTest(WecomBase):
         self.assertEqual(call["path"], "/wecom/bell")
         self.assertEqual(call["secret"], SECRET)
         self.assertEqual(call["body"], {"contact": "kimi", "text": "铃铛响了"})
+
+    def test_kiro_bell_is_allowed(self) -> None:
+        captured = self.make_server(payload={"ok": True, "contact": "kiro", "user_id": "u", "sent": 1, "bubbles": 1})
+        self.assertTrue(wecom_bridge.send_bell("kiro", "叮")["ok"])
+        self.assertEqual(captured[0]["body"], {"contact": "kiro", "text": "叮"})
 
     def test_unsupported_contact_and_empty_text_never_call_http(self) -> None:
         captured = self.make_server()
@@ -427,6 +540,12 @@ class WecomPromptTest(unittest.TestCase):
         self.assertIn("wecom_kairos_app", wx)
         self.assertIn("contact_id: kairos", wx)
         self.assertNotIn("cc_companion_kairos_private", wx)
+
+    def test_kiro_prompt_entry_lines(self) -> None:
+        lines = "\n".join(wecom_bridge.prompt_entry_lines("kiro"))
+        self.assertIn("wecom_kiro_app", lines)
+        self.assertIn("企业微信「Kiro」应用", lines)
+        self.assertIn("contact_id: kiro", lines)
 
     def test_client_cannot_forge_marker(self) -> None:
         # /chat/send strips metadata.wecom before any pipeline sees it.

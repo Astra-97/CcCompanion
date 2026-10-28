@@ -1,4 +1,4 @@
-"""企业微信 ↔ CC Companion 联系人桥（2026-10-26：卡拉米 kimi、kairos）。
+"""企业微信 ↔ CC Companion 联系人桥（2026-10-26：卡拉米 kimi、kairos；2026-10-28：Kiro）。
 
 入站：/root/wecom-channel 的回调服务按解密后的 AgentID 分流（WECOM_ROUTES），
 companion 路由的消息 POST 到本服务 ``/wecom/inbound``（X-Wecom-Webhook-Secret，
@@ -38,8 +38,13 @@ META_SOURCE = "wecom"
 
 # 已接好「微信入站 + 最终回复回微信」的联系人。新增联系人要先在它自己的
 # 发送管线里接上 outbox 钩子（push.py 的 _mirror_reply_to_wecom），再加进来。
-INBOUND_CONTACTS = frozenset({"kimi", "kairos"})
-_APP_LABEL = {"kimi": ("wecom_karami_app", "卡拉米"), "kairos": ("wecom_kairos_app", "kairos")}
+# Kiro（2026-10-28）：只收文字，钩子在 _handle_kiro_chat_send 的最终回复落历史处。
+INBOUND_CONTACTS = frozenset({"kimi", "kairos", "kiro"})
+_APP_LABEL = {
+    "kimi": ("wecom_karami_app", "卡拉米"),
+    "kairos": ("wecom_kairos_app", "kairos"),
+    "kiro": ("wecom_kiro_app", "Kiro"),
+}
 
 SECRET_FILE_ENV = "CC_COMPANION_WECOM_WEBHOOK_SECRET_FILE"
 DEFAULT_SECRET_FILE = Path("/root/.secrets/wecom_companion_webhook_secret")

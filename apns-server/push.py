@@ -16879,10 +16879,15 @@ class PushHandler(BaseHTTPRequestHandler):
                         },
                     )
                     self._publish_persisted_assistant_completion(contact_id, final)
-                    return str(final.get("ts") or "")
                 except Exception:
                     logger.exception("Kiro assistant history append failed")
                     return ""
+                final_ts = str(final.get("ts") or "")
+                # 企业微信 (2026-10-28)：只有这一轮回答的用户消息来自企业微信，
+                # 才把同一份可见回复交给 wecom-channel 发回微信；app 里发的
+                # 消息没有标记。_mirror_reply_to_wecom 从不抛错。
+                self._mirror_reply_to_wecom(contact_id, rec, message, reply_ts=final_ts)
+                return final_ts
 
             def write_tool_summary(outcome: str) -> None:
                 """Durable tool card before the terminal row, once per turn."""
@@ -16975,8 +16980,15 @@ class PushHandler(BaseHTTPRequestHandler):
                 recall_ms = int((time.monotonic() - recall_started) * 1000)
                 recall_context = str(getattr(recall_result, "context", "") or "").strip()
                 attachment_hint, images = self._kiro_attachment_prompt(staged_attachments)
+                prompt_text = text
+                if wecom_bridge.origin(rec) is not None:
+                    # 企业微信来源 (2026-10-28)：告诉 Kiro 回复也会进微信（纯文本、
+                    # 空行分气泡）；app 里的消息保持原样，不加任何来源说明。
+                    prompt_text = "\n".join(
+                        ["[消息来源]", *wecom_bridge.prompt_entry_lines("kiro"), f"对方说：{text}"]
+                    )
                 prompt = "\n\n".join(
-                    part for part in (text, attachment_hint, recall_context) if part
+                    part for part in (prompt_text, attachment_hint, recall_context) if part
                 )
                 self.state.kiro_acp.prompt_existing(
                     prompt,
@@ -28212,7 +28224,7 @@ class PushHandler(BaseHTTPRequestHandler):
         self._send_json = capture  # type: ignore[method-assign]
         try:
             # 只放行 INBOUND_CONTACTS（已接好出站钩子的联系人），走它在 app
-            # 里的同一条发送管线（kimi → Kimi Web，kairos → Codex 队列）。
+            # 里的同一条发送管线（kimi → Kimi Web，kairos → Codex 队列，kiro → ACP）。
             if not dispatch_contact_send(self, clean["contact_id"], forward):
                 original_send_json(501, {"ok": False, "error": "contact not wired"})
                 outcome.append((501, {}))
