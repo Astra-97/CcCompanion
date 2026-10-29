@@ -216,6 +216,15 @@ allowed_ips = []
 # /root/.ssh/ccc-kiro-* 在东京执行；附件和 forge 交接登记复制到
 # <home>/.cache/ccc/。远程模式下 request timeout 缺省 60。
 # 回滚：删掉 kiro_ssh_host（及上面几项），本机 kiro-cli 数据恢复原位即可。
+# 哥哥写手 gege (2026-10-29)：只写夏以昼同人文的联系人，本体是东京用户 pi 的 pi
+# （pi coding agent，--mode rpc），系统提示只有设定档 + LENI 文风手册 + 角色说明。
+#   gege_ssh_host = "tokyo"            # 设了才启用；不设 = 回复「后台还没配置好」
+#   gege_remote_user = "pi"            # ssh 直接以 pi 登录（authorized_keys 里本机 root 公钥，restrict）
+#   gege_remote_home = "/home/pi"      # 缺省 /home/<user>
+#   gege_home = "/home/pi/gege"        # 缺省 <home>/gege（bin/gege-rpc、gege.env、sessions/、run/）
+#   gege_idle_close_seconds = 10800    # pi 空闲多久关掉（存档都在东京磁盘上，下次 --continue 接着写）
+# 进程 = `ssh -T -l pi tokyo sh -c <launch> ... /home/pi/gege/bin/gege-rpc`（remote_stdio.py），
+# 进程组记在 <gege_home>/run/rpc.pid。POST /gege/restart 关掉它（改了 gege.env 后用）。
 # kiro 切模型 (2026-09-10)：模型选择由 App 端 /kiro/preferences 管理，持久化在
 # tokens/kiro_preferences.json；可选目录来自 ACP 动态上报，缓存在
 # tokens/kiro_models_cache.json。无配置项，默认 auto（Kiro 自动路由）。

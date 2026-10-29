@@ -235,6 +235,9 @@ from kiro_terminal import (
 from remote_stdio import RemoteStdio, RemoteStdioTarget
 # kiro 常驻 (2026-10-28): optional keep-warm loop for the ACP connection.
 from kiro_keep_warm import KiroKeepWarm
+# 哥哥写手 (2026-10-29): pi (RPC mode) on Tokyo as the writing-only contact gege.
+import gege_writer
+from pi_rpc import PiRPCAuthRequired, PiRPCBusy, PiRPCCancelled, PiRPCClient, PiRPCError
 # kiro 桥接 (2026-09-09): ACP 文本聊天联系人，Phase 1。
 from kiro_acp import (
     DEFAULT_KIRO_CWD,
@@ -3049,6 +3052,36 @@ def _kiro_remote_from_config(server_cfg: dict[str, Any]) -> tuple[RemoteStdio | 
     return remote, kiro_bin, kiro_cwd, home
 
 
+def _gege_client_from_config(server_cfg: dict[str, Any]) -> PiRPCClient | None:
+    """哥哥写手 (2026-10-29): pi RPC client for contact gege, or None.
+
+    ``gege_ssh_host`` (e.g. "tokyo") runs ``gege_bin`` (default
+    ``/home/pi/gege/bin/gege-rpc``) there as ``gege_remote_user`` (default pi,
+    ssh key in its authorized_keys, ``restrict``).  Unset = contact answers
+    "not configured" (never a local pi on this 4G box).
+    """
+    host = str(server_cfg.get("gege_ssh_host", "") or "").strip()
+    if not host:
+        return None
+    user = str(server_cfg.get("gege_remote_user", "pi") or "pi").strip()
+    home = str(server_cfg.get("gege_remote_home", "") or f"/home/{user}").rstrip("/")
+    gege_home = str(server_cfg.get("gege_home", "") or f"{home}/gege").rstrip("/")
+    remote = RemoteStdio(RemoteStdioTarget(
+        host=host,
+        user=user,
+        cwd=f"{gege_home}/workdir",
+        env={"HOME": home, "LANG": "C.UTF-8", "PATH": "/usr/local/bin:/usr/bin:/bin"},
+        pidfile=f"{gege_home}/run/rpc.pid",
+        control_path=str(Path.home() / ".ssh" / "ccc-gege-%C"),
+    ))
+    return PiRPCClient(
+        [str(server_cfg.get("gege_bin", "") or f"{gege_home}/bin/gege-rpc")],
+        remote=remote,
+        idle_close_sec=float(server_cfg.get("gege_idle_close_seconds", 3 * 3600)),
+        start_timeout=float(server_cfg.get("gege_start_timeout_seconds", 60)),
+    )
+
+
 def _kiro_model_selection_for(state: Any) -> str:
     store = getattr(state, "kiro_preferences", None)
     snapshot_model = getattr(store, "snapshot_model", None)
@@ -5151,6 +5184,11 @@ class ServerState:
                 contact_history_dir / "chat_history_kiro.jsonl",
                 assistant_text_normalizer=bqb_normalizer,
             ),
+            # 哥哥写手 (2026-10-29)
+            "gege": ChatHistory(
+                contact_history_dir / "chat_history_gege.jsonl",
+                assistant_text_normalizer=bqb_normalizer,
+            ),
             "hajiki": ChatHistory(
                 contact_history_dir / "chat_history_hajiki.jsonl",
                 assistant_text_normalizer=bqb_normalizer,
@@ -5404,6 +5442,13 @@ class ServerState:
         self.kiro_turn_lock = threading.RLock()
         self.kiro_active_turn: dict[str, Any] = {}
         self.kiro_prepare_token = ""
+        # 哥哥写手 (2026-10-29): pi RPC on Tokyo; one FIFO, one worker thread.
+        self.gege_client: PiRPCClient | None = _gege_client_from_config(server_cfg)
+        self.gege_lock = threading.Lock()
+        self.gege_queue: deque[dict[str, Any]] = deque()
+        self.gege_worker_running = False
+        self.gege_active: dict[str, Any] = {}
+        self.gege_list_until = 0.0
         # kiro 搬东京 (2026-10-28): kiro_ssh_host = "tokyo" runs kiro-cli (ACP
         # + terminal TUI) on that host as kiro_remote_user; kiro_bin/kiro_cwd
         # are then remote paths.  Unset = the old local Kiro.
@@ -28382,6 +28427,190 @@ class PushHandler(BaseHTTPRequestHandler):
             return False
         logger.info("wecom mirror: %s reply queued for agent %s (%s)", contact_id, marker.get("agent_id"), path.name)
         return True
+
+    # ── 哥哥写手 gege (2026-10-29): pi on Tokyo, writing only ───────────────
+    _GEGE_LIST_TTL_SEC = 15 * 60
+    _GEGE_MAX_QUEUE = 20
+
+    def _handle_gege_chat_send(self, body: dict[str, Any], contact_id: str = "gege") -> None:
+        """App / WeChat message to 哥哥写手: commit to history, queue, 200.
+
+        Every message (writing request or command) goes through one FIFO and
+        one worker thread, so turns, /roll, /undo and /open never overlap.
+        """
+        staged = [item for item in list(body.get("_pwa_staged_attachments") or []) if isinstance(item, dict)]
+        if staged:
+            self._discard_uncommitted_staged_attachments(staged)
+            self._send_json(415, {"ok": False, "error": "gege_text_only", "reason": "哥哥写手只收文字。"})
+            return
+        text = str(body.get("text") or "").strip()
+        if not text:
+            self._send_json(400, {"ok": False, "error": "text required"})
+            return
+        metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else None
+        chat = self._chat_for_contact(contact_id)
+        with self.state.gege_lock:
+            if len(self.state.gege_queue) >= self._GEGE_MAX_QUEUE:
+                self._send_json(429, {"ok": False, "error": "gege_queue_full", "reason": "排队的消息太多了，等前面的写完再发。"})
+                return
+            try:
+                rec = chat.append(
+                    role="user",
+                    text=text,
+                    source=self._source_for_request("gege"),
+                    quoted_ts=body.get("quoted_ts") or None,
+                    metadata=metadata,
+                )
+            except Exception:
+                logger.exception("gege history append failed")
+                self._send_json(500, {"ok": False, "error": "gege_history_unavailable"})
+                return
+            self.state.gege_queue.append({"contact_id": contact_id, "record": rec, "text": text})
+            position = len(self.state.gege_queue) + (1 if self.state.gege_active else 0)
+            start_worker = not self.state.gege_worker_running
+            if start_worker:
+                self.state.gege_worker_running = True
+        if position > 1:
+            self._set_chat_queued(contact_id, user_ts=str(rec.get("ts") or ""), queued_at=str(rec.get("ts") or ""),
+                                  queue_position=position - 1, source="cc-app:gege")
+        if start_worker:
+            threading.Thread(target=self._gege_worker, name="gege-worker", daemon=True).start()
+        self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec, "queued": True, "queue_position": position})
+
+    def _handle_gege_chat_stop(self, body: dict[str, Any]) -> None:
+        user_ts = str((body or {}).get("user_ts") or "").strip()
+        with self.state.gege_lock:
+            active = dict(self.state.gege_active)
+            cleared = 0
+            if (body or {}).get("clear_queued"):
+                cleared = len(self.state.gege_queue)
+                self.state.gege_queue.clear()
+        cancel = active.get("cancel_event")
+        if not active or not isinstance(cancel, threading.Event):
+            self._send_json(200, {"ok": True, "stopped": False, "already_finished": True, "cleared_queued": cleared})
+            return
+        if user_ts and user_ts != str(active.get("user_ts") or ""):
+            self._send_json(409, {"ok": False, "error": "stale_turn", "reason": "当前轮次与停止目标不一致。"})
+            return
+        cancel.set()
+        self._send_json(200, {"ok": True, "stopped": True, "user_ts": active.get("user_ts"), "cleared_queued": cleared})
+
+    def _handle_gege_restart(self, body: dict[str, Any]) -> None:
+        """POST /gege/restart — close pi on Tokyo; the next message starts it fresh
+        (re-reads gege.env / secrets / prompt files).  Refused while a turn runs."""
+        client = self.state.gege_client
+        if client is None:
+            self._send_json(503, {"ok": False, "error": "gege_not_configured"})
+            return
+        with self.state.gege_lock:
+            busy = bool(self.state.gege_active) or bool(self.state.gege_queue)
+        if busy:
+            self._send_json(409, {"ok": False, "error": "gege_busy"})
+            return
+        client.close()
+        self._send_json(200, {"ok": True, "restarted": True})
+
+    def _gege_worker(self) -> None:
+        while True:
+            with self.state.gege_lock:
+                if not self.state.gege_queue:
+                    self.state.gege_worker_running = False
+                    return
+                item = self.state.gege_queue.popleft()
+                cancel_event = threading.Event()
+                self.state.gege_active = {"user_ts": str(item["record"].get("ts") or ""), "cancel_event": cancel_event}
+            try:
+                self._gege_process(item, cancel_event)
+            except Exception:
+                logger.exception("gege turn crashed")
+            finally:
+                with self.state.gege_lock:
+                    self.state.gege_active = {}
+
+    def _gege_finish(self, contact_id: str, rec: dict[str, Any], text: str, source: str, *, failed: bool = False) -> None:
+        """Assistant row + live completion + WeChat mirror (only for WeChat turns)."""
+        chat = self._chat_for_contact(contact_id)
+        user_ts = str(rec.get("ts") or "")
+        final_ts = ""
+        try:
+            final = chat.append(
+                role="assistant", text=text, source=source,
+                metadata={"gege_user_ts": user_ts, "turn_terminal": True, "turn_message_kind": "terminal_answer"},
+            )
+            final_ts = str(final.get("ts") or "")
+            self._publish_persisted_assistant_completion(contact_id, final)
+        except Exception:
+            logger.exception("gege assistant history append failed")
+        self._mirror_reply_to_wecom(contact_id, rec, text, reply_ts=final_ts)
+        if failed:
+            self._set_chat_failed(contact_id, user_ts=user_ts, final_ts=final_ts, source=source)
+        else:
+            self._set_chat_completed(contact_id, user_ts=user_ts, final_ts=final_ts, source=source)
+        self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
+
+    def _gege_process(self, item: dict[str, Any], cancel_event: threading.Event) -> None:
+        contact_id = item["contact_id"]
+        rec = item["record"]
+        user_ts = str(rec.get("ts") or "")
+        self._set_chat_generating(contact_id, user_ts=user_ts, queued_at=user_ts, source="cc-app:gege")
+        self._set_typing_for_contact(contact_id, {"is_typing": True, "since": user_ts, "transport": "pi-rpc"})
+        client = self.state.gege_client
+        if client is None:
+            self._gege_finish(contact_id, rec, gege_writer.NOT_CONFIGURED_TEXT, "gege:not-configured", failed=True)
+            return
+        list_pending = time.time() < self.state.gege_list_until
+        command = gege_writer.parse_command(item["text"], list_pending=list_pending)
+        started = time.monotonic()
+        prompt_text = gege_writer.strip_source_prefix(item["text"])
+        try:
+            if command is not None:
+                name, arg = command
+                if name == "help":
+                    self._gege_finish(contact_id, rec, gege_writer.HELP_TEXT, "gege:command")
+                    return
+                result = client.gege(f"{name} {arg}".strip())
+                if name == "list":
+                    self.state.gege_list_until = time.time() + self._GEGE_LIST_TTL_SEC
+                    archives = result.get("archives") if isinstance(result.get("archives"), list) else []
+                    self._gege_finish(contact_id, rec, gege_writer.format_list(archives) if result.get("ok") else gege_writer.format_result(result), "gege:command")
+                    return
+                self.state.gege_list_until = 0.0
+                if name != "roll" or not result.get("ok"):
+                    self._gege_finish(contact_id, rec, gege_writer.format_result(result), "gege:command")
+                    return
+                # /roll: the old reply left the active branch; write it again
+                prompt_text = gege_writer.strip_source_prefix(str(result.get("text") or ""))
+                if not prompt_text:
+                    self._gege_finish(contact_id, rec, gege_writer.EMPTY_TEXT, "gege:command")
+                    return
+            else:
+                self.state.gege_list_until = 0.0
+
+            last_published = [0.0]
+
+            def on_delta(current: str) -> None:
+                now = time.monotonic()
+                if now - last_published[0] >= 0.15:
+                    last_published[0] = now
+                    self._set_chat_draft(contact_id, current, source="cc-app:gege", user_ts=user_ts, queued_at=user_ts)
+
+            answer = client.prompt(prompt_text, on_delta=on_delta, cancel_event=cancel_event)
+            self._gege_finish(contact_id, rec, answer.strip() or gege_writer.EMPTY_TEXT, "gege:pi" if command is None else "gege:roll")
+        except PiRPCCancelled as exc:
+            partial = str(exc.partial or "").strip()
+            self._gege_finish(contact_id, rec, f"{partial}\n\n（已停止）" if partial else "已停止这一段。", "gege:interrupted")
+        except PiRPCAuthRequired:
+            logger.warning("gege: writer backend not logged in / no credentials")
+            self._gege_finish(contact_id, rec, gege_writer.AUTH_REQUIRED_TEXT, "gege:auth-required")
+        except PiRPCBusy:
+            self._gege_finish(contact_id, rec, gege_writer.BUSY_TEXT, "gege:busy")
+        except PiRPCError as exc:
+            logger.warning("gege turn failed: %s", str(exc)[:200])
+            client.close()
+            self._gege_finish(contact_id, rec, gege_writer.ERROR_TEXT, "gege:error", failed=True)
+        finally:
+            # timing only, never text
+            logger.info("gege turn: kind=%s total_ms=%d", (command or ("write", ""))[0], int((time.monotonic() - started) * 1000))
 
 
     # ── NFC 螃蟹挂件 "碰一下召唤小克" (2026-10-21) ─────────────────────────
