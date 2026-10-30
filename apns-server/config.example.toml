@@ -244,6 +244,16 @@ allowed_ips = []
 # 时沿用旧会话发送本条消息，下一轮再触发。
 # kiro_auto_forge_enabled = true
 # kiro_auto_forge_threshold_percent = 80
+# 自适应（2026-10-30）：硬阈值 = min(上面的百分比 × 模型窗口, max_tokens)，
+# 200k 窗口仍是 80%，1M 窗口在 300k（30%）触发；0 = 不设 token 上限。
+# 窗口按模型名查（ACP 不报窗口大小；内置表取自 kiro-cli --list-models，
+# 名字带 1m 的按 1M），未知模型回落到纯百分比；新模型可在这里补。
+# 软阈值 = 硬阈值 × soft_ratio（默认 "75/80"；0 关闭）：越过后在 Kiro
+# 下一轮输入里附一次系统通知，他可以在回复里单独一行写 [[KIRO_FORGE]]
+# 自己决定 forge（标记会被剥掉，本轮结束后走同一套受控 forge 管线）。
+# kiro_auto_forge_max_tokens = 300000
+# kiro_auto_forge_soft_ratio = "75/80"
+# kiro_model_context_windows = { "some-new-model" = 1000000 }
 # forge seed 原文 tail：旧会话最近 N 条 user/assistant 对话原文（取自
 # 服务端聊天记录，跳过系统通知/记忆卡片/工具卡）。默认 80，钳位 0–160；
 # 0 表示关闭原文 tail、退回纯摘要 seed；读取失败同样降级，不让 forge 失败。

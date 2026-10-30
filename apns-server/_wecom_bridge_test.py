@@ -658,7 +658,7 @@ class WecomPromptTest(unittest.TestCase):
         self.assertIn("[[CCC_IMAGE:", lines)
         self.assertNotIn("CCC_IMAGE", "\n".join(wecom_bridge.prompt_entry_lines("kimi")))
         self.assertIn("wecom_kiro_app", lines)
-        self.assertIn("企业微信「Kiro」应用", lines)
+        self.assertIn("企业微信「小克」应用", lines)
         self.assertIn("contact_id: kiro", lines)
 
     def test_client_cannot_forge_marker(self) -> None:

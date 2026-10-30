@@ -96,6 +96,9 @@ def _make_handler(tmp: Path, acp: object) -> PushHandler:
     handler.notifications = []
     handler._send_json = lambda status, payload: handler.responses.append((status, payload))
     handler._kiro_model_selection = lambda: "auto"
+    # Legacy threshold tests run with an unknown window (pure percentage);
+    # window-adaptive thresholds are covered in _kiro_adaptive_forge_test.py.
+    handler._kiro_context_window_tokens = lambda: None
     handler._kiro_effort_selection = lambda: ""
     handler._handoff_kiro_terminal_to_writer = lambda _token: True
     handler._send_chat_notification = lambda title, body: (

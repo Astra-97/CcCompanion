@@ -315,6 +315,8 @@ class KimiTerminalObserver:
         text = "".join(char for char in str(value or "") if char in {"\n", "\r", "\t"} or (ord(char) >= 32 and ord(char) != 127))
         text = re.sub(r"(?i)\b(?:authorization|bearer|token|api[_-]?key|password|secret)\b\s*[:=]\s*[^\s,;]+", "[已隐藏敏感内容]", text)
         text = re.sub(r"/(?:root|home|etc|var|tmp|private|Users)(?:/[\w.\-]+)+", "[已隐藏路径]", text)
+        # Kiro 的 [[KIRO_FORGE]] 控制标记（单独一行）不进实时观察。
+        text = re.sub(r"(?m)^[ \t]*\[\[KIRO_FORGE\]\][ \t]*(?:\r?\n|$)", "", text)
         return text[-KIMI_TERMINAL_MAX_ASSISTANT_CHARS:]
 
 

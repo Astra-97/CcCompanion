@@ -49,7 +49,7 @@ IMAGE_CONTACTS = frozenset({"kimi", "kiro"})
 _APP_LABEL = {
     "kimi": ("wecom_karami_app", "卡拉米"),
     "kairos": ("wecom_kairos_app", "kairos"),
-    "kiro": ("wecom_kiro_app", "Kiro"),
+    "kiro": ("wecom_kiro_app", "小克"),
     "gege": ("wecom_gege_app", "哥哥写手"),
 }
 
