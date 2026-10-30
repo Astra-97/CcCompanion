@@ -236,9 +236,43 @@ class WecomInboundTest(WecomBase):
         self.assertEqual(chat.records[-1]["text"], "图里是一只猫")
         self.assertEqual(self.outbox_items()[0]["text"], "图里是一只猫")
 
-    def test_kairos_image_stays_text_only(self) -> None:
+    def test_kairos_image_file_reaches_kairos_task(self) -> None:
+        # kairos (2026-10-30) takes WeChat pictures like an app upload: staged
+        # into the attachment store, image_paths on the Codex task (-> localImage).
+        raw = b"\xff\xd8\xff\xe0" + b"wecom-kairos-image"
+        source = self.media / "kairos-downloaded.jpg"
+        source.write_bytes(raw)
+        os.chmod(source, 0o600)
+        h, captured = self.run_inbound({
+            "contact_id": "kairos", "agent_id": "1000004", "id": "k-img", "msg_type": "image",
+            "text": "（发来一张图片，请看看并描述内容）",
+            "media": {"status": "ok", "path": str(source), "bytes": len(raw), "content_type": "image/jpeg"},
+        })
+        self.assertEqual(h.responses[-1][0], 200)
+        contact_id, forward = captured[0]
+        self.assertEqual(contact_id, "kairos")
+        attachment = forward["_pwa_staged_attachments"][0]
+        stored = Path(attachment["stored_path"])
+        self.assertEqual(stored.parent, self.attachments)
+        self.assertEqual(stored.read_bytes(), raw)
+        self.assertEqual(attachment["media_type"], "image/jpeg")
+
+        kh, chat = WecomKairosTaskTest.make(self)
+        kh._handle_kairos_chat_send(forward, "kairos")
+        self.assertEqual(kh.responses[-1][0], 200)
+        self.assertEqual(chat.records[0]["attachment_type"], "image")
+        self.assertEqual(chat.records[0]["attachment_url"], attachment["attachment_url"])
+        task = kh.tasks[0]
+        self.assertEqual(task["image_paths"], [str(stored)])
+        self.assertEqual(task["wecom"]["msg_type"], "image")
+        prompt = kh._kairos_prompt_for_task(task)
+        self.assertIn("wecom_kairos_app", prompt)
+        self.assertIn(str(stored), prompt)
+        self.assertNotIn(str(self.media), prompt)
+
+    def test_gege_image_stays_text_only(self) -> None:
         body = {
-            **self.BODY, "contact_id": "kairos", "agent_id": "1000004", "id": "k-img", "msg_type": "image",
+            **self.BODY, "contact_id": "gege", "agent_id": "1000007", "id": "g-img", "msg_type": "image",
             "text": "（发来一张图片，这个通道暂时只转文字，看不到图片内容）",
             "media": {"status": "ok", "path": str(self.media / "x.jpg")},
         }

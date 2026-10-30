@@ -4,7 +4,7 @@
 companion 路由的消息 POST 到本服务 ``/wecom/inbound``（X-Wecom-Webhook-Secret，
 0600 文件，fail-closed）。本服务把它当成方小南在 app 里给该联系人发了一条
 ``［💬微信］原文``：同入历史、同走该联系人的发送管线，metadata 带
-``source=wecom`` + ``wecom={msg_id, agent_id, msg_type}``。卡拉米、Kiro
+``source=wecom`` + ``wecom={msg_id, agent_id, msg_type}``。卡拉米、Kiro、kairos
 （IMAGE_CONTACTS）的图片由回调服务下载到私有 media 目录，本服务校验并复制到
 附件库，作为普通图片附件交给该联系人（同 app 里上传的图片）。
 
@@ -45,7 +45,9 @@ META_SOURCE = "wecom"
 INBOUND_CONTACTS = frozenset({"kimi", "kairos", "kiro", "gege"})
 # 微信图片作为真图片附件交给联系人的（其余联系人只收回调给的一句文字说明）。
 # 回调服务 lib/companion.mjs 的 IMAGE_CONTACTS 必须与此一致。
-IMAGE_CONTACTS = frozenset({"kimi", "kiro"})
+# kairos（2026-10-30）：_handle_kairos_chat_send 把 stored_path 放进 task 的
+# image_paths，Codex app-server 这一轮收到 localImage 输入（同 app 里上传的图片）。
+IMAGE_CONTACTS = frozenset({"kimi", "kiro", "kairos"})
 _APP_LABEL = {
     "kimi": ("wecom_karami_app", "卡拉米"),
     "kairos": ("wecom_kairos_app", "kairos"),

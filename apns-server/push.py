@@ -28559,7 +28559,7 @@ class PushHandler(BaseHTTPRequestHandler):
         """POST /wecom/inbound — 方小南在个人微信里给某联系人的企业微信应用发消息。
 
         body: {"contact_id", "agent_id", "id", "msg_type", "text", "media"?}（由
-        wecom-channel 回调服务按 WECOM_ROUTES 分流后发出；卡拉米图片带已下载文件）。
+        wecom-channel 回调服务按 WECOM_ROUTES 分流后发出；卡拉米 / Kiro / kairos 图片带已下载文件）。
         效果等同她在 app
         里给该联系人发了一条 ``［💬微信］原文``：整体委托该联系人的发送管线
         （同入历史 + 忙时排队），metadata 带 source=wecom 标记，最终回复据此
