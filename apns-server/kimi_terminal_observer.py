@@ -322,4 +322,4 @@ class KiroTerminalObserver(KimiTerminalObserver):
     """Kiro ACP turns in the terminal tab: same prompt-free projection as Kimi."""
 
     TARGET = "kiro"
-    DISPLAY_NAME = "Kiro"
+    DISPLAY_NAME = "小克"

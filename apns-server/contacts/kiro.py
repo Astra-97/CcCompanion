@@ -19,7 +19,7 @@ from typing import Any
 
 CONTACT = {
     "id": "kiro",
-    "display_name": "Kiro",
+    "display_name": "小克",
     "provider": "kiro-acp",
     "terminal_target": "",
     "capabilities": [

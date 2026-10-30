@@ -372,7 +372,7 @@ class KiroTerminalObserverTest(unittest.TestCase):
         snapshot = observer.snapshot(SID)
         self.assertEqual("kiro", snapshot["target"])
         self.assertEqual("read_only", snapshot["mode"])
-        self.assertIn("Kiro 实时观察 · 只读", snapshot["content"])
+        self.assertIn("小克 实时观察 · 只读", snapshot["content"])
         self.assertIn("正在使用工具（名称与参数已隐藏）", snapshot["content"])
         for secret in (".secret", "/root/private", "abc", SID):
             self.assertNotIn(secret, json.dumps(snapshot, ensure_ascii=False))
@@ -468,7 +468,7 @@ class KiroTerminalHandlerTest(BridgeTestBase):
         status, payload = handler.responses[-1]
         self.assertEqual(200, status)
         self.assertEqual(("waiting", "read_only"), (payload["state"], payload["mode"]))
-        self.assertIn("Kiro 实时观察 · 只读", payload["content"])
+        self.assertIn("小克 实时观察 · 只读", payload["content"])
         self.assertNotIn("lease", payload)
         self.assertEqual({}, self.tmux.sessions)
         self.assertEqual(0, acp.closed)
