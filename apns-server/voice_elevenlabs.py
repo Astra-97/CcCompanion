@@ -4,7 +4,7 @@
 Stdlib only (urllib), so it can be imported both by apns-server's venv and by
 ``stackchan_voice_call.py`` running under the xiaozhi venv.
 
-- Call TTS: voice ``7Y9gzqRdYDFMdRdNzDHu`` + ``eleven_v4``, no voice_settings,
+- Call TTS: voice ``zJkzOPmQZx3vFhVX8zNR`` + ``eleven_v4``, no voice_settings,
   no language_code (the text decides). Streaming PCM s16le mono for live calls,
   mp3 file for the batch ``/voice-call/tts`` endpoint.
 - Call ASR: Scribe batch speech-to-text, ``scribe_v2`` with ``scribe_v1`` as
@@ -37,7 +37,7 @@ from typing import Iterator, Optional
 
 HERE = Path(__file__).resolve().parent
 API_BASE = "https://api.elevenlabs.io"
-VOICE_ID = os.environ.get("CC_VOICE_ELEVENLABS_VOICE_ID", "7Y9gzqRdYDFMdRdNzDHu")
+VOICE_ID = os.environ.get("CC_VOICE_ELEVENLABS_VOICE_ID", "zJkzOPmQZx3vFhVX8zNR")
 TTS_MODEL_ID = os.environ.get("CC_VOICE_ELEVENLABS_TTS_MODEL", "eleven_v4")
 STT_MODEL_IDS = ("scribe_v2", "scribe_v1")
 DEFAULT_KEY_FILE = "/root/.elevenlabs_key"
