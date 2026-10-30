@@ -23032,21 +23032,92 @@ class PushHandler(BaseHTTPRequestHandler):
                         CODEX_RUNS.set_observer_phase(run_id, "running")
                         CODEX_RUNS.publish_runner_activity(run_id, activity_text)
 
+                    def _on_thread(new_thread_id: str) -> None:
+                        nonlocal session_id
+                        if not self._save_codex_target(new_thread_id, cwd, "cc-app:apples:kairos:app-server"):
+                            raise CodexAppBridgeError("failed to persist app-server thread pointer")
+                        session_id = new_thread_id
+                        _append_group_recall_for_session(new_thread_id)
+
                     CODEX_RUNS.set_observer_phase(run_id, "running")
 
-                    thread_id, answer, stderr_text, return_code = runner.run_prompt(
-                        prompt=prompt,
-                        cwd=cwd,
-                        session_id=session_id,
-                        env_overrides=env_overrides,
-                        cancel_event=cancel_event,
-                        on_update=_on_update,
-                        on_activity=_on_activity,
-                    )
-                    if cancel_event.is_set():
+                    # The shared app-server daemon is the single writer of the
+                    # Kairos thread (Codex 0.166 enforces this), so the group
+                    # must speak through it exactly like the private path; a
+                    # separate ``codex exec resume`` would be a second writer.
+                    bridge_status: str | None = None
+                    run_legacy_exec = self.state.codex_kairos_backend != "app-server"
+                    if not run_legacy_exec:
+                        try:
+                            bridge_result = self.state.codex_app_bridge.run_turn(
+                                thread_id=session_id,
+                                cwd=cwd,
+                                prompt=prompt,
+                                model=selected_model,
+                                effort=selected_effort,
+                                cancel_event=cancel_event,
+                                on_update=_on_update,
+                                on_activity=_on_activity,
+                                on_thread=_on_thread,
+                                on_turn_accepted=_commit_group_recall_for_session,
+                                marker_provider=self._codex_rollout_marker,
+                                max_runtime_sec=0,
+                            )
+                            thread_id = bridge_result.thread_id
+                            answer = bridge_result.text
+                            stderr_text = bridge_result.error or ""
+                            bridge_status = bridge_result.status
+                            return_code = 0 if bridge_status == "completed" else 1
+                        except CodexPromptLockBusy:
+                            append_group_assistant(
+                                text="我正在处理另一边的消息，稍等一下再叫我。",
+                                source="group:kairos",
+                                sender_id="kairos",
+                                sender_name=self._apples_member_name("kairos"),
+                            )
+                            return
+                        except CodexAppBridgeError as exc:
+                            logger.warning(
+                                "group kairos app-server failure fallback_safe=%s uncertain=%s error=%s",
+                                exc.fallback_safe,
+                                exc.uncertain,
+                                str(exc)[:500],
+                            )
+                            if exc.uncertain or not (
+                                self.state.codex_app_server_fallback_to_exec and exc.fallback_safe
+                            ):
+                                append_group_assistant(
+                                    text="Kairos 的 app-server 接入失败了，这条消息可能没有送达，稍后再叫我一次。",
+                                    source="group:kairos:app-server-error",
+                                    sender_id="kairos",
+                                    sender_name=self._apples_member_name("kairos"),
+                                )
+                                return
+                            logger.warning("group kairos app-server pre-start failure; using legacy exec fallback")
+                            run_legacy_exec = True
+                    if run_legacy_exec:
+                        thread_id, answer, stderr_text, return_code = runner.run_prompt(
+                            prompt=prompt,
+                            cwd=cwd,
+                            session_id=session_id,
+                            env_overrides=env_overrides,
+                            cancel_event=cancel_event,
+                            on_update=_on_update,
+                            on_activity=_on_activity,
+                        )
+                    if cancel_event.is_set() or bridge_status == "interrupted":
                         append_group_assistant(
                             text="已中断当前生成。",
                             source="group:kairos",
+                            sender_id="kairos",
+                            sender_name=self._apples_member_name("kairos"),
+                        )
+                        return
+                    if bridge_status in {"failed", "uncertain"}:
+                        logger.warning("group kairos app-server turn %s error=%s", bridge_status, stderr_text[:500])
+                        append_group_assistant(
+                            text="Kairos 这次生成失败了，app-server 已保留原 thread；稍后再叫我一次。",
+                            source="group:kairos:app-server-failed",
                             sender_id="kairos",
                             sender_name=self._apples_member_name("kairos"),
                         )

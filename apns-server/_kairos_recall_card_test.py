@@ -329,5 +329,99 @@ class KairosRecallCardTest(unittest.TestCase):
         self.assertEqual(records[-1]["source"], "codex:kairos:recovered")
 
 
+class _SyncThread:
+    def __init__(self, target=None, daemon=None, **_kwargs):
+        self._target = target
+
+    def start(self):
+        self._target()
+
+
+class GroupKairosBackendTest(unittest.TestCase):
+    """The group path must reuse the shared app-server writer, not `codex exec`."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.chat = ChatHistory(Path(self.tmp.name) / "apples.jsonl")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def handler(self, *, backend="app-server", bridge=None):
+        state = types.SimpleNamespace(
+            codex_bin="/nonexistent/codex",
+            codex_home=self.tmp.name,
+            codex_kairos_backend=backend,
+            codex_app_server_fallback_to_exec=False,
+            codex_app_bridge=bridge or mock.MagicMock(),
+        )
+        handler = object.__new__(PushHandler)
+        handler.state = state
+        handler.saved_targets = []
+        handler._apples_member_name = lambda member_id: "Kairos"
+        handler._clear_chat_draft = lambda *_a, **_k: None
+        handler._set_chat_draft = lambda *_a, **_k: None
+        handler._set_typing_for_contact = lambda *_a, **_k: None
+        handler._publish_persisted_assistant_completion = lambda *_a, **_k: None
+        handler._load_codex_target = lambda: ("thread-shared", Path(self.tmp.name))
+        handler._codex_preference_snapshot = lambda: ("model-x", "medium")
+        handler._codex_session_busy = lambda _sid: False
+        handler._codex_rollout_marker = lambda _sid: None
+        handler._save_codex_target = lambda sid, _cwd, source: handler.saved_targets.append((sid, source)) or True
+        handler._detect_apples_mentions = lambda _text: set()
+        handler._maybe_route_apples_assistant_mention = lambda *_a, **_k: []
+        handler._has_pending_group_reply = lambda: False
+        return handler
+
+    def run_group(self, handler):
+        runner_cls = mock.MagicMock()
+        fake_common = types.SimpleNamespace(CodexRunner=runner_cls)
+        with mock.patch("push.threading.Thread", _SyncThread), \
+                mock.patch.dict(sys.modules, {"codex_common": fake_common}):
+            handler._start_group_kairos_reply(self.chat, "@kairos 在吗", user_ts="t1")
+        return runner_cls.return_value
+
+    def test_app_server_backend_uses_shared_bridge_thread(self):
+        bridge = mock.MagicMock()
+        bridge.run_turn.return_value = types.SimpleNamespace(
+            thread_id="thread-shared", text="收到", status="completed", error=None,
+        )
+        handler = self.handler(bridge=bridge)
+        runner = self.run_group(handler)
+
+        bridge.run_turn.assert_called_once()
+        kwargs = bridge.run_turn.call_args.kwargs
+        self.assertEqual(kwargs["thread_id"], "thread-shared")
+        self.assertEqual((kwargs["model"], kwargs["effort"]), ("model-x", "medium"))
+        runner.run_prompt.assert_not_called()
+        self.assertEqual(self.chat.tail(1)[0]["text"], "收到")
+        self.assertEqual(self.chat.tail(1)[0]["source"], "group:kairos")
+        self.assertIn(("thread-shared", "cc-app:apples:kairos"), handler.saved_targets)
+
+    def test_app_server_failure_does_not_spawn_second_exec_writer(self):
+        from codex_app_bridge import CodexAppBridgeError
+
+        bridge = mock.MagicMock()
+        bridge.run_turn.side_effect = CodexAppBridgeError("boom", fallback_safe=True)
+        handler = self.handler(bridge=bridge)
+        runner = self.run_group(handler)
+
+        runner.run_prompt.assert_not_called()
+        self.assertEqual(self.chat.tail(1)[0]["source"], "group:kairos:app-server-error")
+
+    def test_legacy_backend_still_uses_exec_runner(self):
+        bridge = mock.MagicMock()
+        handler = self.handler(backend="legacy-exec", bridge=bridge)
+        runner_cls = mock.MagicMock()
+        runner_cls.return_value.run_prompt.return_value = ("thread-shared", "旧链路", "", 0)
+        with mock.patch("push.threading.Thread", _SyncThread), \
+                mock.patch.dict(sys.modules, {"codex_common": types.SimpleNamespace(CodexRunner=runner_cls)}):
+            handler._start_group_kairos_reply(self.chat, "@kairos 在吗", user_ts="t1")
+
+        bridge.run_turn.assert_not_called()
+        runner_cls.return_value.run_prompt.assert_called_once()
+        self.assertEqual(self.chat.tail(1)[0]["text"], "旧链路")
+
+
 if __name__ == "__main__":
     unittest.main()
