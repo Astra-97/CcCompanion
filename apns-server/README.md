@@ -145,6 +145,45 @@ steering + 记忆库 MCP。原来的 `kiro`（kiro-cli）完全不动。
   完整回滚（含 ~/.kiro 备份）见 vps-xiaoke-config `system-config/tokyo/README.md`「Crew」。
 - 测试：`.venv/bin/python3 -m unittest _kirocrew_test`。
 
+### 小克的本地能力（`phone-ctl`，2026-10-31，App v1.9.233+，不需要 Shizuku）
+
+方小南的 OPPO / ColorOS 上 Shizuku 不可用（「adb 权限受限」），所以这一批能力全部由 App 自己用普通
+Android 权限完成。投递走手机操控同一条任务队列（`phone_control.py` 的 `local` 档），但送达靠
+App 常驻的「实时提醒」SSE：入队即在 `/chat/stream?contacts=all` 推 `{event:"phone_task", task_id, action}`，
+App 收到后 `POST /phone/tasks/claim` 按 id 领 → 执行 → `/phone/tasks/<id>/result`（之后的「她点了确认 /
+谁停的强提醒」走 `/followup`）。新 App 的长轮询带 `local=1` 时也顺手领。和「手机操控」总开关无关。
+
+她怎么开：App → 设置 → **小克的本地能力**。每项一个开关（默认开），旁边显示缺哪个 Android 权限，
+按钮直达授权 / 系统设置页；关掉某项后 App 上报，服务端投递时直接 403「手机端关着『…』」。
+
+| 命令 | 做什么 | 需要她给的权限 |
+|---|---|---|
+| `phone-ctl local` | 各项开关 / 缺的权限（App 最近一次上报） | — |
+| `phone-ctl alarm 07:30 [--msg 起床] [--days 1,2,3\|workdays\|weekend\|daily]` | 系统时钟里建闹钟（1=周一） | 无（时钟 App 接 `ACTION_SET_ALARM`）；后台直接设要「悬浮窗」，否则发通知「点一下确认」 |
+| `phone-ctl timer 25m [--msg …]` / `phone-ctl alarms` | 倒计时 / 打开闹钟列表 | 同上 |
+| `phone-ctl health [today\|yesterday\|YYYY-MM-DD] [--range N]` | 按需读一次 Health Connect：睡眠分期、步数、距离、活动热量、运动、心率 min/avg/max + 静息、体重/体脂、血氧、血压（华为健康同步进 HC 的数据）。不定时同步 | HC 各项读取 + 「在后台读取」（没有就只能在 App 前台时读） |
+| `phone-ctl calendar sync [--no-wait]` | 日程本 → 她手机上独立的本地日历「小克日程」（只动这一个日历；定时日程挂提醒 = remind 分钟） | 日历读写 |
+| `phone-ctl ring [--msg …] [--seconds 60] [--volume 80]` / `phone-ctl ring --stop` | 强提醒 / 找手机：全屏 + 闹钟音量 + 震动，直到她点「停」 | 通知；全屏要「全屏通知」（Android 14+）或悬浮窗；勿扰「完全静音」时只剩震动/全屏 |
+| `phone-ctl clip "文字"` | 写剪贴板 + 小通知「小克复制了：…」 | 通知（可选） |
+| `phone-ctl widget` | 桌面小部件马上刷新（接下来 3 条日程 + 小克最新一句；系统 30 分钟兜底刷新） | 她把「小克」小部件放到桌面 |
+| `phone-ctl places` | 她在 App 里设的地点（只有名字 + 半径，坐标不出手机） | 精确定位 + 后台定位 |
+| `phone-ctl notifs [--since 1h] [--clear]` | 白名单 App（美团/饿了么/京东/淘宝闪购/菜鸟/顺丰/拼多多，可在 App 里改；QQ/微信/短信/银行永远不转）转来的通知，最近 200 条 / 48h，文件 0600 | 通知使用权 |
+| `phone-ctl task <id 前缀>` | 一条任务的结果 + 后续（闹钟/强提醒结果留 6 小时） | — |
+
+- 退出码：0 成功；1 失败（原因已打印：开关关着 / 缺权限 / 不支持 / 后台弹不出界面 / App 没来领）；
+  2 = 闹钟/计时器在等她点通知确认，还没真设上。
+- 自动触发（只注入 cctg 会话，知悉级，不进聊天记录）：`【📦 外卖快递·自动触发】外卖/快递通知：<app>: <标题>`
+  （同一 App 3 分钟最多一次，长数字打码，验证码类整条丢弃）；`【📍 到达·自动触发】方小南到了「健身房」附近`
+  （同一地点同一方向 5 分钟去抖）。
+- 日程联动：`schedule-ctl` 每次 add/edit/done/undone/rm 后台跑 `phone-ctl calendar sync --no-wait`
+  （顺带刷新小部件）；`schedule-ctl add … --strong` / `edit --strong on` 的日程到点时 `schedule-remind`
+  另排一个 `phone-ctl ring`。
+- 坑：ColorOS 会杀后台 / 拦后台弹界面——App 要允许自启动、关电池优化、留着「实时提醒」常驻通知；
+  闹钟在后台没悬浮窗权限时只能发「点一下确认」通知（结果 `state=awaiting_tap`，她点了以后
+  `phone-ctl task` 能看到 `set_verified`）。HC 后台读取权限要 Android 14+ / 新版 HC。
+- 代码：`phone_control.py`（任务 / 校验）、`phone_local.py`（通知缓冲、地点去抖、日程→日历、小部件）、
+  `scripts/phone-ctl`；测试 `.venv/bin/python3 -m unittest _phone_local_test _phone_control_test`。
+
 ## Quick start
 
 ### 1. Deps

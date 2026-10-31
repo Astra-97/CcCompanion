@@ -81,6 +81,14 @@ For the iOS side, install via TestFlight: <https://testflight.apple.com/join/PLA
 
 Network: app and server communicate over Tailscale, ZeroTier, or LAN. The default `config.toml` binds the server to `127.0.0.1`; you bump it to `0.0.0.0` once you've configured the overlay network and the auth secret.
 
+## 小克的本地能力 (phone-ctl, App v1.9.233+)
+
+Alarm / timer, on-demand Health Connect reads, a private 「小克日程」 calendar, strong alert / find-phone,
+clipboard, a home-screen widget, allow-listed delivery/parcel notification forwarding and arrival triggers —
+all done by the Android app with ordinary permissions (no Shizuku), each with its own switch under
+App → 设置 → 小克的本地能力. Usage (`phone-ctl alarm|timer|health|calendar sync|ring|clip|widget|places|notifs|local`),
+permissions and caveats: [apns-server/README.md](apns-server/README.md#小克的本地能力phone-ctl2026-10-31app-v19233不需要-shizuku).
+
 ## Experimental Feature Flags
 
 New CcCompanion features that change navigation, notifications, rendering, or agent workflows should start behind a Settings toggle backed by `@AppStorage`. The default should be off unless the feature is a compatibility or safety fix. This keeps upgrades stable for existing users while allowing local testers to opt in.
