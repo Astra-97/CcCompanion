@@ -1267,7 +1267,69 @@ def _extract_tmux_prompt_box(capture: str) -> str | None:
     )
 
 
-def _capture_tmux_prompt_box(session: str) -> str | None:
+def _is_tmux_queued_prompt_hint(box: str | None) -> bool:
+    """Whether a compacted prompt box only holds Claude Code's queue hint.
+
+    While a turn is running, Enter on a typed prompt does not submit it but
+    *queues* it; the input box is then empty and Claude Code 2.1.280 renders a
+    dim placeholder such as "Press up to edit queued messages" (or "Press up to
+    select a queued message ..." / "Press Enter to edit the selected message
+    ...") inside it.  That placeholder is not prompt text: it proves the
+    prompt was accepted into Claude Code's own queue.  The 2026-10-31 sunset
+    notice read it as a stuck prompt and the cleanup C-c killed the running
+    turn.
+    """
+
+    if not box:
+        return False
+    lowered = box.lower()
+    return lowered.startswith("press") and (
+        "queuedmessage" in lowered or "theselectedmessage" in lowered
+    )
+
+
+# Claude Code's working spinner sits right above the prompt box while a turn
+# (including its hooks) runs: ``✽ Elucidating… (8s · ↓ 65 tokens)``.  Finished
+# or idle lines (``✻ Churned for 36s``, ``✻ Waiting for 2 background agents
+# to finish``) carry no ellipsis.  The spinner is drawn at column 0 while
+# transcript text is indented, so an indented ``  · foo…`` line never counts.
+_TMUX_BUSY_SPINNER_RE = re.compile(
+    r"^[·✢✳✶✻✽*]\s+\S[^\n]{0,80}?…(?:\s*\(.*\))?\s*$"
+)
+_TMUX_BUSY_SCAN_LINES = 10
+
+
+def _tmux_capture_shows_busy_turn(capture: str) -> bool:
+    """Whether a Claude Code pane capture shows a running turn.
+
+    Reads only the lines just above the bottom prompt box (spinner region) and
+    the box/footer itself; transcript text further up is ignored.  A queued
+    prompt hint inside the box also implies a running turn.
+    """
+
+    lines = capture.splitlines()
+    borders = [i for i, line in enumerate(lines) if _is_tmux_prompt_border(line)]
+    if len(borders) < 2:
+        return "esc to interrupt" in "\n".join(lines[-15:])
+    top = borders[-2]
+    tail = "\n".join(lines[top:])
+    if "esc to interrupt" in tail:
+        return True
+    if _is_tmux_queued_prompt_hint(_extract_tmux_prompt_box(capture)):
+        return True
+    scanned = 0
+    for line in reversed(lines[:top]):
+        if not line.strip():
+            continue
+        if "esc to interrupt" in line or _TMUX_BUSY_SPINNER_RE.match(line):
+            return True
+        scanned += 1
+        if scanned >= _TMUX_BUSY_SCAN_LINES:
+            break
+    return False
+
+
+def _capture_tmux_pane(session: str) -> str | None:
     try:
         capture = subprocess.run(
             ["tmux", "capture-pane", "-t", session, "-p"],
@@ -1279,7 +1341,27 @@ def _capture_tmux_prompt_box(session: str) -> str | None:
         return None
     if capture.returncode != 0:
         return None
-    return _extract_tmux_prompt_box(capture.stdout)
+    return capture.stdout
+
+
+def _tmux_session_turn_busy(session: str) -> bool:
+    """Read-only probe: is the Claude Code TUI in ``session`` mid-turn?
+
+    An unreadable pane reports not-busy; the injection that follows then
+    fails on its own (missing session) or verifies normally.
+    """
+
+    capture = _capture_tmux_pane(session)
+    if capture is None:
+        return False
+    return _tmux_capture_shows_busy_turn(capture)
+
+
+def _capture_tmux_prompt_box(session: str) -> str | None:
+    capture = _capture_tmux_pane(session)
+    if capture is None:
+        return None
+    return _extract_tmux_prompt_box(capture)
 
 
 @contextmanager
@@ -4767,35 +4849,34 @@ def _kill_and_reap_tmux_loader(process: subprocess.Popen, *, timeout: float = 1.
         process.wait(timeout=timeout)
 
 
-def _tmux_interrupt_uncertain_injection(
+def _tmux_uncertain_injection(
     session: str,
     *,
     phase: str,
     error: str,
 ) -> TmuxInjectionResult:
-    """Try to clear a prompt whose paste/submission result is uncertain."""
+    """Report a prompt whose paste/submission result is uncertain.
 
-    try:
-        cleanup = subprocess.run(
-            ["tmux", "send-keys", "-t", session, "C-c"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-        if cleanup.returncode == 0:
-            return TmuxInjectionResult(
-                False,
-                f"{error}; terminal input cleared",
-                phase,
-                injection_uncertain=False,
-                cleanup_confirmed=True,
-            )
-        detail = cleanup.stderr.strip() or f"tmux exit {cleanup.returncode}"
-    except Exception as exc:
-        detail = str(exc)
+    Automatic injection never sends a cleanup key.  The old bounded ``C-c``
+    "clear the input" step was Claude Code's ``app:interrupt``: whenever the
+    TUI was mid-turn (a QQ/TG message, a hook, a queued prompt) it cancelled
+    that turn instead of clearing text — 2026-10-31 a sunset notice killed the
+    turn answering 方小南's QQ 「开了」.  Escape is ``chat:cancel`` and just as
+    destructive, and ``C-l`` only redraws.  Any text left behind therefore
+    stays in the box and the caller treats the injection as uncertain (the
+    App path keeps its exact turn so the human Stop button can resolve it).
+    """
+
+    logger.warning(
+        "tmux injection uncertain session=%s phase=%s error=%s; "
+        "no interrupt/cleanup key sent",
+        session,
+        phase,
+        error,
+    )
     return TmuxInjectionResult(
         False,
-        f"{error}; terminal cleanup failed: {detail}",
+        f"{error}; prompt left in place (no interrupt key sent)",
         phase,
         injection_uncertain=True,
         cleanup_confirmed=False,
@@ -4816,13 +4897,18 @@ def _confirm_tmux_prompt_submission(session: str) -> TmuxInjectionResult:
     An unreadable pane fails closed towards one more Enter — pressing Enter
     on an empty box is a no-op, while a withheld Enter strands the prompt.
 
+    A box that only shows Claude Code's queued-message placeholder ("Press up
+    to edit queued messages") means the TUI was busy and accepted the prompt
+    into its own queue: that is a successful submission (``submitted_queued``)
+    and no further Enter is sent (an Enter there can mean "send queued now").
+
     Bounds: at most ``DIRECT_TMUX_ENTER_MAX_ATTEMPTS`` Enters in total (the
     caller already sent one), ``DIRECT_TMUX_ENTER_VERIFY_GRACE_SECONDS``
     apart, so worst-case added latency stays around two seconds.  On
-    exhaustion, a visibly stuck prompt gets the same bounded C-c cleanup as
-    other uncertain injections; an unreadable box returns success as
-    ``submitted_unverified`` (tmux did accept every Enter) rather than
-    risking a blind C-c against a possibly healthy running turn.
+    exhaustion a visibly stuck prompt is left where it is and reported as
+    uncertain — never C-c/Escape, which would interrupt a running turn; an
+    unreadable box returns success as ``submitted_unverified`` (tmux did
+    accept every Enter).
     """
 
     attempts = 1  # the caller's Enter is attempt one
@@ -4831,6 +4917,13 @@ def _confirm_tmux_prompt_submission(session: str) -> TmuxInjectionResult:
         box = _capture_tmux_prompt_box(session)
         if box == "":
             return TmuxInjectionResult(True, "", "submitted")
+        if _is_tmux_queued_prompt_hint(box):
+            logger.info(
+                "tmux prompt queued by busy TUI session=%s attempts=%d",
+                session,
+                attempts,
+            )
+            return TmuxInjectionResult(True, "", "submitted_queued")
         if attempts >= DIRECT_TMUX_ENTER_MAX_ATTEMPTS:
             if box is None:
                 logger.warning(
@@ -4839,7 +4932,7 @@ def _confirm_tmux_prompt_submission(session: str) -> TmuxInjectionResult:
                     attempts,
                 )
                 return TmuxInjectionResult(True, "", "submitted_unverified")
-            return _tmux_interrupt_uncertain_injection(
+            return _tmux_uncertain_injection(
                 session,
                 phase="enter_verify",
                 error=f"prompt still in input box after {attempts} Enter attempts",
@@ -4852,19 +4945,19 @@ def _confirm_tmux_prompt_submission(session: str) -> TmuxInjectionResult:
                 timeout=3,
             )
         except subprocess.TimeoutExpired:
-            return _tmux_interrupt_uncertain_injection(
+            return _tmux_uncertain_injection(
                 session,
                 phase="enter",
                 error="tmux send-keys Enter timed out",
             )
         except Exception as exc:
-            return _tmux_interrupt_uncertain_injection(
+            return _tmux_uncertain_injection(
                 session,
                 phase="enter",
                 error=f"tmux send-keys Enter failed: {exc}",
             )
         if resend.returncode != 0:
-            return _tmux_interrupt_uncertain_injection(
+            return _tmux_uncertain_injection(
                 session,
                 phase="enter",
                 error=(
@@ -4935,13 +5028,13 @@ def _direct_tmux_injection(
                     timeout=3,
                 )
             except subprocess.TimeoutExpired:
-                result = _tmux_interrupt_uncertain_injection(
+                result = _tmux_uncertain_injection(
                     session,
                     phase="paste",
                     error="tmux paste-buffer timed out",
                 )
             except Exception as exc:
-                result = _tmux_interrupt_uncertain_injection(
+                result = _tmux_uncertain_injection(
                     session,
                     phase="paste",
                     error=f"tmux paste-buffer failed: {exc}",
@@ -4974,20 +5067,20 @@ def _direct_tmux_injection(
                     timeout=3,
                 )
             except subprocess.TimeoutExpired:
-                result = _tmux_interrupt_uncertain_injection(
+                result = _tmux_uncertain_injection(
                     session,
                     phase="enter",
                     error="tmux send-keys Enter timed out",
                 )
             except Exception as exc:
-                result = _tmux_interrupt_uncertain_injection(
+                result = _tmux_uncertain_injection(
                     session,
                     phase="enter",
                     error=f"tmux send-keys Enter failed: {exc}",
                 )
             else:
                 if send.returncode != 0:
-                    result = _tmux_interrupt_uncertain_injection(
+                    result = _tmux_uncertain_injection(
                         session,
                         phase="enter",
                         error=(
@@ -5020,21 +5113,32 @@ def _direct_tmux_injection(
     return result or TmuxInjectionResult(False, "tmux injection failed", "unknown")
 
 
+def _xiaoke_low_key_notice_session(state: "ServerState") -> str:
+    return (
+        str(getattr(state, "default_session", "") or "").strip()
+        or rollback_driver.PRODUCTION_TMUX_SESSION
+    )
+
+
 def _xiaoke_busy_for_low_key_notice(state: "ServerState") -> bool:
-    """小克是否正处在 App 回合 / Stop 收尾 / 发送预留中（调用方持 xiaoke_stop_lock）。"""
+    """小克是否正忙（调用方持 xiaoke_stop_lock）。
+
+    App 回合 / Stop 收尾 / 发送预留之外，还要看 cctg 画面本身：QQ/TG/微信/
+    hook 触发的回合不经过 App 状态（2026-10-31 日落通知撞上 QQ「开了」那一轮）。
+    画面上有工作中的 spinner 或排队提示就算忙。
+    """
     if getattr(state, "xiaoke_stopping_claim", None):
         return True
     if getattr(state, "xiaoke_send_reservation", None):
         return True
-    return bool((getattr(state, "typing_state", None) or {}).get("is_typing"))
+    if bool((getattr(state, "typing_state", None) or {}).get("is_typing")):
+        return True
+    return _tmux_session_turn_busy(_xiaoke_low_key_notice_session(state))
 
 
 def _inject_xiaoke_low_key_notice(state: "ServerState", text: str) -> bool:
     """把一条知悉级通知注入小克 tmux 会话（同 roborock/mihome watcher 的 cctg）。"""
-    session = (
-        str(getattr(state, "default_session", "") or "").strip()
-        or rollback_driver.PRODUCTION_TMUX_SESSION
-    )
+    session = _xiaoke_low_key_notice_session(state)
     result = _direct_tmux_injection(session, text)
     if not result.success:
         logger.warning(
@@ -13904,10 +14008,11 @@ class PushHandler(BaseHTTPRequestHandler):
             ok, err = injection_result
             if not ok:
                 if injection_result.injection_uncertain:
-                    # Paste or Enter may have taken effect and the bounded C-c
-                    # cleanup could not be confirmed.  Keep the exact turn
-                    # active: this blocks another send and lets the Stop button
-                    # retry one real terminal C-c against the same identity.
+                    # Paste or Enter may have taken effect and automatic
+                    # injection never sends a cleanup C-c (it would interrupt
+                    # a running turn).  Keep the exact turn active: this
+                    # blocks another send and lets the human Stop button send
+                    # one real terminal C-c against the same identity.
                     uncertain = dict(self.state.typing_state or {})
                     if (
                         str(uncertain.get("since") or "") == str(rec.get("ts") or "")

@@ -15,6 +15,8 @@ from push import (
     _direct_tmux_injection,
     _extract_tmux_prompt_box,
     _inject_to_tmux_session,
+    _is_tmux_queued_prompt_hint,
+    _tmux_capture_shows_busy_turn,
     _xiaoke_attachment_paste_settle_seconds,
     _should_expire_chat_typing,
 )
@@ -36,6 +38,57 @@ STUCK_PROMPT_BOX_CAPTURE = (
     "────────────────────────────────────────────────\n"
     "  Fable 5 | Ctx13% 131k/1.0M\n"
 )
+# Claude Code 2.1.280 layouts sampled from cctg (2026-10-31).
+BUSY_QUEUED_PROMPT_CAPTURE = (
+    "● 开了 handling…\n"
+    "\n"
+    "✽ Elucidating… (8s · ↓ 65 tokens)\n"
+    "\n"
+    "────────────────────────────────────────────────\n"
+    "❯ Press up to edit queued messages\n"
+    "────────────────────────────────────────────────\n"
+    "  Opus5.5 1M | Ctx26% 263k/1.0M\n"
+    "  ⏵⏵ don't ask on · ← for agents\n"
+)
+BUSY_STUCK_PROMPT_CAPTURE = (
+    "✶ Sublimating… (3s · thinking with high effort)\n"
+    "  ⎿  Tip: Run /install-slack-app to use Claude in Slack\n"
+    "\n"
+    "────────────────────────────────────────────────\n"
+    "❯ hello stuck prompt\n"
+    "────────────────────────────────────────────────\n"
+    "  Opus5.5 1M | Ctx26% 263k/1.0M\n"
+)
+BUSY_HOOK_CAPTURE = (
+    "· Elucidating… (running Stop hooks… 2/3 · 13s · ↓ 437 tokens)\n"
+    "\n"
+    "────────────────────────────────────────────────\n"
+    "❯ \n"
+    "────────────────────────────────────────────────\n"
+    "  Opus5.5 1M | Ctx26% 263k/1.0M\n"
+)
+IDLE_WAITING_AGENTS_CAPTURE = (
+    "* a list item… then more\n"
+    "✻ Waiting for 2 background agents to finish\n"
+    "\n"
+    "────────────────────────────────────────────────\n"
+    "❯ \n"
+    "────────────────────────────────────────────────\n"
+    "  Opus5.5 1M | Ctx26% 263k/1.0M\n"
+    "  ● main\n"
+    "  ◯ opus5-worker  Fix notice injection…  26s · ↓ 68.2k tokens\n"
+)
+IDLE_INDENTED_ELLIPSIS_CAPTURE = (
+    "● 好的\n"
+    "  · 先等一下…\n"
+    "  ✻ 还在想…\n"
+    "\n"
+    "────────────────────────────────────────────────\n"
+    "❯ \n"
+    "────────────────────────────────────────────────\n"
+    "  Opus5.5 1M | Ctx26% 263k/1.0M\n"
+)
+INTERRUPT_KEYS = {"C-c", "Escape", "C-[", "C-d"}
 
 
 class XiaokeStopTest(unittest.TestCase):
@@ -970,7 +1023,10 @@ class XiaokeStopTest(unittest.TestCase):
         ))
         self.assertEqual(sum(call.args[0][1] == "delete-buffer" for call in run.call_args_list), 1)
 
-    def test_enter_failure_with_confirmed_cleanup_returns_safe_idle(self) -> None:
+    def test_enter_failure_never_sends_cleanup_interrupt(self) -> None:
+        # 2026-10-31: the old "clear input" C-c is Claude Code's app:interrupt
+        # and killed a running QQ turn.  A failed Enter now leaves the prompt
+        # in place, keeps the exact turn (uncertain) and sends no C-c/Escape.
         handler = self.send_handler()
         loader = MagicMock(returncode=0)
         loader.returncode = 0
@@ -988,13 +1044,14 @@ class XiaokeStopTest(unittest.TestCase):
             handler._handle_chat_send({"contact_id": "xiaoke", "text": "hello"})
 
         self.assertEqual(handler.responses[-1][0], 502)
-        self.assertFalse(handler.responses[-1][1]["injection_uncertain"])
-        self.assertFalse(handler.state.typing_state["is_typing"])
-        ctrl_c = [
+        self.assertTrue(handler.responses[-1][1]["injection_uncertain"])
+        self.assertTrue(handler.state.typing_state["is_typing"])
+        self.assertEqual(handler.state.typing_state["injection_phase"], "enter")
+        interrupt_keys = [
             call.args[0] for call in run.call_args_list
-            if call.args[0][1] == "send-keys" and call.args[0][-1] == "C-c"
+            if call.args[0][1] == "send-keys" and call.args[0][-1] in INTERRUPT_KEYS
         ]
-        self.assertEqual(ctrl_c, [["tmux", "send-keys", "-t", "cctg", "C-c"]])
+        self.assertEqual(interrupt_keys, [])
 
     def test_enter_failure_cleanup_failure_keeps_exact_turn_for_send_and_stop(self) -> None:
         handler = self.send_handler()
@@ -1140,7 +1197,7 @@ class XiaokeStopTest(unittest.TestCase):
         self.assertTrue(handler.state.typing_state["is_typing"])
         self.assertEqual(handler.state.typing_state["since"], "turn-1")
 
-    def test_stuck_prompt_after_max_enters_gets_bounded_cleanup(self) -> None:
+    def test_stuck_prompt_after_max_enters_is_left_without_interrupt(self) -> None:
         loader = MagicMock()
         loader.returncode = 0
         loader.communicate.return_value = (b"", b"")
@@ -1162,10 +1219,101 @@ class XiaokeStopTest(unittest.TestCase):
 
         self.assertFalse(result.success)
         self.assertEqual(result.phase, "enter_verify")
-        self.assertFalse(result.injection_uncertain)
-        self.assertTrue(result.cleanup_confirmed)
-        self.assertEqual(sent_keys, ["Enter", "Enter", "Enter", "C-c"])
+        self.assertTrue(result.injection_uncertain)
+        self.assertFalse(result.cleanup_confirmed)
+        self.assertIn("no interrupt key sent", result.error)
+        self.assertEqual(sent_keys, ["Enter", "Enter", "Enter"])
         self.assertEqual(len(sleep.call_args_list), 3)
+
+    def test_busy_tui_queued_hint_counts_as_submitted_without_interrupt(self) -> None:
+        # The 2026-10-31 incident: the TUI was mid-turn, Enter queued the
+        # notice, and the box showed Claude Code's queued-message placeholder.
+        loader = MagicMock()
+        loader.returncode = 0
+        loader.communicate.return_value = (b"", b"")
+        sent_keys: list[str] = []
+
+        def run_tmux(args, **_kwargs):
+            if args[1] == "capture-pane":
+                return subprocess.CompletedProcess(args, 0, BUSY_QUEUED_PROMPT_CAPTURE, "")
+            if args[1] == "send-keys":
+                sent_keys.append(args[-1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with (
+            patch("push.subprocess.Popen", return_value=loader),
+            patch("push.subprocess.run", side_effect=run_tmux),
+            patch("push.time.sleep"),
+        ):
+            result = _direct_tmux_injection("cctg", "【🌅 日出日落·自动触发】")
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.phase, "submitted_queued")
+        self.assertEqual(sent_keys, ["Enter"])
+
+    def test_busy_tui_stuck_text_never_gets_escape_or_ctrl_c(self) -> None:
+        loader = MagicMock()
+        loader.returncode = 0
+        loader.communicate.return_value = (b"", b"")
+        sent_keys: list[str] = []
+
+        def run_tmux(args, **_kwargs):
+            if args[1] == "capture-pane":
+                return subprocess.CompletedProcess(args, 0, BUSY_STUCK_PROMPT_CAPTURE, "")
+            if args[1] == "send-keys":
+                sent_keys.append(args[-1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with (
+            patch("push.subprocess.Popen", return_value=loader),
+            patch("push.subprocess.run", side_effect=run_tmux),
+            patch("push.time.sleep"),
+        ):
+            result = _direct_tmux_injection("cctg", "hello")
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.injection_uncertain)
+        self.assertFalse(set(sent_keys) & INTERRUPT_KEYS)
+        self.assertEqual(sent_keys, ["Enter", "Enter", "Enter"])
+
+    def test_paste_timeout_sends_no_interrupt_key(self) -> None:
+        loader = MagicMock()
+        loader.returncode = 0
+        loader.communicate.return_value = (b"", b"")
+        sent_keys: list[str] = []
+
+        def run_tmux(args, **_kwargs):
+            if args[1] == "paste-buffer":
+                raise subprocess.TimeoutExpired(args, 3)
+            if args[1] == "send-keys":
+                sent_keys.append(args[-1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with (
+            patch("push.subprocess.Popen", return_value=loader),
+            patch("push.subprocess.run", side_effect=run_tmux),
+        ):
+            result = _direct_tmux_injection("cctg", "hello")
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.phase, "paste")
+        self.assertTrue(result.injection_uncertain)
+        self.assertEqual(sent_keys, [])
+
+    def test_pane_busy_detection(self) -> None:
+        self.assertTrue(_tmux_capture_shows_busy_turn(BUSY_STUCK_PROMPT_CAPTURE))
+        self.assertTrue(_tmux_capture_shows_busy_turn(BUSY_QUEUED_PROMPT_CAPTURE))
+        self.assertTrue(_tmux_capture_shows_busy_turn(BUSY_HOOK_CAPTURE))
+        self.assertFalse(_tmux_capture_shows_busy_turn(EMPTY_PROMPT_BOX_CAPTURE))
+        self.assertFalse(_tmux_capture_shows_busy_turn(STUCK_PROMPT_BOX_CAPTURE))
+        self.assertFalse(_tmux_capture_shows_busy_turn(IDLE_WAITING_AGENTS_CAPTURE))
+        self.assertFalse(_tmux_capture_shows_busy_turn(IDLE_INDENTED_ELLIPSIS_CAPTURE))
+        self.assertTrue(_is_tmux_queued_prompt_hint(
+            _extract_tmux_prompt_box(BUSY_QUEUED_PROMPT_CAPTURE)
+        ))
+        self.assertFalse(_is_tmux_queued_prompt_hint("hellostuckprompt"))
+        self.assertFalse(_is_tmux_queued_prompt_hint(""))
+        self.assertFalse(_is_tmux_queued_prompt_hint(None))
 
     def test_unreadable_pane_returns_submitted_unverified_without_cleanup(self) -> None:
         loader = MagicMock()

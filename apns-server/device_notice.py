@@ -7,10 +7,14 @@
 和外部 watcher 的差别只有一点：它们是独立进程直接 ``send-keys``，这里跑在
 apns-server 进程内，和 App 私聊的 exact-turn 注入共用同一个 tmux 会话。
 为了不把设备通知粘进她正在发送/生成中的那一轮，注入走单一后台 worker：
-小克忙（App 回合进行中 / Stop 收尾中 / 发送预留中）时按 FIFO 排队等空闲，
-空闲判定与真正注入在同一把 xiaoke_stop_lock 内完成（App 路径也在这把锁里
-paste+Enter），等待有上限——超时仍照注（等价于 watcher 的直接 send-keys，
-由 Claude Code 自身的输入队列兜底），宁可晚到不可漏报。
+小克忙（App 回合进行中 / Stop 收尾中 / 发送预留中，或 cctg 画面显示正在跑
+回合——QQ/TG/hook 触发的回合不经过 App 状态）时按 FIFO 排队等空闲，空闲判定
+与真正注入在同一把 xiaoke_stop_lock 内完成（App 路径也在这把锁里 paste+Enter），
+等待有上限（30 分钟）——超时仍照注并记 warning（等价于 watcher 的直接
+send-keys，由 Claude Code 自身的输入队列兜底），宁可晚到不可漏报。
+
+2026-10-31 事故：日落通知在小克处理 QQ「开了」时注入，排队提示被当成「卡在
+输入框」，清理用的 C-c 打断了那一轮。注入路径现在绝不发 C-c/Escape。
 
 隐私红线：注入文案只含当下这一条事件，本模块不落盘、不留历史。
 """
@@ -48,7 +52,7 @@ NOTICE_TAGS = {
 }
 
 BUSY_POLL_SECONDS = 2.0
-BUSY_MAX_WAIT_SECONDS = 600.0
+BUSY_MAX_WAIT_SECONDS = 1800.0
 QUEUE_MAX = 50
 
 
@@ -139,7 +143,9 @@ class XiaokeLowKeyNotifier:
 
     def deliver(self, text: str) -> bool:
         """等小克空闲（有上限）后在锁内注入一条；返回是否投递成功。"""
-        deadline = self._clock() + self._max_wait_seconds
+        started = self._clock()
+        deadline = started + self._max_wait_seconds
+        waited_busy = False
         while True:
             with self._lock:
                 busy = False
@@ -148,11 +154,19 @@ class XiaokeLowKeyNotifier:
                 except Exception:
                     logger.debug("device notice busy probe failed", exc_info=True)
                 timed_out = self._clock() >= deadline
+                if busy:
+                    waited_busy = True
                 if not busy or timed_out:
                     if busy:
                         logger.warning(
-                            "device notice waited %.0fs for xiaoke idle; injecting anyway",
+                            "device notice waited %.0fs for xiaoke idle; injecting anyway "
+                            "(Claude Code queues it; no interrupt key is sent)",
                             self._max_wait_seconds,
+                        )
+                    elif waited_busy:
+                        logger.info(
+                            "device notice delivered after waiting %.0fs for xiaoke idle",
+                            self._clock() - started,
                         )
                     try:
                         ok = bool(self._inject(text))

@@ -13,8 +13,10 @@ import tempfile
 import threading
 import time
 import types
+import subprocess
 import unittest
 from datetime import datetime
+from unittest import mock
 from pathlib import Path
 
 import push
@@ -622,7 +624,15 @@ class XiaokeBusyProbeTest(unittest.TestCase):
         return types.SimpleNamespace(**base)
 
     def test_idle(self):
-        self.assertFalse(push._xiaoke_busy_for_low_key_notice(self.state()))
+        with mock.patch.object(push, "_tmux_session_turn_busy", return_value=False) as probe:
+            self.assertFalse(push._xiaoke_busy_for_low_key_notice(self.state()))
+        probe.assert_called_once_with("cctg")
+
+    def test_pane_busy_turn_counts_as_busy(self):
+        # QQ/TG/hook turns never touch App typing state (2026-10-31 incident).
+        with mock.patch.object(push, "_tmux_session_turn_busy", return_value=True):
+            self.assertTrue(push._xiaoke_busy_for_low_key_notice(
+                self.state(default_session="cctg")))
 
     def test_busy_signals(self):
         self.assertTrue(push._xiaoke_busy_for_low_key_notice(
@@ -647,6 +657,94 @@ class XiaokeBusyProbeTest(unittest.TestCase):
             push._direct_tmux_injection = orig
         self.assertTrue(ok and ok_fallback)
         self.assertEqual([("cctg", "hello"), ("cctg", "hi")], calls)
+
+
+BUSY_PANE = (
+    "✽ Elucidating… (8s · ↓ 65 tokens)\n"
+    "\n"
+    "────────────────────────────────────────────────\n"
+    "❯ \n"
+    "────────────────────────────────────────────────\n"
+    "  Opus5.5 1M | Ctx26%\n"
+)
+IDLE_PANE = (
+    "✻ Churned for 36s\n"
+    "\n"
+    "────────────────────────────────────────────────\n"
+    "❯ \n"
+    "────────────────────────────────────────────────\n"
+    "  Opus5.5 1M | Ctx26%\n"
+)
+INTERRUPT_KEYS = {"C-c", "Escape", "C-[", "C-d"}
+
+
+class XiaokeNoticeBusyPaneEndToEndTest(unittest.TestCase):
+    """Notifier + real busy probe + real tmux injection with tmux faked."""
+
+    def run_notice(self, panes_before_idle: int):
+        state = types.SimpleNamespace(
+            default_session="cctg", xiaoke_stopping_claim={},
+            xiaoke_send_reservation={}, typing_state={"is_typing": False},
+        )
+        lock = threading.RLock()
+        calls: list[list[str]] = []
+        busy_left = [panes_before_idle]
+
+        def fake_run(args, **_kwargs):
+            calls.append(list(args))
+            if args[1] == "capture-pane":
+                if busy_left[0] > 0:
+                    busy_left[0] -= 1
+                    return subprocess.CompletedProcess(args, 0, BUSY_PANE, "")
+                return subprocess.CompletedProcess(args, 0, IDLE_PANE, "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        loader = mock.MagicMock()
+        loader.returncode = 0
+        loader.communicate.return_value = (b"", b"")
+        slept: list[float] = []
+        clock = [0.0]
+
+        def sleep(seconds):
+            slept.append(seconds)
+            clock[0] += seconds
+
+        n = XiaokeLowKeyNotifier(
+            is_busy=lambda: push._xiaoke_busy_for_low_key_notice(state),
+            inject=lambda text: push._inject_xiaoke_low_key_notice(state, text),
+            lock=lock, poll_seconds=2.0, max_wait_seconds=1800.0,
+            sleep=sleep, clock=lambda: clock[0], start_worker=False,
+        )
+        with (
+            mock.patch("push.subprocess.run", side_effect=fake_run),
+            mock.patch("push.subprocess.Popen", return_value=loader),
+            mock.patch("push.time.sleep"),
+        ):
+            n.enqueue("【🌅 日出日落·自动触发】17:14 日落")
+            ok = n.drain_once()
+        return ok, calls, slept
+
+    def test_busy_session_waits_then_delivers_without_interrupt(self):
+        ok, calls, slept = self.run_notice(panes_before_idle=3)
+        self.assertTrue(ok)
+        self.assertEqual([2.0, 2.0, 2.0], slept)
+        first_paste = next(i for i, c in enumerate(calls) if c[1] == "paste-buffer")
+        busy_captures = [c for c in calls[:first_paste] if c[1] == "capture-pane"]
+        self.assertEqual(4, len(busy_captures))  # 3 busy probes + 1 idle probe
+        sent = [c[-1] for c in calls if c[1] == "send-keys"]
+        self.assertEqual(["Enter"], sent)
+        self.assertFalse(set(sent) & INTERRUPT_KEYS)
+
+    def test_idle_session_injects_immediately(self):
+        ok, calls, slept = self.run_notice(panes_before_idle=0)
+        self.assertTrue(ok)
+        self.assertEqual([], slept)
+        kinds = [c[1] for c in calls]
+        self.assertEqual(
+            ["capture-pane", "has-session", "paste-buffer", "send-keys",
+             "capture-pane", "delete-buffer"],
+            kinds,
+        )
 
 
 class DeviceActivityAndStatusHandlerTest(DeviceHandlerTestBase):
