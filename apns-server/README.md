@@ -121,6 +121,11 @@ steering + 记忆库 MCP。原来的 `kiro`（kiro-cli）完全不动。
   工具行含 purpose/input/output 截断），加正在生成的草稿尾巴，整页再过 `_kirocrew_terminal_redact`
   （header/查询串/常见 key 形状/长 hex 与 token_urlsafe 串）。**不读网关 journal**（那里有 5 分钟
   dashboard `?token=` 链接）。`/tmux/send` `/terminal/key|resize|release` 对 kirocrew 一律 409 只读。
+- 企业微信（2026-10-31，自建应用 1000008「Kiro Crew」）：同 Kiro——`wecom_bridge.INBOUND_CONTACTS`
+  / `IMAGE_CONTACTS` 放行，微信图片拷到东京以路径交给 Crew；只有回答微信消息的最终回复
+  （`_kirocrew_finish`）和命令回执（`_kirocrew_reply_now`；微信里打 `/status` 等也认）才经
+  `_mirror_reply_to_wecom` 写 outbox，取回的图片随 `files` 发成微信图片，`[bqb:]` 由
+  wecom-channel 展开；`send_bell("kirocrew", …)` 可用。测试在 `_wecom_bridge_test`。
 - 关掉：`config.toml` 里 `kirocrew_enabled = false`，重启 cc-companion（联系人消失，
   `tokens/chat_history_kirocrew.jsonl` 保留）；东京 `sudo systemctl disable --now kirocrew`。
   完整回滚（含 ~/.kiro 备份）见 vps-xiaoke-config `system-config/tokyo/README.md`「Kiro Crew」。
