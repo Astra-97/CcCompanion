@@ -225,8 +225,8 @@ allowed_ips = []
 #   gege_idle_close_seconds = 10800    # pi 空闲多久关掉（存档都在东京磁盘上，下次 --continue 接着写）
 # 进程 = `ssh -T -l pi tokyo sh -c <launch> ... /home/pi/gege/bin/gege-rpc`（remote_stdio.py），
 # 进程组记在 <gege_home>/run/rpc.pid。POST /gege/restart 关掉它（改了 gege.env 后用）。
-# Kiro Crew kirocrew (2026-10-31)：和 kiro 并排试用的第二个小克入口，本体是东京
-# kirocrew.service（Kiro Crew 网关，用户 kiro，只绑 127.0.0.1:5476）。216 经
+# Crew kirocrew (2026-10-31)：和 kiro 并排试用的第二个小克入口，本体是东京
+# kirocrew.service（Crew 网关，用户 kiro，只绑 127.0.0.1:5476）。216 经
 # `ssh -l kiro tokyo python3 -c <kirocrew_remote_bridge.py>` 访问，网关的内部
 # secret 只在东京读，不出东京。关掉：kirocrew_enabled = false 后重启 cc-companion
 # （联系人从 /chat/contacts 消失，历史文件 tokens/chat_history_kirocrew.jsonl 保留）。

@@ -59,7 +59,7 @@ _APP_LABEL = {
     "kairos": ("wecom_kairos_app", "kairos"),
     "kiro": ("wecom_kiro_app", "小克"),
     "gege": ("wecom_gege_app", "哥哥写手"),
-    "kirocrew": ("wecom_kirocrew_app", "Kiro Crew"),
+    "kirocrew": ("wecom_kirocrew_app", "Crew"),
 }
 
 SECRET_FILE_ENV = "CC_COMPANION_WECOM_WEBHOOK_SECRET_FILE"

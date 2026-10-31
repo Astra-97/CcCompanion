@@ -682,7 +682,7 @@ class WecomKiroCrewPipelineTest(WecomBase):
         )
         self.assertNotIn("files", items[0])
         self.assertIn("wecom_kirocrew_app", crew.prompts[0])
-        self.assertIn("企业微信「Kiro Crew」应用", crew.prompts[0])
+        self.assertIn("企业微信「Crew」应用", crew.prompts[0])
         self.assertIn("contact_id: kirocrew", crew.prompts[0])
         self.assertIn("对方说：［💬微信］在吗", crew.prompts[0])
         self.assertIn("[[CCC_IMAGE:", crew.prompts[0])
@@ -891,7 +891,7 @@ class WecomPromptTest(unittest.TestCase):
         lines = "\n".join(wecom_bridge.prompt_entry_lines("kirocrew"))
         self.assertIn("[[CCC_IMAGE:", lines)
         self.assertIn("wecom_kirocrew_app", lines)
-        self.assertIn("企业微信「Kiro Crew」应用", lines)
+        self.assertIn("企业微信「Crew」应用", lines)
         self.assertIn("contact_id: kirocrew", lines)
         self.assertNotIn("CCC_IMAGE", "\n".join(wecom_bridge.prompt_entry_lines("gege")))
 

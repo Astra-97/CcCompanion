@@ -550,7 +550,7 @@ class KiroCrewHandlerTest(unittest.TestCase):
         self.assertTrue(payload["busy"])
         self.assertNotIn("lease", payload)
         content = payload["content"]
-        self.assertIn("Kiro Crew · ccc-kirocrew · 运行中 · turn 4", content)
+        self.assertIn("Crew · ccc-kirocrew · 运行中 · turn 4", content)
         self.assertIn("[10:31:16] › 帮我看下日志", content)
         self.assertIn("🔧 Shell", content)
         self.assertIn("$ journalctl -u kirocrew -n 5", content)
@@ -791,7 +791,7 @@ class KiroCrewForgeTest(unittest.TestCase):
         self.assertEqual(len(notice), 1)
         self.assertIn("已自动 forge 新会话", notice[0]["text"])
         self.assertEqual(notice[0]["metadata"]["turn_terminal"], False)
-        self.assertEqual(handler.notifications[0][0], "Kiro Crew 上下文将满，已自动切换新会话")
+        self.assertEqual(handler.notifications[0][0], "Crew 上下文将满，已自动切换新会话")
         self.assertEqual(chat.records[-1]["text"], "小克在。")
         self.assertEqual(handler.state.chat_reply_states["kirocrew"]["session_id"], new_session)
         self.assertEqual(handler.state.kirocrew_last_context_pct, 2.5)
@@ -830,7 +830,7 @@ class KiroCrewForgeTest(unittest.TestCase):
         self.assertTrue(client.prompts[2].startswith("【CcCompanion 受控 forge"))
         self.assertIn("今天先聊到这", client.prompts[2])  # tail carries the stripped reply
         self.assertNotIn("[[KIRO_FORGE]]", client.prompts[2].split("以下为旧会话", 1)[-1])
-        self.assertEqual(handler.notifications[0][0], "Kiro Crew 在聊天停顿处自己切换了新会话")
+        self.assertEqual(handler.notifications[0][0], "Crew 在聊天停顿处自己切换了新会话")
         self.assertEqual(handler.state.kirocrew_self_forge_pending_session, "")
 
     def test_marker_with_queued_message_forges_before_next_send(self):
@@ -946,7 +946,7 @@ class RegistryTest(unittest.TestCase):
         on = types.SimpleNamespace(contact_routes=routes, contact_catalog=[], contact_chats={"kiro": object(), "kirocrew": object()})
         off = types.SimpleNamespace(contact_routes=routes, contact_catalog=[], contact_chats={"kiro": object()})
         listed = {c["id"]: c for c in chat_contact_directory(on)}
-        self.assertEqual(listed["kirocrew"]["display_name"], "Kiro Crew")
+        self.assertEqual(listed["kirocrew"]["display_name"], "Crew")
         self.assertIn("stop", listed["kirocrew"]["capabilities"])
         self.assertIn("attachments", listed["kirocrew"]["capabilities"])
         self.assertEqual(listed["kiro"]["display_name"], "小克")

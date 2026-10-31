@@ -23,7 +23,7 @@ from .kiro import rejects_inbound  # noqa: F401 -- same ingress policy as Kiro
 
 CONTACT = {
     "id": "kirocrew",
-    "display_name": "Kiro Crew",
+    "display_name": "Crew",
     "provider": "kiro-crew",
     "terminal_target": "",
     "capabilities": [

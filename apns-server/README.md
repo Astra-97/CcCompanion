@@ -100,11 +100,11 @@ with its own context/memory.
 
 ---
 
-### Kiro Crew 联系人 `kirocrew`（2026-10-31，和 `kiro` 并排试用）
+### Crew 联系人 `kirocrew`（2026-10-31，和 `kiro` 并排试用；显示名原叫「Kiro Crew」，当天改成「Crew」，内部 id 不变）
 
 方小南「先做一个 crew，然后功能和接口对齐 cli，稳定运行几天再看用哪个」。App 里多出一个
-联系人「Kiro Crew」（服务端 `/chat/contacts` 下发，安卓不用发版），背后是东京
-`kirocrew.service`（Kiro Crew 网关，用户 kiro，只绑 127.0.0.1:5476），人设 = 同一份 xiaoke
+联系人「Crew」（服务端 `/chat/contacts` 下发，安卓不用发版），背后是东京
+`kirocrew.service`（Crew 网关，用户 kiro，只绑 127.0.0.1:5476），人设 = 同一份 xiaoke
 steering + 记忆库 MCP。原来的 `kiro`（kiro-cli）完全不动。
 
 - 代码：`kirocrew_client.py`（经 `ssh -l kiro tokyo python3 -c <kirocrew_remote_bridge.py>`
@@ -135,14 +135,14 @@ steering + 记忆库 MCP。原来的 `kiro`（kiro-cli）完全不动。
   最近 80 条原文，跳过聊天指令与回执）→ 聊天行 `system:crew-forge` + 推送；总结失败/为空不换会话。手动：
   `POST /kirocrew/forge`。配置键 `kirocrew_auto_forge_*` 缺省沿用同名 `kiro_auto_forge_*`。东京 Crew 自己的
   autocompact 已调到上限 90%（全局 `session.autocompact_pct` + 槽 override），不会抢在这里之前；`/compact` 仍可手动。
-- 企业微信（2026-10-31，自建应用 1000008「Kiro Crew」）：同 Kiro——`wecom_bridge.INBOUND_CONTACTS`
+- 企业微信（2026-10-31，自建应用 1000008「Crew」）：同 Kiro——`wecom_bridge.INBOUND_CONTACTS`
   / `IMAGE_CONTACTS` 放行，微信图片拷到东京以路径交给 Crew；只有回答微信消息的最终回复
   （`_kirocrew_finish`）和命令回执（`_kirocrew_reply_now`；微信里打 `/status` 等也认）才经
   `_mirror_reply_to_wecom` 写 outbox，取回的图片随 `files` 发成微信图片，`[bqb:]` 由
   wecom-channel 展开；`send_bell("kirocrew", …)` 可用。测试在 `_wecom_bridge_test`。
 - 关掉：`config.toml` 里 `kirocrew_enabled = false`，重启 cc-companion（联系人消失，
   `tokens/chat_history_kirocrew.jsonl` 保留）；东京 `sudo systemctl disable --now kirocrew`。
-  完整回滚（含 ~/.kiro 备份）见 vps-xiaoke-config `system-config/tokyo/README.md`「Kiro Crew」。
+  完整回滚（含 ~/.kiro 备份）见 vps-xiaoke-config `system-config/tokyo/README.md`「Crew」。
 - 测试：`.venv/bin/python3 -m unittest _kirocrew_test`。
 
 ## Quick start

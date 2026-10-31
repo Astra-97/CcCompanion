@@ -1439,16 +1439,16 @@ def _format_kirocrew_terminal(
     state = "运行中" if running else ("停止中" if detail.get("stopping") else "空闲")
     ctx = f"{context_pct:.0f}%" if isinstance(context_pct, (int, float)) else "—"
     lines = [
-        f"Kiro Crew · {slot} · {state} · turn {detail.get('turn', '—')}",
+        f"Crew · {slot} · {state} · turn {detail.get('turn', '—')}",
         f"model {model or 'auto'} · effort {effort or '默认'} · context {ctx}",
-        "终端中继：整行回车 = 发给 Kiro Crew（进聊天记录），Ctrl-C = 停止当前回复；工具输入/输出已截断，凭据已隐藏",
+        "终端中继：整行回车 = 发给 Crew（进聊天记录），Ctrl-C = 停止当前回复；工具输入/输出已截断，凭据已隐藏",
         "─" * 40,
     ]
     if error:
         lines.append(f"! {error}")
     messages = [m for m in (detail.get("messages") or []) if isinstance(m, dict)]
     if not messages and not error:
-        lines.append("（会话还没有记录；在聊天页给 Kiro Crew 发一条消息即可开始）")
+        lines.append("（会话还没有记录；在聊天页给 Crew 发一条消息即可开始）")
     for message in messages[-KIROCREW_TERMINAL_ROWS:]:
         role = str(message.get("role") or "")
         cls = str(message.get("cls") or "")
@@ -13513,7 +13513,7 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(415, {
                 "ok": False,
                 "error": "kirocrew_text_only",
-                "reason": "Kiro Crew 只接受文字消息和聊天框里上传的附件。",
+                "reason": "Crew 只接受文字消息和聊天框里上传的附件。",
             })
             return
         if contact_id == "kiro" and self._kiro_inbound_not_text_only(body):
@@ -29293,7 +29293,7 @@ class PushHandler(BaseHTTPRequestHandler):
     # sources containing it to the Kiro contact), hence "crew-gateway".
     _KIROCREW_MAX_QUEUE = 20
     _KIROCREW_HELP = (
-        "Kiro Crew 联系人的指令（不花 credits，/compact 除外）：\n"
+        "Crew 联系人的指令（不花 credits，/compact 除外）：\n"
         "/new 开新会话（清掉当前上下文）\n"
         "/stop 停止正在生成的回复\n"
         "/model 查看模型；/model <id> 切换；/model auto 恢复默认\n"
@@ -29304,7 +29304,7 @@ class PushHandler(BaseHTTPRequestHandler):
         "/help 这条说明"
     )
     _KIROCREW_COMMAND_RE = re.compile(r"^/(new|stop|model|effort|status|help)(?:\s+(\S.*))?$", re.IGNORECASE | re.DOTALL)
-    _KIROCREW_DISABLED_TEXT = "Kiro Crew 联系人没有开启（config.toml 的 kirocrew_enabled）。"
+    _KIROCREW_DISABLED_TEXT = "Crew 联系人没有开启（config.toml 的 kirocrew_enabled）。"
 
     def _kirocrew_session_id(self) -> str:
         client = getattr(self.state, "kirocrew_client", None)
@@ -29597,7 +29597,7 @@ class PushHandler(BaseHTTPRequestHandler):
         handoff_path = self._write_kirocrew_forge_handoff(ctx)
         seed_ok, retained = self._seed_kirocrew_forged_session(ctx, cancel_event, pending_user_ts=pending_user_ts)
         notice = self._kiro_forge_notice_text(
-            old_session_id, new_session_id, tasks, seed_ok, trigger=trigger, agent_label="Kiro Crew",
+            old_session_id, new_session_id, tasks, seed_ok, trigger=trigger, agent_label="Crew",
         )
         try:
             # Like Kiro's: role=assistant so Android notifies; auxiliary so it
@@ -29609,9 +29609,9 @@ class PushHandler(BaseHTTPRequestHandler):
         except Exception:
             logger.exception("kirocrew forge notice history append failed")
         title = {
-            "auto": "Kiro Crew 上下文将满，已自动切换新会话",
-            "self": "Kiro Crew 在聊天停顿处自己切换了新会话",
-        }.get(trigger, "Kiro Crew 已按你的要求切换新会话")
+            "auto": "Crew 上下文将满，已自动切换新会话",
+            "self": "Crew 在聊天停顿处自己切换了新会话",
+        }.get(trigger, "Crew 已按你的要求切换新会话")
         try:
             self._send_chat_notification(title, notice[:80])
         except Exception:
@@ -29714,7 +29714,7 @@ class PushHandler(BaseHTTPRequestHandler):
         with self.state.kirocrew_lock:
             if self.state.kirocrew_active or self.state.kirocrew_queue:
                 self._send_json(409, {"ok": False, "error": "kirocrew_turn_active",
-                                      "reason": "Kiro Crew 正在回复，等当前回复结束后再 forge。"})
+                                      "reason": "Crew 正在回复，等当前回复结束后再 forge。"})
                 return
             self.state.kirocrew_active = {"user_ts": "", "cancel_event": cancel_event, "forge": True}
         try:
@@ -29858,7 +29858,7 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(503, {"ok": False, "error": "kirocrew_disabled"})
             return
         if self._kirocrew_busy():
-            self._send_json(409, {"ok": False, "error": "kirocrew_turn_active", "reason": "Kiro Crew 正在回复，等当前回复结束后再开新会话。"})
+            self._send_json(409, {"ok": False, "error": "kirocrew_turn_active", "reason": "Crew 正在回复，等当前回复结束后再开新会话。"})
             return
         ok, message = self._kirocrew_reset()
         if not ok:
@@ -29897,7 +29897,7 @@ class PushHandler(BaseHTTPRequestHandler):
         header_text = f"{model_id} · {pct:.0f}%" if pct is not None else model_id
         return {
             "ok": True,
-            "provider": "Kiro Crew",
+            "provider": "Crew",
             "models": entries,
             "available_models": [e["id"] for e in entries],
             "available_efforts": list(kirocrew_client.EFFORTS),
@@ -29913,8 +29913,8 @@ class PushHandler(BaseHTTPRequestHandler):
             "context_usage_percent": pct,
             "header_display": self._header_status_display(
                 text=header_text,
-                loading_text="Kiro Crew 状态加载中",
-                unavailable_text="Kiro Crew 状态暂不可用",
+                loading_text="Crew 状态加载中",
+                unavailable_text="Crew 状态暂不可用",
                 model=model_id,
                 context_percent=pct,
             ),
@@ -29998,7 +29998,7 @@ class PushHandler(BaseHTTPRequestHandler):
 
     def _handle_kirocrew_terminal_capture(self) -> None:
         if self.state.kirocrew_client is None:
-            self._send_json(503, {"error": "Kiro Crew 未启用", "target": KIROCREW_TERMINAL_ALIAS})
+            self._send_json(503, {"error": "Crew 未启用", "target": KIROCREW_TERMINAL_ALIAS})
             return
         content, running = self._kirocrew_terminal_content()
         # 可输入 (2026-10-31)：Crew 没有能接到固定会话槽上的 TUI（`kirocrew chat`
@@ -30021,7 +30021,7 @@ class PushHandler(BaseHTTPRequestHandler):
     def _handle_kirocrew_terminal_send(self, body: dict[str, Any]) -> None:
         """/tmux/send for kirocrew: a whole line becomes a chat turn (history, queue, commands)."""
         if self.state.kirocrew_client is None:
-            self._send_json(503, {"error": "Kiro Crew 未启用", "target": KIROCREW_TERMINAL_ALIAS})
+            self._send_json(503, {"error": "Crew 未启用", "target": KIROCREW_TERMINAL_ALIAS})
             return
         special_key = str(body.get("key") or "").strip()
         if special_key:
@@ -30041,7 +30041,7 @@ class PushHandler(BaseHTTPRequestHandler):
         if not bool(body.get("enter", True)):
             self._send_json(400, {
                 "ok": False, "error": "kirocrew_terminal_line_only", "target": KIROCREW_TERMINAL_ALIAS,
-                "message": "Kiro Crew 终端按整行发送：输入后回车。",
+                "message": "Crew 终端按整行发送：输入后回车。",
             })
             return
         with self.state.kirocrew_terminal_lock:
@@ -30059,7 +30059,7 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": f"key '{key_name}' not in allowed list"})
             return
         if self.state.kirocrew_client is None:
-            self._send_json(503, {"error": "Kiro Crew 未启用", "target": KIROCREW_TERMINAL_ALIAS})
+            self._send_json(503, {"error": "Crew 未启用", "target": KIROCREW_TERMINAL_ALIAS})
             return
         if key_name not in self._KIROCREW_TERMINAL_STOP_KEYS:
             self._send_json(200, {"ok": True, "key": key_name, "session": KIROCREW_TERMINAL_ALIAS, "ignored": True})
@@ -30156,7 +30156,7 @@ class PushHandler(BaseHTTPRequestHandler):
             if target:
                 hints.append(f"[用户发了{kind}: {name}]\n本地路径: {target}")
             else:
-                hints.append(f"[用户发了{kind}: {name}]\n（文件没能同步到 Kiro Crew 所在的服务器）")
+                hints.append(f"[用户发了{kind}: {name}]\n（文件没能同步到 Crew 所在的服务器）")
         if copied and remote is not None:
             try:
                 remote.run(["find", f"{home}/.cache/ccc/crew-attachments", "-type", "f", "-mtime", "+30", "-delete"], timeout=10)
@@ -30230,7 +30230,7 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.exception("kirocrew outbound images failed")
             visible = agent_images.strip_markers(text)
         if not visible and not outbound:
-            visible = "Kiro Crew 没有返回可展示内容。"
+            visible = "Crew 没有返回可展示内容。"
         final_ts = ""
         try:
             for extra in outbound[:-1]:
@@ -30384,14 +30384,14 @@ class PushHandler(BaseHTTPRequestHandler):
                 "crew-gateway:interrupted", status="interrupted", tools=tools,
             )
         except KiroCrewAuthRequired:
-            self._kirocrew_finish(contact_id, rec, "Kiro Crew 用的 kiro-cli 还没有登录。请先在东京完成 Kiro 登录后再发一次。", "crew-gateway:auth-required")
+            self._kirocrew_finish(contact_id, rec, "Crew 用的 kiro-cli 还没有登录。请先在东京完成 Kiro 登录后再发一次。", "crew-gateway:auth-required")
         except KiroCrewQuotaExceeded:
             self._kirocrew_finish(contact_id, rec, "Kiro 的额度已用完。请充值或等待额度重置后再发一次；原消息已经保留。", "crew-gateway:quota-exceeded")
         except KiroCrewBusy:
-            self._kirocrew_finish(contact_id, rec, "Kiro Crew 那边这个会话还在忙（可能是 dashboard 里开的轮次），稍后再发一次。", "crew-gateway:busy", status="failed")
+            self._kirocrew_finish(contact_id, rec, "Crew 那边这个会话还在忙（可能是 dashboard 里开的轮次），稍后再发一次。", "crew-gateway:busy", status="failed")
         except KiroCrewError as exc:
             logger.warning("kirocrew turn failed: %s", type(exc).__name__)
-            self._kirocrew_finish(contact_id, rec, "Kiro Crew 这次没有成功回复。请稍后重试；原消息已经保留。", "crew-gateway:error", status="failed", tools=tools)
+            self._kirocrew_finish(contact_id, rec, "Crew 这次没有成功回复。请稍后重试；原消息已经保留。", "crew-gateway:error", status="failed", tools=tools)
         finally:
             # Timing only; never message text, paths or provider output.
             logger.info(
@@ -36090,7 +36090,7 @@ def run_server(state: ServerState):
         class _CrewKeepWarmLog(logging.LoggerAdapter):
             # KiroKeepWarm's messages say "Kiro keep-warm"; keep the two apart in the journal.
             def process(self, msg, kwargs):
-                return str(msg).replace("Kiro keep-warm", "Kiro Crew keep-warm", 1), kwargs
+                return str(msg).replace("Kiro keep-warm", "Crew keep-warm", 1), kwargs
 
         state.kirocrew_keep_warm = KiroKeepWarm(
             attempt=lambda: _kirocrew_keep_warm_attempt(state),
@@ -36099,7 +36099,7 @@ def run_server(state: ServerState):
             boot_delay=60.0,
         )
         state.kirocrew_keep_warm.start()
-        logger.info("Kiro Crew keep-warm enabled")
+        logger.info("Crew keep-warm enabled")
     # 小克·工具版 dispatcher — rule-driven scheduler injecting triggers into the
     # main session at scheduled times (no AI here; the session does the thinking).
     if getattr(state, "tool_schedule_enabled", False):
