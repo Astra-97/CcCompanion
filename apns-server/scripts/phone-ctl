@@ -28,6 +28,27 @@
   phone-ctl stat <手机路径>           文件大小/时间
   phone-ctl sh "<命令>" [--timeout 秒] 通用 shell (uid 2000; 手机端 Shell 档默认关闭)
   phone-ctl tasks                     最近任务
+
+「小克的本地能力」(App v1.9.233+, 不需要 Shizuku / 手机操控总开关; App 在后台开着
+「实时提醒」就能收到; 每项在 App → 设置 → 小克的本地能力 里单独开关):
+  phone-ctl local                     各项本地能力的开关 / 权限状态 (App 最近一次上报)
+  phone-ctl alarm HH:MM [--msg 文字] [--days 1,2,3|workdays|weekend|daily]
+                                      在她的系统时钟里建闹钟 (时间按手机本地时间; 1=周一)
+  phone-ctl timer 秒数|5m|1h30m [--msg 文字]   系统时钟倒计时
+  phone-ctl alarms                    打开她的时钟闹钟列表 (会弹界面)
+  phone-ctl health [YYYY-MM-DD|today|yesterday] [--range N]
+                                      读 Health Connect: 睡眠/步数/心率/体重/血氧/血压… (N 天, 截止该日)
+  phone-ctl calendar sync [--no-wait] 把日程本同步进她手机上独立的「小克日程」日历 (并刷新小部件;
+                                      schedule-ctl 每次改动会自动在后台跑 --no-wait 版)
+  phone-ctl ring [--msg 文字] [--seconds N] [--volume 80]
+                                      强提醒 / 找手机: 全屏 + 闹钟音量响铃 + 震动, 直到她点停
+  phone-ctl ring --stop               远程停掉正在响的强提醒
+  phone-ctl clip "文字"               写进她的剪贴板 + 小通知「小克复制了：…」
+  phone-ctl widget                    让桌面小部件马上刷新
+  phone-ctl places                    她在手机上设的地点 (只有名字和半径, 没有坐标)
+  phone-ctl notifs [--since 1h] [--clear]
+                                      白名单 App (外卖/快递) 转发来的通知 (最近 200 条 / 48h)
+  退出码: 0 成功; 1 失败 (原因已打印); 2 闹钟/计时器在等她点通知确认 (还没真设上)
   phone-ctl cancel <任务id>
   通用参数: --json 输出原始 JSON; --wait 秒 (等结果的最长时间)
 
@@ -112,15 +133,36 @@ def _request(method: str, path: str, body: dict | None = None, *, timeout: float
         raise CtlError(f"连不上 CcCompanion 服务: {e}") from None
 
 
-def run_task(action: str, args: dict | None = None, *, wait: float = 90, timeout_s: int | None = None,
-             on_progress=None) -> dict:
-    """投递任务并等结果; 返回终态 task dict (status=done 才算成功)。"""
+LOCAL_ACTIONS = {"alarm", "timer", "show_alarms", "health", "calendar_sync", "ring", "ring_stop",
+                 "clip", "widget_refresh", "places"}
+FEATURE_ZH = {
+    "alarm": "设闹钟 / 计时器", "health": "健康数据", "calendar": "日历「小克日程」",
+    "ring": "强提醒 / 找手机", "clip": "剪贴板", "widget": "桌面小部件",
+    "notifs": "通知转发", "places": "到达提醒",
+}
+
+
+def enqueue(action: str, args: dict | None = None, *, timeout_s: int | None = None) -> dict:
     body: dict = {"action": action, "args": args or {}}
     if timeout_s is not None:
         body["timeout_s"] = timeout_s
-    task = _request("POST", "/phone/tasks", body)["task"]
+    return _request("POST", "/phone/tasks", body)["task"]
+
+
+def run_task(action: str, args: dict | None = None, *, wait: float | None = None, timeout_s: int | None = None,
+             on_progress=None) -> dict:
+    """投递任务并等结果; 返回终态 task dict (status=done 才算成功)。"""
+    local = action in LOCAL_ACTIONS
+    if wait is None:
+        wait = 150 if local else 90
+    task = enqueue(action, args, timeout_s=timeout_s)
     device = task.get("device") or {}
-    if not device.get("online"):
+    if local:
+        info = device.get("local") or {}
+        if not info.get("seen"):
+            print("phone-ctl: 服务重启以来 App 还没来领过本地任务（App 的「实时提醒」没开 / 被杀后台 / "
+                  "还没装 v1.9.233+），先排队等它连上…", file=sys.stderr)
+    elif not device.get("online"):
         ago = device.get("seconds_ago")
         hint = "从没来过" if ago is None else f"上次来是 {ago} 秒前"
         print(f"phone-ctl: 手机现在好像不在线（{hint}），先排队等 {task.get('timeout_s')} 秒内领取…",
@@ -338,7 +380,7 @@ def cmd_stat(args) -> None:
 
 def cmd_sh(args) -> None:
     r = ensure_done(run_task("shell", {"cmd": args.command, "timeout_s": args.timeout},
-                             wait=max(args.wait, args.timeout + 30)))
+                             wait=max(args.wait or 90, args.timeout + 30)))
     if args.json:
         _out(args, r, "")
         return
@@ -369,10 +411,284 @@ def cmd_cancel(args) -> None:
     _out(args, r, f"{match[0]['id'][:8]} → {r['task']['status']}")
 
 
+# ── 小克的本地能力 (App v1.9.233+, 不需要 Shizuku) ─────────────────────────────
+
+
+def _parse_hhmm(raw: str) -> tuple[int, int]:
+    m = re.fullmatch(r"(\d{1,2})[:：.](\d{2})", raw.strip())
+    if not m or not (0 <= int(m.group(1)) <= 23 and 0 <= int(m.group(2)) <= 59):
+        raise CtlError(f"时间要写成 HH:MM（24 小时制），收到 {raw!r}")
+    return int(m.group(1)), int(m.group(2))
+
+
+def _parse_duration(raw: str) -> int:
+    text = raw.strip().lower()
+    if text.isdigit():
+        return int(text)
+    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", text)
+    if not m or not any(m.groups()):
+        raise CtlError(f"时长写成 秒数 / 5m / 1h30m / 90s，收到 {raw!r}")
+    h, mi, se = (int(g) if g else 0 for g in m.groups())
+    return h * 3600 + mi * 60 + se
+
+
+def _parse_days(raw: str | None):
+    if not raw:
+        return []
+    alias = raw.strip().lower()
+    if alias in ("workdays", "weekdays", "工作日", "weekend", "weekends", "周末", "daily", "everyday", "每天"):
+        return alias
+    try:
+        days = sorted({int(p) for p in re.split(r"[,，\s]+", alias) if p})
+    except ValueError:
+        raise CtlError("--days 写 1,2,3（1=周一 … 7=周日）或 workdays / weekend / daily") from None
+    if any(not 1 <= d <= 7 for d in days):
+        raise CtlError("--days 只能是 1-7（1=周一，7=周日）")
+    return days
+
+
+_DAY_ZH = "一二三四五六日"
+
+_STATE_ZH = {
+    "set_verified": "已设好（系统「下一个闹钟」已经变成它，确认生效）",
+    "set_unverified": "已交给时钟 App（没法从系统确认，通常是已设好）",
+    "awaiting_tap": "App 在后台没法直接弹时钟，已发通知等她点一下确认（点之前还没设上）",
+}
+_VIA_ZH = {"foreground": "App 在前台直接设", "overlay": "后台 + 悬浮窗权限直接设",
+           "notification": "发通知等她点"}
+
+
+def _finish_local(args, task: dict, ok_text) -> int:
+    """本地能力统一收尾: 失败抛原因; 成功打印; awaiting_tap 退出码 2。"""
+    r = ensure_done(task)
+    state = r.get("state")
+    text = ok_text(r) if callable(ok_text) else ok_text
+    if state in _STATE_ZH:
+        text += f"\n状态: {_STATE_ZH[state]}"
+    if r.get("via"):
+        text += f"（{_VIA_ZH.get(r['via'], r['via'])}）"
+    if r.get("reason"):
+        text += f"\n说明: {r['reason']}"
+    if state == "awaiting_tap":
+        text += f"\n她点了之后用 phone-ctl task {task['id'][:8]} 看后续"
+    _out(args, {"task_id": task["id"], **r}, text)
+    return 2 if state == "awaiting_tap" else 0
+
+
+def cmd_alarm(args) -> None:
+    hour, minutes = _parse_hhmm(args.time)
+    body = {"hour": hour, "minutes": minutes, "message": args.msg or "", "days": _parse_days(args.days)}
+    task = run_task("alarm", body, wait=args.wait)
+
+    def text(r):
+        days = r.get("days") or []
+        rep = "" if not days else "，重复: 周" + "、".join(_DAY_ZH[d - 1] for d in days)
+        return f"闹钟 {hour:02d}:{minutes:02d}{rep}" + (f"「{args.msg}」" if args.msg else "")
+    raise SystemExit(_finish_local(args, task, text))
+
+
+def cmd_timer(args) -> None:
+    seconds = _parse_duration(args.seconds)
+    if not 1 <= seconds <= 86400:
+        raise CtlError("计时器 1 秒到 24 小时")
+    task = run_task("timer", {"seconds": seconds, "message": args.msg or ""}, wait=args.wait)
+    raise SystemExit(_finish_local(args, task, f"计时器 {seconds} 秒" + (f"「{args.msg}」" if args.msg else "")))
+
+
+def cmd_alarms(args) -> None:
+    raise SystemExit(_finish_local(args, run_task("show_alarms", wait=args.wait), "已打开时钟的闹钟列表"))
+
+
+def _resolve_date(raw: str | None) -> str:
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    if not raw or raw == "today":
+        return today.isoformat()
+    if raw == "yesterday":
+        return (today - timedelta(days=1)).isoformat()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        return raw
+    raise CtlError("日期写 YYYY-MM-DD / today / yesterday")
+
+
+def _fmt_min(m) -> str:
+    if m is None:
+        return "?"
+    m = int(round(m))
+    return f"{m // 60}h{m % 60:02d}m"
+
+
+def cmd_health(args) -> None:
+    date = _resolve_date(args.date)
+    r = ensure_done(run_task("health", {"date": date, "days": args.range}, wait=args.wait))
+    lines = [f"Health Connect {r.get('start_date', date)} → {r.get('end_date', date)}（{r.get('tz', '')}）"]
+    for day in r.get("days") or []:
+        parts = [day.get("date", "?")]
+        sl = day.get("sleep") or {}
+        if sl.get("total_min"):
+            parts.append(f"睡眠 {_fmt_min(sl['total_min'])}"
+                         + (f"（深{_fmt_min(sl.get('deep_min'))} 浅{_fmt_min(sl.get('light_min'))} "
+                            f"REM{_fmt_min(sl.get('rem_min'))} 醒{_fmt_min(sl.get('awake_min'))}）"
+                            if sl.get("has_stages") else ""))
+        if day.get("steps") is not None:
+            parts.append(f"步数 {day['steps']}")
+        if day.get("distance_m"):
+            parts.append(f"{day['distance_m'] / 1000:.2f}km")
+        if day.get("active_kcal"):
+            parts.append(f"活动 {day['active_kcal']:.0f}kcal")
+        hr = day.get("heart_rate") or {}
+        if hr.get("avg"):
+            parts.append(f"心率 {hr.get('min')}/{hr.get('avg')}/{hr.get('max')}")
+        if day.get("resting_hr"):
+            parts.append(f"静息 {day['resting_hr']}")
+        if day.get("spo2_avg"):
+            parts.append(f"血氧 {day['spo2_avg']:.0f}%")
+        if day.get("exercise"):
+            parts.append("运动 " + "、".join(f"{e.get('type')} {_fmt_min(e.get('minutes'))}" for e in day["exercise"]))
+        lines.append("  ".join(parts))
+    if r.get("weight"):
+        w = r["weight"]
+        lines.append(f"体重 {w.get('kg')}kg（{w.get('time', '')[:10]}）")
+    if r.get("body_fat"):
+        lines.append(f"体脂 {r['body_fat'].get('pct')}%")
+    if r.get("blood_pressure"):
+        bp = r["blood_pressure"]
+        lines.append(f"血压 {bp.get('systolic')}/{bp.get('diastolic')}（{bp.get('time', '')[:16]}）")
+    if r.get("missing_permissions"):
+        lines.append("没授权的项: " + "、".join(r["missing_permissions"]))
+    if r.get("background_note"):
+        lines.append(f"注意: {r['background_note']}")
+    _out(args, r, "\n".join(lines))
+
+
+def _nudge_widget() -> None:
+    """日程变了, 桌面小部件也顺手刷 (排队不等; 关着 / 失败都无所谓)。"""
+    try:
+        enqueue("widget_refresh")
+    except CtlError:
+        pass
+
+
+def cmd_calendar(args) -> None:
+    if args.what != "sync":
+        raise CtlError("用法: phone-ctl calendar sync [--no-wait]")
+    if args.no_wait:
+        task = enqueue("calendar_sync")
+        _nudge_widget()
+        _out(args, {"task_id": task["id"], "status": task["status"]},
+             f"已排队同步「小克日程」（{len(task['args'].get('events') or [])} 条，任务 {task['id'][:8]}）")
+        return
+    r = ensure_done(run_task("calendar_sync", wait=args.wait))
+    _nudge_widget()
+    _out(args, r, f"「小克日程」已同步：新增 {r.get('inserted', 0)} / 更新 {r.get('updated', 0)} / "
+                  f"删除 {r.get('deleted', 0)} / 不变 {r.get('unchanged', 0)}"
+                  + (f"\n说明: {r['reason']}" if r.get("reason") else ""))
+
+
+def cmd_ring(args) -> None:
+    if args.stop:
+        r = ensure_done(run_task("ring_stop", wait=args.wait))
+        _out(args, r, "已停止强提醒" if r.get("stopped") else "本来就没在响")
+        return
+    task = run_task("ring", {"message": args.msg or "", "seconds": args.seconds, "volume_pct": args.volume},
+                    wait=args.wait)
+    r = ensure_done(task)
+    bits = [f"在响了（最多 {args.seconds} 秒，她点「停」就停）"]
+    bits.append("全屏弹出: " + ("能" if r.get("full_screen") else "不能（只有横幅通知；去「小克的本地能力」开全屏通知权限）"))
+    if r.get("volume") is not None:
+        bits.append(f"闹钟音量 {r.get('volume')}/{r.get('volume_max')}")
+    if r.get("dnd"):
+        bits.append(f"勿扰: {r['dnd']}")
+    if r.get("reason"):
+        bits.append(f"说明: {r['reason']}")
+    bits.append(f"停没停 / 谁停的: phone-ctl task {task['id'][:8]}")
+    _out(args, {"task_id": task["id"], **r}, "\n".join(bits))
+
+
+def cmd_clip(args) -> None:
+    r = ensure_done(run_task("clip", {"text": args.text, "notify": not args.quiet}, wait=args.wait))
+    _out(args, r, f"已写进剪贴板（{len(args.text)} 字）" + ("" if r.get("notified") else "（通知没发出来）"))
+
+
+def cmd_widget(args) -> None:
+    r = ensure_done(run_task("widget_refresh", wait=args.wait))
+    n = r.get("widgets", 0)
+    _out(args, r, f"桌面小部件已刷新（{n} 个）" if n else "她桌面上还没放「小克」小部件")
+
+
+def cmd_places(args) -> None:
+    r = ensure_done(run_task("places", wait=args.wait))
+    rows = [f"{p.get('name')}  半径 {p.get('radius_m')}m" for p in r.get("places") or []]
+    head = "后台定位: " + ("已允许" if r.get("background_location") else "没允许（到达提醒不会触发）")
+    _out(args, r, head + "\n" + ("\n".join(rows) or "(她还没设地点)"))
+
+
+def _parse_since(raw: str | None) -> float | None:
+    if not raw:
+        return None
+    text = raw.strip().lower()
+    try:
+        if text.endswith("d"):
+            return float(text[:-1]) * 86400
+        return float(_parse_duration(text))
+    except (CtlError, ValueError):
+        raise CtlError("--since 写 30m / 2h / 1d / 秒数") from None
+
+
+def cmd_notifs(args) -> None:
+    if args.clear:
+        r = _request("POST", "/phone/notifs/clear", {})
+        _out(args, r, f"已清空 {r.get('cleared', 0)} 条")
+        return
+    since = _parse_since(args.since)
+    path = "/phone/notifs" + (f"?since={since:.0f}" if since is not None else "")
+    items = _request("GET", path).get("items") or []
+    rows = []
+    for i in items:
+        ts = datetime.fromtimestamp(i.get("posted_at") or i.get("at") or 0).strftime("%m-%d %H:%M")
+        rows.append(f"{ts}  {i.get('app')}: {i.get('title')}" + (f" — {i.get('text')}" if i.get("text") else ""))
+    _out(args, {"items": items}, "\n".join(rows) or "(没有)")
+
+
+def cmd_local(args) -> None:
+    device = _request("GET", "/phone/device")["device"]
+    info = device.get("local") or {}
+    if not info.get("seen"):
+        _out(args, info, "服务重启以来 App 还没来领过本地任务（「实时提醒」没开 / 被杀后台 / App 版本 < 1.9.233）")
+        return
+    lines = [f"App v{info.get('app_version') or '?'}，{info.get('seconds_ago')} 秒前上报"]
+    for name, zh in FEATURE_ZH.items():
+        f = (info.get("features") or {}).get(name)
+        if not f:
+            lines.append(f"  {zh}: ?")
+            continue
+        state = "开" if f.get("enabled") else "关"
+        miss = f.get("missing") or []
+        lines.append(f"  {zh}: {state}" + (f"，缺: {'、'.join(miss)}" if miss else "")
+                     + (f"（{f['note']}）" if f.get("note") else ""))
+    _out(args, info, "\n".join(lines))
+
+
+def cmd_task(args) -> None:
+    tasks = _request("GET", "/phone/tasks").get("tasks") or []
+    match = [t for t in tasks if t["id"].startswith(args.task_id)]
+    if len(match) != 1:
+        raise CtlError("找不到唯一匹配的任务 id（结果普通任务留 15 分钟，闹钟 / 强提醒留 6 小时）")
+    t = match[0]
+    lines = [f"{t['id'][:8]} {t['action']} {t['status']}" + (f" — {t.get('message')}" if t.get("message") else "")]
+    if t.get("result"):
+        lines.append("结果: " + json.dumps(t["result"], ensure_ascii=False))
+    for f in t.get("followup") or []:
+        ts = datetime.fromtimestamp(f.get("at") or 0).strftime("%H:%M:%S")
+        lines.append(f"后续 {ts}: " + json.dumps({k: v for k, v in f.items() if k != "at"}, ensure_ascii=False))
+    _out(args, t, "\n".join(lines))
+
+
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", help="输出原始 JSON")
-    common.add_argument("--wait", type=float, default=90, help="等结果的最长秒数")
+    common.add_argument("--wait", type=float, default=None, help="等结果的最长秒数 (默认 90, 本地能力 150)")
     p = argparse.ArgumentParser(prog="phone-ctl", description="小克操作方小南的手机（Shizuku）",
                                 parents=[common])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -409,6 +725,27 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_sh)
     sub.add_parser("tasks", parents=[common]).set_defaults(fn=cmd_tasks)
     s = sub.add_parser("cancel", parents=[common]); s.add_argument("task_id"); s.set_defaults(fn=cmd_cancel)
+    s = sub.add_parser("task", parents=[common]); s.add_argument("task_id"); s.set_defaults(fn=cmd_task)
+    # ── 本地能力 ──
+    sub.add_parser("local", parents=[common]).set_defaults(fn=cmd_local)
+    s = sub.add_parser("alarm", parents=[common]); s.add_argument("time"); s.add_argument("--msg")
+    s.add_argument("--days"); s.set_defaults(fn=cmd_alarm)
+    s = sub.add_parser("timer", parents=[common]); s.add_argument("seconds"); s.add_argument("--msg")
+    s.set_defaults(fn=cmd_timer)
+    sub.add_parser("alarms", parents=[common]).set_defaults(fn=cmd_alarms)
+    s = sub.add_parser("health", parents=[common]); s.add_argument("date", nargs="?")
+    s.add_argument("--range", type=int, default=1); s.set_defaults(fn=cmd_health)
+    s = sub.add_parser("calendar", parents=[common]); s.add_argument("what", choices=["sync"])
+    s.add_argument("--no-wait", action="store_true"); s.set_defaults(fn=cmd_calendar)
+    s = sub.add_parser("ring", parents=[common]); s.add_argument("--msg"); s.add_argument("--seconds", type=int, default=60)
+    s.add_argument("--volume", type=int, default=80); s.add_argument("--stop", action="store_true")
+    s.set_defaults(fn=cmd_ring)
+    s = sub.add_parser("clip", parents=[common]); s.add_argument("text"); s.add_argument("--quiet", action="store_true")
+    s.set_defaults(fn=cmd_clip)
+    sub.add_parser("widget", parents=[common]).set_defaults(fn=cmd_widget)
+    sub.add_parser("places", parents=[common]).set_defaults(fn=cmd_places)
+    s = sub.add_parser("notifs", parents=[common]); s.add_argument("--since"); s.add_argument("--clear", action="store_true")
+    s.set_defaults(fn=cmd_notifs)
     return p
 
 

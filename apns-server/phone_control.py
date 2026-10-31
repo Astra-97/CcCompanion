@@ -32,14 +32,61 @@ from typing import Any, BinaryIO, Callable
 
 logger = logging.getLogger("phone_control")
 
-TIERS: tuple[str, ...] = ("status", "screen", "input", "files", "shell")
+TIERS: tuple[str, ...] = ("status", "screen", "input", "files", "shell", "local")
 TIER_ZH = {
     "status": "查看状态",
     "screen": "截屏",
     "input": "点按输入",
     "files": "文件",
     "shell": "Shell",
+    "local": "本地能力",
 }
+
+# 「小克的本地能力」(2026-10-31, App v1.9.233): 不需要 Shizuku、App 只在后台开着通知
+# 也能做的事。投递走同一条任务队列, 但手机端另有一条送达路: 入队时经
+# /chat/stream?contacts=all 推 phone_task 事件 (RealtimeNotificationService 那条常驻 SSE),
+# App 收到后 POST /phone/tasks/claim 按 id 领取 → 执行 → /result (+ 之后的 /followup)。
+# 每个本地能力在手机端有自己的开关 (设置 → 小克的本地能力), 和「手机操控」总开关无关。
+LOCAL_TIER = "local"
+SSE_EVENT = "phone_task"  # /chat/stream?contacts=all 上的唤醒事件 {event, task_id, action, ts}
+LOCAL_FEATURES: dict[str, str] = {
+    "alarm": "设闹钟 / 计时器",
+    "health": "健康数据",
+    "calendar": "日历「小克日程」",
+    "ring": "强提醒 / 找手机",
+    "clip": "剪贴板",
+    "widget": "桌面小部件",
+    "notifs": "通知转发",
+    "places": "到达提醒",
+}
+# action → feature
+LOCAL_ACTION_FEATURE: dict[str, str] = {
+    "alarm": "alarm",
+    "timer": "alarm",
+    "show_alarms": "alarm",
+    "health": "health",
+    "calendar_sync": "calendar",
+    "ring": "ring",
+    "ring_stop": "ring",
+    "clip": "clip",
+    "widget_refresh": "widget",
+    "places": "places",
+}
+# 只保留最新一条待领的 action (旧的 pending 直接 superseded)
+COALESCE_ACTIONS = frozenset({"calendar_sync", "widget_refresh"})
+LOCAL_CLAIM_TIMEOUT_S = 90
+LONG_CLAIM_TIMEOUT_S = {"calendar_sync": 30 * 60, "widget_refresh": 30 * 60}
+MAX_CLIP_CHARS = 20000
+MAX_MSG_CHARS = 200
+MAX_CALENDAR_EVENTS = 600
+MAX_FOLLOWUPS = 5
+LOCAL_SEEN_FRESH_S = 7 * 24 * 3600
+# 本地任务的结果留久一点: 闹钟「点一下确认」/ 强提醒「谁停的」这类后续可能隔很久才来
+LOCAL_RESULT_TTL_S = 6 * 3600
+FOLLOWUP_ACTIONS = frozenset({"alarm", "timer", "show_alarms", "ring"})
+LOCAL_NOT_CLAIMED_MESSAGE = (
+    "App 没来领本地任务：「实时提醒」没开 / App 被系统杀了后台 / App 版本低于 1.9.233"
+)
 
 # action → (tier, default timeout seconds, max timeout seconds)
 ACTIONS: dict[str, tuple[str, int, int]] = {
@@ -57,6 +104,17 @@ ACTIONS: dict[str, tuple[str, int, int]] = {
     "stat": ("files", 20, 60),
     "pull": ("files", 900, 3600),
     "shell": ("shell", 60, 600),
+    # ── 本地能力 (不需要 Shizuku) ──
+    "alarm": ("local", 30, 120),
+    "timer": ("local", 30, 120),
+    "show_alarms": ("local", 20, 60),
+    "health": ("local", 60, 180),
+    "calendar_sync": ("local", 120, 600),
+    "ring": ("local", 20, 60),
+    "ring_stop": ("local", 15, 60),
+    "clip": ("local", 15, 60),
+    "widget_refresh": ("local", 30, 120),
+    "places": ("local", 15, 60),
 }
 
 # 键名 → Android KeyEvent keycode (手机端用同一张表, 见 PhoneControlPolicy.KEYS)
@@ -259,7 +317,142 @@ def validate_task(action: Any, args: Any) -> dict[str, Any]:
         out["cmd"] = cmd
         out["timeout_s"] = _int_arg(args, "timeout_s", 1, 600, default=30)
         return out
+    if action in LOCAL_ACTION_FEATURE:
+        return _validate_local(action, args)
     raise PhoneTaskError(400, "unknown_action", f"不支持的操作: {action!r}")  # pragma: no cover
+
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+_EVENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+
+def _opt_text(args: dict[str, Any], key: str, limit: int) -> str:
+    value = args.get(key)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise PhoneTaskError(400, "bad_args", f"{key} 必须是字符串")
+    value = value.strip()
+    if len(value) > limit or "\x00" in value:
+        raise PhoneTaskError(400, "bad_args", f"{key} 最长 {limit} 字")
+    return value
+
+
+def _valid_date(raw: Any, key: str = "date") -> str:
+    if not isinstance(raw, str) or not _DATE_RE.match(raw):
+        raise PhoneTaskError(400, "bad_args", f"{key} 必须是 YYYY-MM-DD")
+    try:
+        time.strptime(raw, "%Y-%m-%d")
+    except ValueError:
+        raise PhoneTaskError(400, "bad_args", f"{key} 不是有效日期") from None
+    return raw
+
+
+def normalize_days(raw: Any) -> list[int]:
+    """闹钟重复日: ISO 星期 1=周一 … 7=周日 (手机端换算成 Calendar.SUNDAY=1 那套)。"""
+    if raw is None or raw == [] or raw == "":
+        return []
+    if isinstance(raw, str):
+        alias = raw.strip().lower()
+        if alias in ("workdays", "weekdays", "工作日"):
+            return [1, 2, 3, 4, 5]
+        if alias in ("weekend", "weekends", "周末"):
+            return [6, 7]
+        if alias in ("daily", "everyday", "每天"):
+            return [1, 2, 3, 4, 5, 6, 7]
+        raw = [p for p in re.split(r"[,，\s]+", alias) if p]
+    if not isinstance(raw, list):
+        raise PhoneTaskError(400, "bad_days", "days 必须是 1-7 的列表（1=周一）")
+    out: set[int] = set()
+    for item in raw:
+        try:
+            n = int(item)
+        except (TypeError, ValueError):
+            raise PhoneTaskError(400, "bad_days", f"days 里有非数字: {item!r}") from None
+        if isinstance(item, bool) or not 1 <= n <= 7:
+            raise PhoneTaskError(400, "bad_days", "days 只能是 1-7（1=周一，7=周日）")
+        out.add(n)
+    return sorted(out)
+
+
+def normalize_calendar_event(raw: Any) -> dict[str, Any] | None:
+    """schedule-ctl events.json 的一条 → 下发给手机的最小字段; 坏条目返回 None (跳过不报错)。"""
+    if not isinstance(raw, dict):
+        return None
+    event_id = raw.get("id")
+    title = raw.get("title")
+    date = raw.get("date")
+    if not isinstance(event_id, str) or not _EVENT_ID_RE.match(event_id):
+        return None
+    if not isinstance(title, str) or not title.strip():
+        return None
+    if not isinstance(date, str) or not _DATE_RE.match(date):
+        return None
+    hhmm = raw.get("time")
+    if not (isinstance(hhmm, str) and _HHMM_RE.match(hhmm)):
+        hhmm = None
+    remind = raw.get("remind_minutes_before")
+    if isinstance(remind, bool) or not isinstance(remind, int) or not 0 <= remind <= 7 * 24 * 60:
+        remind = None
+    note = raw.get("note") if isinstance(raw.get("note"), str) else ""
+    return {
+        "id": event_id,
+        "title": title.strip()[:200],
+        "date": date,
+        "time": hhmm,
+        "remind_minutes_before": remind,
+        "note": note[:2000],
+        "done": raw.get("done") is True,
+    }
+
+
+def _validate_local(action: str, args: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {"feature": LOCAL_ACTION_FEATURE[action]}
+    if action == "alarm":
+        out["hour"] = _int_arg(args, "hour", 0, 23)
+        out["minutes"] = _int_arg(args, "minutes", 0, 59)
+        out["message"] = _opt_text(args, "message", MAX_MSG_CHARS)
+        out["days"] = normalize_days(args.get("days"))
+        out["skip_ui"] = args.get("skip_ui", True) is not False
+        if "vibrate" in args:
+            out["vibrate"] = bool(args.get("vibrate"))
+        return out
+    if action == "timer":
+        out["seconds"] = _int_arg(args, "seconds", 1, 24 * 3600)
+        out["message"] = _opt_text(args, "message", MAX_MSG_CHARS)
+        out["skip_ui"] = args.get("skip_ui", True) is not False
+        return out
+    if action == "health":
+        out["date"] = _valid_date(args.get("date"))
+        out["days"] = _int_arg(args, "days", 1, 31, default=1)
+        return out
+    if action == "calendar_sync":
+        events = args.get("events")
+        if not isinstance(events, list):
+            raise PhoneTaskError(400, "bad_events", "events 必须是列表")
+        clean = [e for e in (normalize_calendar_event(x) for x in events) if e is not None]
+        if len(clean) > MAX_CALENDAR_EVENTS:
+            clean = sorted(clean, key=lambda e: (e["date"], e["time"] or ""))[-MAX_CALENDAR_EVENTS:]
+        out["events"] = clean
+        out["window_start"] = _valid_date(args.get("window_start"), "window_start")
+        return out
+    if action == "ring":
+        out["message"] = _opt_text(args, "message", MAX_MSG_CHARS)
+        out["seconds"] = _int_arg(args, "seconds", 5, 600, default=60)
+        out["volume_pct"] = _int_arg(args, "volume_pct", 10, 100, default=80)
+        return out
+    if action == "clip":
+        text = args.get("text")
+        if not isinstance(text, str) or not text:
+            raise PhoneTaskError(400, "bad_text", "text 不能为空")
+        if len(text) > MAX_CLIP_CHARS or "\x00" in text:
+            raise PhoneTaskError(400, "bad_text", f"text 最长 {MAX_CLIP_CHARS} 字")
+        out["text"] = text
+        out["notify"] = args.get("notify", True) is not False
+        return out
+    # show_alarms / ring_stop / widget_refresh / places: 无参数
+    return out
 
 
 def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
@@ -298,8 +491,15 @@ def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
 class PhoneControlHub:
     """线程安全的内存任务队列 + 二进制结果 / 待下发文件的磁盘存放。"""
 
-    def __init__(self, state_dir: str | Path, *, clock: Callable[[], float] = time.time) -> None:
+    def __init__(self, state_dir: str | Path, *, clock: Callable[[], float] = time.time,
+                 calendar_loader: Callable[[], dict[str, Any]] | None = None,
+                 on_local_enqueue: Callable[[dict[str, Any]], None] | None = None) -> None:
         self.state_dir = Path(state_dir)
+        # calendar_sync 没带 events 时从这里取 (push.py 接 /root/schedule/events.json)
+        self.calendar_loader = calendar_loader
+        # 本地能力任务入队后的送达钩子 (push.py: 推 phone_task SSE 事件)
+        self.on_local_enqueue = on_local_enqueue
+        self._local: dict[str, Any] = {}
         self.blob_dir = self.state_dir / "phone_blobs"
         self.outbox_dir = self.state_dir / "phone_outbox"
         self.audit_path = self.state_dir / "phone_control_audit.jsonl"
@@ -338,6 +538,8 @@ class PhoneControlHub:
             "error": task["error"],
             "message": task["message"],
             "progress": task["progress"],
+            "followup": list(task.get("followup") or []),
+            "claimed_via": task.get("claimed_via"),
         }
         blob = task.get("blob")
         view["blob"] = (
@@ -370,6 +572,10 @@ class PhoneControlHub:
             args["text"] = f"<{len(args['text'])} 字>"
         if "cmd" in args:
             args["cmd"] = args["cmd"][:120]
+        if "events" in args:
+            args["events"] = f"<{len(args['events'])} 条>"
+        if args.get("message"):
+            args["message"] = f"<{len(args['message'])} 字>"
         line = {
             "id": task["id"],
             "action": task["action"],
@@ -402,12 +608,14 @@ class PhoneControlHub:
                 if status == STATUS_PENDING and now - task["created_at"] > task["claim_timeout_s"]:
                     self._finish(
                         task, STATUS_TIMEOUT, error="phone_not_claimed",
-                        message="手机没来领任务：App 不在线 / 手机操控总开关没开 / 被系统杀了后台",
+                        message=(LOCAL_NOT_CLAIMED_MESSAGE if task["tier"] == LOCAL_TIER else
+                                 "手机没来领任务：App 不在线 / 手机操控总开关没开 / 被系统杀了后台"),
                     )
                 elif status == STATUS_CLAIMED and now - (task["claimed_at"] or now) > task["timeout_s"]:
                     self._finish(task, STATUS_TIMEOUT, error="phone_no_result",
                                  message=f"手机领走后 {task['timeout_s']} 秒没回结果")
-                elif status in TERMINAL and now - (task["finished_at"] or now) > RESULT_TTL_S:
+                elif status in TERMINAL and now - (task["finished_at"] or now) > (
+                        LOCAL_RESULT_TTL_S if task["action"] in FOLLOWUP_ACTIONS else RESULT_TTL_S):
                     self._drop_blob(task)
                     del self._tasks[task["id"]]
             for file_id, entry in list(self._outbox.items()):
@@ -422,6 +630,12 @@ class PhoneControlHub:
 
     def enqueue(self, action: Any, args: Any, *, timeout_s: Any = None,
                 claim_timeout_s: Any = None) -> dict[str, Any]:
+        if action == "calendar_sync" and args is None:
+            args = {}
+        if action == "calendar_sync" and isinstance(args, dict) and "events" not in args:
+            if self.calendar_loader is None:
+                raise PhoneTaskError(503, "no_calendar_source", "服务端没配置日程来源")
+            args = {**args, **self.calendar_loader()}
         clean = validate_task(action, args)
         tier, default_timeout, max_timeout = ACTIONS[action]
         timeout = default_timeout
@@ -430,12 +644,27 @@ class PhoneControlHub:
         if action == "shell":
             timeout = max(timeout, clean["timeout_s"] + 15)
         claim_timeout = CLAIM_TIMEOUT_S
+        if tier == LOCAL_TIER:
+            claim_timeout = LONG_CLAIM_TIMEOUT_S.get(action, LOCAL_CLAIM_TIMEOUT_S)
         if claim_timeout_s is not None:
             claim_timeout = _int_arg({"claim_timeout_s": claim_timeout_s}, "claim_timeout_s", 1, 3600)
         with self._cond:
             self.sweep()
             device = self._device_view_locked()
-            if device["online"] and device["caps"] is not None and tier not in device["caps"]:
+            if tier == LOCAL_TIER:
+                feature = LOCAL_ACTION_FEATURE[action]
+                reported = (self._local.get("features") or {}).get(feature)
+                if isinstance(reported, dict) and reported.get("enabled") is False and device["local"]["fresh"]:
+                    raise PhoneTaskError(
+                        403, "feature_disabled",
+                        f"手机端关着「{LOCAL_FEATURES[feature]}」（App → 设置 → 小克的本地能力）",
+                    )
+                if action in COALESCE_ACTIONS:
+                    for old in self._tasks.values():
+                        if old["action"] == action and old["status"] == STATUS_PENDING:
+                            self._finish(old, STATUS_CANCELLED, error="superseded",
+                                         message="被更新的同类任务取代")
+            elif device["online"] and device["caps"] is not None and tier not in device["caps"]:
                 raise PhoneTaskError(
                     403, "tier_disabled",
                     f"手机端没开「{TIER_ZH[tier]}」权限（App → 设置 → 手机操控）",
@@ -467,6 +696,8 @@ class PhoneControlHub:
                 "error": None,
                 "message": None,
                 "progress": None,
+                "followup": [],
+                "claimed_via": None,
             }
             if action == "download":
                 self._outbox[clean["file_id"]]["task_id"] = task_id
@@ -474,7 +705,12 @@ class PhoneControlHub:
             self._cond.notify_all()
             view = self._public(task)
             view["device"] = device
-            return view
+        if tier == LOCAL_TIER and self.on_local_enqueue is not None:
+            try:
+                view["stream_listeners"] = self.on_local_enqueue(self._public(task))
+            except Exception:
+                logger.warning("local task wake hook failed", exc_info=True)
+        return view
 
     def get(self, task_id: str, *, wait_s: float = 0.0) -> dict[str, Any]:
         """取任务状态; wait_s>0 时阻塞到任务结束或超时 (长轮询)。"""
@@ -588,7 +824,46 @@ class PhoneControlHub:
             "shizuku": self._device.get("shizuku"),
             "app_version": self._device.get("app_version"),
             "shizuku_version": self._device.get("shizuku_version"),
+            "local": self._local_view_locked(now),
         }
+
+    def _local_view_locked(self, now: float) -> dict[str, Any]:
+        seen = self._local.get("last_seen")
+        ago = None if seen is None else max(0, int(now - seen))
+        return {
+            "seen": seen is not None,
+            "seconds_ago": ago,
+            "fresh": ago is not None and ago <= LOCAL_SEEN_FRESH_S,
+            "app_version": self._local.get("app_version"),
+            "features": self._local.get("features"),
+        }
+
+    @staticmethod
+    def _clean_features(raw: Any) -> dict[str, Any] | None:
+        if not isinstance(raw, dict):
+            return None
+        out: dict[str, Any] = {}
+        for name, value in raw.items():
+            if name not in LOCAL_FEATURES or not isinstance(value, dict):
+                continue
+            item: dict[str, Any] = {"enabled": value.get("enabled") is True}
+            missing = value.get("missing")
+            if isinstance(missing, list):
+                item["missing"] = [str(m)[:80] for m in missing[:12]]
+            note = value.get("note")
+            if isinstance(note, str) and note:
+                item["note"] = note[:200]
+            out[name] = item
+        return out
+
+    def note_local(self, *, app_version: Any = None, features: Any = None) -> None:
+        with self._cond:
+            self._local["last_seen"] = self._now()
+            if isinstance(app_version, str):
+                self._local["app_version"] = app_version[:40]
+            clean = self._clean_features(features)
+            if clean is not None:
+                self._local["features"] = clean
 
     # ── 手机侧 ────────────────────────────────────────────────────────────
 
@@ -607,7 +882,8 @@ class PhoneControlHub:
             self._device.update(info)
 
     def claim(self, *, wait_s: float = 0.0, caps: Any = None, shizuku: Any = None,
-              app_version: Any = None, shizuku_version: Any = None) -> dict[str, Any] | None:
+              app_version: Any = None, shizuku_version: Any = None,
+              include_local: bool = False) -> dict[str, Any] | None:
         """手机领最早的 pending 任务; 没有就最多等 wait_s 秒 (长轮询)。"""
         wait = max(0.0, min(float(wait_s), float(MAX_POLL_WAIT_S)))
         deadline = time.monotonic() + wait
@@ -618,19 +894,12 @@ class PhoneControlHub:
             try:
                 while True:
                     self.sweep()
-                    pending = [t for t in self._tasks.values() if t["status"] == STATUS_PENDING]
+                    # 老 App 的轮询不认识本地能力; 新 App 带 local=1 才顺手领本地任务。
+                    pending = [t for t in self._tasks.values() if t["status"] == STATUS_PENDING
+                               and (include_local or t["tier"] != LOCAL_TIER)]
                     if pending:
                         task = min(pending, key=lambda t: t["created_at"])
-                        task["status"] = STATUS_CLAIMED
-                        task["claimed_at"] = self._now()
-                        self._cond.notify_all()
-                        return {
-                            "id": task["id"],
-                            "action": task["action"],
-                            "tier": task["tier"],
-                            "args": task["args"],
-                            "timeout_s": task["timeout_s"],
-                        }
+                        return self._mark_claimed(task, "poll")
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         return None
@@ -638,6 +907,66 @@ class PhoneControlHub:
             finally:
                 self._pollers -= 1
                 self._device["last_seen"] = self._now()
+
+    def _mark_claimed(self, task: dict[str, Any], via: str) -> dict[str, Any]:
+        task["status"] = STATUS_CLAIMED
+        task["claimed_at"] = self._now()
+        task["claimed_via"] = via
+        self._cond.notify_all()
+        return {
+            "id": task["id"],
+            "action": task["action"],
+            "tier": task["tier"],
+            "args": task["args"],
+            "timeout_s": task["timeout_s"],
+        }
+
+    def claim_local(self, *, task_id: Any = None, app_version: Any = None,
+                    features: Any = None) -> dict[str, Any] | None:
+        """App 收到 phone_task 事件 / SSE 重连后领本地能力任务 (不需要 Shizuku, 不阻塞)。
+
+        task_id 给了就只领那一条 (已被领 / 不存在返回 None); 没给就领最早的一条本地任务。
+        顺带记下 App 上报的本地能力开关状态 (投递前预检用)。
+        """
+        self.note_local(app_version=app_version, features=features)
+        with self._cond:
+            self.sweep()
+            if task_id is not None:
+                if not isinstance(task_id, str) or not TASK_ID_RE.match(task_id):
+                    raise PhoneTaskError(400, "bad_task_id", "task_id 不合法")
+                task = self._tasks.get(task_id)
+                if task is None or task["status"] != STATUS_PENDING or task["tier"] != LOCAL_TIER:
+                    return None
+                return self._mark_claimed(task, "stream")
+            pending = [t for t in self._tasks.values()
+                       if t["status"] == STATUS_PENDING and t["tier"] == LOCAL_TIER]
+            if not pending:
+                return None
+            return self._mark_claimed(min(pending, key=lambda t: t["created_at"]), "stream")
+
+    def add_followup(self, task_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """结果交了之后的后续 (她点了确认通知 / 强提醒被谁停了), 最多 5 条。"""
+        with self._cond:
+            self.sweep()
+            task = self._tasks.get(task_id)
+            if task is None:
+                raise PhoneTaskError(404, "task_not_found", "任务不存在或已过期")
+            if task["tier"] != LOCAL_TIER:
+                raise PhoneTaskError(400, "followup_not_expected", "只有本地能力任务有后续")
+            followups = task.setdefault("followup", [])
+            if len(followups) >= MAX_FOLLOWUPS:
+                raise PhoneTaskError(429, "too_many_followups", "后续太多了")
+            entry: dict[str, Any] = {"at": self._now()}
+            for key in ("event", "ok", "error", "message", "state"):
+                value = body.get(key)
+                if isinstance(value, (str, bool)):
+                    entry[key] = value[:500] if isinstance(value, str) else value
+            result = body.get("result")
+            if isinstance(result, dict) and len(json.dumps(result)) <= 8192:
+                entry["result"] = result
+            followups.append(entry)
+            self._cond.notify_all()
+            return {"ok": True, "count": len(followups)}
 
     def _claimed(self, task_id: str) -> dict[str, Any]:
         self.sweep()

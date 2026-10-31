@@ -37,10 +37,14 @@ SILENT_SUFFIX = (
 NOTICE_KIND_BATTERY = "battery"
 NOTICE_KIND_APP = "app"
 NOTICE_KIND_SUN = "sun"  # 2026-10-12 北京日出日落（sun-bubble timer → POST /sun-event）
+NOTICE_KIND_NOTIF = "notif"  # 2026-10-31 通知转发（外卖/快递白名单）
+NOTICE_KIND_PLACE = "place"  # 2026-10-31 到达提醒（地点名，不含坐标）
 NOTICE_TAGS = {
     NOTICE_KIND_BATTERY: "🔋 手机电量",
     NOTICE_KIND_APP: "📱 手机应用",
     NOTICE_KIND_SUN: "🌅 日出日落",
+    NOTICE_KIND_NOTIF: "📦 外卖快递",
+    NOTICE_KIND_PLACE: "📍 到达",
 }
 
 BUSY_POLL_SECONDS = 2.0

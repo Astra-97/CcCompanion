@@ -87,6 +87,7 @@ from plugins_store import MAX_DOC_BODY_BYTES, PluginStore
 from calendar_store import CalendarStore, CATEGORIES, CATEGORY_LABELS
 import crab_pet_state
 import phone_control
+import phone_local
 import cn_workday
 from rp_history import RPHistory, validate_sid as validate_rp_sid
 from diary import Diary
@@ -192,6 +193,8 @@ from device_activity import (
 from device_notice import (
     NOTICE_KIND_APP,
     NOTICE_KIND_BATTERY,
+    NOTICE_KIND_NOTIF,
+    NOTICE_KIND_PLACE,
     NOTICE_KIND_SUN,
     TZ_BEIJING,
     XiaokeLowKeyNotifier,
@@ -5775,9 +5778,20 @@ class ServerState:
             Path(self.token_store_path).parent / "crab_pet_state.json"
         )
         # 手机操控 (2026-10-24, App v1.9.227 Shizuku): /phone/* 任务队列 (只存内存)
-        self.phone_control = phone_control.PhoneControlHub(
-            Path(self.token_store_path).parent / "phone_control"
+        # 「小克的本地能力」(2026-10-31, App v1.9.233): 本地任务入队即经 contacts=all SSE
+        # 推 phone_task 唤醒 App 来领; 日历同步从 schedule-ctl 的 events.json 取。
+        self.schedule_events_path = os.environ.get(
+            "CC_SCHEDULE_EVENTS", "/root/schedule/events.json"
         )
+        self.phone_control = phone_control.PhoneControlHub(
+            Path(self.token_store_path).parent / "phone_control",
+            calendar_loader=lambda: phone_local.load_schedule_events(self.schedule_events_path),
+            on_local_enqueue=self._wake_phone_local_task,
+        )
+        self.phone_notifs = phone_local.NotifBuffer(
+            Path(self.token_store_path).parent / "phone_control" / "notif_buffer.json"
+        )
+        self.phone_places = phone_local.PlaceEvents()
         # typing indicator 状态 (内存 不持久化)
         self.typing_state: dict[str, Any] = {"is_typing": False, "since": None}
         self.contact_typing_states: dict[str, dict[str, Any]] = {
@@ -6241,6 +6255,24 @@ class ServerState:
             len(self.tokens.all_active()),
             self.tasks.snapshot()["active"]["title"] if self.tasks.snapshot()["active"] else None,
         )
+
+    def _wake_phone_local_task(self, task: dict[str, Any]) -> int:
+        """本地能力任务入队 → contacts=all SSE 推 phone_task (只带 id/action, 参数靠领取)。
+
+        返回当前 SSE 订阅数 (含网页 / 前台单联系人流, 只作参考)。
+        """
+        bus = getattr(self, "chat_stream_bus", None)
+        publish = getattr(bus, "publish", None)
+        if not callable(publish):
+            return 0
+        publish({
+            "event": phone_control.SSE_EVENT,
+            "task_id": task["id"],
+            "action": task["action"],
+            "ts": datetime.now(timezone.utc).isoformat(),
+        })
+        count = getattr(bus, "subscriber_count", None)
+        return int(count()) if callable(count) else 0
 
     def _load_kimi_chat_queue(self) -> deque[dict[str, Any]]:
         """重启后载入滞留的 Kimi 队列条目；只认结构完整的条目，损坏即丢弃。"""
@@ -25014,6 +25046,9 @@ class PushHandler(BaseHTTPRequestHandler):
         elif kind == crab_pet_state.SSE_EVENT:
             # 螃蟹桌宠远程换装 (2026-10-23)：不属于任何联系人，只发 contacts=all 订阅。
             keys = ("event", "act", "seq", "ts")
+        elif kind == phone_control.SSE_EVENT:
+            # 本地能力任务唤醒 (2026-10-31)：只带 id/action，App 用 native secret 领取。
+            keys = ("event", "task_id", "action", "ts")
         else:
             return None
         payload = {key: rec[key] for key in keys if key in rec}
@@ -25146,7 +25181,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     public_rec = self._public_chat_stream_event(rec)
                     if public_rec is None:
                         continue
-                    if public_rec.get("event") == crab_pet_state.SSE_EVENT:
+                    if public_rec.get("event") in (crab_pet_state.SSE_EVENT, phone_control.SSE_EVENT):
                         if contact_filter != "all":
                             continue
                     else:
@@ -31073,7 +31108,7 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
     #          POST /phone/tasks {action,args,timeout_s?}    GET /phone/tasks[/<id>?wait=]
     #          GET  /phone/tasks/<id>/blob     POST /phone/tasks/<id>/cancel
     #          POST /phone/files {path,name?}  GET /phone/device
-    _PHONE_TASK_PATH = re.compile(r"^/phone/tasks/([0-9a-f]{32})(?:/(result|blob|progress|cancel))?$")
+    _PHONE_TASK_PATH = re.compile(r"^/phone/tasks/([0-9a-f]{32})(?:/(result|blob|progress|cancel|followup))?$")
     _PHONE_FILE_PATH = re.compile(r"^/phone/files/([0-9a-f]{32})$")
 
     def _phone_hub(self) -> "phone_control.PhoneControlHub":
@@ -31084,6 +31119,20 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
             )
             self.state.phone_control = hub
         return hub
+
+    def _phone_notif_buffer(self) -> "phone_local.NotifBuffer":
+        buf = getattr(self.state, "phone_notifs", None)
+        if buf is None:
+            buf = phone_local.NotifBuffer(self._phone_hub().state_dir / "notif_buffer.json")
+            self.state.phone_notifs = buf
+        return buf
+
+    def _phone_place_events(self) -> "phone_local.PlaceEvents":
+        events = getattr(self.state, "phone_places", None)
+        if events is None:
+            events = phone_local.PlaceEvents()
+            self.state.phone_places = events
+        return events
 
     def _phone_local_peer(self) -> bool:
         try:
@@ -31149,6 +31198,7 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
                     shizuku=q("shizuku") or None,
                     app_version=q("v") or None,
                     shizuku_version=q("sv") or None,
+                    include_local=q("local") == "1",
                 )
                 if task is None:
                     self.send_response(204)
@@ -31165,7 +31215,27 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
                     return
                 self._serve_phone_file(hub, m.group(1))
                 return
+            if request_path == "/phone/widget":
+                if not self._phone_auth(local_only=False):
+                    return
+                self._send_json(200, self._phone_widget_payload(), extra_headers={"Cache-Control": "no-store"})
+                return
             if not self._phone_auth(local_only=True):
+                return
+            if request_path == "/phone/notifs":
+                since = q("since")
+                seconds = None
+                if since:
+                    try:
+                        seconds = float(since)
+                    except ValueError:
+                        self._send_json(400, {"ok": False, "error": "bad_since", "message": "since 是秒数"})
+                        return
+                items = self._phone_notif_buffer().since(seconds, limit=int(q_float("limit", 200)))
+                self._send_json(200, {"ok": True, "items": items})
+                return
+            if request_path == "/phone/places/events":
+                self._send_json(200, {"ok": True, "events": list(self._phone_place_events().recent)})
                 return
             if request_path == "/phone/device":
                 self._send_json(200, {"ok": True, "device": hub.device()})
@@ -31229,6 +31299,34 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
         try:
             m = self._PHONE_TASK_PATH.match(request_path)
             kind = m.group(2) if m else None
+            if request_path in ("/phone/tasks/claim", "/phone/notifs", "/phone/places/event") or kind == "followup":
+                if not self._phone_auth(local_only=False):
+                    return
+                body = self._phone_read_json(64 * 1024)
+                if body is None:
+                    return
+                if request_path == "/phone/tasks/claim":
+                    task = hub.claim_local(
+                        task_id=body.get("task_id"),
+                        app_version=body.get("v"),
+                        features=body.get("features"),
+                    )
+                    if task is None:
+                        self._send_json(200, {"ok": True, "task": None})
+                        return
+                    logger.info("phone local task claimed id=%s action=%s", task["id"], task["action"])
+                    self._send_json(200, {"ok": True, "task": task})
+                    return
+                if kind == "followup":
+                    payload = hub.add_followup(m.group(1), body)
+                    logger.info("phone task followup id=%s event=%s", m.group(1), body.get("event"))
+                    self._send_json(200, payload)
+                    return
+                if request_path == "/phone/notifs":
+                    self._handle_phone_notifs_post(body)
+                    return
+                self._handle_phone_place_event(body)
+                return
             if m and kind in ("result", "blob", "progress"):
                 if not self._phone_auth(local_only=False):
                     return
@@ -31285,6 +31383,11 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
                     return
                 self._send_json(200, {"ok": True, "task": hub.cancel(m.group(1))})
                 return
+            if request_path == "/phone/notifs/clear":
+                if self._phone_read_json(4096) is None:
+                    return
+                self._send_json(200, {"ok": True, "cleared": self._phone_notif_buffer().clear()})
+                return
             if request_path == "/phone/files":
                 body = self._phone_read_json(8 * 1024)
                 if body is None:
@@ -31299,6 +31402,59 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
             self._send_json(404, {"ok": False, "error": "not found"})
         except phone_control.PhoneTaskError as exc:
             self._phone_error(exc)
+
+    def _phone_widget_payload(self) -> dict[str, Any]:
+        try:
+            records = self._chat_for_contact("xiaoke").tail(80)
+        except Exception:
+            records = []
+        try:
+            return phone_local.build_widget_payload(
+                getattr(self.state, "schedule_events_path", "/root/schedule/events.json"), records,
+            )
+        except phone_control.PhoneTaskError as exc:
+            return {"ok": False, "error": exc.code, "error_message": exc.message,
+                    "schedule": [], "schedule_more": 0, "message": None}
+
+    def _phone_low_key_notice(self, kind: str, text: str) -> bool:
+        """只注入 cctg (知悉级), 不落小克私聊气泡: 通知/地点不进聊天记录。"""
+        notifier = getattr(self.state, "xiaoke_low_key_notifier", None)
+        if notifier is None:
+            return False
+        try:
+            return bool(notifier.enqueue(build_device_notice(kind, text)))
+        except Exception:
+            logger.warning("phone low-key notice enqueue failed", exc_info=True)
+            return False
+
+    def _handle_phone_notifs_post(self, body: dict[str, Any]) -> None:
+        """POST /phone/notifs {items:[{pkg,app,title,text,posted_at}]} — 白名单 App 的通知。
+
+        手机端已按白名单 + 验证码规则过滤; 这里再滤一次验证码、去重, 进环形缓冲
+        (最近 200 条 / 48h, 0600), 每个 App 最多 3 分钟一次低调注入。日志不写正文。
+        """
+        items = body.get("items")
+        if not isinstance(items, list):
+            self._send_json(400, {"ok": False, "error": "items required"})
+            return
+        kept, notify = self._phone_notif_buffer().add(items)
+        for item in notify:
+            self._phone_low_key_notice(NOTICE_KIND_NOTIF, phone_local.notif_notice_text(item))
+        logger.info("phone notifs received=%d kept=%d noticed=%d", len(items), len(kept), len(notify))
+        self._send_json(200, {"ok": True, "kept": len(kept), "noticed": len(notify)})
+
+    def _handle_phone_place_event(self, body: dict[str, Any]) -> None:
+        """POST /phone/places/event {place, transition: enter|exit} — 只收地点名, 不收坐标。"""
+        parsed = phone_local.PlaceEvents.normalize(body)
+        if parsed is None:
+            self._send_json(400, {"ok": False, "error": "place (<=20 chars) and transition enter|exit required"})
+            return
+        place, transition = parsed
+        accepted = self._phone_place_events().accept(place, transition)
+        if accepted and body.get("test") is not True:
+            self._phone_low_key_notice(NOTICE_KIND_PLACE, phone_local.place_notice_text(place, transition))
+        logger.info("phone place event transition=%s accepted=%s", transition, accepted)
+        self._send_json(200, {"ok": True, "accepted": accepted})
 
     def _crab_pet_store(self) -> "crab_pet_state.CrabPetStore":
         store = getattr(self.state, "crab_pet", None)
