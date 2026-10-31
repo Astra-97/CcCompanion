@@ -173,6 +173,7 @@ FAKE_BRIDGE = textwrap.dedent(r'''
     if mode == "ok":
         emit({"t": "d", "c": "第一"}); emit({"t": "final", "c": "第一段。"})
         emit({"t": "ev", "type": "tool", "c": "🔧 ls -la", "cls": "msg msg-tool"})
+        emit({"t": "ev", "type": "permission", "c": "rm /tmp/x", "cls": "msg msg-permission"})
         emit({"t": "d", "c": "第二"}); emit({"t": "final", "c": "第二段。"})
         emit({"t": "ev", "type": "context_usage", "c": json.dumps({"pct": 12.5, "used_tokens": 125000, "window_tokens": 1000000})})
         emit({"t": "done"})
@@ -219,11 +220,11 @@ class ClientTest(unittest.TestCase):
         updates, tool_calls = [], []
         turn = client.prompt("你好", on_update=updates.append, on_tool=tool_calls.append)
         self.assertEqual(turn.text, "第一段。\n\n第二段。")
-        self.assertEqual(turn.tools, ["ls -la"])
+        self.assertEqual(turn.tools, ["ls -la", "等待 Crew 授权：rm /tmp/x"])
         self.assertEqual(turn.context_pct, 12.5)
         self.assertEqual(turn.context_window_tokens, 1000000)
         self.assertIn("第一段。\n\n第二", updates)
-        self.assertEqual(tool_calls[-1], ["ls -la"])
+        self.assertEqual(tool_calls[0], ["ls -la"])
 
     def test_error_classes(self):
         with self.assertRaises(KiroCrewBusy):

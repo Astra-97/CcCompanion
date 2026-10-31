@@ -361,6 +361,13 @@ class KiroCrewClient:
                         tools.append(label or "工具调用")
                         if on_tool is not None:
                             on_tool(list(tools))
+                    elif etype in {"permission", "elicitation"}:
+                        # Crew (approval_mode auto) rarely asks; the app has no
+                        # approval UI, so make the wait visible instead of silent.
+                        label = content.strip().splitlines()[0][:100] if content.strip() else "工具调用"
+                        tools.append(f"等待 Crew 授权：{label}")
+                        if on_tool is not None:
+                            on_tool(list(tools))
                     elif etype in {"error", "system_error", "turn_error"} and content.strip():
                         turn.errors.append(content.strip()[:300])
                 elif kind in {"done", "err"}:
