@@ -467,6 +467,138 @@ class KiroCrewHandlerTest(unittest.TestCase):
         handler._handle_kirocrew_preferences_get()
         self.assertEqual(handler.responses[-1][1]["effort"], "max")
 
+    def test_preferences_payload_matches_kiro_shape(self):
+        # The Android client parses /kirocrew/preferences with the /kiro one's parser.
+        handler, _chat, _ = self.handler(FakeCrew())
+        handler.state.kirocrew_last_context_pct = 42.4
+        handler._handle_kirocrew_preferences_get()
+        status, payload = handler.responses[-1]
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["model"], "auto")
+        self.assertEqual(payload["selection"], {"model": "auto", "effort": ""})
+        self.assertEqual(payload["available_models"], ["auto", "claude-opus-5.5"])
+        self.assertEqual([m["id"] for m in payload["models"]], ["auto", "claude-opus-5.5"])
+        self.assertEqual(payload["available_efforts"], ["low", "medium", "high", "xhigh", "max"])
+        self.assertFalse(payload["effort_applies"])
+        self.assertEqual(payload["current_model"], "auto")
+        self.assertEqual(payload["context_usage_percent"], 42.4)
+        display = payload["header_display"]
+        self.assertEqual(display["version"], 1)
+        self.assertEqual(display["text"], "auto · 42%")
+        self.assertEqual(display["context_percent"], 42.4)
+        handler._handle_kirocrew_preferences_post({"model": "claude-opus-5.5", "effort": "high"})
+        payload = handler.responses[-1][1]
+        self.assertTrue(payload["effort_applies"])
+        self.assertEqual(payload["header_display"]["text"], "claude-opus-5.5 · 42%")
+
+    def test_preferences_offer_auto_without_kiro_catalog(self):
+        handler, _chat, _ = self.handler(FakeCrew())
+        handler.state.kiro_acp = types.SimpleNamespace(available_models=lambda: ([], "none"))
+        handler._handle_kirocrew_preferences_get()
+        payload = handler.responses[-1][1]
+        self.assertEqual(payload["available_models"], ["auto"])
+        self.assertEqual(payload["header_display"]["text"], "auto")
+        self.assertIsNone(payload["context_usage_percent"])
+
+    def _terminal_handler(self, detail):
+        crew = FakeCrew()
+        crew.gets = []
+
+        def get(path):
+            crew.gets.append(path)
+            return 200, detail
+
+        crew.get = get
+        handler, _chat, _ = self.handler(crew)
+        handler.state.kirocrew_terminal_lock = threading.Lock()
+        handler.state.kirocrew_terminal_cache = None
+        handler.state.default_session = "cctg"
+        handler.state.active_session = "cctg"
+        return handler, crew
+
+    def test_terminal_renders_slot_transcript_read_only_and_redacted(self):
+        detail = {
+            "key": "ccc-kirocrew", "running": True, "turn": 4,
+            "messages": [
+                {"role": "user", "content": "帮我看下日志", "cls": "msg msg-u", "ts": "2026-10-31T02:31:16+00:00"},
+                {"role": "tool", "content": "🔧 Shell", "cls": "msg msg-tool", "ts": "2026-10-31T02:31:17+00:00",
+                 "meta": {"purpose": "read the gateway journal",
+                          "input": "journalctl -u kirocrew -n 5",
+                          "output": "Dashboard: http://127.0.0.1:5476/?token=abcDEF123_secretvalue\n"
+                                    "X-Internal-Secret: 0123456789abcdef0123456789abcdef\n"
+                                    "api_key=sk-THISISAVERYSECRETKEY1234"}},
+                {"role": "assistant", "content": "看完了", "cls": "msg msg-a", "ts": "2026-10-31T02:31:20+00:00"},
+                {"role": "system", "content": "ctx warn", "cls": "msg msg-warn", "ts": "bad"},
+            ],
+        }
+        handler, crew = self._terminal_handler(detail)
+        with handler.state.chat_draft_lock:
+            handler.state.chat_drafts["kirocrew"] = {"is_active": True, "text": "正在写第二段 token=hunter2hunter2"}
+        handler.path = "/tmux/capture?session=kirocrew"
+        handler._handle_tmux_capture()
+        status, payload = handler.responses[-1]
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["session"], "kirocrew")
+        self.assertEqual(payload["state"], "waiting")
+        self.assertEqual(payload["mode"], "read_only")
+        self.assertTrue(payload["busy"])
+        self.assertNotIn("lease", payload)
+        content = payload["content"]
+        self.assertIn("Kiro Crew · ccc-kirocrew · 运行中 · turn 4", content)
+        self.assertIn("[10:31:16] › 帮我看下日志", content)
+        self.assertIn("🔧 Shell", content)
+        self.assertIn("$ journalctl -u kirocrew -n 5", content)
+        self.assertIn("◆ 看完了", content)
+        self.assertIn("! ctx warn", content)
+        self.assertIn("正在写第二段", content)
+        for leaked in ("abcDEF123_secretvalue", "0123456789abcdef0123456789abcdef",
+                       "sk-THISISAVERYSECRETKEY1234", "hunter2hunter2"):
+            self.assertNotIn(leaked, content)
+        self.assertIn("?token=[已隐藏]", content)
+        self.assertEqual(crew.gets, ["/api/chat/slots/ccc-kirocrew?limit=40"])
+        # Polls inside the cache window reuse the last read (one ssh call).
+        handler._handle_tmux_capture()
+        self.assertEqual(len(crew.gets), 1)
+
+    def test_terminal_without_slot_and_gateway_down(self):
+        handler, crew = self._terminal_handler({})
+        crew.get = lambda path: (404, {"error": "slot not found"})
+        handler.path = "/tmux/capture?session=kirocrew"
+        handler._handle_tmux_capture()
+        self.assertIn("会话还没有记录", handler.responses[-1][1]["content"])
+
+        handler, crew = self._terminal_handler({})
+
+        def down(path):
+            raise kirocrew_client.KiroCrewUnavailable("ssh failed")
+
+        crew.get = down
+        handler.path = "/tmux/capture?session=kirocrew"
+        handler._handle_tmux_capture()
+        status, payload = handler.responses[-1]
+        self.assertEqual(status, 200)
+        self.assertIn("! Crew 网关暂时连不上", payload["content"])
+        self.assertFalse(payload["busy"])
+
+    def test_terminal_input_routes_are_read_only(self):
+        handler, _crew = self._terminal_handler({})
+        handler._handle_tmux_send({"session": "kirocrew", "text": "hi"})
+        self.assertEqual(handler.responses[-1][0], 409)
+        handler._handle_terminal_key({"session": "kirocrew", "key": "Enter"})
+        self.assertEqual(handler.responses[-1][0], 409)
+        handler._handle_terminal_resize({"session": "kirocrew", "columns": 80, "rows": 24})
+        self.assertEqual(handler.responses[-1][0], 409)
+        handler._handle_terminal_release({"target": "kirocrew"})
+        self.assertEqual(handler.responses[-1][1]["error"], "kirocrew_terminal_read_only")
+
+    def test_terminal_redaction_keeps_ordinary_text(self):
+        from push import _kirocrew_terminal_redact
+        text = "ls /home/kiro/Kiro-Crew-Workspace && echo hello_world 42"
+        self.assertEqual(_kirocrew_terminal_redact(text), text)
+        self.assertNotIn("ghp_", _kirocrew_terminal_redact("ghp_abcdefghijklmnopqrstuvwx"))
+        self.assertEqual(_kirocrew_terminal_redact("Authorization: Bearer abc.def.ghi12345"), "Authorization: [已隐藏]")
+        self.assertEqual(_kirocrew_terminal_redact("curl -H 'Bearer abc.def.ghi12345'"), "curl -H 'Bearer [已隐藏]'")
+
     def test_disabled(self):
         handler, _chat, _ = self.handler(None, enabled=False)
         handler._discard_uncommitted_staged_attachments = lambda _items: None

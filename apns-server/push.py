@@ -1357,6 +1357,129 @@ def _trim_terminal_capture(content: str) -> str:
     return f"{trimmed}\n" if trimmed else ""
 
 
+# Kiro Crew terminal (2026-10-31): read-only view of the contact's fixed Crew
+# slot, rendered from the gateway's own slot transcript (GET
+# /api/chat/slots/<slot>, already redacted by Crew) over the existing ssh
+# bridge.  Never the gateway journal: that is where Crew prints its 5-minute
+# dashboard ?token= link.  Everything shown passes _kirocrew_terminal_redact.
+KIROCREW_TERMINAL_ALIAS = "kirocrew"
+KIROCREW_TERMINAL_ROWS = 40
+KIROCREW_TERMINAL_CACHE_SECONDS = 2.5
+_KIROCREW_REDACTED = "[已隐藏]"
+_KIROCREW_REDACT_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    # Header / assignment style: X-Internal-Secret: v, token=v, "api_key": "v", Bearer v
+    (re.compile(
+        r"(?i)\b((?:x-internal-secret|x-auth-token|x-auth|authorization|proxy-authorization|cookie|set-cookie|"
+        r"xi-api-key|api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|shared[_-]?secret|"
+        r"client[_-]?secret|internal[_-]?secret|secret|token|password|passwd|passphrase)[\"']?\s*[:=]\s*[\"']?)"
+        r"(?:bearer\s+|basic\s+)?[^\s\"',;&]{4,}"
+    ), r"\1" + _KIROCREW_REDACTED),
+    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 " + _KIROCREW_REDACTED),
+    # URL query / fragment credentials (the dashboard's ?token= link)
+    (re.compile(r"(?i)([?&#](?:token|access_token|key|api_key|secret|auth|sig|signature|code)=)[^&\s\"'<>]+"),
+     r"\1" + _KIROCREW_REDACTED),
+    # Well-known credential shapes
+    (re.compile(
+        r"\b(?:sk-[A-Za-z0-9_-]{16,}|ntn_[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
+        r"xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,})"
+    ), _KIROCREW_REDACTED),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)"), _KIROCREW_REDACTED),
+    # Long opaque runs (hex secrets, token_urlsafe values)
+    (re.compile(r"(?<![A-Za-z0-9])[A-Fa-f0-9]{32,}(?![A-Za-z0-9])"), _KIROCREW_REDACTED),
+    (re.compile(r"(?<![A-Za-z0-9_/.-])(?=[A-Za-z0-9_-]*\d)(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_/.-])"),
+     _KIROCREW_REDACTED),
+)
+
+
+def _kirocrew_terminal_redact(text: str) -> str:
+    out = str(text or "")
+    for pattern, replacement in _KIROCREW_REDACT_RULES:
+        out = pattern.sub(replacement, out)
+    return out
+
+
+def _kirocrew_terminal_clip(text: Any, *, max_lines: int, max_chars: int) -> str:
+    value = text if isinstance(text, str) else ("" if text is None else json.dumps(text, ensure_ascii=False))
+    value = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    lines = value.split("\n")
+    clipped = "\n".join(lines[:max_lines])
+    if len(clipped) > max_chars:
+        clipped = clipped[:max_chars].rstrip() + "…"
+    elif len(lines) > max_lines:
+        clipped += f"\n… (+{len(lines) - max_lines} 行)"
+    return clipped
+
+
+def _kirocrew_terminal_time(ts: Any) -> str:
+    try:
+        moment = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return "--:--:--"
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
+
+
+def _format_kirocrew_terminal(
+    detail: dict[str, Any] | None,
+    *,
+    slot: str,
+    model: str,
+    effort: str,
+    context_pct: float | None,
+    live_text: str = "",
+    error: str = "",
+) -> str:
+    """Render the Crew slot transcript as a read-only terminal page (redacted)."""
+    detail = detail if isinstance(detail, dict) else {}
+    running = bool(detail.get("running"))
+    state = "运行中" if running else ("停止中" if detail.get("stopping") else "空闲")
+    ctx = f"{context_pct:.0f}%" if isinstance(context_pct, (int, float)) else "—"
+    lines = [
+        f"Kiro Crew · {slot} · {state} · turn {detail.get('turn', '—')}",
+        f"model {model or 'auto'} · effort {effort or '默认'} · context {ctx}",
+        "只读视图：Crew 会话记录（工具输入/输出已截断，凭据已隐藏）",
+        "─" * 40,
+    ]
+    if error:
+        lines.append(f"! {error}")
+    messages = [m for m in (detail.get("messages") or []) if isinstance(m, dict)]
+    if not messages and not error:
+        lines.append("（会话还没有记录；在聊天页给 Kiro Crew 发一条消息即可开始）")
+    for message in messages[-KIROCREW_TERMINAL_ROWS:]:
+        role = str(message.get("role") or "")
+        cls = str(message.get("cls") or "")
+        meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+        stamp = _kirocrew_terminal_time(message.get("ts"))
+        content = message.get("content")
+        if role == "user":
+            lines.append(f"[{stamp}] › {_kirocrew_terminal_clip(content, max_lines=6, max_chars=400)}")
+        elif role == "assistant":
+            # /context answers (keep-warm, /status) are a JSON dump: headline only.
+            brief = isinstance(content, str) and content.startswith("Context breakdown")
+            lines.append(f"[{stamp}] ◆ {_kirocrew_terminal_clip(content, max_lines=1 if brief else 14, max_chars=1200)}")
+        elif role == "tool":
+            lines.append(f"[{stamp}] {_kirocrew_terminal_clip(content, max_lines=1, max_chars=160)}")
+            purpose = _kirocrew_terminal_clip(meta.get("purpose"), max_lines=1, max_chars=160)
+            if purpose:
+                lines.append(f"    ↳ {purpose}")
+            tool_input = _kirocrew_terminal_clip(meta.get("input"), max_lines=4, max_chars=320)
+            if tool_input:
+                lines.extend(f"    $ {row}" for row in tool_input.split("\n"))
+            tool_output = _kirocrew_terminal_clip(meta.get("output"), max_lines=6, max_chars=480)
+            if tool_output:
+                lines.extend(f"    │ {row}" for row in tool_output.split("\n"))
+        else:
+            mark = "!" if ("err" in cls or "warn" in cls) else "·"
+            lines.append(f"[{stamp}] {mark} {_kirocrew_terminal_clip(content, max_lines=4, max_chars=320)}")
+    if running and live_text.strip():
+        lines.append("─" * 40)
+        lines.append("◆ 生成中 …")
+        tail = live_text.strip().split("\n")[-12:]
+        lines.append(_kirocrew_terminal_clip("\n".join(tail), max_lines=12, max_chars=1200))
+    return _trim_terminal_capture(_kirocrew_terminal_redact("\n".join(lines)))
+
+
 def _format_kairos_observer(snapshot: dict[str, Any]) -> str:
     """Render only the bridge's already-redacted observer fields."""
     phase = str(snapshot.get("phase") or "正在处理")
@@ -5661,6 +5784,8 @@ class ServerState:
         self.kirocrew_active: dict[str, Any] = {}
         self.kirocrew_applied: tuple[str, str] | None = None
         self.kirocrew_last_context_pct: float | None = None
+        self.kirocrew_terminal_lock = threading.Lock()
+        self.kirocrew_terminal_cache: tuple[float, dict[str, Any] | None, str] | None = None
         self.kirocrew_keep_warm_enabled = bool(server_cfg.get("kirocrew_keep_warm", True))
         self.kirocrew_warm_gen = ""  # gateway generation the keep-warm last warmed
         self.kirocrew_keep_warm_interval = float(server_cfg.get("kirocrew_keep_warm_interval_seconds", 600))
@@ -8622,7 +8747,7 @@ class PushHandler(BaseHTTPRequestHandler):
         # 2026-10-17：WEB_CONTROL_GET/POST_PATHS 里逐条登记的控制面板路径
         # （status/preferences 读 + preferences 写）对网页 cookie 开口。
         if (
-            request_path.startswith(("/kimi/", "/kiro/", "/xiaoke/"))
+            request_path.startswith(("/kimi/", "/kiro/", "/kirocrew/", "/xiaoke/"))
             and not self._native_pairing_auth_matches()
             and not self._web_control_gate_matches(request_path)
         ):
@@ -8636,7 +8761,7 @@ class PushHandler(BaseHTTPRequestHandler):
             # 2026-10-24：PWA cookie 只在 session 恰为四个固定身份之一时放行
             # （_web_session_route_allowed → _web_terminal_capture_target_allowed）。
             if (
-                str(requested).strip().lower() in {KIMI_TERMINAL_ALIAS, KIRO_TERMINAL_ALIAS}
+                str(requested).strip().lower() in {KIMI_TERMINAL_ALIAS, KIRO_TERMINAL_ALIAS, KIROCREW_TERMINAL_ALIAS}
                 and not self._native_pairing_auth_matches()
                 and not self._web_terminal_session_matches()
             ):
@@ -9335,7 +9460,7 @@ class PushHandler(BaseHTTPRequestHandler):
         # 2026-10-17：WEB_CONTROL_POST_PATHS 逐条登记的 preferences 写动作对
         # 网页 cookie 开口（随后 _require_write_auth 仍强制 origin+CSRF）。
         if (
-            request_path.startswith(("/kimi/", "/kiro/", "/xiaoke/"))
+            request_path.startswith(("/kimi/", "/kiro/", "/kirocrew/", "/xiaoke/"))
             and not self._native_pairing_auth_matches()
             and not self._web_control_gate_matches(request_path)
         ):
@@ -29329,19 +29454,58 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         self._send_json(200, {"ok": True, "session_id": self._kirocrew_session_id()})
 
+    def _kirocrew_model_entries(self) -> tuple[list[dict[str, str]], str]:
+        """Kiro's catalog as /kiro/preferences entries, "auto" always first.
+
+        "auto" is valid on the Crew slot even before kiro-cli ever reported a
+        catalog (it means: no pinned model), so the app's model sheet never
+        disappears just because the kiro contact has not handshaked yet.
+        """
+        entries: list[dict[str, str]] = []
+        source = "none"
+        try:
+            raw, source = self.state.kiro_acp.available_models()
+            entries = [
+                {"id": str(e.get("id") or ""), "name": str(e.get("name") or ""), "description": str(e.get("description") or "")}
+                for e in raw if isinstance(e, dict) and e.get("id")
+            ]
+        except Exception:
+            entries = [{"id": item, "name": item, "description": ""} for item in self._kirocrew_known_models()]
+            source = "cache" if entries else "none"
+        if not any(e["id"] == "auto" for e in entries):
+            entries.insert(0, {"id": "auto", "name": "auto", "description": "Crew 默认（不钉模型）"})
+        return entries, source
+
     def _kirocrew_preferences_payload(self) -> dict[str, Any]:
+        """Same JSON shape as /kiro/preferences, so the app reuses one parser."""
         model, effort = self.state.kirocrew_preferences.snapshot()
-        pct = self.state.kirocrew_last_context_pct
-        label = model or "auto"
+        model_id = model or "auto"
+        pct = self._pwa_bounded_percent(self.state.kirocrew_last_context_pct)
+        entries, source = self._kirocrew_model_entries()
+        header_text = f"{model_id} · {pct:.0f}%" if pct is not None else model_id
         return {
             "ok": True,
-            "model": model or "auto",
+            "provider": "Kiro Crew",
+            "models": entries,
+            "available_models": [e["id"] for e in entries],
+            "available_efforts": list(kirocrew_client.EFFORTS),
+            "selection": {"model": model_id, "effort": effort},
+            "model": model_id,
             "effort": effort,
-            "efforts": list(kirocrew_client.EFFORTS),
-            "available_models": [{"id": item} for item in self._kirocrew_known_models()],
-            "context_usage_percent": pct,
+            # The gateway ignores effort while the model is auto.
+            "effort_applies": model_id != "auto",
             "busy": self._kirocrew_busy(),
-            "header_display": f"{label} · {pct:.0f}%" if isinstance(pct, (int, float)) else label,
+            "catalog_source": source,
+            "applies_from": "next_turn",
+            "current_model": model_id,
+            "context_usage_percent": pct,
+            "header_display": self._header_status_display(
+                text=header_text,
+                loading_text="Kiro Crew 状态加载中",
+                unavailable_text="Kiro Crew 状态暂不可用",
+                model=model_id,
+                context_percent=pct,
+            ),
         }
 
     def _handle_kirocrew_preferences_get(self) -> None:
@@ -29379,6 +29543,66 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         self.state.kirocrew_applied = None
         self._send_json(200, self._kirocrew_preferences_payload())
+
+    def _kirocrew_terminal_content(self) -> tuple[str, bool]:
+        """(rendered page, slot running) — cached briefly; the app polls every 1.5s."""
+        client = self.state.kirocrew_client
+        now = time.monotonic()
+        with self.state.kirocrew_terminal_lock:
+            cached = getattr(self.state, "kirocrew_terminal_cache", None)
+            if cached and now - cached[0] < KIROCREW_TERMINAL_CACHE_SECONDS:
+                detail, error = cached[1], cached[2]
+            else:
+                detail, error = None, ""
+                try:
+                    status, body = client.get(f"/api/chat/slots/{client.slot}?limit={KIROCREW_TERMINAL_ROWS}")
+                    if status == 200 and isinstance(body, dict):
+                        detail = body
+                    elif status == 404:
+                        detail = {}
+                    else:
+                        error = f"Crew 网关返回 {status}"
+                except KiroCrewError:
+                    error = "Crew 网关暂时连不上"
+                except Exception:
+                    logger.exception("kirocrew terminal read failed")
+                    error = "Crew 会话读取失败"
+                self.state.kirocrew_terminal_cache = (now, detail, error)
+        model, effort = self.state.kirocrew_preferences.snapshot()
+        with self.state.chat_draft_lock:
+            draft = dict(self.state.chat_drafts.get("kirocrew") or {})
+        live = str(draft.get("text") or "") if draft.get("is_active") else ""
+        running = bool((detail or {}).get("running")) or self._kirocrew_busy()
+        page = _format_kirocrew_terminal(
+            {**(detail or {}), "running": running},
+            slot=client.slot,
+            model=model,
+            effort=effort,
+            context_pct=self._pwa_bounded_percent(self.state.kirocrew_last_context_pct),
+            live_text=live,
+            error=error,
+        )
+        return page, running
+
+    def _handle_kirocrew_terminal_capture(self) -> None:
+        if self.state.kirocrew_client is None:
+            self._send_json(503, {"error": "Kiro Crew 未启用", "target": KIROCREW_TERMINAL_ALIAS})
+            return
+        content, running = self._kirocrew_terminal_content()
+        self._send_json(200, {
+            "ok": True,
+            "session": KIROCREW_TERMINAL_ALIAS,
+            "content": content,
+            "state": "waiting",
+            "mode": "read_only",
+            "busy": running,
+        })
+
+    def _send_kirocrew_terminal_read_only(self) -> None:
+        self._send_json(409, {
+            "ok": False, "error": "kirocrew_terminal_read_only", "target": KIROCREW_TERMINAL_ALIAS,
+            "state": "waiting", "message": "Kiro Crew 终端是只读视图，请在聊天页发消息。",
+        })
 
     def _kirocrew_worker(self) -> None:
         while True:
@@ -32916,6 +33140,9 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
 
     def _handle_terminal_release(self, body: dict[str, Any]) -> None:
         target = str(body.get("target") or "").strip().lower()
+        if target == KIROCREW_TERMINAL_ALIAS:
+            self._send_kirocrew_terminal_read_only()
+            return
         if target == KIRO_TERMINAL_ALIAS:
             self._handle_kiro_terminal_release(body)
             return
@@ -32983,6 +33210,9 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
             lines = 120
         if str(requested_session).strip().lower() == KIRO_TERMINAL_ALIAS:
             self._handle_kiro_terminal_capture(lines)
+            return
+        if str(requested_session).strip().lower() == KIROCREW_TERMINAL_ALIAS:
+            self._handle_kirocrew_terminal_capture()
             return
         if str(requested_session).strip().lower() == KIMI_TERMINAL_ALIAS:
             with self.state.kimi_terminal.input_transaction():
@@ -33181,6 +33411,9 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
 
     def _handle_terminal_key(self, body: dict[str, Any]):
         requested_session = str(body.get("session", "cctg")).strip() or "cctg"
+        if requested_session.lower() == KIROCREW_TERMINAL_ALIAS:
+            self._send_kirocrew_terminal_read_only()
+            return
         if requested_session.lower() == KIRO_TERMINAL_ALIAS:
             self._handle_kiro_terminal_key(str(body.get("key", "")).strip())
             return
@@ -33208,6 +33441,9 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
             self._send_json(400, {"error": "terminal size out of range"})
             return
         target = requested_session.lower()
+        if target == KIROCREW_TERMINAL_ALIAS:
+            self._send_kirocrew_terminal_read_only()
+            return
         if target == KIRO_TERMINAL_ALIAS:
             self._handle_kiro_terminal_resize(columns, rows)
             return
@@ -33352,6 +33588,9 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
 
     def _handle_tmux_send(self, body: dict[str, Any]):
         requested_session = body.get("session") or self.state.active_session or self.state.default_session
+        if str(requested_session).strip().lower() == KIROCREW_TERMINAL_ALIAS:
+            self._send_kirocrew_terminal_read_only()
+            return
         if str(requested_session).strip().lower() == KIRO_TERMINAL_ALIAS:
             self._handle_kiro_terminal_send(body)
             return

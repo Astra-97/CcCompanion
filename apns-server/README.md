@@ -111,7 +111,16 @@ steering + 记忆库 MCP。原来的 `kiro`（kiro-cli）完全不动。
   调网关，内部 secret 只在东京读）、`contacts/kirocrew.py`、push.py `_handle_kirocrew_*`。
 - 一个固定的 Crew 会话槽 `ccc-kirocrew` = 持久会话；聊天指令 `/new /stop /model /effort
   /status /compact /help`（只有 /compact 走模型）；HTTP：`GET|POST /kirocrew/preferences`、
-  `POST /kirocrew/new_session`、`/chat/stop`（contact_id + user_ts）。
+  `POST /kirocrew/new_session`、`/chat/stop`（contact_id + user_ts）。`/kirocrew/` 和 `/kiro/`
+  同闸（只认 native pairing 的 X-Auth-Token）。
+- `/kirocrew/preferences` 的 JSON 和 `/kiro/preferences` 同形（models / available_models /
+  available_efforts / selection / current_model / context_usage_percent / header_display 对象），
+  安卓用同一个解析器；`auto` 永远在模型表第一位；`effort_applies=false` 表示 auto 下网关忽略 effort。
+- 终端 tab：`GET /tmux/capture?session=kirocrew` 是**只读**视图——每次（缓存 2.5 秒）经同一条
+  ssh 桥读 `GET /api/chat/slots/ccc-kirocrew?limit=40`（Crew 自己已脱敏的会话记录：用户/回复/
+  工具行含 purpose/input/output 截断），加正在生成的草稿尾巴，整页再过 `_kirocrew_terminal_redact`
+  （header/查询串/常见 key 形状/长 hex 与 token_urlsafe 串）。**不读网关 journal**（那里有 5 分钟
+  dashboard `?token=` 链接）。`/tmux/send` `/terminal/key|resize|release` 对 kirocrew 一律 409 只读。
 - 关掉：`config.toml` 里 `kirocrew_enabled = false`，重启 cc-companion（联系人消失，
   `tokens/chat_history_kirocrew.jsonl` 保留）；东京 `sudo systemctl disable --now kirocrew`。
   完整回滚（含 ~/.kiro 备份）见 vps-xiaoke-config `system-config/tokyo/README.md`「Kiro Crew」。
