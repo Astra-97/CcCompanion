@@ -226,6 +226,7 @@ from kimi_preferences import (
 )
 from kimi_terminal_observer import KimiTerminalObserver, KiroTerminalObserver
 # kiro 对齐 CC r3 (2026-09-26): 终端页 Kiro 标签（租约 TUI + 只读观察）。
+from terminal_capture_cache import TerminalCaptureCache
 from kiro_terminal import (
     KIRO_TERMINAL_ALIAS,
     KIRO_TERMINAL_TMUX_SESSION,
@@ -1367,7 +1368,11 @@ def _trim_terminal_capture(content: str) -> str:
 # dashboard ?token= link.  Everything shown passes _kirocrew_terminal_redact.
 KIROCREW_TERMINAL_ALIAS = "kirocrew"
 KIROCREW_TERMINAL_ROWS = 40
-KIROCREW_TERMINAL_CACHE_SECONDS = 2.5
+# 2026-10-31: terminals hosted on Tokyo — their capture goes through TerminalCaptureCache.
+REMOTE_CAPTURE_TARGETS = frozenset({KIMI_TERMINAL_ALIAS, KIRO_TERMINAL_ALIAS, KIROCREW_TERMINAL_ALIAS})
+# 2026-10-31: was 2.5 s; the terminal capture refresher (terminal_capture_cache)
+# now bounds how often this runs while someone is looking, so keep it short.
+KIROCREW_TERMINAL_CACHE_SECONDS = 1.0
 _KIROCREW_REDACTED = "[已隐藏]"
 _KIROCREW_REDACT_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     # Header / assignment style: X-Internal-Secret: v, token=v, "api_key": "v", Bearer v
@@ -5889,6 +5894,8 @@ class ServerState:
         # Window the gateway reported with that reading (Crew reports it; kiro ACP does not).
         self.kirocrew_last_context_window: int | None = None
         self.kirocrew_terminal_lock = threading.Lock()
+        # 2026-10-31: Tokyo terminal polls served from a background-refreshed frame.
+        self.terminal_capture_cache = TerminalCaptureCache()
         self.kirocrew_terminal_cache: tuple[float, dict[str, Any] | None, str] | None = None
         self.kirocrew_keep_warm_enabled = bool(server_cfg.get("kirocrew_keep_warm", True))
         self.kirocrew_warm_gen = ""  # gateway generation the keep-warm last warmed
@@ -10150,24 +10157,28 @@ class PushHandler(BaseHTTPRequestHandler):
             if not self.state.allow_remote_control:
                 self._send_json(403, {"error": "remote_control disabled"})
                 return
-            self._handle_terminal_release(body)
+            with self._terminal_input_scope(body):
+                self._handle_terminal_release(body)
         elif self.path == "/terminal/key":
             # Virtual keyboard: send a special key (Escape, C-c, Tab, etc.) to tmux
             if not self.state.allow_remote_control:
                 self._send_json(403, {"error": "remote_control disabled"})
                 return
-            self._handle_terminal_key(body)
+            with self._terminal_input_scope(body):
+                self._handle_terminal_key(body)
         elif self.path == "/terminal/resize":
             if not self.state.allow_remote_control:
                 self._send_json(403, {"error": "remote_control disabled"})
                 return
-            self._handle_terminal_resize(body)
+            with self._terminal_input_scope(body):
+                self._handle_terminal_resize(body)
         elif self.path == "/tmux/send":
             # P0-2: direct tmux send-keys — remote control gate
             if not self.state.allow_remote_control:
                 self._send_json(403, {"error": "remote_control disabled"})
                 return
-            self._handle_tmux_send(body)
+            with self._terminal_input_scope(body):
+                self._handle_tmux_send(body)
         elif self.path == "/system/lock":
             try:
                 import subprocess
@@ -33856,6 +33867,48 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
             lines = int(qs.get("lines", ["120"])[0])
         except Exception:
             lines = 120
+        target = str(requested_session).strip().lower()
+        cache = getattr(self.state, "terminal_capture_cache", None)
+        if cache is not None and target in REMOTE_CAPTURE_TARGETS:
+            # 2026-10-31: Tokyo terminals answer from the refresher's latest
+            # frame (see terminal_capture_cache); the producer below is the
+            # unchanged capture path, run on a detached handler.
+            status, payload = cache.get(target, lines, self._terminal_capture_producer(target, lines))
+            self._send_json(status, payload)
+            return
+        self._handle_tmux_capture_direct(requested_session, lines)
+
+    def _terminal_capture_producer(self, target: str, lines: int) -> "Callable[[], tuple[int, Any]]":
+        state = self.state
+        handler_cls = type(self)
+
+        def produce() -> tuple[int, Any]:
+            handler = object.__new__(handler_cls)
+            handler.state = state
+            handler.headers = {}
+            handler.client_address = ("127.0.0.1", 0)
+            handler.path = f"/tmux/capture?session={target}&lines={lines}"
+            out: list[tuple[int, Any]] = []
+            handler._send_json = lambda status, payload=None, **_kw: out.append((status, payload))
+            handler._handle_tmux_capture_direct(target, lines)
+            if not out:
+                return 503, {"error": "终端捕获失败", "target": target}
+            return out[-1]
+
+        return produce
+
+    @contextmanager
+    def _terminal_input_scope(self, body: Any):
+        """Around /tmux/send, /terminal/key|resize|release: refreshes yield, next poll is fresh."""
+        cache = getattr(self.state, "terminal_capture_cache", None)
+        target = str((body or {}).get("session") or "").strip().lower() if isinstance(body, dict) else ""
+        if cache is None or target not in REMOTE_CAPTURE_TARGETS:
+            yield
+            return
+        with cache.input_scope(target):
+            yield
+
+    def _handle_tmux_capture_direct(self, requested_session: str, lines: int) -> None:
         if str(requested_session).strip().lower() == KIRO_TERMINAL_ALIAS:
             self._handle_kiro_terminal_capture(lines)
             return
