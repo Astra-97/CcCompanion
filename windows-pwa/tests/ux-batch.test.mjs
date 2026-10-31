@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
-import { createHttpAdapter, historyCursor, mergeHistoryDelta, normalizeRecord } from '../src/api.js';
+import { backgroundPollable, createHttpAdapter, historyCursor, mergeHistoryDelta, normalizeRecord } from '../src/api.js';
 import { createUnreadStore, latestChatRecord, previewText, seedUnreadCursors, unreadCount, unseenAssistant } from '../src/unread.js';
 import { createNotifier } from '../src/notifications.js';
 
@@ -241,7 +241,65 @@ test('first-batch UX source contracts: no innerHTML, markdown renderer, thinking
   assert.match(app, /state\.notifier\.notify/);
   assert.match(app, /startBackgroundPolling\(\)/);
   assert.match(html, /id="notification-button"[^>]*aria-pressed="false"/);
-  assert.match(sw, /src\/markdown\.js\?v=35/);
-  assert.match(sw, /src\/unread\.js\?v=35/);
-  assert.match(sw, /src\/notifications\.js\?v=35/);
+  assert.match(sw, /src\/markdown\.js\?v=36/);
+  assert.match(sw, /src\/unread\.js\?v=36/);
+  assert.match(sw, /src\/notifications\.js\?v=36/);
+});
+
+// 2026-10-31 轮询修复：/chat/status 失败不再丢掉已下载的 history 增量（以前 Promise.all
+// 一并 reject，cursor 不前进，同一个 since 窗口 500 条反复下载）；会话过期 401 停止轮询。
+function pollHarness(handler) {
+  const calls = []; const events = []; const timers = [];
+  const clock = { setTimeout(fn, delay) { const timer = { fn, delay }; timers.push(timer); return timer; }, clearTimeout() {} };
+  const adapter = createHttpAdapter({
+    request: async (path) => { calls.push(path); return handler(path); },
+    clock,
+    visibility: { visibilityState: 'visible', addEventListener() {}, removeEventListener() {} },
+    network: { navigator: { onLine: true }, addEventListener() {}, removeEventListener() {} },
+  });
+  return { adapter, calls, events, timers };
+}
+const httpError = (status) => Object.assign(new Error(`Request failed: ${status}`), { status });
+
+test('a failing /chat/status no longer discards the history delta or freezes the cursor', async () => {
+  let round = 0;
+  const h = pollHarness((path) => {
+    if (path.startsWith('/chat/status')) throw httpError(500);
+    round += 1;
+    return { records: [{ ts: `2026-10-31T0${round}:00:00+00:00`, role: 'assistant', text: `r${round}` }] };
+  });
+  const stop = h.adapter.subscribe((event) => h.events.push(event), { contactId: 'xiaoke' });
+  await h.timers.shift().fn();
+  await h.timers.shift().fn();
+  await h.timers.shift().fn();
+  const historyCalls = h.calls.filter((path) => path.startsWith('/chat/history'));
+  assert.ok(historyCalls[1].includes('since=2026-10-31T01%3A00%3A00%2B00%3A00'), historyCalls[1]);
+  assert.ok(historyCalls[2].includes('since=2026-10-31T02%3A00%3A00%2B00%3A00'), 'cursor advances poll after poll');
+  const snapshots = h.events.filter(({ type }) => type === 'snapshot');
+  assert.equal(snapshots.length, 3);
+  assert.equal(snapshots.at(-1).history[0].body, 'r3');
+  assert.equal('state' in snapshots.at(-1), false, 'no fabricated live state when status failed');
+  stop();
+});
+
+test('an expired session (401) stops the live poll instead of retrying forever', async () => {
+  const h = pollHarness((path) => {
+    if (path.startsWith('/chat/status')) throw httpError(401);
+    return { records: [] };
+  });
+  h.adapter.subscribe((event) => h.events.push(event), { contactId: 'xiaoke' });
+  await h.timers.shift().fn();
+  assert.equal(h.events.at(-1).type, 'unauthorized');
+  assert.equal(h.timers.length, 0, 'no further poll is scheduled');
+});
+
+test('background polling skips archive-only contacts such as the retired hajiki', () => {
+  assert.equal(backgroundPollable({ id: 'hajiki', capabilities: ['history'] }), false);
+  assert.equal(backgroundPollable({ id: 'toolbot', capabilities: ['history', 'realtime'] }), true);
+  assert.equal(backgroundPollable({ id: 'kiro', capabilities: ['chat', 'history'] }), true);
+  assert.equal(backgroundPollable({ id: 'x' }), false);
+  const app = readFileSync(new URL('../src/app.js', import.meta.url), 'utf8');
+  assert.match(app, /if \(!backgroundPollable\(item\)\) continue;/);
+  assert.match(app, /if \(error\?\.status === 401\) \{ handleSessionExpired\(\); return; \}/);
+  assert.match(app, /if \(event\.type === 'unauthorized'\) \{ handleSessionExpired\(\); return; \}/);
 });

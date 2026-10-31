@@ -416,10 +416,15 @@ class ChatHistory:
                 self._ensure_cache()
                 cache = self._cache
                 cache_oldest_ts = cache[0].get("ts", "") if cache else ""
-                if since_ts >= cache_oldest_ts or not cache:
-                    snapshot = [r for r in cache if r.get("ts", "") > since_ts]
-                    if not include_hidden:
-                        snapshot = [r for r in snapshot if not r.get("hidden_in_ui")]
+                snapshot = [r for r in cache if r.get("ts", "") > since_ts]
+                if not include_hidden:
+                    snapshot = [r for r in snapshot if not r.get("hidden_in_ui")]
+                # 2026-10-31: a stale cursor (since older than the tail cache)
+                # used to fall through to a full-file scan (77 MB, ≈1.1 s) on
+                # every poll.  The answer is "the last `limit` matching records";
+                # when the tail cache alone already holds ≥ limit of them, those
+                # are exactly the file's last `limit` matches — no scan needed.
+                if since_ts >= cache_oldest_ts or not cache or len(snapshot) >= limit:
                     return snapshot[-limit:]
 
         # Slow path: before_ts pagination or since_ts older than cache

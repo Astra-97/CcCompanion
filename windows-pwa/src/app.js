@@ -1,18 +1,18 @@
-import { createPwaBootstrap } from './bootstrap.js?v=35';
-import { createComposerState } from './composer-state.js?v=35';
-import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=35';
-import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=35';
-import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, upsertHistoryRecord, controlPanelSupported } from './api.js?v=35';
-import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=35';
-import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=35';
-import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=35';
-import { createUnreadStore, latestChatRecord, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=35';
-import { createNotifier } from './notifications.js?v=35';
-import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=35';
-import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=35';
-import { TERMINAL_TARGETS, TERMINAL_KEYBAR, DEFAULT_TERMINAL_TARGET, createTerminalController, isTerminalTargetId, canSend as terminalCanSend, emptyTerminalText, inputPlaceholder as terminalInputPlaceholder, terminalStatusBanner, slashSuggestions, resolveKeybarKey, ctrlLetterKey, passthroughKey, terminalGrid } from './terminal.js?v=35';
+import { createPwaBootstrap } from './bootstrap.js?v=36';
+import { createComposerState } from './composer-state.js?v=36';
+import { formatPairingCode, normalizePairingCode } from './pairing-code.js?v=36';
+import { composeLiveMessages, shouldShowTypingBubble, reconcileSnapshotStream, reduceStreamDraft } from './live-messages.js?v=36';
+import { normalizeLiveState, normalizeSendRecord, optimisticBusyState, stopControlState, reconcileHistorySnapshot, mergeHistoryDelta, historyCursor, backgroundPollable, upsertHistoryRecord, controlPanelSupported } from './api.js?v=36';
+import { extractClipboardImageFiles, resolveAttachmentFilename } from './clipboard-images.js?v=36';
+import { insertStickerToken, isSafeStickerName, parseStickerParts, removeStickerToken, stickerTokens } from './sticker-protocol.js?v=36';
+import { appendMarkdown, copyText, parseMarkdown } from './markdown.js?v=36';
+import { createUnreadStore, latestChatRecord, previewText, seedUnreadCursors, unseenAssistant } from './unread.js?v=36';
+import { createNotifier } from './notifications.js?v=36';
+import { buildMonthGrid, monthKey, shiftMonth, todayKey } from './memory-calendar.js?v=36';
+import { clockText, greetingFor, todoFeed, weekStrip } from './home-dashboard.js?v=36';
+import { TERMINAL_TARGETS, TERMINAL_KEYBAR, DEFAULT_TERMINAL_TARGET, createTerminalController, isTerminalTargetId, canSend as terminalCanSend, emptyTerminalText, inputPlaceholder as terminalInputPlaceholder, terminalStatusBanner, slashSuggestions, resolveKeybarKey, ctrlLetterKey, passthroughKey, terminalGrid } from './terminal.js?v=36';
 
-const WEB_SHELL_VERSION = 'desk-v35 · 2026-10-25';
+const WEB_SHELL_VERSION = 'desk-v36 · 2026-10-31';
 
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, attrs = {}, children = []) => {
@@ -985,7 +985,20 @@ function notifyNewMessages(contactId, records) {
     onOpen: (target) => { if (state.view !== 'chat') switchView('chat'); if (homeQuery.matches) { state.mobileChatOpen = true; syncView(); } void switchContact(target); },
   }));
 }
+/**
+ * The browser session expired or was revoked (401). Every poll would keep
+ * failing, so stop all polling once and go back to the pairing screen.
+ */
+let sessionExpiredHandled = false;
+function handleSessionExpired() {
+  if (sessionExpiredHandled) return;
+  sessionExpiredHandled = true;
+  state.stopBackground?.(); state.stopBackground = null;
+  state.stopLive?.(); state.stopLive = null;
+  void logout().catch(() => {}).finally(() => { sessionExpiredHandled = false; });
+}
 function applyLiveEvent(event) {
+  if (event.type === 'unauthorized') { handleSessionExpired(); return; }
   if (event.type === 'message') { updateMessage(event.contactId, event.message); if (event.message?.role === 'assistant') notifyNewMessages(event.contactId, [event.message]); }
   if (event.type === 'state') state.live[event.contactId] = event.state;
   if (event.type === 'snapshot') {
@@ -997,7 +1010,8 @@ function applyLiveEvent(event) {
       const reconciled = reconcileHistorySnapshot(state.histories[event.contactId] || [], event.history, state.pendingCanonical[event.contactId] || []);
       state.histories[event.contactId] = reconciled.history; state.pendingCanonical[event.contactId] = reconciled.pendingIds;
     }
-    state.live[event.contactId] = event.state; state.streams[event.contactId] = reconcileSnapshotStream(state.streams[event.contactId], event.state);
+    // A snapshot whose /chat/status leg failed still carries the history delta.
+    if (event.state) { state.live[event.contactId] = event.state; state.streams[event.contactId] = reconcileSnapshotStream(state.streams[event.contactId], event.state); }
   }
   if (event.type === 'stream') {
     const next = reduceStreamDraft(state.streams[event.contactId], event.payload);
@@ -1025,6 +1039,9 @@ async function pollInactiveContacts() {
   try {
     for (const item of state.contacts) {
       if (item.id === state.activeContactId) continue;
+      // Archive-only contacts (capabilities ["history"], e.g. retired hajiki)
+      // never receive new records: nothing to poll for.
+      if (!backgroundPollable(item)) continue;
       const known = state.histories[item.id] || [];
       const since = historyCursor(known);
       try {
@@ -1037,7 +1054,11 @@ async function pollInactiveContacts() {
         state.histories[item.id] = merged.history; state.pendingCanonical[item.id] = merged.pendingIds;
         // The first fetch only seeds the preview: backlog is not "new".
         if (known.length && fresh.length) notifyNewMessages(item.id, fresh);
-      } catch { /* one contact failing must not starve the others */ }
+      } catch (error) {
+        // An expired session fails every contact the same way: stop polling.
+        if (error?.status === 401) { handleSessionExpired(); return; }
+        /* one contact failing must not starve the others */
+      }
     }
   } finally { state.backgroundPollInFlight = false; }
   renderContacts();

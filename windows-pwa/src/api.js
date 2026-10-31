@@ -1,6 +1,6 @@
-import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY, MOCK_MEMORY_STATS, MOCK_MEMORY_CALENDAR_ENTRIES, MOCK_MEMORY_BOARD, MOCK_MEMORY_SEARCH, MOCK_PLUGINS, MOCK_TODOS, MOCK_WEATHER, MOCK_APPEARANCE, MOCK_CONTROL } from './data.js?v=35';
-import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=35';
-import { normalizeStickerCatalog } from './sticker-protocol.js?v=35';
+import { MOCK_CONTACTS, INITIAL_CONVERSATIONS, MOCK_MEMORIES, MOCK_TAXONOMY, MOCK_MEMORY_STATS, MOCK_MEMORY_CALENDAR_ENTRIES, MOCK_MEMORY_BOARD, MOCK_MEMORY_SEARCH, MOCK_PLUGINS, MOCK_TODOS, MOCK_WEATHER, MOCK_APPEARANCE, MOCK_CONTROL } from './data.js?v=36';
+import { isImageFile, resolveAttachmentFilename } from './clipboard-images.js?v=36';
+import { normalizeStickerCatalog } from './sticker-protocol.js?v=36';
 
 const clone = (value) => structuredClone(value);
 const now = () => new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
@@ -302,6 +302,16 @@ export function mergeHistoryDelta(currentHistory = [], delta = [], pendingIds = 
   });
   const seen = new Set((Array.isArray(delta) ? delta : []).map(({ id }) => id).filter(Boolean));
   return { history: next, pendingIds: pendingIds.filter((id) => !seen.has(id)) };
+}
+
+/**
+ * Background (inactive-contact) polling only for contacts that can still
+ * receive new records; archive-only ones (capabilities ["history"], e.g. the
+ * retired hajiki) are skipped.
+ * Contacts that can still receive new records (chat or realtime capability). */
+export function backgroundPollable(contact) {
+  const capabilities = Array.isArray(contact?.capabilities) ? contact.capabilities : [];
+  return capabilities.includes('chat') || capabilities.includes('realtime');
 }
 
 /** Latest server timestamp in a normalized history ('' when unknown). */
@@ -692,13 +702,28 @@ export function createHttpAdapter({ baseUrl = '', request = defaultRequest, uplo
         // after the newest record seen so far (server `since` is exclusive).
         const since = cursor;
         try {
-          const [history, state] = await Promise.all([this.getHistory(contactId, { signal: requestController.signal, ...(since ? { since, limit: 500 } : {}) }), this.getLiveState(contactId, { signal: requestController.signal })]);
+          // allSettled, not all: a failing /chat/status used to reject the
+          // whole poll, so a successfully downloaded history delta (up to
+          // 500 records) was thrown away and the cursor never advanced —
+          // the same `since` window was re-downloaded forever.
+          const [historyResult, stateResult] = await Promise.allSettled([this.getHistory(contactId, { signal: requestController.signal, ...(since ? { since, limit: 500 } : {}) }), this.getLiveState(contactId, { signal: requestController.signal })]);
           if (stopped) return;
+          const unauthorized = [historyResult, stateResult].find((result) => result.status === 'rejected' && result.reason?.status === 401);
+          if (unauthorized) {
+            // Expired/revoked browser session: polling cannot recover on its
+            // own, so stop instead of retrying every few seconds forever.
+            stopped = true; closeStream();
+            listener({ type: 'unauthorized', contactId, error: unauthorized.reason });
+            return;
+          }
+          if (historyResult.status === 'rejected') throw historyResult.reason;
+          const history = historyResult.value;
           const nextCursor = historyCursor(history);
           if (nextCursor > cursor) cursor = nextCursor;
-          listener({ type: 'snapshot', contactId, history, state, incremental: Boolean(since) });
+          const state = stateResult.status === 'fulfilled' ? stateResult.value : null;
+          listener({ type: 'snapshot', contactId, history, ...(state ? { state } : {}), incremental: Boolean(since) });
           failureDelay = 1_000;
-          schedulePoll(isHidden() ? HIDDEN_POLL_MS : (state.busy ? BUSY_POLL_MS : VISIBLE_POLL_MS));
+          schedulePoll(isHidden() ? HIDDEN_POLL_MS : (state?.busy ? BUSY_POLL_MS : VISIBLE_POLL_MS));
         } catch (error) {
           if (!stopped && error.name !== 'AbortError') listener({ type: 'connection', contactId, online: false, error });
           if (!stopped) schedulePoll(isHidden() ? HIDDEN_POLL_MS : failureDelay);
