@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""phone-ctl — 小克操作方小南的真机 (CC Companion App v1.9.227+ 「手机操控」, Shizuku)。
+"""phone-ctl — 小克操作方小南的真机 (CC Companion App v1.9.227+ 「手机操控」, Shizuku / 无障碍)。
 
 链路: phone-ctl → 本机 CcCompanion 服务 /phone/tasks (任务队列) → 手机 App 前台服务
 长轮询领任务 → Shizuku UserService (uid 2000/shell) 执行 → 回传结果。连接由手机发起,
@@ -27,7 +27,15 @@
   phone-ctl ls [手机路径]             列目录 (默认 /sdcard)
   phone-ctl stat <手机路径>           文件大小/时间
   phone-ctl sh "<命令>" [--timeout 秒] 通用 shell (uid 2000; 手机端 Shell 档默认关闭)
+  phone-ctl ui [--all] [--max N] [--windows]
+                                      当前界面的节点 (文字/描述/id/坐标/可点) — 只在调用时读一次屏
+  phone-ctl clicktext "文字" [--index N] [--exact]
+                                      按文字/描述找节点点下去 (点它或最近的可点父节点; N 从 0 数)
   phone-ctl tasks                     最近任务
+
+操控后端 (App v1.9.234+): Shizuku 不可用时自动改走 App 的无障碍服务 —— 点按/滑动/长按、
+home/back/recent/notification、open、shot (Android 11+)、app、text 照常用; ui / clicktext 只走无障碍;
+push / pull / ls / stat / sh 只能 Shizuku (无障碍模式下报「需要 Shizuku」)。status 会显示当前后端。
 
 「小克的本地能力」(App v1.9.233+, 不需要 Shizuku / 手机操控总开关; App 在后台开着
 「实时提醒」就能收到; 每项在 App → 设置 → 小克的本地能力 里单独开关):
@@ -70,6 +78,13 @@ from pathlib import Path
 
 CONFIG = Path(os.environ.get("CC_COMPANION_CONFIG", "/root/CcCompanion/apns-server/config.toml"))
 TIER_ZH = {"status": "查看状态", "screen": "截屏", "input": "点按输入", "files": "文件", "shell": "Shell"}
+A11Y_ZH = {
+    "on": "已开启",
+    "enabled": "系统里开着，服务还没连上（关了重开一次）",
+    "off": "没开（App → 设置 → 小克的本地能力 → 屏幕操作（无障碍））",
+    "unsupported": "这台手机不支持",
+}
+BACKEND_ZH = {"shizuku": "Shizuku", "accessibility": "无障碍服务", "none": "无"}
 SHIZUKU_ZH = {
     "ready": "就绪",
     "not_installed": "没装 Shizuku",
@@ -232,6 +247,11 @@ def cmd_status(args) -> None:
         sz = device.get("shizuku") or "?"
         lines.append(f"Shizuku: {SHIZUKU_ZH.get(sz, sz)}"
                      + (f" (v{device['shizuku_version']})" if device.get("shizuku_version") else ""))
+    a11y = device.get("accessibility") or device.get("accessibility_any")
+    if a11y:
+        lines.append(f"无障碍: {A11Y_ZH.get(a11y, a11y)}")
+    backend = device.get("backend") or "none"
+    lines.append(f"操控后端: {backend}（{device.get('backend_reason') or BACKEND_ZH.get(backend, backend)}）")
     result = None
     if device.get("online") and "status" in (device.get("caps") or []):
         try:
@@ -247,7 +267,9 @@ def cmd_status(args) -> None:
         )
         if result.get("screen_w"):
             lines.append(f"屏幕尺寸: {result['screen_w']}x{result['screen_h']}")
-        if result.get("shizuku_error"):
+        if result.get("backend") and result["backend"] != backend:
+            lines.append(f"手机端实际后端: {result['backend']}")
+        if result.get("shizuku_error") and result.get("backend") != "accessibility":
             lines.append(f"Shizuku 提示: {result['shizuku_error']}")
     _out(args, {"device": device, "status": result}, "\n".join(lines))
 
@@ -391,6 +413,61 @@ def cmd_sh(args) -> None:
     if r.get("timed_out"):
         print(f"phone-ctl: 命令超时（{args.timeout}s）被杀", file=sys.stderr)
     raise SystemExit(r.get("code", 0) if isinstance(r.get("code"), int) else 0)
+
+
+def _clip(text: str | None, n: int = 60) -> str:
+    text = (text or "").replace("\n", " ").strip()
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def format_ui(r: dict) -> str:
+    head = f"{r.get('package') or '?'}  {len(r.get('nodes') or [])} 个节点"
+    if r.get("total") is not None:
+        head += f"（共扫 {r['total']}）"
+    if r.get("truncated"):
+        head += "，已截断（--max 调大）"
+    if r.get("screen_w"):
+        head += f"  屏幕 {r['screen_w']}x{r['screen_h']}"
+    rows = [head]
+    for n in r.get("nodes") or []:
+        b = n.get("b") or [0, 0, 0, 0]
+        cx, cy = (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
+        parts = [f"[{n.get('i')}]", " " * min(int(n.get("d") or 0), 12) + (n.get("cls") or "View")]
+        if n.get("text"):
+            parts.append(f'"{_clip(n["text"])}"')
+        if n.get("desc"):
+            parts.append(f"desc={_clip(n['desc'], 40)!r}")
+        if n.get("id"):
+            parts.append(f"id={n['id']}")
+        parts.append(f"@{cx},{cy}")
+        flags = [k for k in ("click", "long", "edit", "scroll", "sel", "focus") if n.get(k)]
+        if n.get("check") is not None:
+            flags.append("checked" if n["check"] else "unchecked")
+        if n.get("pw"):
+            flags.append("password")
+        if n.get("win"):
+            flags.append(f"win={n['win']}")
+        if flags:
+            parts.append(",".join(flags))
+        rows.append(" ".join(parts))
+    return "\n".join(rows)
+
+
+def cmd_ui(args) -> None:
+    r = ensure_done(run_task("ui", {"max_nodes": args.max, "all": args.all, "windows": args.windows},
+                             wait=args.wait))
+    _out(args, r, format_ui(r))
+
+
+def cmd_clicktext(args) -> None:
+    r = ensure_done(run_task("clicktext", {"text": args.text, "index": args.index, "exact": args.exact},
+                             wait=args.wait))
+    via = {"click_action": "无障碍点击", "gesture_tap": "按坐标点"}.get(r.get("via"), r.get("via") or "?")
+    target = r.get("target") or {}
+    label = target.get("text") or target.get("desc") or args.text
+    text = (f"点了「{_clip(label, 40)}」（第 {r.get('index', 0)} 个，共 {r.get('matches', '?')} 个匹配，{via}）"
+            + (f" @({r['x']},{r['y']})" if r.get("x") is not None else ""))
+    _out(args, r, text)
 
 
 def cmd_tasks(args) -> None:
@@ -689,7 +766,7 @@ def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", help="输出原始 JSON")
     common.add_argument("--wait", type=float, default=None, help="等结果的最长秒数 (默认 90, 本地能力 150)")
-    p = argparse.ArgumentParser(prog="phone-ctl", description="小克操作方小南的手机（Shizuku）",
+    p = argparse.ArgumentParser(prog="phone-ctl", description="小克操作方小南的手机（Shizuku / 无障碍）",
                                 parents=[common])
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status", parents=[common]).set_defaults(fn=cmd_status)
@@ -723,6 +800,13 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("stat", parents=[common]); s.add_argument("path"); s.set_defaults(fn=cmd_stat)
     s = sub.add_parser("sh", parents=[common]); s.add_argument("command"); s.add_argument("--timeout", type=int, default=30)
     s.set_defaults(fn=cmd_sh)
+    s = sub.add_parser("ui", parents=[common]); s.add_argument("--all", action="store_true", help="连没文字的容器也列")
+    s.add_argument("--max", type=int, default=300); s.add_argument("--windows", action="store_true", help="所有窗口（弹窗/通知栏）")
+    s.set_defaults(fn=cmd_ui)
+    s = sub.add_parser("clicktext", parents=[common]); s.add_argument("text")
+    s.add_argument("--index", type=int, default=0, help="第几个匹配（从 0 数）")
+    s.add_argument("--exact", action="store_true", help="只要完全相等，不要包含")
+    s.set_defaults(fn=cmd_clicktext)
     sub.add_parser("tasks", parents=[common]).set_defaults(fn=cmd_tasks)
     s = sub.add_parser("cancel", parents=[common]); s.add_argument("task_id"); s.set_defaults(fn=cmd_cancel)
     s = sub.add_parser("task", parents=[common]); s.add_argument("task_id"); s.set_defaults(fn=cmd_task)

@@ -104,6 +104,34 @@ class ValidateTest(unittest.TestCase):
         with self.assertRaises(PhoneTaskError):
             pc.validate_task("shell", {"cmd": "  "})
 
+    def test_ui_and_clicktext_args(self) -> None:
+        self.assertEqual(pc.validate_task("ui", {}), {"max_nodes": 300, "all": False, "windows": False})
+        self.assertEqual(pc.validate_task("ui", {"max_nodes": 50, "all": True, "windows": True}),
+                         {"max_nodes": 50, "all": True, "windows": True})
+        for bad in ({"max_nodes": 0}, {"max_nodes": 5000}, {"max_nodes": "x"}):
+            with self.assertRaises(PhoneTaskError):
+                pc.validate_task("ui", bad)
+        self.assertEqual(pc.validate_task("clicktext", {"text": "  发送 "}),
+                         {"text": "发送", "index": 0, "exact": False})
+        self.assertEqual(pc.validate_task("clicktext", {"text": "OK", "index": 2, "exact": True}),
+                         {"text": "OK", "index": 2, "exact": True})
+        for bad in ({}, {"text": ""}, {"text": "   "}, {"text": "a\nb"}, {"text": "x" * 201},
+                    {"text": "a", "index": -1}, {"text": "a", "index": 100}):
+            with self.assertRaises(PhoneTaskError):
+                pc.validate_task("clicktext", bad)
+        self.assertEqual(pc.ACTIONS["ui"][0], "screen")
+        self.assertEqual(pc.ACTIONS["clicktext"][0], "input")
+
+    def test_active_backend(self) -> None:
+        self.assertEqual(pc.active_backend("ready", "on"), "shizuku")
+        self.assertEqual(pc.active_backend("binding", None), "shizuku")
+        self.assertEqual(pc.active_backend("no_permission", "on"), "accessibility")
+        self.assertEqual(pc.active_backend(None, "on"), "accessibility")
+        self.assertEqual(pc.active_backend("not_running", "enabled"), "none")
+        self.assertEqual(pc.active_backend(None, None), "none")
+        self.assertTrue(pc.SHIZUKU_ONLY_ACTIONS.isdisjoint(pc.A11Y_ONLY_ACTIONS))
+        self.assertEqual(pc.SHIZUKU_ONLY_ACTIONS, {"download", "ls", "stat", "pull", "shell"})
+
     def test_parse_range(self) -> None:
         self.assertIsNone(pc.parse_range(None, 100))
         self.assertIsNone(pc.parse_range("items=0-1", 100))
@@ -209,6 +237,66 @@ class HubTest(unittest.TestCase):
         # 很久没来 → 不再按旧档位拒, 交给手机判
         self.clock.t += pc.DEVICE_ONLINE_S + 5
         self.hub.enqueue("screenshot", {})
+
+    def test_backend_reported_in_device_view(self) -> None:
+        d = self.hub.device()
+        self.assertEqual((d["backend"], d["accessibility"]), ("none", None))
+        self.hub.note_device(caps="status,input", shizuku="no_permission", accessibility="on")
+        d = self.hub.device()
+        self.assertEqual((d["backend"], d["accessibility"]), ("accessibility", "on"))
+        self.assertIn("无障碍", d["backend_reason"])
+        self.hub.note_device(caps="status,input", shizuku="ready", accessibility="on")
+        self.assertEqual(self.hub.device()["backend"], "shizuku")
+        self.hub.note_device(caps="", shizuku="not_running", accessibility="on")
+        d = self.hub.device()
+        self.assertEqual(d["backend"], "none")
+        self.assertIn("总开关", d["backend_reason"])
+        self.hub.note_device(caps="status", shizuku="not_running", accessibility="BAD STATE!")
+        self.assertEqual(self.hub.device()["accessibility"], "on")  # 脏值不覆盖
+        self.clock.t += pc.DEVICE_ONLINE_S + 5
+        self.assertEqual(self.hub.device()["backend"], "none")
+
+    def test_a11y_state_from_local_channel_when_poll_off(self) -> None:
+        self.hub.claim_local(app_version="1.9.234", accessibility="enabled")
+        d = self.hub.device()
+        self.assertIsNone(d["accessibility"])
+        self.assertEqual(d["accessibility_any"], "enabled")
+        self.assertEqual(d["backend"], "none")
+
+    def test_shizuku_only_and_a11y_only_prereject(self) -> None:
+        self.hub.note_device(caps="status,screen,input,files,shell", shizuku="no_permission", accessibility="on")
+        for action, args in (("shell", {"cmd": "id"}), ("ls", {"path": "/sdcard"}),
+                             ("stat", {"path": "/sdcard/a"}), ("pull", {"path": "/sdcard/a"})):
+            with self.assertRaises(PhoneTaskError) as cm:
+                self.hub.enqueue(action, args)
+            self.assertEqual((cm.exception.status, cm.exception.code), (409, "needs_shizuku"))
+            self.assertIn("需要 Shizuku", cm.exception.message)
+        # 无障碍能做的照常排队
+        for action, args in (("tap", {"x": 1, "y": 2}), ("screenshot", {}), ("ui", {}),
+                             ("clicktext", {"text": "发送"}), ("text", {"text": "你好"}), ("open", {"package": "com.a.b"})):
+            self.assertEqual(self.hub.enqueue(action, args)["status"], "pending")
+        # Shizuku 就绪但无障碍没开: ui / clicktext 提前拒
+        self.hub.note_device(caps="status,screen,input", shizuku="ready", accessibility="off")
+        with self.assertRaises(PhoneTaskError) as cm:
+            self.hub.enqueue("ui", {})
+        self.assertEqual((cm.exception.status, cm.exception.code), (409, "needs_accessibility"))
+        # Shizuku 就绪时 shell 照常 (档位开着)
+        self.hub.note_device(caps="status,shell", shizuku="ready", accessibility="off")
+        self.hub.enqueue("shell", {"cmd": "id"})
+        # 老 App 不报 a11y → 不提前拒, 交给手机判
+        hub2 = PhoneControlHub(Path(self.tmp.name) / "pc2", clock=self.clock)
+        hub2.note_device(caps="status,screen,input", shizuku="not_running")
+        hub2.enqueue("ui", {})
+        # binding 可能马上就绪 → 不拒
+        hub2.note_device(caps="status,files", shizuku="binding")
+        hub2.enqueue("ls", {"path": "/sdcard"})
+
+    def test_clicktext_text_masked_in_audit(self) -> None:
+        t = self.hub.enqueue("clicktext", {"text": "我的银行卡"})
+        self.hub.cancel(t["id"])
+        audit = (Path(self.tmp.name) / "pc" / "phone_control_audit.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn("银行卡", audit)
+        self.assertIn("<5 字>", audit)
 
     def test_blob_roundtrip_and_ttl(self) -> None:
         t = self.hub.enqueue("screenshot", {})
@@ -346,17 +434,22 @@ def http(base: str, method: str, path: str, body=None, *, token: str | None = SE
 class FakePhone(threading.Thread):
     """假手机: 长轮询领任务, 按 action 回结果; download 走 Range 续传 (第一次故意只拿一半)。"""
 
-    def __init__(self, base: str, caps: str = "status,screen,input,files") -> None:
+    def __init__(self, base: str, caps: str = "status,screen,input,files", *,
+                 shizuku: str = "ready", a11y: str | None = None) -> None:
         super().__init__(daemon=True)
         self.base = base
         self.caps = caps
+        self.shizuku = shizuku
+        self.a11y = a11y
         self.stop = threading.Event()
         self.files: dict[str, bytes] = {}
         self.range_headers: list[str] = []
 
     def run(self) -> None:
         while not self.stop.is_set():
-            st, _, body = http(self.base, "GET", f"/phone/tasks/next?wait=1&caps={self.caps}&shizuku=ready&v=1.9.227")
+            extra = f"&a11y={self.a11y}" if self.a11y else ""
+            st, _, body = http(self.base, "GET",
+                               f"/phone/tasks/next?wait=1&caps={self.caps}&shizuku={self.shizuku}{extra}&v=1.9.227")
             if st != 200:
                 continue
             task = json.loads(body)["task"]
@@ -376,6 +469,26 @@ class FakePhone(threading.Thread):
                                                       "foreground": "com.android.launcher"}})
         elif a == "tap":
             self.result(task, {"ok": True, "result": {"x": task["args"]["x"]}})
+        elif a == "ui":
+            self.result(task, {"ok": True, "result": {
+                "package": "com.tencent.mm", "screen_w": 1080, "screen_h": 2400, "total": 57,
+                "truncated": False,
+                "nodes": [
+                    {"i": 0, "d": 0, "cls": "FrameLayout", "b": [0, 0, 1080, 2400]},
+                    {"i": 3, "d": 4, "cls": "EditText", "text": "", "id": "input", "b": [40, 2200, 860, 2300],
+                     "click": True, "edit": True, "focus": True},
+                    {"i": 4, "d": 4, "cls": "Button", "text": "发送", "id": "send", "b": [880, 2200, 1040, 2300],
+                     "click": True},
+                    {"i": 5, "d": 4, "cls": "EditText", "text": "••••", "b": [0, 0, 10, 10], "pw": True},
+                ]}})
+        elif a == "clicktext":
+            if task["args"]["text"] == "不存在":
+                self.result(task, {"ok": False, "error": "not_found",
+                                   "message": "屏幕上没找到「不存在」（phone-ctl ui 看看有什么）"})
+            else:
+                self.result(task, {"ok": True, "result": {
+                    "via": "click_action", "index": task["args"]["index"], "matches": 2,
+                    "target": {"text": task["args"]["text"]}, "x": 960, "y": 2250}})
         elif a == "screenshot":
             data = b"\xff\xd8\xff" + b"J" * 500
             st, _, _ = http(self.base, "POST", f"/phone/tasks/{task['id']}/blob", raw=data,
@@ -530,6 +643,44 @@ class HttpTest(unittest.TestCase):
         r = self._cli("open", "com.tencent.mm")
         self.assertEqual(r.returncode, 1)
         self.assertIn("unsupported", r.stderr)
+
+    def test_poll_and_claim_report_accessibility(self) -> None:
+        st, _, _ = http(self.base, "GET", "/phone/tasks/next?wait=0&caps=status,input&shizuku=no_permission&a11y=on")
+        self.assertEqual(st, 204)
+        st, _, body = http(self.base, "GET", "/phone/device")
+        d = json.loads(body)["device"]
+        self.assertEqual((d["accessibility"], d["backend"]), ("on", "accessibility"))
+        st, _, body = http(self.base, "POST", "/phone/tasks/claim", {"v": "1.9.234", "a11y": "enabled"})
+        self.assertEqual(st, 200)
+        self.assertEqual(self.state.phone_control.device()["local"]["seen"], True)
+        self.assertEqual(self.state.phone_control._local["accessibility"], "enabled")
+
+    def test_cli_accessibility_backend(self) -> None:
+        phone = FakePhone(self.base, caps="status,screen,input,files,shell", shizuku="no_permission", a11y="on")
+        phone.start()
+        self.addCleanup(phone.stop.set)
+        time.sleep(0.3)
+        r = self._cli("status")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("操控后端: accessibility", r.stdout)
+        self.assertIn("无障碍: 已开启", r.stdout)
+        r = self._cli("ui")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('Button "发送" id=send @960,2250 click', r.stdout)
+        self.assertIn("password", r.stdout)
+        self.assertIn("com.tencent.mm", r.stdout)
+        r = self._cli("clicktext", "发送", "--index", "1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("点了「发送」（第 1 个，共 2 个匹配，无障碍点击） @(960,2250)", r.stdout)
+        r = self._cli("clicktext", "不存在")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("没找到", r.stderr)
+        r = self._cli("sh", "id")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("需要 Shizuku", r.stderr)
+        r = self._cli("ls")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("需要 Shizuku", r.stderr)
 
     def test_cli_tier_disabled_message(self) -> None:
         phone = FakePhone(self.base, caps="status")

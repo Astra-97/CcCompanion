@@ -184,6 +184,36 @@ App 收到后 `POST /phone/tasks/claim` 按 id 领 → 执行 → `/phone/tasks/
 - 代码：`phone_control.py`（任务 / 校验）、`phone_local.py`（通知缓冲、地点去抖、日程→日历、小部件）、
   `scripts/phone-ctl`；测试 `.venv/bin/python3 -m unittest _phone_local_test _phone_control_test`。
 
+### 屏幕操作的无障碍后端（`phone-ctl`，2026-10-31，App v1.9.234+）
+
+Shizuku 在她的 OPPO / ColorOS 上永远授权不了（shell 拿不到 `GRANT_RUNTIME_PERMISSIONS`，也没有「禁止权限监控」），
+所以 App 自带一个 AccessibilityService「小克手机操控」。手机端 Shizuku 不可用、无障碍开着时，原来的
+`phone-ctl` 屏幕类命令**自动**改走无障碍，命令不变：
+
+| 命令 | 无障碍怎么做 |
+|---|---|
+| `tap` / `swipe` / `longpress` | `dispatchGesture`（物理像素坐标，同 `shot` 原图坐标） |
+| `home` / `back` / `recent` / `key notification` / `key power`（锁屏，`--long` 电源菜单） | `performGlobalAction` |
+| `key enter` / `delete` / `paste` / `copy` / `cut` | 对当前输入焦点做节点动作（enter = `ACTION_IME_ENTER`，Android 11+）；其它键报「需要 Shizuku」 |
+| `open <包名>` | launch intent（结果带 `verified`：3 秒内真到前台没有） |
+| `shot` | `AccessibilityService.takeScreenshot`（Android 11+），同一条 blob 上传路；支付/密码页系统不给截 |
+| `app` | 当前活动窗口的包名，兜底最近的窗口切换事件 |
+| `text "…" [--enter]` | 焦点输入框 `ACTION_SET_TEXT`（在光标处插入），不行就写剪贴板 + `ACTION_PASTE`；密码框只走粘贴 |
+| `apps` | 桌面可启动 App 列表（不需要任何特权） |
+| **`ui [--all] [--max N] [--windows]`**（新） | 精简节点 dump：`[下标] 类名 "文字" desc= id= @中心x,y` + click/edit/scroll/checked 标记；默认只列有字/可点的可见节点，`--windows` 连弹窗/通知栏一起 |
+| **`clicktext "文字" [--index N] [--exact]`**（新） | 按文字/描述找节点（先完全相等再包含，活动窗口优先，同一点击目标只算一个），`ACTION_CLICK` 它或最近的可点父节点，不行就按坐标点；N 从 0 数 |
+
+- 只能 Shizuku：`push` / `pull` / `ls` / `stat` / `sh` —— 无障碍模式下服务端直接 409「需要 Shizuku」。
+  `ui` / `clicktext` 只能无障碍（手机报无障碍没开时 409「需要无障碍服务」）。
+- `phone-ctl status` 多两行：`无障碍: 已开启 / 没开…`、`操控后端: shizuku | accessibility | none（原因）`。
+  手机轮询带 `a11y=on|enabled|off`，`/phone/device` 给出 `backend` / `backend_reason`。
+- 仍受手机操控**总开关 + 档位**约束：`ui` 算「截屏」档（会读屏幕内容），`clicktext` 算「点按输入」档。
+- 她怎么开：App → 设置 → 小克的本地能力 →「屏幕操作（无障碍）」卡片 → 打开无障碍设置 → 「小克手机操控」。
+  Android 13+ / ColorOS 侧载的 App 开关是灰的：先 App 信息 → 右上角 ⋮ →「允许受限制的设置」。
+  还要在「手机操控」页开总开关 + 「截屏」「点按输入」档。ColorOS 偶尔会自己关掉无障碍，`status` 显示没开就让她再开一次。
+- 隐私：服务只订阅窗口切换事件、只记包名；屏幕文字只在 `ui` / `clicktext` / `text`（读焦点框）/ `shot` 时读一次，
+  服务里不写日志；密码框内容不读（dump 里只有 `password` 标记）；审计日志里 `clicktext` 的文字只记字数。
+
 ## Quick start
 
 ### 1. Deps

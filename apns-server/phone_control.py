@@ -13,6 +13,10 @@ susu-phone-agent (MIT, Copyright (c) 2026 2005selene2005-a11y) 的
   * 投递 / 查结果 / 取截图 / 挂文件 只许本机 (loopback 且非 cloudflared/nginx 转发)。
   * 手机端另有总开关 + 分档权限, 是最终权威; 服务端只按手机上报的档位提前拒。
 
+v1.9.234 起手机端有第二个后端: Shizuku 不可用时自动改走 App 自己的 AccessibilityService
+(点按/滑动/返回/Home/打开 App/截屏/前台 App/输入文字 + ui / clicktext); 文件 / Shell 仍只认
+Shizuku。手机轮询带 a11y=on|enabled|off, /phone/device 给出 backend = shizuku/accessibility/none。
+
 任务只存内存 (服务重启即清空); 二进制结果与待下发文件落 state 目录, 有 TTL 清理。
 """
 from __future__ import annotations
@@ -104,6 +108,9 @@ ACTIONS: dict[str, tuple[str, int, int]] = {
     "stat": ("files", 20, 60),
     "pull": ("files", 900, 3600),
     "shell": ("shell", 60, 600),
+    # ── 无障碍后端专属 (App v1.9.234): 读界面节点 / 按文字点 ──
+    "ui": ("screen", 30, 90),
+    "clicktext": ("input", 20, 60),
     # ── 本地能力 (不需要 Shizuku) ──
     "alarm": ("local", 30, 120),
     "timer": ("local", 30, 120),
@@ -116,6 +123,43 @@ ACTIONS: dict[str, tuple[str, int, int]] = {
     "widget_refresh": ("local", 30, 120),
     "places": ("local", 15, 60),
 }
+
+# ── 操控后端 (App v1.9.234) ──────────────────────────────────────────────────
+# Shizuku 不可用 (她的 OPPO/ColorOS 上 shell 拿不到 GRANT_RUNTIME_PERMISSIONS, 永远授权不了)
+# 时, App 自动改走自己的 AccessibilityService: 点按/滑动 dispatchGesture、返回/Home/多任务
+# performGlobalAction、打开 App 用 launch intent、截屏 takeScreenshot (Android 11+)、
+# 前台 App 来自无障碍事件、输入文字 ACTION_SET_TEXT (兜底剪贴板 + ACTION_PASTE)。
+# 文件 / Shell 只能 Shizuku; ui / clicktext 只能无障碍。
+BACKENDS: tuple[str, ...] = ("shizuku", "accessibility", "none")
+SHIZUKU_ONLY_ACTIONS = frozenset({"download", "ls", "stat", "pull", "shell"})
+A11Y_ONLY_ACTIONS = frozenset({"ui", "clicktext"})
+# Shizuku 的这些状态说明一时半会儿好不了 (binding / service_error 可能马上恢复, 不提前拒)
+SHIZUKU_DOWN_STATES = frozenset({"not_installed", "not_running", "no_permission", "too_old"})
+# 手机上报的无障碍状态: on=已连上; enabled=系统里开着但服务还没连上; off=没开; unsupported
+A11Y_STATE_RE = re.compile(r"^[a-z_]{1,24}$")
+A11Y_ZH = {
+    "on": "已开启",
+    "enabled": "系统里开着，服务还没连上（重开一次开关试试）",
+    "off": "没开",
+    "unsupported": "这台手机不支持",
+}
+NEEDS_SHIZUKU_MESSAGE = (
+    "需要 Shizuku：文件传输 / 列目录 / 拉文件 / Shell 只能走 Shizuku，"
+    "无障碍模式做不了（她的 ColorOS 上 Shizuku 授权不了）"
+)
+NEEDS_A11Y_MESSAGE = "需要无障碍服务：App → 设置 → 小克的本地能力 →「屏幕操作（无障碍）」去开"
+MAX_UI_NODES = 1000
+MAX_CLICKTEXT_CHARS = 200
+
+
+def active_backend(shizuku: Any, accessibility: Any) -> str:
+    """手机现在会用哪个后端执行点按/截屏类操作 (和 App 里 PhoneControlPolicy.chooseBackend 同规则)。"""
+    if shizuku in ("ready", "binding"):
+        return "shizuku"
+    if accessibility == "on":
+        return "accessibility"
+    return "none"
+
 
 # 键名 → Android KeyEvent keycode (手机端用同一张表, 见 PhoneControlPolicy.KEYS)
 KEYS: dict[str, int] = {
@@ -307,6 +351,22 @@ def validate_task(action: Any, args: Any) -> dict[str, Any]:
         out["file_id"] = file_id
         out["dest"] = normalize_phone_path(args.get("dest"), allow_root=False)
         out["overwrite"] = bool(args.get("overwrite", False))
+        return out
+    if action == "ui":
+        out["max_nodes"] = _int_arg(args, "max_nodes", 1, MAX_UI_NODES, default=300)
+        out["all"] = args.get("all") is True
+        out["windows"] = args.get("windows") is True
+        return out
+    if action == "clicktext":
+        text = args.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise PhoneTaskError(400, "bad_text", "text 不能为空")
+        text = text.strip()
+        if len(text) > MAX_CLICKTEXT_CHARS or any(ord(ch) < 0x20 for ch in text):
+            raise PhoneTaskError(400, "bad_text", f"text 最长 {MAX_CLICKTEXT_CHARS} 字、不能含控制字符")
+        out["text"] = text
+        out["index"] = _int_arg(args, "index", 0, 99, default=0)
+        out["exact"] = args.get("exact") is True
         return out
     if action == "shell":
         cmd = args.get("cmd")
@@ -669,6 +729,11 @@ class PhoneControlHub:
                     403, "tier_disabled",
                     f"手机端没开「{TIER_ZH[tier]}」权限（App → 设置 → 手机操控）",
                 )
+            elif device["online"] and action in SHIZUKU_ONLY_ACTIONS and device["shizuku"] in SHIZUKU_DOWN_STATES:
+                raise PhoneTaskError(409, "needs_shizuku", NEEDS_SHIZUKU_MESSAGE)
+            elif (device["online"] and action in A11Y_ONLY_ACTIONS and device["accessibility"] is not None
+                  and device["accessibility"] != "on"):
+                raise PhoneTaskError(409, "needs_accessibility", NEEDS_A11Y_MESSAGE)
             if action == "download":
                 entry = self._outbox.get(clean["file_id"])
                 if entry is None:
@@ -814,14 +879,34 @@ class PhoneControlHub:
         last_seen = self._device.get("last_seen")
         now = self._now()
         ago = None if last_seen is None else max(0, int(now - last_seen))
+        online = self._pollers > 0 or (ago is not None and ago <= DEVICE_ONLINE_S)
+        caps = self._device.get("caps")
+        shizuku = self._device.get("shizuku")
+        accessibility = self._device.get("accessibility")
+        # 手机操控总开关关着时轮询停了; 无障碍状态退而看本地能力那条通道最近一次上报
+        a11y_any = accessibility or self._local.get("accessibility")
+        if not online:
+            backend, reason = "none", "手机操控没在线（总开关没开 / App 被杀后台）"
+        elif not caps:
+            backend, reason = "none", "手机操控总开关关着"
+        else:
+            backend = active_backend(shizuku, accessibility)
+            reason = {
+                "shizuku": "Shizuku 就绪",
+                "accessibility": "Shizuku 不可用，改走无障碍服务",
+            }.get(backend, "Shizuku 不可用，无障碍服务也没开")
         return {
             "seen": last_seen is not None,
             "last_seen": last_seen,
             "seconds_ago": ago,
-            "online": self._pollers > 0 or (ago is not None and ago <= DEVICE_ONLINE_S),
+            "online": online,
             "polling_now": self._pollers > 0,
-            "caps": self._device.get("caps"),
-            "shizuku": self._device.get("shizuku"),
+            "caps": caps,
+            "shizuku": shizuku,
+            "accessibility": accessibility,
+            "accessibility_any": a11y_any,
+            "backend": backend,
+            "backend_reason": reason,
             "app_version": self._device.get("app_version"),
             "shizuku_version": self._device.get("shizuku_version"),
             "local": self._local_view_locked(now),
@@ -856,11 +941,19 @@ class PhoneControlHub:
             out[name] = item
         return out
 
-    def note_local(self, *, app_version: Any = None, features: Any = None) -> None:
+    @staticmethod
+    def _clean_a11y(raw: Any) -> str | None:
+        return raw if isinstance(raw, str) and A11Y_STATE_RE.match(raw) else None
+
+    def note_local(self, *, app_version: Any = None, features: Any = None,
+                   accessibility: Any = None) -> None:
         with self._cond:
             self._local["last_seen"] = self._now()
             if isinstance(app_version, str):
                 self._local["app_version"] = app_version[:40]
+            a11y = self._clean_a11y(accessibility)
+            if a11y is not None:
+                self._local["accessibility"] = a11y
             clean = self._clean_features(features)
             if clean is not None:
                 self._local["features"] = clean
@@ -868,9 +961,13 @@ class PhoneControlHub:
     # ── 手机侧 ────────────────────────────────────────────────────────────
 
     def note_device(self, *, caps: Any = None, shizuku: Any = None,
-                    app_version: Any = None, shizuku_version: Any = None) -> None:
+                    app_version: Any = None, shizuku_version: Any = None,
+                    accessibility: Any = None) -> None:
         with self._cond:
             info: dict[str, Any] = {"last_seen": self._now()}
+            a11y = self._clean_a11y(accessibility)
+            if a11y is not None:
+                info["accessibility"] = a11y
             if isinstance(caps, str):
                 info["caps"] = [c for c in caps.split(",") if c in TIERS]
             if isinstance(shizuku, str):
@@ -883,12 +980,12 @@ class PhoneControlHub:
 
     def claim(self, *, wait_s: float = 0.0, caps: Any = None, shizuku: Any = None,
               app_version: Any = None, shizuku_version: Any = None,
-              include_local: bool = False) -> dict[str, Any] | None:
+              include_local: bool = False, accessibility: Any = None) -> dict[str, Any] | None:
         """手机领最早的 pending 任务; 没有就最多等 wait_s 秒 (长轮询)。"""
         wait = max(0.0, min(float(wait_s), float(MAX_POLL_WAIT_S)))
         deadline = time.monotonic() + wait
         self.note_device(caps=caps, shizuku=shizuku, app_version=app_version,
-                         shizuku_version=shizuku_version)
+                         shizuku_version=shizuku_version, accessibility=accessibility)
         with self._cond:
             self._pollers += 1
             try:
@@ -922,13 +1019,13 @@ class PhoneControlHub:
         }
 
     def claim_local(self, *, task_id: Any = None, app_version: Any = None,
-                    features: Any = None) -> dict[str, Any] | None:
+                    features: Any = None, accessibility: Any = None) -> dict[str, Any] | None:
         """App 收到 phone_task 事件 / SSE 重连后领本地能力任务 (不需要 Shizuku, 不阻塞)。
 
         task_id 给了就只领那一条 (已被领 / 不存在返回 None); 没给就领最早的一条本地任务。
         顺带记下 App 上报的本地能力开关状态 (投递前预检用)。
         """
-        self.note_local(app_version=app_version, features=features)
+        self.note_local(app_version=app_version, features=features, accessibility=accessibility)
         with self._cond:
             self.sweep()
             if task_id is not None:

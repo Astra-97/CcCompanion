@@ -89,6 +89,12 @@ all done by the Android app with ordinary permissions (no Shizuku), each with it
 App → 设置 → 小克的本地能力. Usage (`phone-ctl alarm|timer|health|calendar sync|ring|clip|widget|places|notifs|local`),
 permissions and caveats: [apns-server/README.md](apns-server/README.md#小克的本地能力phone-ctl2026-10-31app-v19233不需要-shizuku).
 
+Screen control without Shizuku (App v1.9.234+): when Shizuku is unavailable the existing `phone-ctl`
+tap/swipe/longpress/home/back/recent/open/shot/app/text commands route automatically to the app's
+AccessibilityService, plus new `phone-ctl ui` (compact node dump) and `phone-ctl clicktext "文字"`;
+`phone-ctl status` shows the active backend (shizuku / accessibility / none). File transfer and shell stay
+Shizuku-only. Details: [apns-server/README.md](apns-server/README.md#屏幕操作的无障碍后端phone-ctl2026-10-31app-v19234).
+
 ## Experimental Feature Flags
 
 New CcCompanion features that change navigation, notifications, rendering, or agent workflows should start behind a Settings toggle backed by `@AppStorage`. The default should be off unless the feature is a compatibility or safety fix. This keeps upgrades stable for existing users while allowing local testers to opt in.

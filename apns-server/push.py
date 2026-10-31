@@ -31110,7 +31110,8 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
 
     # ━━━━━━━━━━ 手机操控 (2026-10-24, App v1.9.227 Shizuku) ━━━━━━━━━━
     # 路由表（全部 native shared secret fail-closed；网页 cookie 一律 401）：
-    #   手机侧  GET  /phone/tasks/next?wait=&caps=&shizuku=&v=&sv=   长轮询领任务（200 任务 / 204 无）
+    #   手机侧  GET  /phone/tasks/next?wait=&caps=&shizuku=&a11y=&v=&sv=   长轮询领任务（200 任务 / 204 无）
+    #          (a11y = 无障碍服务状态 on/enabled/off, v1.9.234 起; Shizuku 不可用时 App 改走无障碍)
     #          POST /phone/tasks/<id>/result   {ok,result,error,message}
     #          POST /phone/tasks/<id>/blob     原始 body（截图 / 拉回的文件）
     #          POST /phone/tasks/<id>/progress {done,total} → {cancelled}
@@ -31210,6 +31211,7 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
                     app_version=q("v") or None,
                     shizuku_version=q("sv") or None,
                     include_local=q("local") == "1",
+                    accessibility=q("a11y") or None,
                 )
                 if task is None:
                     self.send_response(204)
@@ -31321,6 +31323,7 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
                         task_id=body.get("task_id"),
                         app_version=body.get("v"),
                         features=body.get("features"),
+                        accessibility=body.get("a11y"),
                     )
                     if task is None:
                         self._send_json(200, {"ok": True, "task": None})
