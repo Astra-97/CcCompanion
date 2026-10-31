@@ -4,11 +4,12 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from . import gege, kairos, kimi, kiro, xiaoke
+from . import gege, kairos, kimi, kiro, kirocrew, xiaoke
 
 # kiro 桥接 (2026-09-09): ACP text chat contact, Phase 1.
 # 哥哥写手 (2026-10-29): pi on Tokyo, writing only.
-_CONTACT_MODULES = {"xiaoke": xiaoke, "kairos": kairos, "kimi": kimi, "kiro": kiro, "gege": gege}
+# Kiro Crew (2026-10-31): 小克 via the Kiro Crew gateway on Tokyo, beside kiro.
+_CONTACT_MODULES = {"xiaoke": xiaoke, "kairos": kairos, "kimi": kimi, "kiro": kiro, "gege": gege, "kirocrew": kirocrew}
 _OTHER_CONTACTS = (
     {
         "id": "hajiki", "display_name": "哈基米", "provider": "contact-local",
@@ -41,7 +42,7 @@ _LEGACY_FALLBACK_ROUTES = {
     "apples": {"send_handler": "apples", "capabilities": ["chat", "history", "draft", "busy", "attachments", "forward", "group_chat", "realtime"]},
     "toolbot": {"capabilities": ["history", "realtime"]},
 }
-_SEND_HANDLERS = frozenset({"xiaoke", "kairos", "kimi", "apples", "kiro", "gege"})
+_SEND_HANDLERS = frozenset({"xiaoke", "kairos", "kimi", "apples", "kiro", "gege", "kirocrew"})
 _GROUP_DISPATCHERS = frozenset({"xiaoke", "kairos", "kimi"})
 
 

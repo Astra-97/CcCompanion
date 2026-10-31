@@ -100,6 +100,23 @@ with its own context/memory.
 
 ---
 
+### Kiro Crew 联系人 `kirocrew`（2026-10-31，和 `kiro` 并排试用）
+
+方小南「先做一个 crew，然后功能和接口对齐 cli，稳定运行几天再看用哪个」。App 里多出一个
+联系人「Kiro Crew」（服务端 `/chat/contacts` 下发，安卓不用发版），背后是东京
+`kirocrew.service`（Kiro Crew 网关，用户 kiro，只绑 127.0.0.1:5476），人设 = 同一份 xiaoke
+steering + 记忆库 MCP。原来的 `kiro`（kiro-cli）完全不动。
+
+- 代码：`kirocrew_client.py`（经 `ssh -l kiro tokyo python3 -c <kirocrew_remote_bridge.py>`
+  调网关，内部 secret 只在东京读）、`contacts/kirocrew.py`、push.py `_handle_kirocrew_*`。
+- 一个固定的 Crew 会话槽 `ccc-kirocrew` = 持久会话；聊天指令 `/new /stop /model /effort
+  /status /compact /help`（只有 /compact 走模型）；HTTP：`GET|POST /kirocrew/preferences`、
+  `POST /kirocrew/new_session`、`/chat/stop`（contact_id + user_ts）。
+- 关掉：`config.toml` 里 `kirocrew_enabled = false`，重启 cc-companion（联系人消失，
+  `tokens/chat_history_kirocrew.jsonl` 保留）；东京 `sudo systemctl disable --now kirocrew`。
+  完整回滚（含 ~/.kiro 备份）见 vps-xiaoke-config `system-config/tokyo/README.md`「Kiro Crew」。
+- 测试：`.venv/bin/python3 -m unittest _kirocrew_test`。
+
 ## Quick start
 
 ### 1. Deps

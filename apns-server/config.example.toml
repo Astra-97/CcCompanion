@@ -225,6 +225,22 @@ allowed_ips = []
 #   gege_idle_close_seconds = 10800    # pi 空闲多久关掉（存档都在东京磁盘上，下次 --continue 接着写）
 # 进程 = `ssh -T -l pi tokyo sh -c <launch> ... /home/pi/gege/bin/gege-rpc`（remote_stdio.py），
 # 进程组记在 <gege_home>/run/rpc.pid。POST /gege/restart 关掉它（改了 gege.env 后用）。
+# Kiro Crew kirocrew (2026-10-31)：和 kiro 并排试用的第二个小克入口，本体是东京
+# kirocrew.service（Kiro Crew 网关，用户 kiro，只绑 127.0.0.1:5476）。216 经
+# `ssh -l kiro tokyo python3 -c <kirocrew_remote_bridge.py>` 访问，网关的内部
+# secret 只在东京读，不出东京。关掉：kirocrew_enabled = false 后重启 cc-companion
+# （联系人从 /chat/contacts 消失，历史文件 tokens/chat_history_kirocrew.jsonl 保留）。
+#   kirocrew_enabled = true
+#   kirocrew_ssh_host = "tokyo"          # 缺省同 kiro_ssh_host
+#   kirocrew_remote_user = "kiro"        # 缺省同 kiro_remote_user
+#   kirocrew_port = 5476                 # 东京上的网关端口（loopback）
+#   kirocrew_agent = "xiaoke-persona"    # ~/.kiro/agents/xiaoke-persona.json（includeCrewContext=false）
+#   kirocrew_slot = "ccc-kirocrew"       # 固定的 Crew 会话槽；/new = reset-conversation
+#   kirocrew_semantic_memory_recall_enabled = true   # 同 kiro 的记忆浮现卡片
+#   kirocrew_keep_warm = true            # 网关重启后用 /context（不花 credits）把会话重新拉起
+#   kirocrew_keep_warm_interval_seconds = 600
+# 聊天指令 /new /stop /model /effort /status /compact /help；偏好存
+# tokens/kirocrew_preferences.json。
 # kiro 切模型 (2026-09-10)：模型选择由 App 端 /kiro/preferences 管理，持久化在
 # tokens/kiro_preferences.json；可选目录来自 ACP 动态上报，缓存在
 # tokens/kiro_models_cache.json。无配置项，默认 auto（Kiro 自动路由）。

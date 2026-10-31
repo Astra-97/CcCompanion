@@ -238,6 +238,17 @@ from kiro_keep_warm import KiroKeepWarm
 # 哥哥写手 (2026-10-29): pi (RPC mode) on Tokyo as the writing-only contact gege.
 import gege_writer
 from pi_rpc import PiRPCAuthRequired, PiRPCBusy, PiRPCCancelled, PiRPCClient, PiRPCError
+# Kiro Crew (2026-10-31): contact kirocrew, 小克 through the Crew gateway on Tokyo.
+import kirocrew_client
+from kirocrew_client import (
+    KiroCrewAuthRequired,
+    KiroCrewBusy,
+    KiroCrewCancelled,
+    KiroCrewClient,
+    KiroCrewError,
+    KiroCrewPreferences,
+    KiroCrewQuotaExceeded,
+)
 # kiro 桥接 (2026-09-09): ACP 文本聊天联系人，Phase 1。
 from kiro_acp import (
     DEFAULT_KIRO_CWD,
@@ -3148,6 +3159,40 @@ def _kiro_remote_from_config(server_cfg: dict[str, Any]) -> tuple[RemoteStdio | 
     return remote, kiro_bin, kiro_cwd, home
 
 
+def _kirocrew_client_from_config(server_cfg: dict[str, Any]) -> tuple[KiroCrewClient | None, RemoteStdio | None, str]:
+    """Kiro Crew (2026-10-31): (client, remote, remote home) for contact kirocrew.
+
+    ``kirocrew_enabled = true`` turns the contact on.  The gateway runs on
+    ``kirocrew_ssh_host`` (default: ``kiro_ssh_host``) as
+    ``kirocrew_remote_user`` (default: ``kiro_remote_user``), port
+    ``kirocrew_port`` (5476, loopback there), agent template
+    ``kirocrew_agent`` (xiaoke-persona), chat slot ``kirocrew_slot``
+    (ccc-kirocrew).  Disabled or no host -> (None, None, "").
+    """
+    if not bool(server_cfg.get("kirocrew_enabled", False)):
+        return None, None, ""
+    host = str(server_cfg.get("kirocrew_ssh_host", "") or server_cfg.get("kiro_ssh_host", "") or "").strip()
+    if not host:
+        return None, None, ""
+    user = str(server_cfg.get("kirocrew_remote_user", "") or server_cfg.get("kiro_remote_user", "kiro") or "kiro").strip()
+    home = str(server_cfg.get("kirocrew_remote_home", "") or f"/home/{user}").rstrip("/")
+    remote = RemoteStdio(RemoteStdioTarget(
+        host=host,
+        user=user,
+        cwd=f"{home}/Kiro-Crew-Workspace",
+        env={"HOME": home, "LANG": "C.UTF-8"},
+        control_path=str(Path.home() / ".ssh" / "ccc-kirocrew-%C"),
+    ))
+    client = KiroCrewClient(
+        remote,
+        port=int(server_cfg.get("kirocrew_port", kirocrew_client.DEFAULT_PORT) or kirocrew_client.DEFAULT_PORT),
+        agent=str(server_cfg.get("kirocrew_agent", "") or kirocrew_client.DEFAULT_AGENT),
+        slot=str(server_cfg.get("kirocrew_slot", "") or kirocrew_client.DEFAULT_SLOT),
+        turn_timeout=float(server_cfg.get("kirocrew_turn_timeout_seconds", 4 * 3600)),
+    )
+    return client, remote, home
+
+
 def _gege_client_from_config(server_cfg: dict[str, Any]) -> PiRPCClient | None:
     """哥哥写手 (2026-10-29): pi RPC client for contact gege, or None.
 
@@ -3260,6 +3305,50 @@ def _kiro_keep_warm_attempt(state: Any) -> str:
             if state.kiro_prepare_token == prepare_token:
                 state.kiro_prepare_token = ""
     return "warmed"
+
+
+def _kirocrew_keep_warm_attempt(state: Any) -> str:
+    """Kiro Crew (2026-10-31): one keep-warm check for the crew slot.
+
+    Crew keeps the slot's kiro-cli session alive by itself while the gateway
+    runs (``session.idle_exempt_keys``), but a gateway restart leaves the slot
+    without a session until the next turn.  ``mcp_report`` is None exactly
+    then; a ``/context`` harness command (answered by kiro-cli, no model call,
+    no credits) spawns the session again.  The slot's own history replay keeps
+    the conversation.  Runs only while the contact is idle and holds the
+    contact's turn slot meanwhile, so an App message queues behind it.
+    """
+    from kiro_keep_warm import ALREADY_WARM, BUSY, WARMED
+
+    client = getattr(state, "kirocrew_client", None)
+    if client is None:
+        return BUSY
+    with state.kirocrew_lock:
+        if state.kirocrew_active or state.kirocrew_queue:
+            return BUSY
+    info = client.slot_info()
+    if not info:
+        client.ensure_slot()  # creating the slot spawns its session (eager_spawn)
+        return WARMED
+    if info.get("running") or info.get("compacting"):
+        return BUSY
+    if info.get("mcp_report") is not None:
+        return ALREADY_WARM
+    cancel_event = threading.Event()
+    with state.kirocrew_lock:
+        if state.kirocrew_active or state.kirocrew_queue:
+            return BUSY
+        state.kirocrew_active = {"user_ts": "", "cancel_event": cancel_event, "keep_warm": True}
+    try:
+        client.ensure_slot()
+        client.prompt("/context", cancel_event=cancel_event)
+    except KiroCrewCancelled:
+        return BUSY  # /stop or a new message arrived first; try again next tick
+    finally:
+        with state.kirocrew_lock:
+            if state.kirocrew_active.get("cancel_event") is cancel_event:
+                state.kirocrew_active = {}
+    return WARMED
 
 
 def _kiro_cli_data_dir() -> Path:
@@ -5300,6 +5389,18 @@ class ServerState:
                 assistant_text_normalizer=bqb_normalizer,
             ),
         }
+        # Kiro Crew (2026-10-31): only an enabled crew contact gets a history
+        # store, so kirocrew_enabled = false hides it from /chat/contacts.
+        (
+            self.kirocrew_client,
+            self.kirocrew_remote,
+            self.kirocrew_remote_home,
+        ) = _kirocrew_client_from_config(server_cfg)
+        if self.kirocrew_client is not None:
+            self.contact_chats["kirocrew"] = ChatHistory(
+                contact_history_dir / "chat_history_kirocrew.jsonl",
+                assistant_text_normalizer=bqb_normalizer,
+            )
         # This is a registration table, not merely a presentation catalog.
         # A contact becomes chat/forward-capable only after a concrete handler
         # is registered here.  Adding a JSON catalog entry or a history file
@@ -5545,6 +5646,30 @@ class ServerState:
         self.gege_worker_running = False
         self.gege_active: dict[str, Any] = {}
         self.gege_list_until = 0.0
+        # Kiro Crew (2026-10-31): one FIFO + one worker, like gege.  The Crew
+        # slot itself is the persistent session (no pointer kept on 216).
+        self.kirocrew_lock = threading.Lock()
+        self.kirocrew_queue: deque[dict[str, Any]] = deque()
+        self.kirocrew_worker_running = False
+        self.kirocrew_active: dict[str, Any] = {}
+        self.kirocrew_applied: tuple[str, str] | None = None
+        self.kirocrew_last_context_pct: float | None = None
+        self.kirocrew_keep_warm_enabled = bool(server_cfg.get("kirocrew_keep_warm", True))
+        self.kirocrew_keep_warm_interval = float(server_cfg.get("kirocrew_keep_warm_interval_seconds", 600))
+        self.kirocrew_preferences = KiroCrewPreferences(contact_history_dir / "kirocrew_preferences.json")
+        self.kirocrew_semantic_memory_recall_enabled: bool = bool(
+            server_cfg.get("kirocrew_semantic_memory_recall_enabled", True)
+        )
+        self.kirocrew_semantic_memory_recall_timeout_sec: float = float(
+            server_cfg.get("kirocrew_semantic_memory_recall_timeout_sec", 2.5)
+        )
+        self.kirocrew_semantic_memory_recall: Any = None
+        self.kirocrew_semantic_memory_recall_init_attempted = False
+        self.kirocrew_semantic_memory_recall_lock = threading.Lock()
+        self.kirocrew_recall_card_lock = threading.Lock()
+        self.kirocrew_recall_index = KairosRecallIndex(
+            Path(self.token_store_path).expanduser().parent / "kirocrew_recall_index.json"
+        )
         # kiro 搬东京 (2026-10-28): kiro_ssh_host = "tokyo" runs kiro-cli (ACP
         # + terminal TUI) on that host as kiro_remote_user; kiro_bin/kiro_cwd
         # are then remote paths.  Unset = the old local Kiro.
@@ -9646,7 +9771,7 @@ class PushHandler(BaseHTTPRequestHandler):
             # kiro 对齐 CC (2026-09-26): Kiro's Stop is an in-process ACP
             # session/cancel fenced by exact user_ts, like Kimi.
             requested_stop_contact = str(body.get("contact_id") or "").strip()
-            if requested_stop_contact not in {"kairos", "kimi", "kiro"} and not self.state.allow_remote_control:
+            if requested_stop_contact not in {"kairos", "kimi", "kiro", "kirocrew"} and not self.state.allow_remote_control:
                 self._send_json(403, {"error": "remote_control disabled", "hint": "set allow_remote_control=true in config.toml"})
                 return
             self._handle_chat_stop(body)
@@ -13123,6 +13248,14 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         # kiro 桥接 (2026-09-09)：旧式附件/语音/卡片在入口拒绝。
         # kiro 对齐 CC (2026-09-26)：与 Kimi 同款，只放行 staged attachment_ids。
+        # Kiro Crew (2026-10-31): same ingress policy as Kiro.
+        if contact_id == "kirocrew" and self._kiro_inbound_not_text_only(body):
+            self._send_json(415, {
+                "ok": False,
+                "error": "kirocrew_text_only",
+                "reason": "Kiro Crew 只接受文字消息和聊天框里上传的附件。",
+            })
+            return
         if contact_id == "kiro" and self._kiro_inbound_not_text_only(body):
             self._send_json(415, {
                 "ok": False,
@@ -28907,6 +29040,609 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.info("gege turn: kind=%s total_ms=%d", (command or ("write", ""))[0], int((time.monotonic() - started) * 1000))
 
 
+    # ── Kiro Crew kirocrew (2026-10-31): 小克 through the Crew gateway ───────
+    # 方小南「先做一个 crew，然后功能和接口对齐 cli，稳定运行几天再看用哪个」.
+    # Independent of the kiro contact: own history, queue, worker, prefs.
+    # Sources never contain the substring "kiro" (the Android client maps
+    # sources containing it to the Kiro contact), hence "crew-gateway".
+    _KIROCREW_MAX_QUEUE = 20
+    _KIROCREW_HELP = (
+        "Kiro Crew 联系人的指令（不花 credits，/compact 除外）：\n"
+        "/new 开新会话（清掉当前上下文）\n"
+        "/stop 停止正在生成的回复\n"
+        "/model 查看模型；/model <id> 切换；/model auto 恢复默认\n"
+        "/effort 查看推理强度；/effort low|medium|high|xhigh|max；/effort default 恢复默认\n"
+        "/status 模型、强度、上下文占用、今日 credits\n"
+        "/compact 让 Crew 压缩当前会话（会花一点 credits）\n"
+        "/help 这条说明"
+    )
+    _KIROCREW_COMMAND_RE = re.compile(r"^/(new|stop|model|effort|status|help)(?:\s+(\S.*))?$", re.IGNORECASE | re.DOTALL)
+    _KIROCREW_DISABLED_TEXT = "Kiro Crew 联系人没有开启（config.toml 的 kirocrew_enabled）。"
+
+    def _kirocrew_session_id(self) -> str:
+        client = getattr(self.state, "kirocrew_client", None)
+        slot = getattr(client, "slot", "ccc-kirocrew")
+        prefs = getattr(self.state, "kirocrew_preferences", None)
+        return f"crew:{slot}:{int(getattr(prefs, 'epoch', 0) or 0)}"
+
+    def _kirocrew_busy(self) -> bool:
+        with self.state.kirocrew_lock:
+            return bool(self.state.kirocrew_active) or bool(self.state.kirocrew_queue)
+
+    def _kirocrew_known_models(self) -> tuple[str, ...]:
+        """Kiro's own model catalog (same account); read-only cache, may be empty."""
+        try:
+            return tuple(self.state.kiro_acp.available_model_ids())
+        except Exception:
+            return ()
+
+    def _kirocrew_reply_now(self, contact_id: str, rec: dict[str, Any], text: str, source: str) -> None:
+        """Answer a chat command without a model turn (assistant row + completed)."""
+        chat = self._chat_for_contact(contact_id)
+        user_ts = str(rec.get("ts") or "")
+        final_ts = ""
+        try:
+            final = chat.append(
+                role="assistant", text=text, source=source,
+                metadata={"crew_user_ts": user_ts, "turn_terminal": True, "turn_message_kind": "terminal_answer"},
+            )
+            final_ts = str(final.get("ts") or "")
+            self._publish_persisted_assistant_completion(contact_id, final)
+        except Exception:
+            logger.exception("kirocrew command reply append failed")
+        self._set_chat_completed(contact_id, user_ts=user_ts, final_ts=final_ts, source=source)
+
+    def _kirocrew_status_text(self) -> str:
+        client = self.state.kirocrew_client
+        model, effort = self.state.kirocrew_preferences.snapshot()
+        lines = [f"模型：{model or 'auto（默认）'}", f"推理强度：{effort or '默认'}"]
+        try:
+            info = client.slot_info() if client is not None else {}
+        except KiroCrewError:
+            info = None
+        if info is None:
+            lines.append("Crew 网关：连不上")
+        elif not info:
+            lines.append("会话：还没开始（发第一条消息时创建）")
+        else:
+            pct = info.get("context_pct")
+            used = info.get("context_used_tokens")
+            window = info.get("context_window_tokens")
+            if isinstance(pct, (int, float)):
+                detail = f"（{int(used) // 1000}k / {int(window) // 1000}k tokens）" if isinstance(used, int) and isinstance(window, int) and window else ""
+                lines.append(f"上下文：{pct:.1f}%{detail}，到 30% 时 Crew 会自动压缩")
+            lines.append("状态：正在回复" if info.get("running") else "状态：空闲")
+        credits = self._kirocrew_credits()
+        if credits:
+            lines.append(credits)
+        return "\n".join(lines)
+
+    def _kirocrew_credits(self) -> str:
+        """One display line from Tokyo's kiro-credits (shared with Kiro), "" on failure."""
+        remote = getattr(self.state, "kirocrew_remote", None)
+        if remote is None:
+            return ""
+        try:
+            result = remote.run(["/usr/local/bin/kiro-credits"], timeout=20)
+            data = json.loads(str(getattr(result, "stdout", "") or "{}"))
+            for item in data.get("breakdowns") or []:
+                if isinstance(item, dict) and item.get("resourceType") == "CREDIT":
+                    used = float(item.get("used") or 0)
+                    limit = float(item.get("limit") or 0)
+                    return f"Kiro credits（和 Kiro 联系人共用）：已用 {used:g} / {limit:g}"
+        except Exception:
+            return ""
+        return ""
+
+    def _kirocrew_command(self, contact_id: str, rec: dict[str, Any], name: str, arg: str) -> None:
+        """/model /effort /status /help /new — answered here, no model call."""
+        store = self.state.kirocrew_preferences
+        name = name.lower()
+        arg = arg.strip()
+        if name == "help":
+            self._kirocrew_reply_now(contact_id, rec, self._KIROCREW_HELP, "crew-gateway:command")
+            return
+        if name == "status":
+            self._kirocrew_reply_now(contact_id, rec, self._kirocrew_status_text(), "crew-gateway:command")
+            return
+        if name == "model":
+            known = self._kirocrew_known_models()
+            if not arg:
+                model, _effort = store.snapshot()
+                listing = "、".join(known) if known else "（Kiro 还没上报模型目录，可以直接写模型 id）"
+                self._kirocrew_reply_now(contact_id, rec, f"当前模型：{model or 'auto（默认）'}\n可选：{listing}", "crew-gateway:command")
+                return
+            target = "" if arg.lower() in {"auto", "default", "默认"} else arg
+            if target and known and target not in known:
+                self._kirocrew_reply_now(contact_id, rec, f"没有这个模型：{arg[:80]}\n可选：{'、'.join(known)}", "crew-gateway:command")
+                return
+            try:
+                store.save(model=target)
+            except (ValueError, OSError):
+                self._kirocrew_reply_now(contact_id, rec, "模型名不合法，没有切换。", "crew-gateway:command")
+                return
+            self.state.kirocrew_applied = None
+            self._kirocrew_reply_now(contact_id, rec, f"好，下一条起用 {target or 'auto（默认）'}。", "crew-gateway:command")
+            return
+        if name == "effort":
+            if not arg:
+                _model, effort = store.snapshot()
+                self._kirocrew_reply_now(contact_id, rec, f"当前推理强度：{effort or '默认'}\n可选：{' / '.join(kirocrew_client.EFFORTS)} / default", "crew-gateway:command")
+                return
+            target = "" if arg.lower() in {"default", "auto", "默认"} else arg.lower()
+            try:
+                store.save(effort=target)
+            except (ValueError, OSError):
+                self._kirocrew_reply_now(contact_id, rec, f"推理强度只能是 {' / '.join(kirocrew_client.EFFORTS)} / default。", "crew-gateway:command")
+                return
+            self.state.kirocrew_applied = None
+            self._kirocrew_reply_now(contact_id, rec, f"好，下一条起推理强度 {target or '默认'}。", "crew-gateway:command")
+            return
+        if name == "new":
+            ok, message = self._kirocrew_reset()
+            self._kirocrew_reply_now(contact_id, rec, message, "crew-gateway:new-session" if ok else "crew-gateway:command")
+            return
+
+    def _kirocrew_reset(self) -> tuple[bool, str]:
+        client = self.state.kirocrew_client
+        if client is None:
+            return False, self._KIROCREW_DISABLED_TEXT
+        try:
+            client.reset()
+        except KiroCrewError as exc:
+            logger.warning("kirocrew reset failed: %s", type(exc).__name__)
+            return False, "没能开新会话（Crew 网关没响应），稍后再试。"
+        try:
+            self.state.kirocrew_preferences.bump_epoch()
+        except OSError:
+            logger.warning("kirocrew epoch persist failed")
+        self.state.kirocrew_applied = None
+        self.state.kirocrew_last_context_pct = None
+        return True, "新会话开好了，之前的上下文已经清掉。"
+
+    def _handle_kirocrew_chat_send(self, body: dict[str, Any], contact_id: str = "kirocrew") -> None:
+        """App message to Kiro Crew: history first, then one FIFO worker.
+
+        /stop /status /model /effort /help answer at once (even mid-turn);
+        /new waits for an idle contact; everything else (including /compact,
+        which Crew runs itself) is a turn in the Crew slot.
+        """
+        staged = [item for item in list(body.get("_pwa_staged_attachments") or []) if isinstance(item, dict)]
+        text = str(body.get("text") or "").strip()
+        if self.state.kirocrew_client is None:
+            self._discard_uncommitted_staged_attachments(staged)
+            self._send_json(503, {"ok": False, "error": "kirocrew_disabled", "reason": self._KIROCREW_DISABLED_TEXT})
+            return
+        if not text and not staged:
+            self._send_json(400, {"ok": False, "error": "text required"})
+            return
+        metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else None
+        command = self._KIROCREW_COMMAND_RE.match(text) if text and not staged else None
+        chat = self._chat_for_contact(contact_id)
+        primary = staged[0] if staged else {}
+        with self.state.kirocrew_lock:
+            if command is None and len(self.state.kirocrew_queue) >= self._KIROCREW_MAX_QUEUE:
+                self._discard_uncommitted_staged_attachments(staged)
+                self._send_json(429, {"ok": False, "error": "kirocrew_queue_full", "reason": "排队的消息太多了，等前面的回完再发。"})
+                return
+            try:
+                rec = chat.append(
+                    role="user",
+                    text=text,
+                    source=self._source_for_request("crew"),
+                    quoted_ts=body.get("quoted_ts") or None,
+                    metadata=metadata,
+                    attachment_url=primary.get("attachment_url") or None,
+                    attachment_type=primary.get("type") or None,
+                    attachment_filename=primary.get("filename") or None,
+                )
+            except Exception:
+                logger.exception("kirocrew history append failed")
+                self._discard_uncommitted_staged_attachments(staged)
+                self._send_json(500, {"ok": False, "error": "kirocrew_history_unavailable"})
+                return
+            busy = bool(self.state.kirocrew_active) or bool(self.state.kirocrew_queue)
+            if command is not None:
+                name = command.group(1).lower()
+                if name == "new" and busy:
+                    command_reply = "正在回复，等这条回完再发 /new。"
+                elif name == "stop":
+                    command_reply = None
+                else:
+                    command_reply = ""
+            else:
+                self.state.kirocrew_queue.append({
+                    "contact_id": contact_id, "record": rec, "text": text, "staged_attachments": staged,
+                })
+                position = len(self.state.kirocrew_queue) + (1 if self.state.kirocrew_active else 0)
+                start_worker = not self.state.kirocrew_worker_running
+                if start_worker:
+                    self.state.kirocrew_worker_running = True
+        if command is not None:
+            name, arg = command.group(1).lower(), command.group(2) or ""
+            if name == "stop":
+                stopped = self._kirocrew_cancel_active(clear_queued=True)
+                self._kirocrew_reply_now(contact_id, rec, "好，停下了。" if stopped else "现在没有在生成的回复。", "crew-gateway:command")
+            elif command_reply:
+                self._kirocrew_reply_now(contact_id, rec, command_reply, "crew-gateway:command")
+            else:
+                self._kirocrew_command(contact_id, rec, name, arg)
+            self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec, "command": name})
+            return
+        user_ts = str(rec.get("ts") or "")
+        if position > 1:
+            self._set_chat_queued(contact_id, user_ts=user_ts, queued_at=user_ts, queue_position=position - 1, source="cc-app:crew")
+        if start_worker:
+            threading.Thread(target=self._kirocrew_worker, name="kirocrew-worker", daemon=True).start()
+        self._send_json(200, {
+            "ok": True, "contact_id": contact_id, "record": rec, "queued": True, "queue_position": position,
+            "turn": {"contact_id": contact_id, "user_ts": user_ts, "session_id": self._kirocrew_session_id(), "transport": "kiro-crew"},
+        })
+
+    def _kirocrew_cancel_active(self, *, user_ts: str = "", clear_queued: bool = False) -> bool:
+        with self.state.kirocrew_lock:
+            active = dict(self.state.kirocrew_active)
+            if clear_queued:
+                self.state.kirocrew_queue.clear()
+        cancel = active.get("cancel_event")
+        if not active or not isinstance(cancel, threading.Event):
+            return False
+        if user_ts and user_ts != str(active.get("user_ts") or ""):
+            return False
+        cancel.set()
+        return True
+
+    def _handle_kirocrew_chat_stop(self, body: dict[str, Any]) -> None:
+        user_ts = str((body or {}).get("user_ts") or "").strip()
+        with self.state.kirocrew_lock:
+            active = dict(self.state.kirocrew_active)
+            cleared = len(self.state.kirocrew_queue) if (body or {}).get("clear_queued") else 0
+        if not active:
+            if cleared:
+                self._kirocrew_cancel_active(clear_queued=True)
+            self._send_json(200, {"ok": True, "stopped": False, "already_finished": True, "cleared_queued": cleared})
+            return
+        if user_ts and user_ts != str(active.get("user_ts") or ""):
+            self._send_json(409, {"ok": False, "error": "stale_turn", "reason": "当前轮次与停止目标不一致。"})
+            return
+        self._kirocrew_cancel_active(user_ts=user_ts, clear_queued=bool(cleared))
+        self._send_json(200, {"ok": True, "stopped": True, "user_ts": active.get("user_ts"), "cleared_queued": cleared})
+
+    def _handle_kirocrew_new_session(self, body: dict[str, Any]) -> None:
+        if self.state.kirocrew_client is None:
+            self._send_json(503, {"ok": False, "error": "kirocrew_disabled"})
+            return
+        if self._kirocrew_busy():
+            self._send_json(409, {"ok": False, "error": "kirocrew_turn_active", "reason": "Kiro Crew 正在回复，等当前回复结束后再开新会话。"})
+            return
+        ok, message = self._kirocrew_reset()
+        if not ok:
+            self._send_json(503, {"ok": False, "error": "kirocrew_unavailable", "reason": message})
+            return
+        self._send_json(200, {"ok": True, "session_id": self._kirocrew_session_id()})
+
+    def _kirocrew_preferences_payload(self) -> dict[str, Any]:
+        model, effort = self.state.kirocrew_preferences.snapshot()
+        pct = self.state.kirocrew_last_context_pct
+        label = model or "auto"
+        return {
+            "ok": True,
+            "model": model or "auto",
+            "effort": effort,
+            "efforts": list(kirocrew_client.EFFORTS),
+            "available_models": [{"id": item} for item in self._kirocrew_known_models()],
+            "context_usage_percent": pct,
+            "busy": self._kirocrew_busy(),
+            "header_display": f"{label} · {pct:.0f}%" if isinstance(pct, (int, float)) else label,
+        }
+
+    def _handle_kirocrew_preferences_get(self) -> None:
+        if self.state.kirocrew_client is None:
+            self._send_json(503, {"ok": False, "error": "kirocrew_disabled"})
+            return
+        self._send_json(200, self._kirocrew_preferences_payload())
+
+    def _handle_kirocrew_preferences_post(self, body: dict[str, Any]) -> None:
+        if self.state.kirocrew_client is None:
+            self._send_json(503, {"ok": False, "error": "kirocrew_disabled"})
+            return
+        has_model, has_effort = "model" in body, "effort" in body
+        if not has_model and not has_effort:
+            self._send_json(400, {"ok": False, "error": "invalid_kirocrew_selection"})
+            return
+        model = body.get("model") if has_model else None
+        effort = body.get("effort") if has_effort else None
+        if (has_model and not isinstance(model, str)) or (has_effort and not isinstance(effort, str)):
+            self._send_json(400, {"ok": False, "error": "invalid_kirocrew_selection"})
+            return
+        if isinstance(model, str) and model.strip().lower() in {"auto", ""}:
+            model = ""
+        known = self._kirocrew_known_models()
+        if model and known and model not in known:
+            self._send_json(400, {"ok": False, "error": "invalid_kirocrew_selection"})
+            return
+        try:
+            self.state.kirocrew_preferences.save(model=model, effort=effort)
+        except ValueError:
+            self._send_json(400, {"ok": False, "error": "invalid_kirocrew_selection"})
+            return
+        except OSError:
+            self._send_json(500, {"ok": False, "error": "kirocrew_preferences_persistence_failed"})
+            return
+        self.state.kirocrew_applied = None
+        self._send_json(200, self._kirocrew_preferences_payload())
+
+    def _kirocrew_worker(self) -> None:
+        while True:
+            with self.state.kirocrew_lock:
+                if not self.state.kirocrew_queue:
+                    self.state.kirocrew_worker_running = False
+                    return
+                warming = bool(self.state.kirocrew_active.get("keep_warm"))
+                if not warming:
+                    # Pop and reserve under one lock: the keep-warm check must
+                    # never see an empty queue and an empty turn slot in between.
+                    item = self.state.kirocrew_queue.popleft()
+                    cancel_event = threading.Event()
+                    self.state.kirocrew_active = {"user_ts": str(item["record"].get("ts") or ""), "cancel_event": cancel_event}
+            if warming:
+                # The keep-warm /context holds the slot for a few seconds.
+                time.sleep(0.25)
+                continue
+            try:
+                self._kirocrew_process(item, cancel_event)
+            except Exception:
+                logger.exception("kirocrew turn crashed")
+                try:
+                    self._set_chat_failed(item["contact_id"], user_ts=str(item["record"].get("ts") or ""), source="crew-gateway:error")
+                    self._set_typing_for_contact(item["contact_id"], {"is_typing": False, "since": None})
+                except Exception:
+                    pass
+            finally:
+                with self.state.kirocrew_lock:
+                    self.state.kirocrew_active = {}
+
+    def _kirocrew_apply_preferences(self) -> None:
+        """Pin the app's model / effort on the Crew slot when they changed."""
+        client = self.state.kirocrew_client
+        wanted = self.state.kirocrew_preferences.snapshot()
+        if self.state.kirocrew_applied == wanted:
+            return
+        model, effort = wanted
+        try:
+            client.set_model(model or "auto")
+            client.set_effort(effort)
+        except KiroCrewError as exc:
+            # 404 before the slot's first turn, or a gateway hiccup: retry next turn.
+            logger.info("kirocrew preference apply deferred: %s", type(exc).__name__)
+            return
+        except ValueError:
+            logger.warning("kirocrew preference invalid, skipped")
+        self.state.kirocrew_applied = wanted
+
+    def _kirocrew_attachment_prompt(self, attachments: list[dict[str, Any]]) -> str:
+        """Copy staged attachments to Tokyo; Crew turns an image path in the
+        message into an ACP image block by itself."""
+        remote = self.state.kirocrew_remote
+        home = str(self.state.kirocrew_remote_home or "").rstrip("/")
+        try:
+            root = Path(getattr(self.state, "attachments_dir")).resolve()
+        except Exception:
+            root = None
+        hints: list[str] = []
+        copied = False
+        for item in attachments:
+            if not isinstance(item, dict):
+                continue
+            kind = "图片" if item.get("type") == "image" else "文件"
+            name = str(item.get("filename") or "")[:120]
+            stored = str(item.get("stored_path") or "")
+            target = ""
+            try:
+                if remote is not None and home and root is not None and stored and Path(stored).resolve(strict=True).parent == root:
+                    candidate = f"{home}/.cache/ccc/crew-attachments/{Path(stored).name}"
+                    if re.fullmatch(r"[A-Za-z0-9._/-]{1,300}", candidate) and remote.put_file(stored, candidate):
+                        target = candidate
+                        copied = True
+            except OSError:
+                target = ""
+            if target:
+                hints.append(f"[用户发了{kind}: {name}]\n本地路径: {target}")
+            else:
+                hints.append(f"[用户发了{kind}: {name}]\n（文件没能同步到 Kiro Crew 所在的服务器）")
+        if copied and remote is not None:
+            try:
+                remote.run(["find", f"{home}/.cache/ccc/crew-attachments", "-type", "f", "-mtime", "+30", "-delete"], timeout=10)
+            except Exception:
+                pass
+        return "\n\n".join(hints)
+
+    def _kirocrew_outbound_images(self, message: str) -> tuple[str, list[dict[str, Any]]]:
+        """[[CCC_IMAGE:<Tokyo path>]] (and Crew's ![alt](/abs.png)) -> stored attachments."""
+        message = kirocrew_client.markdown_images_to_markers(message)
+        visible, paths, extra = agent_images.extract_markers(message)
+        if not paths:
+            return message, []
+        remote = self.state.kirocrew_remote
+        home = str(self.state.kirocrew_remote_home or "").rstrip("/")
+        destination = Path(getattr(self.state, "attachments_dir"))
+        stored: list[dict[str, Any]] = []
+        notes: list[str] = []
+        for raw_path in paths:
+            name = raw_path.rsplit("/", 1)[-1] or raw_path
+            reason = ""
+            data: bytes | None = None
+            if not raw_path.startswith("/") or "\0" in raw_path or "/../" in f"{raw_path}/":
+                reason = "invalid"
+            elif remote is None:
+                reason = "failed"
+            else:
+                data, reason = remote.get_file(raw_path, max_bytes=agent_images.MAX_BYTES, roots=[r for r in (home, "/tmp") if r])
+            if data is not None and not reason:
+                try:
+                    stored.append(agent_images.store_image(data, destination, prefix="crew", filename=name))
+                    continue
+                except ValueError:
+                    reason = "not_image" if data else "missing"
+                except OSError:
+                    logger.warning("kirocrew outbound image store failed", exc_info=True)
+                    reason = "failed"
+            logger.info("kirocrew outbound image not sent: %s", reason or "failed")
+            notes.append(f"（图片 {name[:80]} 没发出去：{self._KIRO_IMAGE_FAIL_REASON.get(reason, '取回失败')}）")
+        if extra:
+            notes.append(f"（一次最多发 {agent_images.MAX_IMAGES} 张图，另外 {extra} 张没发）")
+        if notes:
+            visible = "\n\n".join(part for part in (visible, "\n".join(notes)) if part)
+        return visible, stored
+
+    def _kirocrew_finish(
+        self, contact_id: str, rec: dict[str, Any], text: str, source: str, *,
+        status: str = "completed", tools: list[str] | None = None,
+    ) -> None:
+        """Tool card, image rows, the terminal answer row, then the reply state."""
+        chat = self._chat_for_contact(contact_id)
+        user_ts = str(rec.get("ts") or "")
+        if tools:
+            done = {"completed": "完成", "interrupted": "已中断"}.get(status, "失败")
+            lines = [f"{label} · 工具 · {done}" for label in tools[-self._KIRO_TOOL_ITEMS_MAX:]]
+            try:
+                chat.append(
+                    role="task", text=lines[-1], source="crew-gateway:activity",
+                    metadata={
+                        "activity_summary": True, "activity_count": min(999, len(tools)),
+                        "activity_items": lines, "status": status, "crew_user_ts": user_ts,
+                        "turn_terminal": False, "turn_message_kind": "auxiliary_activity",
+                    },
+                )
+            except Exception:
+                logger.exception("kirocrew tool summary append failed")
+        visible, outbound = text, []
+        try:
+            visible, outbound = self._kirocrew_outbound_images(text)
+        except Exception:
+            logger.exception("kirocrew outbound images failed")
+            visible = agent_images.strip_markers(text)
+        if not visible and not outbound:
+            visible = "Kiro Crew 没有返回可展示内容。"
+        final_ts = ""
+        try:
+            for extra in outbound[:-1]:
+                chat.append(
+                    role="assistant", text="", source=f"{source}:image",
+                    attachment_url=extra["attachment_url"], attachment_type="image", attachment_filename=extra["filename"],
+                    metadata={"crew_user_ts": user_ts, "turn_terminal": False, "turn_message_kind": "auxiliary_image"},
+                )
+            last = outbound[-1] if outbound else {}
+            final = chat.append(
+                role="assistant", text=visible, source=source,
+                attachment_url=last.get("attachment_url") or None,
+                attachment_type="image" if last else None,
+                attachment_filename=last.get("filename") or None,
+                metadata={"crew_user_ts": user_ts, "turn_terminal": True, "turn_message_kind": "terminal_answer"},
+            )
+            final_ts = str(final.get("ts") or "")
+            self._publish_persisted_assistant_completion(contact_id, final)
+        except Exception:
+            logger.exception("kirocrew assistant history append failed")
+        session_id = self._kirocrew_session_id()
+        if status == "interrupted":
+            self._set_chat_interrupted(contact_id, user_ts=user_ts, final_ts=final_ts, source=source, session_id=session_id)
+        elif status == "failed":
+            self._set_chat_failed(contact_id, user_ts=user_ts, final_ts=final_ts, source=source, session_id=session_id)
+        else:
+            self._set_chat_completed(contact_id, user_ts=user_ts, final_ts=final_ts, source=source, session_id=session_id)
+        self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
+
+    def _kirocrew_process(self, item: dict[str, Any], cancel_event: threading.Event) -> None:
+        contact_id = item["contact_id"]
+        rec = item["record"]
+        text = str(item.get("text") or "")
+        user_ts = str(rec.get("ts") or "")
+        client = self.state.kirocrew_client
+        session_id = self._kirocrew_session_id()
+        self._set_chat_generating(contact_id, user_ts=user_ts, queued_at=user_ts, source="cc-app:crew", session_id=session_id)
+        self._set_typing_for_contact(contact_id, {"is_typing": True, "since": user_ts, "transport": "crew-gateway"})
+        started = time.monotonic()
+        first_chunk_ms: list[int] = []
+        tools: list[str] = []
+        recall_hit = False
+        if client is None:
+            self._kirocrew_finish(contact_id, rec, self._KIROCREW_DISABLED_TEXT, "crew-gateway:disabled", status="failed")
+            return
+        try:
+            try:
+                client.ensure_slot()
+            except KiroCrewError as exc:
+                # The turn itself still creates the slot; only the fixed title
+                # (no auto-title turn) and the early preference pin are lost.
+                logger.info("kirocrew ensure_slot skipped: %s", type(exc).__name__)
+            self._kirocrew_apply_preferences()
+            is_compact = text.strip().lower() == "/compact"
+            recall_context = ""
+            recall_result = None
+            if not is_compact and not cancel_event.is_set() and self._kiro_recall_allowed(text):
+                recall_result = self._contact_semantic_recall("kirocrew", text, session_id=session_id)
+                if recall_result is not None:
+                    recall_hit = True
+                    self._append_contact_recall_card(
+                        "kirocrew", self._chat_for_contact(contact_id), recall_result,
+                        user_ts=user_ts, session_id=session_id,
+                    )
+                    recall_context = str(getattr(recall_result, "context", "") or "").strip()
+            attachment_hint = self._kirocrew_attachment_prompt(list(item.get("staged_attachments") or []))
+            prompt = text if is_compact else "\n\n".join(part for part in (text, attachment_hint, recall_context) if part)
+            last_published = [0.0]
+
+            def on_update(current: str) -> None:
+                if not first_chunk_ms:
+                    first_chunk_ms.append(int((time.monotonic() - started) * 1000))
+                now = time.monotonic()
+                if now - last_published[0] >= 0.08:
+                    last_published[0] = now
+                    self._set_chat_draft(
+                        contact_id, agent_images.strip_markers(current), source="cc-app:crew",
+                        session_id=session_id, user_ts=user_ts, queued_at=user_ts,
+                        activity_text="正在使用工具" if tools else None, activity_count=len(tools),
+                        activity_items=[f"{label} · 工具 · 进行中" for label in tools[-self._KIRO_TOOL_ITEMS_MAX:]],
+                    )
+
+            def on_tool(labels: list[str]) -> None:
+                tools[:] = labels
+                self._set_chat_activity(
+                    contact_id, activity_text="正在使用工具", activity_count=len(labels),
+                    activity_items=[f"{label} · 工具 · 进行中" for label in labels[-self._KIRO_TOOL_ITEMS_MAX:]],
+                    user_ts=user_ts,
+                )
+
+            turn = client.prompt(prompt, on_update=on_update, on_tool=on_tool, cancel_event=cancel_event)
+            if turn.context_pct is not None:
+                self.state.kirocrew_last_context_pct = turn.context_pct
+            if recall_result is not None:
+                self._commit_contact_recall("kirocrew", recall_result, session_id)
+            self._kirocrew_finish(contact_id, rec, turn.text, "crew-gateway", tools=turn.tools)
+        except KiroCrewCancelled as exc:
+            partial = str(exc.partial or "").strip()
+            self._kirocrew_finish(
+                contact_id, rec, partial + "\n\n**[已停止生成]**" if partial else "已中断当前生成。",
+                "crew-gateway:interrupted", status="interrupted", tools=tools,
+            )
+        except KiroCrewAuthRequired:
+            self._kirocrew_finish(contact_id, rec, "Kiro Crew 用的 kiro-cli 还没有登录。请先在东京完成 Kiro 登录后再发一次。", "crew-gateway:auth-required")
+        except KiroCrewQuotaExceeded:
+            self._kirocrew_finish(contact_id, rec, "Kiro 的额度已用完。请充值或等待额度重置后再发一次；原消息已经保留。", "crew-gateway:quota-exceeded")
+        except KiroCrewBusy:
+            self._kirocrew_finish(contact_id, rec, "Kiro Crew 那边这个会话还在忙（可能是 dashboard 里开的轮次），稍后再发一次。", "crew-gateway:busy", status="failed")
+        except KiroCrewError as exc:
+            logger.warning("kirocrew turn failed: %s", type(exc).__name__)
+            self._kirocrew_finish(contact_id, rec, "Kiro Crew 这次没有成功回复。请稍后重试；原消息已经保留。", "crew-gateway:error", status="failed", tools=tools)
+        finally:
+            # Timing only; never message text, paths or provider output.
+            logger.info(
+                "kirocrew turn timing: recall_hit=%s files=%d tools=%d first_chunk_ms=%s total_ms=%d",
+                recall_hit, len(item.get("staged_attachments") or []), len(tools),
+                first_chunk_ms[0] if first_chunk_ms else "none", int((time.monotonic() - started) * 1000),
+            )
+
     # ── NFC 螃蟹挂件 "碰一下召唤小克" (2026-10-21) ─────────────────────────
     _NFC_TAP_SECRET_FILE_ENV = "CC_COMPANION_NFC_TAP_SECRET_FILE"
     _NFC_TAP_DEFAULT_SECRET_FILE = Path("/root/.config/cc-companion/nfc_tap_secret")
@@ -34454,6 +35190,16 @@ def run_server(state: ServerState):
         )
         state.kiro_keep_warm.start()
         logger.info("Kiro keep-warm enabled")
+    # Kiro Crew (2026-10-31): respawn the crew slot's session after a gateway restart.
+    if getattr(state, "kirocrew_client", None) is not None and getattr(state, "kirocrew_keep_warm_enabled", False):
+        state.kirocrew_keep_warm = KiroKeepWarm(
+            attempt=lambda: _kirocrew_keep_warm_attempt(state),
+            logger=logger,
+            interval=float(getattr(state, "kirocrew_keep_warm_interval", 600.0)),
+            boot_delay=60.0,
+        )
+        state.kirocrew_keep_warm.start()
+        logger.info("Kiro Crew keep-warm enabled")
     # 小克·工具版 dispatcher — rule-driven scheduler injecting triggers into the
     # main session at scheduled times (no AI here; the session does the thinking).
     if getattr(state, "tool_schedule_enabled", False):
