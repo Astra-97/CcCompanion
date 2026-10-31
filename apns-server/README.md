@@ -116,11 +116,25 @@ steering + 记忆库 MCP。原来的 `kiro`（kiro-cli）完全不动。
 - `/kirocrew/preferences` 的 JSON 和 `/kiro/preferences` 同形（models / available_models /
   available_efforts / selection / current_model / context_usage_percent / header_display 对象），
   安卓用同一个解析器；`auto` 永远在模型表第一位；`effort_applies=false` 表示 auto 下网关忽略 effort。
-- 终端 tab：`GET /tmux/capture?session=kirocrew` 是**只读**视图——每次（缓存 2.5 秒）经同一条
+- 终端 tab：`GET /tmux/capture?session=kirocrew` 每次（缓存 2.5 秒，发送后立即失效）经同一条
   ssh 桥读 `GET /api/chat/slots/ccc-kirocrew?limit=40`（Crew 自己已脱敏的会话记录：用户/回复/
   工具行含 purpose/input/output 截断），加正在生成的草稿尾巴，整页再过 `_kirocrew_terminal_redact`
   （header/查询串/常见 key 形状/长 hex 与 token_urlsafe 串）。**不读网关 journal**（那里有 5 分钟
-  dashboard `?token=` 链接）。`/tmux/send` `/terminal/key|resize|release` 对 kirocrew 一律 409 只读。
+  dashboard `?token=` 链接）。
+  可输入（2026-10-31）：Crew 没有能接到固定槽上的 TUI（`kirocrew chat` 是独立 CLI 会话），所以终端
+  是「中继」——capture 回 `state: ready, mode: crew_relay, writable: true`（生成中也可写）；
+  `/tmux/send {session: kirocrew, keys, enter: true}` 整行 = 一条聊天消息（走 `_handle_kirocrew_chat_send`，
+  进聊天记录、忙时排队，`/status` 等聊天指令照样认，metadata `via: terminal`）；`enter: false` 400
+  `kirocrew_terminal_line_only`；`C-c` / `Escape` = 停止当前回复（不清队列）；其余 kiro 白名单键 200
+  `ignored`；resize 200 `deferred`、release 200 `released: false`（都是空操作）。
+- 自适应 forge（2026-10-31，和 kiro 同一套）：硬阈值 = min(`kirocrew_auto_forge_threshold_percent`(80) × 窗口,
+  `kirocrew_auto_forge_max_tokens`(300k))，窗口取 Crew 上报的 `context_window_tokens`（无读数时查 kiro 的模型表，
+  auto = 1M）→ 1M 模型 30%/300k、200k 模型 80%/160k；软阈值 × 75/80 发一次系统通知，它可以单独一行写
+  `[[KIRO_FORGE]]`（从 app、草稿、微信 1000008、终端视图里都摘掉），本轮结束后 forge（队列里有消息就挪到下一条
+  之前）。forge = 旧对话总结一轮 → `reset-conversation`（同 `/kirocrew/new_session`，epoch+1）→ seed（摘要 + 状态 +
+  最近 80 条原文，跳过聊天指令与回执）→ 聊天行 `system:crew-forge` + 推送；总结失败/为空不换会话。手动：
+  `POST /kirocrew/forge`。配置键 `kirocrew_auto_forge_*` 缺省沿用同名 `kiro_auto_forge_*`。东京 Crew 自己的
+  autocompact 已调到上限 90%（全局 `session.autocompact_pct` + 槽 override），不会抢在这里之前；`/compact` 仍可手动。
 - 企业微信（2026-10-31，自建应用 1000008「Kiro Crew」）：同 Kiro——`wecom_bridge.INBOUND_CONTACTS`
   / `IMAGE_CONTACTS` 放行，微信图片拷到东京以路径交给 Crew；只有回答微信消息的最终回复
   （`_kirocrew_finish`）和命令回执（`_kirocrew_reply_now`；微信里打 `/status` 等也认）才经

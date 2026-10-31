@@ -6,7 +6,9 @@ untouched).  Turns go to one persistent Crew chat slot on Tokyo
 (``kirocrew_client.py``).  Same ingress policy as Kiro: text plus staged
 ``attachment_ids`` only.  Chat commands (/new /stop /model /effort /status
 /compact /help) are answered by push.py without a model call, except
-/compact, which Crew runs itself.
+/compact, which Crew runs itself.  Context forge (2026-10-31) follows kiro's
+window-adaptive policy (auto at the hard threshold, a soft notice, the
+agent's own ``[[KIRO_FORGE]]`` line, ``POST /kirocrew/forge``).
 
 Disabled unless ``kirocrew_enabled = true`` in config.toml: while disabled
 the contact has no history store, so /chat/contacts never lists it and
@@ -48,5 +50,6 @@ GET_ROUTES = {
 
 POST_ROUTES = {
     "/kirocrew/new_session": "_handle_kirocrew_new_session",
+    "/kirocrew/forge": "_handle_kirocrew_forge",
     "/kirocrew/preferences": "_handle_kirocrew_preferences_post",
 }

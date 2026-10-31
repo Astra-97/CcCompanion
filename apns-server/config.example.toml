@@ -241,6 +241,20 @@ allowed_ips = []
 #   kirocrew_keep_warm_interval_seconds = 600
 # 聊天指令 /new /stop /model /effort /status /compact /help；偏好存
 # tokens/kirocrew_preferences.json。
+# 自适应 forge（2026-10-31，和 kiro 同一套策略，见下面 kiro_auto_forge_*）：每个
+# kirocrew_auto_forge_<x> 缺省时沿用 kiro_auto_forge_<x>，再缺省才是内置默认；
+# 窗口用 Crew 网关自己上报的 context_window_tokens（没有读数时查
+# kiro_model_context_windows / 内置表，auto = 1M）。硬阈值 = min(80% × 窗口, 300k)：
+# 1M 模型（含 auto）在 300k（30%）、200k 模型在 160k（80%）forge；软阈值 = 硬 × 75/80
+# 时给它发一次系统通知，可以单独一行写 [[KIRO_FORGE]] 自己 forge（app/微信/终端都看不到
+# 这行）。forge = 旧会话总结一轮 + 固定槽 reset-conversation（同 /kirocrew/new_session）
+# + 新会话 seed（摘要 + 状态 + 最近对话原文，跳过 /status 等命令）+ 聊天通知与推送；
+# POST /kirocrew/forge 手动触发。东京 Crew 自己的 autocompact 调到上限 90%，不会抢先。
+#   kirocrew_auto_forge_enabled = true
+#   kirocrew_auto_forge_threshold_percent = 80
+#   kirocrew_auto_forge_max_tokens = 300000
+#   kirocrew_auto_forge_soft_ratio = "75/80"
+#   kirocrew_auto_forge_retain_messages = 80
 # kiro 切模型 (2026-09-10)：模型选择由 App 端 /kiro/preferences 管理，持久化在
 # tokens/kiro_preferences.json；可选目录来自 ACP 动态上报，缓存在
 # tokens/kiro_models_cache.json。无配置项，默认 auto（Kiro 自动路由）。

@@ -8,6 +8,9 @@
      chat commands (/status /model /effort /new /stop /help), disabled switch,
      no "kiro" substring in sources (the Android client maps those to Kiro)
   4. registry: listed only when enabled; kiro untouched
+  5. adaptive forge (kiro's policy): window-based hard/soft thresholds, soft
+     notice once, [[KIRO_FORGE]] stripped + self-forge, summary/reset/seed
+     handoff, POST /kirocrew/forge; terminal relay (line = chat turn, Ctrl-C)
 
 Never touches the live 8291 service or Tokyo.
 """
@@ -35,6 +38,7 @@ from kirocrew_client import (
     KiroCrewError,
     KiroCrewPreferences,
 )
+import push
 from push import PushHandler
 
 from _kiro_acp_test import FakeChat, _immediate_thread
@@ -539,8 +543,10 @@ class KiroCrewHandlerTest(unittest.TestCase):
         status, payload = handler.responses[-1]
         self.assertEqual(status, 200)
         self.assertEqual(payload["session"], "kirocrew")
-        self.assertEqual(payload["state"], "waiting")
-        self.assertEqual(payload["mode"], "read_only")
+        # Writable relay (2026-10-31): stays "ready" even while a turn runs (Ctrl-C must reach it).
+        self.assertEqual(payload["state"], "ready")
+        self.assertEqual(payload["mode"], "crew_relay")
+        self.assertTrue(payload["writable"])
         self.assertTrue(payload["busy"])
         self.assertNotIn("lease", payload)
         content = payload["content"]
@@ -580,16 +586,70 @@ class KiroCrewHandlerTest(unittest.TestCase):
         self.assertIn("! Crew 网关暂时连不上", payload["content"])
         self.assertFalse(payload["busy"])
 
-    def test_terminal_input_routes_are_read_only(self):
-        handler, _crew = self._terminal_handler({})
-        handler._handle_tmux_send({"session": "kirocrew", "text": "hi"})
-        self.assertEqual(handler.responses[-1][0], 409)
-        handler._handle_terminal_key({"session": "kirocrew", "key": "Enter"})
-        self.assertEqual(handler.responses[-1][0], 409)
+    def test_terminal_line_is_a_chat_turn(self):
+        handler, crew = self._terminal_handler({})
+        chat = handler.state.contact_chats["kirocrew"]
+        handler.state.kirocrew_terminal_cache = (0.0, {}, "")
+        with patch("push.threading.Thread", _immediate_thread):
+            handler._handle_tmux_send({"session": "kirocrew", "keys": "  帮我看看日志  ", "enter": True})
+        status, payload = handler.responses[-1]
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["session"], "kirocrew")
+        self.assertTrue(payload["direct"])
+        self.assertEqual(payload["turn"]["transport"], "kiro-crew")
+        self.assertEqual(crew.prompts, ["帮我看看日志"])
+        self.assertEqual(chat.records[0]["text"], "帮我看看日志")
+        self.assertEqual(chat.records[0]["metadata"], {"via": "terminal"})
+        self.assertEqual(chat.records[-1]["text"], "小克在。")
+        self.assertIsNone(handler.state.kirocrew_terminal_cache)  # next capture re-reads
+        # Chat commands work from the terminal too (no model call).
+        with patch("push.threading.Thread", _immediate_thread):
+            handler._handle_tmux_send({"session": "kirocrew", "keys": "/status"})
+        self.assertEqual(handler.responses[-1][1]["command"], "status")
+        self.assertEqual(crew.prompts, ["帮我看看日志"])
+
+    def test_terminal_keys_resize_release(self):
+        handler, crew = self._terminal_handler({})
+        cancel = threading.Event()
+        handler.state.kirocrew_active = {"user_ts": "ts-0", "cancel_event": cancel}
+        handler.state.kirocrew_queue.append({"record": {"ts": "ts-q"}})
+        handler._handle_terminal_key({"session": "kirocrew", "key": "Tab"})
+        self.assertEqual(handler.responses[-1], (200, {"ok": True, "key": "Tab", "session": "kirocrew", "ignored": True}))
+        self.assertFalse(cancel.is_set())
+        handler._handle_terminal_key({"session": "kirocrew", "key": "C-c"})
+        self.assertTrue(handler.responses[-1][1]["stopped"])
+        self.assertTrue(cancel.is_set())
+        self.assertEqual(len(handler.state.kirocrew_queue), 1)  # Ctrl-C stops the reply, not the queue
+        handler.state.kirocrew_active = {}
+        handler._handle_tmux_send({"session": "kirocrew", "key": "Escape"})
+        self.assertFalse(handler.responses[-1][1]["stopped"])
+        handler._handle_terminal_key({"session": "kirocrew", "key": "F13"})
+        self.assertEqual(handler.responses[-1][0], 400)
+        handler._handle_tmux_send({"session": "kirocrew", "keys": "半句", "enter": False})
+        self.assertEqual(handler.responses[-1][1]["error"], "kirocrew_terminal_line_only")
+        handler._handle_tmux_send({"session": "kirocrew", "keys": "   "})
+        self.assertTrue(handler.responses[-1][1]["ignored"])
+        handler._handle_tmux_send({"session": "kirocrew", "keys": "x" * 8001})
+        self.assertEqual(handler.responses[-1][0], 413)
         handler._handle_terminal_resize({"session": "kirocrew", "columns": 80, "rows": 24})
-        self.assertEqual(handler.responses[-1][0], 409)
+        self.assertEqual(handler.responses[-1][0], 200)
+        self.assertTrue(handler.responses[-1][1]["deferred"])
         handler._handle_terminal_release({"target": "kirocrew"})
-        self.assertEqual(handler.responses[-1][1]["error"], "kirocrew_terminal_read_only")
+        self.assertEqual(handler.responses[-1], (200, {"ok": True, "target": "kirocrew", "released": False}))
+        self.assertEqual(crew.prompts, [])
+
+    def test_terminal_hides_forge_marker(self):
+        detail = {"messages": [{"role": "assistant", "content": "先到这里\n[[KIRO_FORGE]]", "ts": "2026-10-31T02:31:20+00:00"}],
+                  "running": True}
+        handler, _crew = self._terminal_handler(detail)
+        with handler.state.chat_draft_lock:
+            handler.state.chat_drafts["kirocrew"] = {"is_active": True, "text": "收尾\n[[KIRO_FORGE]]"}
+        handler.path = "/tmux/capture?session=kirocrew"
+        handler._handle_tmux_capture()
+        content = handler.responses[-1][1]["content"]
+        self.assertIn("◆ 先到这里", content)
+        self.assertIn("收尾", content)
+        self.assertNotIn("KIRO_FORGE", content)
 
     def test_terminal_redaction_keeps_ordinary_text(self):
         from push import _kirocrew_terminal_redact
@@ -621,6 +681,224 @@ class KiroCrewHandlerTest(unittest.TestCase):
         self.assertEqual(puts[0][1], "/home/kiro/.cache/ccc/crew-attachments/abc.png")
         self.assertIn("本地路径: /home/kiro/.cache/ccc/crew-attachments/abc.png", client.prompts[0])
         self.assertEqual(chat.records[0]["attachment_url"], "/attachments/abc.png")
+
+
+class ForgeCrew(FakeCrew):
+    """Answers the forge summary / seed prompts; context % per prompt from a script."""
+
+    def __init__(self, *, text="小克在。", pcts=(), window=1_000_000, summary="旧会话摘要：在聊日志。",
+                 summary_failure=None):
+        super().__init__(text=text)
+        self.pcts = list(pcts)
+        self.window = window
+        self.summary = summary
+        self.summary_failure = summary_failure
+
+    def prompt(self, text, *, on_update=None, on_tool=None, cancel_event=None):
+        self.prompts.append(text)
+        pct = self.pcts.pop(0) if self.pcts else 5.0
+        if text == push.KIROCREW_FORGE_SUMMARY_PROMPT:
+            if self.summary_failure is not None:
+                raise self.summary_failure
+            reply = self.summary
+        elif text.startswith("【CcCompanion 受控 forge"):
+            reply = "收到交接。"
+        else:
+            reply = self.text
+            if on_update is not None:
+                on_update(reply)
+        return kirocrew_client.KiroCrewTurn(text=reply, context_pct=pct, context_window_tokens=self.window)
+
+
+class KiroCrewForgeTest(unittest.TestCase):
+    """Kiro Crew 自适应 forge (2026-10-31): kiro's policy on the Crew slot."""
+
+    send = KiroCrewHandlerTest.send
+
+    def handler(self, client, *, enabled=True):
+        handler, chat, kiro_chat = KiroCrewHandlerTest.handler(self, client, enabled=enabled)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        handler.state.token_store_path = str(Path(tmp.name) / "device_tokens.json")
+        handler.state.kiro_model_context_windows = {}
+        handler.state.kirocrew_soft_forge_notified_session = ""
+        handler.state.kirocrew_self_forge_pending_session = ""
+        handler.state.kirocrew_last_context_window = None
+        for name, value in push._kirocrew_forge_settings({}).items():
+            setattr(handler.state, name, value)
+        handler.notifications = []
+        handler._send_chat_notification = lambda title, body: handler.notifications.append((title, body))
+        handler.mirrored = []
+        handler._mirror_reply_to_wecom = lambda contact_id, rec, text, **kw: handler.mirrored.append(text)
+        return handler, chat, kiro_chat
+
+    def test_settings_fall_back_to_kiro_keys(self):
+        settings = push._kirocrew_forge_settings({})
+        self.assertEqual(settings["kirocrew_auto_forge_threshold_percent"], 80.0)
+        self.assertEqual(settings["kirocrew_auto_forge_max_tokens"], 300_000)
+        self.assertAlmostEqual(settings["kirocrew_auto_forge_soft_ratio"], 75 / 80)
+        self.assertEqual(settings["kirocrew_auto_forge_retain_messages"], 80)
+        self.assertTrue(settings["kirocrew_auto_forge_enabled"])
+        settings = push._kirocrew_forge_settings({
+            "kiro_auto_forge_max_tokens": 200_000, "kiro_auto_forge_enabled": False,
+            "kirocrew_auto_forge_enabled": True, "kirocrew_auto_forge_threshold_percent": 70,
+        })
+        self.assertEqual(settings["kirocrew_auto_forge_max_tokens"], 200_000)  # inherited from kiro
+        self.assertTrue(settings["kirocrew_auto_forge_enabled"])               # crew override wins
+        self.assertEqual(settings["kirocrew_auto_forge_threshold_percent"], 70.0)
+
+    def test_thresholds_follow_the_reported_window(self):
+        handler, _chat, _ = self.handler(ForgeCrew())
+        handler.state.kirocrew_last_context_window = 1_000_000
+        hard, soft, window = handler._kirocrew_forge_threshold_percents()
+        self.assertEqual((round(hard, 3), round(soft, 3), window), (30.0, 28.125, 1_000_000))
+        handler.state.kirocrew_last_context_window = 200_000
+        hard, soft, _ = handler._kirocrew_forge_threshold_percents()
+        self.assertEqual((round(hard, 3), round(soft, 3)), (80.0, 75.0))
+        # No reading yet: kiro's table by pinned model; auto = 1M.
+        handler.state.kirocrew_last_context_window = None
+        self.assertEqual(round(handler._kirocrew_forge_threshold_percents()[0], 3), 30.0)
+        handler.state.kirocrew_preferences.save(model="claude-sonnet-4.5")
+        self.assertEqual(round(handler._kirocrew_forge_threshold_percents()[0], 3), 80.0)
+
+    def test_auto_forge_before_send_seeds_new_conversation(self):
+        client = ForgeCrew(pcts=[31.5, 2.0, 2.5])
+        handler, chat, _ = self.handler(client)
+        chat.append(role="user", text="昨天那个日志怎么样了", source="android-app:crew")
+        chat.append(role="assistant", text="还在看。", source="crew-gateway")
+        chat.append(role="user", text="/status", source="android-app:crew")
+        chat.append(role="assistant", text="模型：auto", source="crew-gateway:command")
+        handler.state.kirocrew_last_context_pct = 30.2
+        handler.state.kirocrew_last_context_window = 1_000_000
+        old_session = handler._kirocrew_session_id()
+        self.send(handler, {"text": "继续"})
+        summary_prompt, seed, user_prompt = client.prompts
+        self.assertEqual(summary_prompt, push.KIROCREW_FORGE_SUMMARY_PROMPT)
+        self.assertIn(("reset",), client.calls)
+        self.assertTrue(seed.startswith("【CcCompanion 受控 forge · 上下文交接】"))
+        self.assertIn("旧会话摘要：\n旧会话摘要：在聊日志。", seed)
+        self.assertIn("forge 前上下文使用率约 30%", seed)
+        self.assertIn("[用户] 昨天那个日志怎么样了", seed)
+        self.assertIn("[助手] 还在看。", seed)
+        self.assertNotIn("/status", seed)
+        self.assertNotIn("模型：auto", seed)
+        self.assertNotIn("[用户] 继续", seed)  # the unanswered message goes in as its own turn
+        self.assertEqual(user_prompt, "继续")
+        self.assertEqual(handler.state.kirocrew_preferences.epoch, 1)
+        new_session = handler._kirocrew_session_id()
+        self.assertNotEqual(old_session, new_session)
+        notice = [r for r in chat.records if r.get("source") == "system:crew-forge"]
+        self.assertEqual(len(notice), 1)
+        self.assertIn("已自动 forge 新会话", notice[0]["text"])
+        self.assertEqual(notice[0]["metadata"]["turn_terminal"], False)
+        self.assertEqual(handler.notifications[0][0], "Kiro Crew 上下文将满，已自动切换新会话")
+        self.assertEqual(chat.records[-1]["text"], "小克在。")
+        self.assertEqual(handler.state.chat_reply_states["kirocrew"]["session_id"], new_session)
+        self.assertEqual(handler.state.kirocrew_last_context_pct, 2.5)
+        handoff = json.loads(Path(handler.state.token_store_path).with_name("kirocrew_forge_handoff.json").read_text())
+        self.assertEqual(handoff["new_session_id"], new_session)
+        for record in chat.records:
+            self.assertNotIn("kiro", str(record.get("source") or "").lower())
+
+    def test_below_threshold_soft_notice_once(self):
+        client = ForgeCrew(pcts=[28.6, 28.7])
+        handler, _chat, _ = self.handler(client)
+        handler.state.kirocrew_last_context_pct = 28.5
+        handler.state.kirocrew_last_context_window = 1_000_000
+        self.send(handler, {"text": "嗯嗯"})
+        self.send(handler, {"text": "还有呢"})
+        self.assertEqual(len(client.prompts), 2)
+        self.assertIn("[[KIRO_FORGE]]", client.prompts[0])
+        self.assertIn("到约 30% 时后台会自动 forge", client.prompts[0])
+        self.assertEqual(client.prompts[1], "还有呢")
+        self.assertNotIn(("reset",), client.calls)
+
+    def test_marker_is_stripped_and_forges_after_the_turn(self):
+        client = ForgeCrew(text="今天先聊到这，我换个新会话。\n[[KIRO_FORGE]]", pcts=[29.0, 1.0])
+        handler, chat, _ = self.handler(client)
+        handler.state.kirocrew_last_context_pct = 28.9
+        handler.state.kirocrew_last_context_window = 1_000_000
+        self.send(handler, {"text": "好呀", "metadata": {"source": "wecom"}})
+        reply = [r for r in chat.records if r.get("source") == "crew-gateway"][-1]
+        self.assertEqual(reply["text"], "今天先聊到这，我换个新会话。")
+        self.assertEqual(handler.mirrored, ["今天先聊到这，我换个新会话。"])
+        for row in chat.records:
+            self.assertNotIn("KIRO_FORGE", str(row.get("text") or "") if row.get("source") != "android-app:crew" else "")
+        drafts = handler.state.chat_drafts.get("kirocrew") or {}
+        self.assertNotIn("KIRO_FORGE", str(drafts.get("text") or ""))
+        self.assertEqual(client.prompts[1], push.KIROCREW_FORGE_SUMMARY_PROMPT)
+        self.assertTrue(client.prompts[2].startswith("【CcCompanion 受控 forge"))
+        self.assertIn("今天先聊到这", client.prompts[2])  # tail carries the stripped reply
+        self.assertNotIn("[[KIRO_FORGE]]", client.prompts[2].split("以下为旧会话", 1)[-1])
+        self.assertEqual(handler.notifications[0][0], "Kiro Crew 在聊天停顿处自己切换了新会话")
+        self.assertEqual(handler.state.kirocrew_self_forge_pending_session, "")
+
+    def test_marker_with_queued_message_forges_before_next_send(self):
+        client = ForgeCrew(text="收到\n[[KIRO_FORGE]]")
+        handler, chat, _ = self.handler(client)
+        session = handler._kirocrew_session_id()
+        handler.state.kirocrew_queue.append({"contact_id": "kirocrew", "record": {"ts": "ts-q"}, "text": "下一条"})
+        handler._kirocrew_process({"contact_id": "kirocrew", "record": chat.append(role="user", text="上一条"), "text": "上一条"},
+                                  threading.Event())
+        self.assertEqual(handler.state.kirocrew_self_forge_pending_session, session)
+        self.assertEqual(client.prompts, ["上一条"])
+        self.assertEqual(handler._kirocrew_forge_trigger(session), "self")
+        self.assertEqual(handler._kirocrew_forge_trigger("crew:ccc-kirocrew:9"), "")  # stale request dropped
+        self.assertEqual(handler.state.kirocrew_self_forge_pending_session, "")
+
+    def test_summary_failure_keeps_old_conversation(self):
+        client = ForgeCrew(pcts=[40.0], summary_failure=KiroCrewError("gateway error 500"))
+        handler, chat, _ = self.handler(client)
+        handler.state.kirocrew_last_context_pct = 35.0
+        handler.state.kirocrew_last_context_window = 1_000_000
+        session = handler._kirocrew_session_id()
+        self.send(handler, {"text": "在吗"})
+        self.assertNotIn(("reset",), client.calls)
+        self.assertEqual(client.prompts[-1], "在吗")
+        self.assertEqual(handler._kirocrew_session_id(), session)
+        self.assertEqual(chat.records[-1]["text"], "小克在。")
+        self.assertFalse([r for r in chat.records if r.get("source") == "system:crew-forge"])
+
+        empty = ForgeCrew(summary="   ")
+        handler, _chat, _ = self.handler(empty)
+        self.assertEqual(handler._kirocrew_run_forge(trigger="manual")["error"], "kirocrew_forge_summary_empty")
+        self.assertNotIn(("reset",), empty.calls)
+
+    def test_disabled_and_compact_never_forge(self):
+        client = ForgeCrew()
+        handler, _chat, _ = self.handler(client)
+        handler.state.kirocrew_auto_forge_enabled = False
+        handler.state.kirocrew_last_context_pct = 85.0
+        self.send(handler, {"text": "嗨"})
+        self.assertEqual(client.prompts, ["嗨"])
+        handler.state.kirocrew_auto_forge_enabled = True
+        handler.state.kirocrew_last_context_pct = 85.0
+        self.send(handler, {"text": "/compact"})
+        self.assertEqual(client.prompts, ["嗨", "/compact"])
+
+    def test_manual_forge_endpoint(self):
+        client = ForgeCrew()
+        handler, chat, _ = self.handler(client)
+        handler.state.kirocrew_active = {"user_ts": "ts-1", "cancel_event": threading.Event()}
+        handler._handle_kirocrew_forge({})
+        self.assertEqual(handler.responses[-1][0], 409)
+        handler.state.kirocrew_active = {}
+        with patch("push.threading.Thread", _immediate_thread):
+            handler._handle_kirocrew_forge({})
+        status, payload = handler.responses[-1]
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["seed_submitted"])
+        self.assertEqual(payload["active_session_id"], "crew:ccc-kirocrew:1")
+        self.assertEqual(handler.state.kirocrew_active, {})
+        self.assertIn("已按你的要求 forge 新会话", chat.records[-1]["text"])
+        from contacts import kirocrew as kirocrew_contact
+        self.assertEqual(kirocrew_contact.POST_ROUTES["/kirocrew/forge"], "_handle_kirocrew_forge")
+
+    def test_status_reports_forge_threshold(self):
+        handler, chat, _ = self.handler(ForgeCrew())
+        handler.state.kirocrew_last_context_window = 1_000_000
+        self.send(handler, {"text": "/status"})
+        self.assertIn("到约 30% 时自动 forge 新会话", chat.records[-1]["text"])
 
 
 class KeepWarmTest(unittest.TestCase):

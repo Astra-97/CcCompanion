@@ -1438,7 +1438,7 @@ def _format_kirocrew_terminal(
     lines = [
         f"Kiro Crew · {slot} · {state} · turn {detail.get('turn', '—')}",
         f"model {model or 'auto'} · effort {effort or '默认'} · context {ctx}",
-        "只读视图：Crew 会话记录（工具输入/输出已截断，凭据已隐藏）",
+        "终端中继：整行回车 = 发给 Kiro Crew（进聊天记录），Ctrl-C = 停止当前回复；工具输入/输出已截断，凭据已隐藏",
         "─" * 40,
     ]
     if error:
@@ -1452,6 +1452,8 @@ def _format_kirocrew_terminal(
         meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
         stamp = _kirocrew_terminal_time(message.get("ts"))
         content = message.get("content")
+        if isinstance(content, str):
+            content = _strip_kiro_forge_marker(content)[0]  # control marker never shown
         if role == "user":
             lines.append(f"[{stamp}] › {_kirocrew_terminal_clip(content, max_lines=6, max_chars=400)}")
         elif role == "assistant":
@@ -1472,6 +1474,7 @@ def _format_kirocrew_terminal(
         else:
             mark = "!" if ("err" in cls or "warn" in cls) else "·"
             lines.append(f"[{stamp}] {mark} {_kirocrew_terminal_clip(content, max_lines=4, max_chars=320)}")
+    live_text = _strip_kiro_forge_marker(live_text)[0] if live_text else ""
     if running and live_text.strip():
         lines.append("─" * 40)
         lines.append("◆ 生成中 …")
@@ -3227,6 +3230,77 @@ def _strip_kiro_forge_marker(text: str) -> tuple[str, bool]:
     return stripped.strip(), True
 
 
+def _forge_soft_notice_text(usage: float, hard: float) -> str:
+    """The one-shot soft-threshold system notice (Kiro and Kiro Crew)."""
+    return (
+        f"[系统通知，不是方小南的话] 当前会话上下文已用约 {usage:.0f}%，"
+        f"到约 {hard:.0f}% 时后台会自动 forge 新会话。你可以在聊天的自然停顿处自己决定 forge："
+        f"在回复里单独一行写 {KIRO_FORGE_MARKER}，这一轮结束后后台会换新会话并做交接"
+        "（这行她看不到）。不写也没关系。这条通知只发一次。"
+    )
+
+
+def _forge_seed_tail_lines(tail: dict[str, Any] | None) -> tuple[list[str], int]:
+    """Seed lines for a verbatim history tail -> (lines, retained messages).
+
+    Shared by the Kiro and Kiro Crew forge seeds; ``tail`` is the dict from
+    ``_load_kiro_recent_messages`` (None/empty -> no lines).
+    """
+    if not tail or not tail.get("messages"):
+        return [], 0
+    retained = len(tail["messages"])
+    caveats = []
+    if tail.get("dropped"):
+        caveats.append(f"因总量上限丢弃了最老的 {tail['dropped']} 条")
+    if tail.get("truncated"):
+        caveats.append("最新一条因超长被截断")
+    suffix = f"（{'，'.join(caveats)}）" if caveats else ""
+    lines = [f"以下为旧会话最近 {retained} 条对话原文，供延续上下文{suffix}："]
+    for role, text in tail["messages"]:
+        speaker = "用户" if role == "user" else "助手"
+        lines.append(f"[{speaker}] {text}")
+    return lines, retained
+
+
+# Kiro Crew 自适应 forge (2026-10-31)：kirocrew 和 kiro 同一套 forge 策略（阈值、
+# 软通知、[[KIRO_FORGE]] 标记、seed tail 全部复用上面的 kiro 助手）。差异：
+# Crew 网关自己上报窗口大小（slot 的 context_window_tokens），没有才回落到
+# kiro 的模型窗口表；forge = 旧会话总结一轮 + 固定槽 reset-conversation
+# （同 /kirocrew/new_session）+ 新会话 seed。Crew 自己的 autocompact 在东京
+# 调到 90%（上限），所以先到的永远是这里的 forge。
+KIROCREW_FORGE_SUMMARY_PROMPT = (
+    "请用一段话总结我们当前会话的所有关键上下文：任务目标、已完成的工作、"
+    "未完成的决策、重要的文件路径或代码位置。要足够详细，让我能在新会话中"
+    "无缝继续。用中文。"
+)
+# Command receipts / forge+session notices are not conversation.
+_KIROCREW_FORGE_TAIL_SKIP_SOURCES = frozenset({
+    "crew-gateway:command", "crew-gateway:new-session", "crew-gateway:disabled",
+})
+
+
+def _kirocrew_forge_settings(server_cfg: dict[str, Any]) -> dict[str, Any]:
+    """kirocrew_auto_forge_* settings (ServerState attribute name -> value).
+
+    kirocrew 和 kiro 同一套策略：每个 kirocrew_auto_forge_<x> 缺省时沿用
+    kiro_auto_forge_<x>，再缺省才是内置默认；窗口表共用 kiro_model_context_windows。
+    """
+    def value(name: str, default: Any) -> Any:
+        return server_cfg.get(f"kirocrew_auto_forge_{name}", server_cfg.get(f"kiro_auto_forge_{name}", default))
+
+    return {
+        "kirocrew_auto_forge_enabled": bool(value("enabled", True)),
+        "kirocrew_auto_forge_threshold_percent": _parse_kiro_auto_forge_threshold(value("threshold_percent", 80.0)),
+        "kirocrew_auto_forge_max_tokens": _parse_kiro_auto_forge_max_tokens(
+            value("max_tokens", KIRO_AUTO_FORGE_MAX_TOKENS_DEFAULT)
+        ),
+        "kirocrew_auto_forge_soft_ratio": _parse_kiro_auto_forge_soft_ratio(value("soft_ratio", "75/80")),
+        "kirocrew_auto_forge_retain_messages": _clamp_kimi_forge_seed_retain(
+            value("retain_messages", KIMI_FORGE_SEED_RETAIN_DEFAULT)
+        ),
+    }
+
+
 def _kiro_delegate_pid_alive(pid: Any) -> bool:
     """Best-effort liveness check for a delegate task's recorded pid.
 
@@ -3475,6 +3549,9 @@ def _kirocrew_keep_warm_attempt(state: Any) -> str:
         pct = getattr(turn, "context_pct", None)
         if isinstance(pct, (int, float)):
             state.kirocrew_last_context_pct = float(pct)
+        window = getattr(turn, "context_window_tokens", None)
+        if isinstance(window, int) and not isinstance(window, bool) and window > 0:
+            state.kirocrew_last_context_window = window
     except KiroCrewCancelled:
         return BUSY  # /stop or a new message arrived first; try again next tick
     finally:
@@ -3727,6 +3804,8 @@ def _load_kiro_recent_messages(
     *,
     limit: int,
     max_bytes: int | None = None,
+    skip_sources: frozenset[str] | None = None,
+    skip_user: Callable[[str], bool] | None = None,
 ) -> dict[str, Any] | None:
     """Read the last ``limit`` user/assistant text messages from Kiro's chat history.
 
@@ -3734,12 +3813,15 @@ def _load_kiro_recent_messages(
     chronological order, or ``None`` when the history is unreadable — a forge
     must never fail because of this best-effort read.  Hidden rows, non-text
     roles (tool cards), system notices and recall cards are skipped; only
-    verbatim conversation survives.
+    verbatim conversation survives.  Kiro Crew (2026-10-31) reuses it with
+    its own ``skip_sources`` (command receipts) and ``skip_user`` (chat
+    commands such as /status, which are not conversation).
     """
     if limit <= 0:
         return {"messages": [], "dropped": 0, "truncated": False}
     if max_bytes is None:
         max_bytes = KIRO_FORGE_SEED_TAIL_MAX_BYTES
+    skipped = _KIRO_FORGE_TAIL_SKIP_SOURCES if skip_sources is None else skip_sources
     try:
         rows = chat.tail(max(limit * 4, limit))
     except Exception:
@@ -3753,11 +3835,13 @@ def _load_kiro_recent_messages(
             continue
         source = str(row.get("source") or "")
         if role == "assistant" and (
-            source in _KIRO_FORGE_TAIL_SKIP_SOURCES
+            source in skipped
             or source.startswith(_KIRO_FORGE_TAIL_SKIP_SOURCE_PREFIXES)
         ):
             continue
         text = str(row.get("text") or "").strip()
+        if role == "user" and skip_user is not None and text and skip_user(text):
+            continue
         if text:
             messages.append((role, text))
     return _cap_forge_message_tail(messages[-limit:], max_bytes)
@@ -5788,6 +5872,8 @@ class ServerState:
         self.kirocrew_active: dict[str, Any] = {}
         self.kirocrew_applied: tuple[str, str] | None = None
         self.kirocrew_last_context_pct: float | None = None
+        # Window the gateway reported with that reading (Crew reports it; kiro ACP does not).
+        self.kirocrew_last_context_window: int | None = None
         self.kirocrew_terminal_lock = threading.Lock()
         self.kirocrew_terminal_cache: tuple[float, dict[str, Any] | None, str] | None = None
         self.kirocrew_keep_warm_enabled = bool(server_cfg.get("kirocrew_keep_warm", True))
@@ -5900,6 +5986,11 @@ class ServerState:
         self.kiro_auto_forge_retain_messages: int = _clamp_kimi_forge_seed_retain(
             server_cfg.get("kiro_auto_forge_retain_messages", KIMI_FORGE_SEED_RETAIN_DEFAULT)
         )
+        # Kiro Crew 自适应 forge (2026-10-31)：见 _kirocrew_forge_settings。
+        for name, value in _kirocrew_forge_settings(server_cfg).items():
+            setattr(self, name, value)
+        self.kirocrew_soft_forge_notified_session: str = ""
+        self.kirocrew_self_forge_pending_session: str = ""
         self.kimi_web = KimiWebClient(
             command=server_cfg.get("kimi_bin", "/root/.kimi-code/bin/kimi"),
             port=int(server_cfg.get("kimi_web_port", 58627)),
@@ -18035,12 +18126,7 @@ class PushHandler(BaseHTTPRequestHandler):
         if usage is None or soft is None or usage < soft or usage >= hard:
             return ""
         self.state.kiro_soft_forge_notified_session = session_id
-        return (
-            f"[系统通知，不是方小南的话] 当前会话上下文已用约 {usage:.0f}%，"
-            f"到约 {hard:.0f}% 时后台会自动 forge 新会话。你可以在聊天的自然停顿处自己决定 forge："
-            f"在回复里单独一行写 {KIRO_FORGE_MARKER}，这一轮结束后后台会换新会话并做交接"
-            "（这行她看不到）。不写也没关系。这条通知只发一次。"
-        )
+        return _forge_soft_notice_text(usage, hard)
 
     @staticmethod
     def _kiro_forge_error_status(error: dict[str, Any]) -> int:
@@ -18256,6 +18342,7 @@ class PushHandler(BaseHTTPRequestHandler):
         seed_ok: bool,
         *,
         trigger: str = "manual",
+        agent_label: str = "Kiro",
     ) -> str:
         if trigger == "auto":
             lines = [
@@ -18265,7 +18352,7 @@ class PushHandler(BaseHTTPRequestHandler):
             ]
         elif trigger == "self":
             lines = [
-                f"上下文快满了，Kiro 在聊天停顿处自己决定 forge 新会话"
+                f"上下文快满了，{agent_label} 在聊天停顿处自己决定 forge 新会话"
                 f"（旧 {old_session_id} → 新 {new_session_id}）。"
                 "旧会话历史仍完整保留。",
             ]
@@ -18354,20 +18441,9 @@ class PushHandler(BaseHTTPRequestHandler):
                 tail = None
             if tail is None:
                 logger.warning("Kiro forge seed tail degraded to summary: chat history unreadable")
-            elif tail["messages"]:
-                retained_messages = len(tail["messages"])
-                caveats = []
-                if tail["dropped"]:
-                    caveats.append(f"因总量上限丢弃了最老的 {tail['dropped']} 条")
-                if tail["truncated"]:
-                    caveats.append("最新一条因超长被截断")
-                suffix = f"（{'，'.join(caveats)}）" if caveats else ""
-                lines.append(
-                    f"以下为旧会话最近 {retained_messages} 条对话原文，供延续上下文{suffix}："
-                )
-                for role, text in tail["messages"]:
-                    speaker = "用户" if role == "user" else "助手"
-                    lines.append(f"[{speaker}] {text}")
+            else:
+                tail_lines, retained_messages = _forge_seed_tail_lines(tail)
+                lines.extend(tail_lines)
         try:
             seed_turn_id = f"forge-seed-{int(time.time() * 1000)}"
             self.state.kiro_acp.prompt_existing(
@@ -29189,6 +29265,7 @@ class PushHandler(BaseHTTPRequestHandler):
         "/effort 查看推理强度；/effort low|medium|high|xhigh|max；/effort default 恢复默认\n"
         "/status 模型、强度、上下文占用、今日 credits\n"
         "/compact 让 Crew 压缩当前会话（会花一点 credits）\n"
+        "上下文快满时后台会自动 forge 新会话（同 Kiro：交接摘要 + 最近对话）\n"
         "/help 这条说明"
     )
     _KIROCREW_COMMAND_RE = re.compile(r"^/(new|stop|model|effort|status|help)(?:\s+(\S.*))?$", re.IGNORECASE | re.DOTALL)
@@ -29247,7 +29324,12 @@ class PushHandler(BaseHTTPRequestHandler):
             window = info.get("context_window_tokens")
             if isinstance(pct, (int, float)):
                 detail = f"（{int(used) // 1000}k / {int(window) // 1000}k tokens）" if isinstance(used, int) and isinstance(window, int) and window else ""
-                lines.append(f"上下文：{pct:.1f}%{detail}，到 30% 时 Crew 会自动压缩")
+                hard, _soft, _window = self._kirocrew_forge_threshold_percents()
+                tail = (
+                    f"，到约 {hard:.0f}% 时自动 forge 新会话"
+                    if getattr(self.state, "kirocrew_auto_forge_enabled", True) else "，自动 forge 已关闭"
+                )
+                lines.append(f"上下文：{pct:.1f}%{detail}{tail}")
             lines.append("状态：正在回复" if info.get("running") else "状态：空闲")
         credits = self._kirocrew_credits()
         if credits:
@@ -29335,9 +29417,297 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.warning("kirocrew epoch persist failed")
         self.state.kirocrew_applied = None
         self.state.kirocrew_last_context_pct = None
+        self.state.kirocrew_last_context_window = None
         return True, "新会话开好了，之前的上下文已经清掉。"
 
-    def _handle_kirocrew_chat_send(self, body: dict[str, Any], contact_id: str = "kirocrew") -> None:
+    # ── Kiro Crew 自适应 forge (2026-10-31)：同 kiro（见 _kiro_forge_thresholds）──
+    # 调用方必须已经占着 Crew 的回合槽（worker 的 kirocrew_active，或
+    # /kirocrew/forge 自己的预约），所以 forge 的总结/seed 两轮和 App 消息、
+    # keep-warm、/new 绝不交错。
+
+    def _kirocrew_context_usage_percent(self) -> float | None:
+        value = getattr(self.state, "kirocrew_last_context_pct", None)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        percent = float(value)
+        return percent if 0.0 <= percent <= 100.0 else None
+
+    def _kirocrew_context_window_tokens(self) -> int | None:
+        """Gateway-reported window first; else kiro's model table (auto = 1M)."""
+        window = getattr(self.state, "kirocrew_last_context_window", None)
+        if isinstance(window, int) and not isinstance(window, bool) and window > 0:
+            return window
+        try:
+            model, _effort = self.state.kirocrew_preferences.snapshot()
+        except Exception:
+            model = ""
+        return _kiro_context_window_for(model or "auto", getattr(self.state, "kiro_model_context_windows", None))
+
+    def _kirocrew_forge_threshold_percents(self) -> tuple[float, float | None, int | None]:
+        window = self._kirocrew_context_window_tokens()
+        hard, soft = _kiro_forge_thresholds(
+            window,
+            threshold_percent=float(getattr(self.state, "kirocrew_auto_forge_threshold_percent", 80.0)),
+            max_tokens=int(getattr(self.state, "kirocrew_auto_forge_max_tokens", KIRO_AUTO_FORGE_MAX_TOKENS_DEFAULT)),
+            soft_ratio=float(getattr(self.state, "kirocrew_auto_forge_soft_ratio", KIRO_AUTO_FORGE_SOFT_RATIO_DEFAULT)),
+        )
+        return hard, soft, window
+
+    def _kirocrew_soft_forge_notice(self, session_id: str) -> str:
+        """One-shot system notice once usage crosses the soft threshold."""
+        if not getattr(self.state, "kirocrew_auto_forge_enabled", True) or not session_id:
+            return ""
+        if getattr(self.state, "kirocrew_soft_forge_notified_session", "") == session_id:
+            return ""
+        usage = self._kirocrew_context_usage_percent()
+        hard, soft, _window = self._kirocrew_forge_threshold_percents()
+        if usage is None or soft is None or usage < soft or usage >= hard:
+            return ""
+        self.state.kirocrew_soft_forge_notified_session = session_id
+        return _forge_soft_notice_text(usage, hard)
+
+    def _kirocrew_forge_trigger(self, session_id: str) -> str:
+        """"self" (a [[KIRO_FORGE]] left pending), "auto" (hard threshold) or ""."""
+        pending = getattr(self.state, "kirocrew_self_forge_pending_session", "")
+        if pending:
+            if pending == session_id:
+                return "self"
+            self.state.kirocrew_self_forge_pending_session = ""  # session changed since
+        if not getattr(self.state, "kirocrew_auto_forge_enabled", True):
+            return ""
+        usage = self._kirocrew_context_usage_percent()
+        hard, _soft, window = self._kirocrew_forge_threshold_percents()
+        if usage is None or usage < hard:
+            return ""
+        logger.info(
+            "kirocrew context usage %.2f%% exceeds threshold %.2f%% (window %s); forging new session",
+            usage, hard, window or "unknown",
+        )
+        return "auto"
+
+    def _kirocrew_forge_tail(self, exclude_ts: str = "") -> dict[str, Any] | None:
+        """Verbatim tail for the seed.  Messages not answered yet (the one that
+        triggered an auto forge, and any queued behind it) are left out: they
+        go to the new conversation as their own turns right after the seed."""
+        retain = _clamp_kimi_forge_seed_retain(
+            getattr(self.state, "kirocrew_auto_forge_retain_messages", KIMI_FORGE_SEED_RETAIN_DEFAULT)
+        )
+        if retain <= 0:
+            return {"messages": [], "dropped": 0, "truncated": False}
+        pending = {exclude_ts} if exclude_ts else set()
+        with self.state.kirocrew_lock:
+            pending.update(str((entry.get("record") or {}).get("ts") or "") for entry in self.state.kirocrew_queue)
+        pending.discard("")
+        chat = self._chat_for_contact("kirocrew")
+
+        class _AnsweredOnly:
+            def tail(self, limit: int) -> list[dict[str, Any]]:
+                rows = chat.tail(limit + len(pending))
+                return [row for row in rows if not (isinstance(row, dict) and str(row.get("ts") or "") in pending)]
+
+        def is_command(text: str) -> bool:
+            typed = wecom_bridge.strip_user_prefix(text).strip()
+            return bool(self._KIROCREW_COMMAND_RE.match(typed)) or typed.lower() == "/compact"
+
+        try:
+            return _load_kiro_recent_messages(
+                _AnsweredOnly(),
+                limit=retain,
+                skip_sources=_KIROCREW_FORGE_TAIL_SKIP_SOURCES,
+                skip_user=is_command,
+            )
+        except Exception:
+            return None
+
+    def _kirocrew_run_forge(
+        self, *, trigger: str, cancel_event: threading.Event | None = None, expected_session_id: str = "",
+        pending_user_ts: str = "",
+    ) -> dict[str, Any]:
+        """Summarize the old conversation, reset the slot, seed the new one, tell the app.
+
+        Same handoff as kiro (summary + state + verbatim tail), never a silent
+        forge.  The slot only resets after a non-empty summary; a failure
+        before that keeps the old conversation (the next turn retries).
+        """
+        client = getattr(self.state, "kirocrew_client", None)
+        if client is None:
+            return {"ok": False, "error": "kirocrew_disabled"}
+        old_session_id = self._kirocrew_session_id()
+        if expected_session_id and old_session_id != expected_session_id:
+            self.state.kirocrew_self_forge_pending_session = ""
+            return {"ok": False, "error": "kirocrew_session_changed"}
+        usage = self._kirocrew_context_usage_percent()
+        model, effort = self.state.kirocrew_preferences.snapshot()
+        try:
+            summary_turn = client.prompt(KIROCREW_FORGE_SUMMARY_PROMPT, cancel_event=cancel_event)
+        except KiroCrewCancelled:
+            return {"ok": False, "error": "kirocrew_forge_cancelled"}
+        except KiroCrewError as exc:
+            logger.warning("kirocrew forge summary failed: %s", type(exc).__name__)
+            return {"ok": False, "error": "kirocrew_unavailable"}
+        summary = _strip_kiro_forge_marker(agent_images.strip_markers(str(summary_turn.text or "")))[0].strip()
+        if not summary:
+            logger.warning("kirocrew forge summary was empty; keeping the old conversation")
+            return {"ok": False, "error": "kirocrew_forge_summary_empty"}
+        ok, _message = self._kirocrew_reset()
+        if not ok:
+            return {"ok": False, "error": "kirocrew_unavailable"}
+        new_session_id = self._kirocrew_session_id()
+        self.state.kirocrew_self_forge_pending_session = ""
+        tasks: dict[str, list[dict[str, Any]]] = {"finished": [], "pending": []}
+        ctx = {
+            "old_session_id": old_session_id, "new_session_id": new_session_id, "summary": summary,
+            "tasks": tasks, "usage_percent": usage, "model": model or "auto", "effort": effort or None,
+        }
+        handoff_path = self._write_kirocrew_forge_handoff(ctx)
+        seed_ok, retained = self._seed_kirocrew_forged_session(ctx, cancel_event, pending_user_ts=pending_user_ts)
+        notice = self._kiro_forge_notice_text(
+            old_session_id, new_session_id, tasks, seed_ok, trigger=trigger, agent_label="Kiro Crew",
+        )
+        try:
+            # Like Kiro's: role=assistant so Android notifies; auxiliary so it
+            # never completes a turn.  The source must not contain "kiro".
+            self._chat_for_contact("kirocrew").append(
+                role="assistant", text=notice, source="system:crew-forge",
+                metadata={"turn_terminal": False, "turn_message_kind": "auxiliary_notice"},
+            )
+        except Exception:
+            logger.exception("kirocrew forge notice history append failed")
+        title = {
+            "auto": "Kiro Crew 上下文将满，已自动切换新会话",
+            "self": "Kiro Crew 在聊天停顿处自己切换了新会话",
+        }.get(trigger, "Kiro Crew 已按你的要求切换新会话")
+        try:
+            self._send_chat_notification(title, notice[:80])
+        except Exception:
+            logger.warning("kirocrew forge notification failed", exc_info=True)
+        logger.info("kirocrew forged new session %s (trigger=%s seed=%s tail=%d)", new_session_id, trigger, seed_ok, retained)
+        return {
+            "ok": True, "previous_session_id": old_session_id, "active_session_id": new_session_id,
+            "model": model or "auto", "effort": effort, "handoff_record": handoff_path,
+            "seed_submitted": seed_ok, "retained_messages": retained,
+        }
+
+    def _write_kirocrew_forge_handoff(self, ctx: dict[str, Any]) -> str:
+        payload = {
+            "version": 1,
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "old_session_id": ctx["old_session_id"], "new_session_id": ctx["new_session_id"],
+            "usage_percent": ctx.get("usage_percent"), "model": str(ctx.get("model") or ""),
+            "effort": str(ctx.get("effort") or ""), "summary": str(ctx.get("summary") or "")[:4000],
+        }
+        try:
+            path = Path(self.state.token_store_path).expanduser().parent / "kirocrew_forge_handoff.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+            return str(path)
+        except Exception:
+            logger.exception("kirocrew forge handoff record could not be written")
+            return ""
+
+    def _seed_kirocrew_forged_session(
+        self, ctx: dict[str, Any], cancel_event: threading.Event | None = None, *, pending_user_ts: str = "",
+    ) -> tuple[bool, int]:
+        """Seed the fresh slot conversation with the handoff; degrade, never fail."""
+        lines = [
+            "【CcCompanion 受控 forge · 上下文交接】这是一条系统交接消息，不是用户指令。",
+            f"你从旧会话 {ctx['old_session_id']} 切换而来（Crew 会话槽已开新对话）；"
+            "服务端聊天记录完整保留。",
+        ]
+        state_bits = [f"模型 {ctx.get('model') or '默认'}"]
+        if ctx.get("effort"):
+            state_bits.append(f"推理强度 {ctx['effort']}")
+        usage = ctx.get("usage_percent")
+        if isinstance(usage, (int, float)) and not isinstance(usage, bool):
+            state_bits.append(f"forge 前上下文使用率约 {float(usage):.0f}%")
+        lines.append("当前状态：" + "，".join(state_bits) + "。")
+        summary = str(ctx.get("summary") or "").strip()
+        if summary:
+            lines.append("旧会话摘要：\n" + summary)
+        tail = self._kirocrew_forge_tail(exclude_ts=pending_user_ts)
+        if tail is None:
+            logger.warning("kirocrew forge seed tail degraded to summary: chat history unreadable")
+        tail_lines, retained = _forge_seed_tail_lines(tail)
+        lines.extend(tail_lines)
+        client = self.state.kirocrew_client
+        try:
+            try:
+                client.ensure_slot()
+            except KiroCrewError:
+                pass
+            self._kirocrew_apply_preferences()  # reset dropped the pin; re-apply before the seed
+            turn = client.prompt("\n".join(lines), cancel_event=cancel_event)
+        except Exception:
+            logger.warning("kirocrew forge seed prompt failed", exc_info=True)
+            return False, 0
+        self._kirocrew_note_context(turn)
+        return True, retained
+
+    def _kirocrew_note_context(self, turn: Any) -> None:
+        pct = getattr(turn, "context_pct", None)
+        if isinstance(pct, (int, float)) and not isinstance(pct, bool):
+            self.state.kirocrew_last_context_pct = float(pct)
+        window = getattr(turn, "context_window_tokens", None)
+        if isinstance(window, int) and not isinstance(window, bool) and window > 0:
+            self.state.kirocrew_last_context_window = window
+
+    def _kirocrew_self_forge_after_turn(self, session_id: str, cancel_event: threading.Event) -> None:
+        """[[KIRO_FORGE]] in a finished reply: forge now if idle, else before the next send."""
+        self.state.kirocrew_self_forge_pending_session = session_id
+        with self.state.kirocrew_lock:
+            queued = bool(self.state.kirocrew_queue)
+        if queued or cancel_event.is_set():
+            logger.info("kirocrew self-forge deferred to next send")
+            return
+        try:
+            result = self._kirocrew_run_forge(trigger="self", cancel_event=cancel_event, expected_session_id=session_id)
+        except Exception:
+            logger.exception("kirocrew self-forge crashed")
+            return
+        if not result.get("ok"):
+            logger.info("kirocrew self-forge deferred to next send: %s", result.get("error"))
+
+    def _handle_kirocrew_forge(self, body: dict[str, Any]) -> None:
+        """POST /kirocrew/forge — manual controlled forge (same pipeline as auto)."""
+        if self.state.kirocrew_client is None:
+            self._send_json(503, {"ok": False, "error": "kirocrew_disabled"})
+            return
+        cancel_event = threading.Event()
+        with self.state.kirocrew_lock:
+            if self.state.kirocrew_active or self.state.kirocrew_queue:
+                self._send_json(409, {"ok": False, "error": "kirocrew_turn_active",
+                                      "reason": "Kiro Crew 正在回复，等当前回复结束后再 forge。"})
+                return
+            self.state.kirocrew_active = {"user_ts": "", "cancel_event": cancel_event, "forge": True}
+        try:
+            result = self._kirocrew_run_forge(trigger="manual", cancel_event=cancel_event)
+        except Exception:
+            logger.exception("kirocrew manual forge crashed")
+            result = {"ok": False, "error": "kirocrew_unavailable"}
+        finally:
+            with self.state.kirocrew_lock:
+                if self.state.kirocrew_active.get("cancel_event") is cancel_event:
+                    self.state.kirocrew_active = {}
+            self._kirocrew_kick_worker()
+        if result.get("ok"):
+            self._send_json(200, result)
+        else:
+            self._send_json(409 if result.get("error") == "kirocrew_forge_cancelled" else 503, result)
+
+    def _kirocrew_kick_worker(self) -> None:
+        """Start the worker for messages that queued behind a forge reservation."""
+        with self.state.kirocrew_lock:
+            if not self.state.kirocrew_queue or self.state.kirocrew_worker_running:
+                return
+            self.state.kirocrew_worker_running = True
+        threading.Thread(target=self._kirocrew_worker, name="kirocrew-worker", daemon=True).start()
+
+    def _handle_kirocrew_chat_send(
+        self, body: dict[str, Any], contact_id: str = "kirocrew", *, response_extra: dict[str, Any] | None = None,
+    ) -> None:
         """App message to Kiro Crew: history first, then one FIFO worker.
 
         /stop /status /model /effort /help answer at once (even mid-turn);
@@ -29406,7 +29776,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._kirocrew_reply_now(contact_id, rec, command_reply, "crew-gateway:command")
             else:
                 self._kirocrew_command(contact_id, rec, name, arg)
-            self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec, "command": name})
+            self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec, "command": name, **(response_extra or {})})
             return
         user_ts = str(rec.get("ts") or "")
         if position > 1:
@@ -29416,6 +29786,7 @@ class PushHandler(BaseHTTPRequestHandler):
         self._send_json(200, {
             "ok": True, "contact_id": contact_id, "record": rec, "queued": True, "queue_position": position,
             "turn": {"contact_id": contact_id, "user_ts": user_ts, "session_id": self._kirocrew_session_id(), "transport": "kiro-crew"},
+            **(response_extra or {}),
         })
 
     def _kirocrew_cancel_active(self, *, user_ts: str = "", clear_queued: bool = False) -> bool:
@@ -29595,20 +29966,81 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(503, {"error": "Kiro Crew 未启用", "target": KIROCREW_TERMINAL_ALIAS})
             return
         content, running = self._kirocrew_terminal_content()
+        # 可输入 (2026-10-31)：Crew 没有能接到固定会话槽上的 TUI（`kirocrew chat`
+        # 是独立的 CLI 会话），所以终端 tab 是「中继」：整行回车 = 一条聊天消息
+        # （同聊天框，进聊天记录），Ctrl-C/Esc = 停止当前回复。生成中也保持
+        # 可写，Ctrl-C 必须送得到；新行会排队。
         self._send_json(200, {
             "ok": True,
             "session": KIROCREW_TERMINAL_ALIAS,
             "content": content,
-            "state": "waiting",
-            "mode": "read_only",
+            "state": "ready",
+            "mode": "crew_relay",
+            "writable": True,
             "busy": running,
         })
 
-    def _send_kirocrew_terminal_read_only(self) -> None:
-        self._send_json(409, {
-            "ok": False, "error": "kirocrew_terminal_read_only", "target": KIROCREW_TERMINAL_ALIAS,
-            "state": "waiting", "message": "Kiro Crew 终端是只读视图，请在聊天页发消息。",
+    # Keys the Crew relay acts on; every other kiro-terminal key is accepted and ignored.
+    _KIROCREW_TERMINAL_STOP_KEYS = frozenset({"C-c", "Escape"})
+
+    def _handle_kirocrew_terminal_send(self, body: dict[str, Any]) -> None:
+        """/tmux/send for kirocrew: a whole line becomes a chat turn (history, queue, commands)."""
+        if self.state.kirocrew_client is None:
+            self._send_json(503, {"error": "Kiro Crew 未启用", "target": KIROCREW_TERMINAL_ALIAS})
+            return
+        special_key = str(body.get("key") or "").strip()
+        if special_key:
+            self._handle_kirocrew_terminal_key(special_key)
+            return
+        keys = body.get("keys", body.get("text", ""))
+        if not isinstance(keys, str):
+            self._send_json(400, {"error": "keys must be a string"})
+            return
+        if len(keys) > 8000:
+            self._send_json(413, {"error": "input too long", "target": KIROCREW_TERMINAL_ALIAS})
+            return
+        line = keys.strip()
+        if not line:
+            self._send_json(200, {"ok": True, "session": KIROCREW_TERMINAL_ALIAS, "ignored": True})
+            return
+        if not bool(body.get("enter", True)):
+            self._send_json(400, {
+                "ok": False, "error": "kirocrew_terminal_line_only", "target": KIROCREW_TERMINAL_ALIAS,
+                "message": "Kiro Crew 终端按整行发送：输入后回车。",
+            })
+            return
+        with self.state.kirocrew_terminal_lock:
+            self.state.kirocrew_terminal_cache = None  # next capture shows the new line
+        self._handle_kirocrew_chat_send(
+            {"text": line, "metadata": {"via": "terminal"}}, "kirocrew",
+            response_extra={"session": KIROCREW_TERMINAL_ALIAS, "direct": True},
+        )
+
+    def _handle_kirocrew_terminal_key(self, key_name: str) -> None:
+        if not key_name:
+            self._send_json(400, {"error": "key required"})
+            return
+        if key_name not in self._KIRO_TERMINAL_KEYS:
+            self._send_json(400, {"error": f"key '{key_name}' not in allowed list"})
+            return
+        if self.state.kirocrew_client is None:
+            self._send_json(503, {"error": "Kiro Crew 未启用", "target": KIROCREW_TERMINAL_ALIAS})
+            return
+        if key_name not in self._KIROCREW_TERMINAL_STOP_KEYS:
+            self._send_json(200, {"ok": True, "key": key_name, "session": KIROCREW_TERMINAL_ALIAS, "ignored": True})
+            return
+        # Ctrl-C stops the running reply only; lines queued behind it still run.
+        stopped = self._kirocrew_cancel_active()
+        self._send_json(200, {"ok": True, "key": key_name, "session": KIROCREW_TERMINAL_ALIAS, "stopped": stopped})
+
+    def _handle_kirocrew_terminal_resize(self, columns: int, rows: int) -> None:
+        # The view is rendered server-side; nothing to resize.
+        self._send_json(200, {
+            "ok": True, "session": KIROCREW_TERMINAL_ALIAS, "columns": columns, "rows": rows, "deferred": True,
         })
+
+    def _handle_kirocrew_terminal_release(self) -> None:
+        self._send_json(200, {"ok": True, "target": KIROCREW_TERMINAL_ALIAS, "released": False})
 
     def _kirocrew_worker(self) -> None:
         while True:
@@ -29616,7 +30048,9 @@ class PushHandler(BaseHTTPRequestHandler):
                 if not self.state.kirocrew_queue:
                     self.state.kirocrew_worker_running = False
                     return
-                warming = bool(self.state.kirocrew_active.get("keep_warm"))
+                # Another holder of the turn slot (keep-warm /context, a manual
+                # /kirocrew/forge): between items the worker's own slot is empty.
+                warming = bool(self.state.kirocrew_active)
                 if not warming:
                     # Pop and reserve under one lock: the keep-warm check must
                     # never see an empty queue and an empty turn slot in between.
@@ -29624,7 +30058,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     cancel_event = threading.Event()
                     self.state.kirocrew_active = {"user_ts": str(item["record"].get("ts") or ""), "cancel_event": cancel_event}
             if warming:
-                # The keep-warm /context holds the slot for a few seconds.
+                # The keep-warm /context holds the slot for a few seconds (a forge longer).
                 time.sleep(0.25)
                 continue
             try:
@@ -29810,6 +30244,7 @@ class PushHandler(BaseHTTPRequestHandler):
         first_chunk_ms: list[int] = []
         tools: list[str] = []
         recall_hit = False
+        self_forge_requested = False
         if client is None:
             self._kirocrew_finish(contact_id, rec, self._KIROCREW_DISABLED_TEXT, "crew-gateway:disabled", status="failed")
             return
@@ -29824,6 +30259,23 @@ class PushHandler(BaseHTTPRequestHandler):
             wecom_turn = wecom_bridge.origin(rec) is not None
             typed = wecom_bridge.strip_user_prefix(text) if wecom_turn else text
             is_compact = typed.strip().lower() == "/compact"
+            # 自适应 forge (2026-10-31)：同 kiro，发送前先看硬阈值 / 上一轮留下的
+            # [[KIRO_FORGE]]；forge 失败只降级，这条消息照常发进当前会话。
+            if not is_compact and not cancel_event.is_set():
+                trigger = ""
+                try:
+                    trigger = self._kirocrew_forge_trigger(session_id)
+                    if trigger:
+                        result = self._kirocrew_run_forge(
+                            trigger=trigger, cancel_event=cancel_event, expected_session_id=session_id,
+                            pending_user_ts=user_ts,
+                        )
+                        if result.get("ok"):
+                            session_id = self._kirocrew_session_id()
+                        else:
+                            logger.warning("kirocrew %s forge skipped: %s", trigger, result.get("error"))
+                except Exception:
+                    logger.warning("kirocrew %s forge failed, continuing with the current session", trigger or "auto", exc_info=True)
             recall_context = ""
             recall_result = None
             if not is_compact and not cancel_event.is_set() and self._kiro_recall_allowed(text):
@@ -29844,7 +30296,15 @@ class PushHandler(BaseHTTPRequestHandler):
                     "kirocrew", text,
                     image=any(isinstance(entry, dict) and entry.get("type") == "image" for entry in staged),
                 )
-            prompt = "/compact" if is_compact else "\n\n".join(part for part in (prompt_text, attachment_hint, recall_context) if part)
+            soft_forge_notice = ""
+            if not is_compact:
+                try:
+                    soft_forge_notice = self._kirocrew_soft_forge_notice(session_id)
+                except Exception:
+                    logger.warning("kirocrew soft forge notice failed", exc_info=True)
+            prompt = "/compact" if is_compact else "\n\n".join(
+                part for part in (prompt_text, attachment_hint, recall_context, soft_forge_notice) if part
+            )
             last_published = [0.0]
 
             def on_update(current: str) -> None:
@@ -29854,7 +30314,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 if now - last_published[0] >= 0.08:
                     last_published[0] = now
                     self._set_chat_draft(
-                        contact_id, agent_images.strip_markers(current), source="cc-app:crew",
+                        contact_id, _strip_kiro_forge_marker(agent_images.strip_markers(current))[0], source="cc-app:crew",
                         session_id=session_id, user_ts=user_ts, queued_at=user_ts,
                         activity_text="正在使用工具" if tools else None, activity_count=len(tools),
                         activity_items=[f"{label} · 工具 · 进行中" for label in tools[-self._KIRO_TOOL_ITEMS_MAX:]],
@@ -29868,14 +30328,22 @@ class PushHandler(BaseHTTPRequestHandler):
                     user_ts=user_ts,
                 )
 
+            if cancel_event.is_set():  # /stop landed while a forge ran: never start the turn
+                raise KiroCrewCancelled("")
             turn = client.prompt(prompt, on_update=on_update, on_tool=on_tool, cancel_event=cancel_event)
-            if turn.context_pct is not None:
-                self.state.kirocrew_last_context_pct = turn.context_pct
+            self._kirocrew_note_context(turn)
             if recall_result is not None:
                 self._commit_contact_recall("kirocrew", recall_result, session_id)
-            self._kirocrew_finish(contact_id, rec, turn.text, "crew-gateway", tools=turn.tools)
+            # 单独一行的 [[KIRO_FORGE]] 是它自己要 forge 的控制标记：先摘掉（app、
+            # 微信都看不到），只有正常完成的回合才触发，这一轮结束后走 forge。
+            answer, forge_marker = _strip_kiro_forge_marker(turn.text)
+            if forge_marker:
+                self_forge_requested = not is_compact
+                if not answer:
+                    answer = "（准备切换新会话）"
+            self._kirocrew_finish(contact_id, rec, answer, "crew-gateway", tools=turn.tools)
         except KiroCrewCancelled as exc:
-            partial = str(exc.partial or "").strip()
+            partial = _strip_kiro_forge_marker(str(exc.partial or "").strip())[0]
             self._kirocrew_finish(
                 contact_id, rec, partial + "\n\n**[已停止生成]**" if partial else "已中断当前生成。",
                 "crew-gateway:interrupted", status="interrupted", tools=tools,
@@ -29896,6 +30364,8 @@ class PushHandler(BaseHTTPRequestHandler):
                 recall_hit, len(item.get("staged_attachments") or []), len(tools),
                 first_chunk_ms[0] if first_chunk_ms else "none", int((time.monotonic() - started) * 1000),
             )
+        if self_forge_requested:
+            self._kirocrew_self_forge_after_turn(session_id, cancel_event)
 
     # ── NFC 螃蟹挂件 "碰一下召唤小克" (2026-10-21) ─────────────────────────
     _NFC_TAP_SECRET_FILE_ENV = "CC_COMPANION_NFC_TAP_SECRET_FILE"
@@ -33163,7 +33633,7 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
     def _handle_terminal_release(self, body: dict[str, Any]) -> None:
         target = str(body.get("target") or "").strip().lower()
         if target == KIROCREW_TERMINAL_ALIAS:
-            self._send_kirocrew_terminal_read_only()
+            self._handle_kirocrew_terminal_release()
             return
         if target == KIRO_TERMINAL_ALIAS:
             self._handle_kiro_terminal_release(body)
@@ -33434,7 +33904,7 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
     def _handle_terminal_key(self, body: dict[str, Any]):
         requested_session = str(body.get("session", "cctg")).strip() or "cctg"
         if requested_session.lower() == KIROCREW_TERMINAL_ALIAS:
-            self._send_kirocrew_terminal_read_only()
+            self._handle_kirocrew_terminal_key(str(body.get("key", "")).strip())
             return
         if requested_session.lower() == KIRO_TERMINAL_ALIAS:
             self._handle_kiro_terminal_key(str(body.get("key", "")).strip())
@@ -33464,7 +33934,7 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
             return
         target = requested_session.lower()
         if target == KIROCREW_TERMINAL_ALIAS:
-            self._send_kirocrew_terminal_read_only()
+            self._handle_kirocrew_terminal_resize(columns, rows)
             return
         if target == KIRO_TERMINAL_ALIAS:
             self._handle_kiro_terminal_resize(columns, rows)
@@ -33611,7 +34081,7 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
     def _handle_tmux_send(self, body: dict[str, Any]):
         requested_session = body.get("session") or self.state.active_session or self.state.default_session
         if str(requested_session).strip().lower() == KIROCREW_TERMINAL_ALIAS:
-            self._send_kirocrew_terminal_read_only()
+            self._handle_kirocrew_terminal_send(body)
             return
         if str(requested_session).strip().lower() == KIRO_TERMINAL_ALIAS:
             self._handle_kiro_terminal_send(body)
