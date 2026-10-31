@@ -645,6 +645,7 @@ class KeepWarmTest(unittest.TestCase):
         self.assertEqual(_kirocrew_keep_warm_attempt(state), "warmed")
         self.assertEqual(client.prompts, ["/context"])
         self.assertEqual(state.kirocrew_active, {})
+        self.assertEqual(state.kirocrew_last_context_pct, 11.0)
         # same gateway generation: /context does not set mcp_report, still warm
         self.assertEqual(_kirocrew_keep_warm_attempt(state), "warm")
         self.assertEqual(client.prompts, ["/context"])

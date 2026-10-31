@@ -3470,7 +3470,11 @@ def _kirocrew_keep_warm_attempt(state: Any) -> str:
         state.kirocrew_active = {"user_ts": "", "cancel_event": cancel_event, "keep_warm": True}
     try:
         client.ensure_slot()
-        client.prompt("/context", cancel_event=cancel_event)
+        turn = client.prompt("/context", cancel_event=cancel_event)
+        # Seeds the chat header's context % after a 216 restart (no turn yet).
+        pct = getattr(turn, "context_pct", None)
+        if isinstance(pct, (int, float)):
+            state.kirocrew_last_context_pct = float(pct)
     except KiroCrewCancelled:
         return BUSY  # /stop or a new message arrived first; try again next tick
     finally:
