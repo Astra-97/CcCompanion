@@ -497,7 +497,7 @@ class KeepWarmTest(unittest.TestCase):
         client.slot_info = lambda: info
         return types.SimpleNamespace(
             kirocrew_client=client, kirocrew_lock=threading.Lock(),
-            kirocrew_queue=__import__("collections").deque(), kirocrew_active={},
+            kirocrew_queue=__import__("collections").deque(), kirocrew_active={}, kirocrew_warm_gen="",
         ), client
 
     def test_outcomes(self):
@@ -509,9 +509,17 @@ class KeepWarmTest(unittest.TestCase):
         state, client = self.state({"turn_gen": "g1", "mcp_report": {"configured": []}})
         self.assertEqual(_kirocrew_keep_warm_attempt(state), "warm")
         state, client = self.state({"turn_gen": "g2", "mcp_report": None})
+        state.kirocrew_warm_gen = ""
         self.assertEqual(_kirocrew_keep_warm_attempt(state), "warmed")
         self.assertEqual(client.prompts, ["/context"])
         self.assertEqual(state.kirocrew_active, {})
+        # same gateway generation: /context does not set mcp_report, still warm
+        self.assertEqual(_kirocrew_keep_warm_attempt(state), "warm")
+        self.assertEqual(client.prompts, ["/context"])
+        # gateway restarted -> new generation -> warm once more
+        client.slot_info = lambda: {"turn_gen": "g3", "mcp_report": None}
+        self.assertEqual(_kirocrew_keep_warm_attempt(state), "warmed")
+        self.assertEqual(client.prompts, ["/context", "/context"])
         state, client = self.state({"mcp_report": None, "running": True})
         self.assertEqual(_kirocrew_keep_warm_attempt(state), "busy")
         state, client = self.state({"mcp_report": None})

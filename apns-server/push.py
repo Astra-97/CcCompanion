@@ -3312,11 +3312,14 @@ def _kirocrew_keep_warm_attempt(state: Any) -> str:
 
     Crew keeps the slot's kiro-cli session alive by itself while the gateway
     runs (``session.idle_exempt_keys``), but a gateway restart leaves the slot
-    without a session until the next turn.  ``mcp_report`` is None exactly
-    then; a ``/context`` harness command (answered by kiro-cli, no model call,
-    no credits) spawns the session again.  The slot's own history replay keeps
-    the conversation.  Runs only while the contact is idle and holds the
-    contact's turn slot meanwhile, so an App message queues behind it.
+    without a session until the next turn.  The slot's ``turn_gen`` changes
+    with every gateway start, so: a gen we have not warmed (and no
+    ``mcp_report``, which only a real turn sets) gets one ``/context`` harness
+    command -- answered by kiro-cli, no model call, no credits -- which spawns
+    the session again; the slot's history replay keeps the conversation.  A
+    missing slot is created (creation spawns the session).  Runs only while
+    the contact is idle and holds the contact's turn slot meanwhile, so an App
+    message queues behind it.
     """
     from kiro_keep_warm import ALREADY_WARM, BUSY, WARMED
 
@@ -3329,10 +3332,13 @@ def _kirocrew_keep_warm_attempt(state: Any) -> str:
     info = client.slot_info()
     if not info:
         client.ensure_slot()  # creating the slot spawns its session (eager_spawn)
+        state.kirocrew_warm_gen = str((client.slot_info() or {}).get("turn_gen") or "")
         return WARMED
+    gen = str(info.get("turn_gen") or "")
     if info.get("running") or info.get("compacting"):
         return BUSY
-    if info.get("mcp_report") is not None:
+    if info.get("mcp_report") is not None or (gen and gen == getattr(state, "kirocrew_warm_gen", "")):
+        state.kirocrew_warm_gen = gen
         return ALREADY_WARM
     cancel_event = threading.Event()
     with state.kirocrew_lock:
@@ -3348,6 +3354,7 @@ def _kirocrew_keep_warm_attempt(state: Any) -> str:
         with state.kirocrew_lock:
             if state.kirocrew_active.get("cancel_event") is cancel_event:
                 state.kirocrew_active = {}
+    state.kirocrew_warm_gen = gen
     return WARMED
 
 
@@ -5655,6 +5662,7 @@ class ServerState:
         self.kirocrew_applied: tuple[str, str] | None = None
         self.kirocrew_last_context_pct: float | None = None
         self.kirocrew_keep_warm_enabled = bool(server_cfg.get("kirocrew_keep_warm", True))
+        self.kirocrew_warm_gen = ""  # gateway generation the keep-warm last warmed
         self.kirocrew_keep_warm_interval = float(server_cfg.get("kirocrew_keep_warm_interval_seconds", 600))
         self.kirocrew_preferences = KiroCrewPreferences(contact_history_dir / "kirocrew_preferences.json")
         self.kirocrew_semantic_memory_recall_enabled: bool = bool(
@@ -35192,9 +35200,14 @@ def run_server(state: ServerState):
         logger.info("Kiro keep-warm enabled")
     # Kiro Crew (2026-10-31): respawn the crew slot's session after a gateway restart.
     if getattr(state, "kirocrew_client", None) is not None and getattr(state, "kirocrew_keep_warm_enabled", False):
+        class _CrewKeepWarmLog(logging.LoggerAdapter):
+            # KiroKeepWarm's messages say "Kiro keep-warm"; keep the two apart in the journal.
+            def process(self, msg, kwargs):
+                return str(msg).replace("Kiro keep-warm", "Kiro Crew keep-warm", 1), kwargs
+
         state.kirocrew_keep_warm = KiroKeepWarm(
             attempt=lambda: _kirocrew_keep_warm_attempt(state),
-            logger=logger,
+            logger=_CrewKeepWarmLog(logger, {}),
             interval=float(getattr(state, "kirocrew_keep_warm_interval", 600.0)),
             boot_delay=60.0,
         )
