@@ -4,8 +4,8 @@
 companion 路由的消息 POST 到本服务 ``/wecom/inbound``（X-Wecom-Webhook-Secret，
 0600 文件，fail-closed）。本服务把它当成方小南在 app 里给该联系人发了一条
 ``［💬微信］原文``：同入历史、同走该联系人的发送管线，metadata 带
-``source=wecom`` + ``wecom={msg_id, agent_id, msg_type}``。卡拉米、Kiro、Kiro Crew、kairos
-（IMAGE_CONTACTS）的图片由回调服务下载到私有 media 目录，本服务校验并复制到
+``source=wecom`` + ``wecom={msg_id, agent_id, msg_type}``。卡拉米、Kiro、Kiro Crew、kairos、
+哈基米（IMAGE_CONTACTS）的图片由回调服务下载到私有 media 目录，本服务校验并复制到
 附件库，作为普通图片附件交给该联系人（同 app 里上传的图片）。
 
 出站：联系人这一轮的最终回复落历史时，*只有*它回答的那条用户消息带 wecom
@@ -44,15 +44,17 @@ META_SOURCE = "wecom"
 # 哥哥写手 gege（2026-10-29）：钩子在 _gege_finish（命令回执与正文都走它）。
 # Kiro Crew kirocrew（2026-10-31，应用 1000008）：钩子在 _kirocrew_finish（模型回复）
 # 与 _kirocrew_reply_now（/status /model … 命令回执）。
-# 哈基米 hajiki（2026-11-01，应用 1000009）：钩子在 _hajiki_finish；只收文字，
-# 微信图片等由回调服务转成一句文字说明（同 gege）。
+# 哈基米 hajiki（2026-11-01，应用 1000009）：钩子在 _hajiki_finish；图片见
+# IMAGE_CONTACTS，视频等其余媒体由回调服务转成一句文字说明（同 gege）。
 INBOUND_CONTACTS = frozenset({"kimi", "kairos", "kiro", "gege", "kirocrew", "hajiki"})
 # 微信图片作为真图片附件交给联系人的（其余联系人只收回调给的一句文字说明）。
 # 回调服务 lib/companion.mjs 的 IMAGE_CONTACTS 必须与此一致。
 # kairos（2026-10-30）：_handle_kairos_chat_send 把 stored_path 放进 task 的
 # image_paths，Codex app-server 这一轮收到 localImage 输入（同 app 里上传的图片）。
 # kirocrew（2026-10-31）：同 app 里上传的图片，拷到东京后以路径交给 Crew。
-IMAGE_CONTACTS = frozenset({"kimi", "kiro", "kairos", "kirocrew"})
+# hajiki（2026-11-01）：同 app 里上传的图片，_hajiki_process 转成 pi 的
+# ImageContent 随 prompt 交给 Argon。
+IMAGE_CONTACTS = frozenset({"kimi", "kiro", "kairos", "kirocrew", "hajiki"})
 # 回复里能用 [[CCC_IMAGE:/东京路径]] 发图（后台经 ssh 取回）的联系人；微信入口说明
 # 里告诉它们怎么发图。
 IMAGE_REPLY_CONTACTS = frozenset({"kiro", "kirocrew"})

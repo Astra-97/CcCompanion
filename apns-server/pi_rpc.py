@@ -367,8 +367,14 @@ class PiRPCClient:
         cancel_event: threading.Event | None = None,
         timeout: float = 1800.0,
         ready_budget: float = 900.0,
+        images: list[dict[str, Any]] | None = None,
     ) -> str:
-        """One writing turn; returns the final assistant text."""
+        """One writing turn; returns the final assistant text.
+
+        ``images``: pi ``ImageContent`` blocks (``{"type": "image", "data":
+        <base64>, "mimeType": "image/png"}``) sent with the prompt — 哈基米
+        (2026-11-01) uses this for pictures she sends.
+        """
         with self._op_lock:
             self._last_used = self._clock()
             self._ensure()
@@ -378,7 +384,7 @@ class PiRPCClient:
             sink: "queue.Queue[dict[str, Any] | None]" = queue.Queue()
             self._sink = sink
             try:
-                return self._run_prompt(text, sink, on_delta, cancel_event, timeout)
+                return self._run_prompt(text, sink, on_delta, cancel_event, timeout, images)
             finally:
                 self._sink = None
                 self._last_used = self._clock()
@@ -390,8 +396,12 @@ class PiRPCClient:
         on_delta: Callable[[str], None] | None,
         cancel_event: threading.Event | None,
         timeout: float,
+        images: list[dict[str, Any]] | None = None,
     ) -> str:
-        response = self._command({"type": "prompt", "message": text})
+        payload: dict[str, Any] = {"type": "prompt", "message": text}
+        if images:
+            payload["images"] = list(images)
+        response = self._command(payload)
         if not response.get("success"):
             raise classify_error(str(response.get("error") or "prompt rejected"))
         if (response.get("data") or {}).get("disposition") == "handled":

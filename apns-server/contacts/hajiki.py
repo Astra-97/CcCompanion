@@ -2,11 +2,16 @@
 
 Was a read-only archive since the group days; 方小南 brought her back with
 Gemini 4 Argon on Vertex AI, running in pi's RPC mode as user ``pi`` on Tokyo
-(``/home/pi/hajiki``, same harness as 哥哥写手 ``gege``).  Text only: no
-attachments, no proactive turns, no heartbeat — pi is called only when she
-sends a message.  Also reachable from WeChat (2026-11-01): 企业微信 app
-「哈基米」 1000009 (wecom-channel route ``companion:hajiki``); WeChat turns are
-mirrored back by ``_hajiki_finish``, pictures arrive as a text note.
+(``/home/pi/hajiki``, same harness as 哥哥写手 ``gege``).  No proactive
+turns, no heartbeat — pi is called only when she sends a message.  Also
+reachable from WeChat (2026-11-01): 企业微信 app 「哈基米」 1000009
+(wecom-channel route ``companion:hajiki``); WeChat turns are mirrored back by
+``_hajiki_finish``.
+
+Pictures (2026-11-01「把他图片接通」): ``attachments`` — staged images from
+the app, and WeChat pictures staged by /wecom/inbound (wecom_bridge
+IMAGE_CONTACTS), go to pi's ``prompt`` as ImageContent (``pi_images``); Argon
+sees them.  Other files are refused with a one-line note.
 """
 from __future__ import annotations
 
@@ -17,7 +22,7 @@ CONTACT = {
     "display_name": "哈基米",
     "provider": "pi-rpc",
     "terminal_target": "",
-    "capabilities": ["chat", "history", "draft", "busy", "stop", "realtime"],
+    "capabilities": ["chat", "history", "draft", "busy", "stop", "attachments", "realtime"],
     "stop_fields": ["contact_id", "user_ts"],
 }
 

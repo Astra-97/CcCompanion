@@ -4,3 +4,5 @@ httpx[http2]>=0.27.0
 pyyaml>=6.0
 websockets>=16.0,<17
 numpy>=2.2,<3
+# 哈基米 hajiki pictures (pi_images.py): shrink before sending to pi
+pillow>=10

@@ -242,6 +242,7 @@ from kiro_keep_warm import KiroKeepWarm
 # 哥哥写手 (2026-10-29): pi (RPC mode) on Tokyo as the writing-only contact gege.
 import gege_writer
 from pi_rpc import PiRPCAuthRequired, PiRPCBusy, PiRPCCancelled, PiRPCClient, PiRPCError
+import pi_images
 # Kiro Crew (2026-10-31): contact kirocrew, 小克 through the Crew gateway on Tokyo.
 import kirocrew_client
 from kirocrew_client import (
@@ -26678,6 +26679,16 @@ class PushHandler(BaseHTTPRequestHandler):
                 "reason": "Kimi 附件必须先上传，再随 /chat/send 原子提交。",
             })
             return
+        # 哈基米 hajiki (2026-11-01)：图片同样只走 staged 管线（旧式直传会写历史
+        # 却不唤醒 pi），直接拒绝。
+        if contact_id == "hajiki":
+            self.close_connection = True
+            self._send_json(415, {
+                "ok": False,
+                "error": "hajiki_staged_attachment_required",
+                "reason": "哈基米的图片必须先上传，再随 /chat/send 原子提交。",
+            })
+            return
         # kiro 对齐 CC (2026-09-26)：Kiro 同样只走 staged 管线；旧式直传会
         # 写历史却不唤醒 Kiro，直接拒绝。
         if contact_id == "kiro":
@@ -29514,6 +29525,11 @@ class PushHandler(BaseHTTPRequestHandler):
     _HAJIKI_BUSY_TEXT = "哈基米还在忙上一句，稍等一下再发嘛。"
     _HAJIKI_ERROR_TEXT = "哈基米卡住了……刚才那句没回出来，小南再发一次试试？"
     _HAJIKI_EMPTY_TEXT = "（哈基米这次什么都没说出来）"
+    # Pictures (2026-11-01): images only, a few per message.
+    _HAJIKI_MAX_IMAGES = 4
+    _HAJIKI_FILES_TEXT = "哈基米现在能看图片，别的文件还看不了，把内容贴成文字发给我吧。"
+    _HAJIKI_IMAGE_TEXT = "这张图哈基米打不开……换成 jpg / png 再发一次试试？"
+    _HAJIKI_IMAGE_ONLY_TEXT = "（发来一张图片）"
     # WeChat turns (企业微信「哈基米」应用 1000009): the reply also goes to her
     # WeChat, which shows plain text; a blank line starts a new bubble.
     _HAJIKI_WECOM_NOTE = (
@@ -29522,21 +29538,28 @@ class PushHandler(BaseHTTPRequestHandler):
     )
 
     def _handle_hajiki_chat_send(self, body: dict[str, Any]) -> None:
-        """App message to 哈基米: commit to history, queue, 200 (text only)."""
+        """App message to 哈基米: commit to history, queue, 200.
+
+        Text and pictures (2026-11-01「把他图片接通」): staged *image*
+        attachments (app upload, or a WeChat picture staged by /wecom/inbound)
+        go to pi as ImageContent; any other file is refused with a note.
+        """
         contact_id = "hajiki"
         staged = [item for item in list(body.get("_pwa_staged_attachments") or []) if isinstance(item, dict)]
-        if staged:
+        if any(str(item.get("type") or "") != "image" for item in staged) or len(staged) > self._HAJIKI_MAX_IMAGES:
             self._discard_uncommitted_staged_attachments(staged)
-            self._send_json(415, {"ok": False, "error": "hajiki_text_only", "reason": "哈基米现在只收文字。"})
+            self._send_json(415, {"ok": False, "error": "hajiki_images_only", "reason": self._HAJIKI_FILES_TEXT})
             return
         text = str(body.get("text") or "").strip()
-        if not text:
+        if not text and not staged:
             self._send_json(400, {"ok": False, "error": "text required"})
             return
         metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else None
         chat = self._chat_for_contact(contact_id)
+        primary = staged[0] if staged else {}
         with self.state.hajiki_lock:
             if len(self.state.hajiki_queue) >= self._HAJIKI_MAX_QUEUE:
+                self._discard_uncommitted_staged_attachments(staged)
                 self._send_json(429, {"ok": False, "error": "hajiki_queue_full", "reason": "排队的消息太多了，等哈基米回完再发。"})
                 return
             try:
@@ -29546,12 +29569,16 @@ class PushHandler(BaseHTTPRequestHandler):
                     source=self._source_for_request(contact_id),
                     quoted_ts=body.get("quoted_ts") or None,
                     metadata=metadata,
+                    attachment_url=primary.get("attachment_url") or None,
+                    attachment_type=primary.get("type") or None,
+                    attachment_filename=primary.get("filename") or None,
                 )
             except Exception:
                 logger.exception("hajiki history append failed")
+                self._discard_uncommitted_staged_attachments(staged)
                 self._send_json(500, {"ok": False, "error": "hajiki_history_unavailable"})
                 return
-            self.state.hajiki_queue.append({"record": rec, "text": text})
+            self.state.hajiki_queue.append({"record": rec, "text": text, "staged_attachments": staged})
             position = len(self.state.hajiki_queue) + (1 if self.state.hajiki_active else 0)
             start_worker = not self.state.hajiki_worker_running
             if start_worker:
@@ -29657,9 +29684,23 @@ class PushHandler(BaseHTTPRequestHandler):
         prompt_text = item["text"]
         if wecom_bridge.origin(rec) is not None:
             prompt_text = self._HAJIKI_WECOM_NOTE + wecom_bridge.strip_user_prefix(prompt_text).strip()
+        images: list[dict[str, Any]] = []
+        for attachment in list(item.get("staged_attachments") or []):
+            try:
+                images.append(pi_images.image_content(
+                    str(attachment.get("stored_path") or ""), str(attachment.get("media_type") or ""),
+                ))
+            except (OSError, ValueError):
+                logger.warning("hajiki: picture unusable (%s)", str(attachment.get("filename") or "")[:40])
+        if item.get("staged_attachments") and not images:
+            self._hajiki_finish(rec, self._HAJIKI_IMAGE_TEXT, "hajiki:image-error", failed=True)
+            return
+        if images and not prompt_text.strip():
+            prompt_text = self._HAJIKI_IMAGE_ONLY_TEXT
         try:
             # Argon thinks before it talks: generous turn budget.
-            answer = client.prompt(prompt_text, on_delta=on_delta, cancel_event=cancel_event, timeout=900.0, ready_budget=300.0)
+            answer = client.prompt(prompt_text, on_delta=on_delta, cancel_event=cancel_event, timeout=900.0,
+                                   ready_budget=300.0, **({"images": images} if images else {}))
             self._hajiki_finish(rec, answer.strip() or self._HAJIKI_EMPTY_TEXT, "hajiki:pi")
         except PiRPCCancelled as exc:
             partial = str(exc.partial or "").strip()
