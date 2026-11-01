@@ -4,17 +4,14 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from . import gege, kairos, kimi, kiro, kirocrew, xiaoke
+from . import gege, hajiki, kairos, kimi, kiro, kirocrew, xiaoke
 
 # kiro 桥接 (2026-09-09): ACP text chat contact, Phase 1.
 # 哥哥写手 (2026-10-29): pi on Tokyo, writing only.
 # Kiro Crew (2026-10-31): 小克 via the Kiro Crew gateway on Tokyo, beside kiro.
-_CONTACT_MODULES = {"xiaoke": xiaoke, "kairos": kairos, "kimi": kimi, "kiro": kiro, "gege": gege, "kirocrew": kirocrew}
+# 哈基米 (2026-11-01): back from the read-only archive, Gemini 4 Argon via pi on Tokyo.
+_CONTACT_MODULES = {"xiaoke": xiaoke, "kairos": kairos, "kimi": kimi, "kiro": kiro, "gege": gege, "kirocrew": kirocrew, "hajiki": hajiki}
 _OTHER_CONTACTS = (
-    {
-        "id": "hajiki", "display_name": "哈基米", "provider": "contact-local",
-        "terminal_target": "", "capabilities": ["history"], "stop_fields": [],
-    },
     {
         "id": "apples", "display_name": "苹果幼稚园", "provider": "group-router",
         "terminal_target": "", "capabilities": ["chat", "history", "draft", "busy", "attachments", "forward", "group_chat", "realtime"], "stop_fields": [],
@@ -25,8 +22,7 @@ _OTHER_CONTACTS = (
     },
 )
 _OTHER_ROUTES = {
-    "hajiki": {"capabilities": ["history"]},
-    "apples": {"send_handler": "apples", "capabilities": _OTHER_CONTACTS[1]["capabilities"]},
+    "apples": {"send_handler": "apples", "capabilities": _OTHER_CONTACTS[0]["capabilities"]},
     "toolbot": {"capabilities": ["history", "realtime"]},
 }
 _LEGACY_FALLBACK_ROUTES = {
@@ -42,7 +38,7 @@ _LEGACY_FALLBACK_ROUTES = {
     "apples": {"send_handler": "apples", "capabilities": ["chat", "history", "draft", "busy", "attachments", "forward", "group_chat", "realtime"]},
     "toolbot": {"capabilities": ["history", "realtime"]},
 }
-_SEND_HANDLERS = frozenset({"xiaoke", "kairos", "kimi", "apples", "kiro", "gege", "kirocrew"})
+_SEND_HANDLERS = frozenset({"xiaoke", "kairos", "kimi", "apples", "kiro", "gege", "kirocrew", "hajiki"})
 _GROUP_DISPATCHERS = frozenset({"xiaoke", "kairos", "kimi"})
 
 

@@ -225,6 +225,12 @@ allowed_ips = []
 #   gege_idle_close_seconds = 10800    # pi 空闲多久关掉（存档都在东京磁盘上，下次 --continue 接着写）
 # 进程 = `ssh -T -l pi tokyo sh -c <launch> ... /home/pi/gege/bin/gege-rpc`（remote_stdio.py），
 # 进程组记在 <gege_home>/run/rpc.pid。POST /gege/restart 关掉它（改了 gege.env 后用）。
+# 哈基米 hajiki (2026-11-01)：Gemini 4 Argon（Vertex 直连，服务账号）跑在东京用户 pi 的 pi RPC 上，
+# 工作区 /home/pi/hajiki（bin/hajiki-rpc、hajiki.env、prompt/persona.md、自己的 pi agent 目录）。
+# 只在她发消息时调用，无心跳、无主动消息；POST /hajiki/restart 关掉 pi（改了 env/人设后用）。
+#   hajiki_ssh_host = "tokyo"          # 设了才启用；不设 = 回复「后台还没配置好」
+#   hajiki_remote_user = "pi"
+#   hajiki_idle_close_seconds = 1800   # 空闲多久关 pi（会话在东京磁盘上，下次 --continue）
 # Crew kirocrew (2026-10-31)：和 kiro 并排试用的第二个小克入口，本体是东京
 # kirocrew.service（Crew 网关，用户 kiro，只绑 127.0.0.1:5476）。216 经
 # `ssh -l kiro tokyo python3 -c <kirocrew_remote_bridge.py>` 访问，网关的内部

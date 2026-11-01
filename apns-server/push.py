@@ -3510,6 +3510,36 @@ def _gege_client_from_config(server_cfg: dict[str, Any]) -> PiRPCClient | None:
     )
 
 
+def _hajiki_client_from_config(server_cfg: dict[str, Any]) -> PiRPCClient | None:
+    """哈基米 (2026-11-01): pi RPC client (Gemini 4 Argon on Vertex) for contact hajiki.
+
+    ``hajiki_ssh_host`` (e.g. "tokyo") runs ``hajiki_bin`` (default
+    ``/home/pi/hajiki/bin/hajiki-rpc``) there as ``hajiki_remote_user``
+    (default pi).  Unset = contact answers "not configured".  pi only starts
+    when she sends a message and closes after ``hajiki_idle_close_seconds``.
+    """
+    host = str(server_cfg.get("hajiki_ssh_host", "") or "").strip()
+    if not host:
+        return None
+    user = str(server_cfg.get("hajiki_remote_user", "pi") or "pi").strip()
+    home = str(server_cfg.get("hajiki_remote_home", "") or f"/home/{user}").rstrip("/")
+    hajiki_home = str(server_cfg.get("hajiki_home", "") or f"{home}/hajiki").rstrip("/")
+    remote = RemoteStdio(RemoteStdioTarget(
+        host=host,
+        user=user,
+        cwd=f"{hajiki_home}/workdir",
+        env={"HOME": home, "LANG": "C.UTF-8", "PATH": "/usr/local/bin:/usr/bin:/bin"},
+        pidfile=f"{hajiki_home}/run/rpc.pid",
+        control_path=str(Path.home() / ".ssh" / "ccc-hajiki-%C"),
+    ))
+    return PiRPCClient(
+        [str(server_cfg.get("hajiki_bin", "") or f"{hajiki_home}/bin/hajiki-rpc")],
+        remote=remote,
+        idle_close_sec=float(server_cfg.get("hajiki_idle_close_seconds", 30 * 60)),
+        start_timeout=float(server_cfg.get("hajiki_start_timeout_seconds", 90)),
+    )
+
+
 def _kiro_model_selection_for(state: Any) -> str:
     store = getattr(state, "kiro_preferences", None)
     snapshot_model = getattr(store, "snapshot_model", None)
@@ -5987,6 +6017,12 @@ class ServerState:
         self.gege_worker_running = False
         self.gege_active: dict[str, Any] = {}
         self.gege_list_until = 0.0
+        # 哈基米 (2026-11-01): pi RPC (Gemini 4 Argon) on Tokyo; one FIFO, one worker.
+        self.hajiki_client: PiRPCClient | None = _hajiki_client_from_config(server_cfg)
+        self.hajiki_lock = threading.Lock()
+        self.hajiki_queue: deque[dict[str, Any]] = deque()
+        self.hajiki_worker_running = False
+        self.hajiki_active: dict[str, Any] = {}
         # Kiro Crew (2026-10-31): one FIFO + one worker, like gege.  The Crew
         # slot itself is the persistent session (no pointer kept on 216).
         self.kirocrew_lock = threading.Lock()
@@ -29469,6 +29505,166 @@ class PushHandler(BaseHTTPRequestHandler):
         finally:
             # timing only, never text
             logger.info("gege turn: kind=%s total_ms=%d", (command or ("write", ""))[0], int((time.monotonic() - started) * 1000))
+
+
+    # ── 哈基米 hajiki (2026-11-01): Gemini 4 Argon via pi on Tokyo ─────────
+    _HAJIKI_MAX_QUEUE = 20
+    _HAJIKI_NOT_CONFIGURED_TEXT = "哈基米的后台还没配置好（hajiki_ssh_host 未设置）。"
+    _HAJIKI_AUTH_TEXT = "哈基米连不上 Gemini（Vertex 凭据或额度有问题），等小克去看看～"
+    _HAJIKI_BUSY_TEXT = "哈基米还在忙上一句，稍等一下再发嘛。"
+    _HAJIKI_ERROR_TEXT = "哈基米卡住了……刚才那句没回出来，小南再发一次试试？"
+    _HAJIKI_EMPTY_TEXT = "（哈基米这次什么都没说出来）"
+
+    def _handle_hajiki_chat_send(self, body: dict[str, Any]) -> None:
+        """App message to 哈基米: commit to history, queue, 200 (text only)."""
+        contact_id = "hajiki"
+        staged = [item for item in list(body.get("_pwa_staged_attachments") or []) if isinstance(item, dict)]
+        if staged:
+            self._discard_uncommitted_staged_attachments(staged)
+            self._send_json(415, {"ok": False, "error": "hajiki_text_only", "reason": "哈基米现在只收文字。"})
+            return
+        text = str(body.get("text") or "").strip()
+        if not text:
+            self._send_json(400, {"ok": False, "error": "text required"})
+            return
+        metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else None
+        chat = self._chat_for_contact(contact_id)
+        with self.state.hajiki_lock:
+            if len(self.state.hajiki_queue) >= self._HAJIKI_MAX_QUEUE:
+                self._send_json(429, {"ok": False, "error": "hajiki_queue_full", "reason": "排队的消息太多了，等哈基米回完再发。"})
+                return
+            try:
+                rec = chat.append(
+                    role="user",
+                    text=text,
+                    source=self._source_for_request(contact_id),
+                    quoted_ts=body.get("quoted_ts") or None,
+                    metadata=metadata,
+                )
+            except Exception:
+                logger.exception("hajiki history append failed")
+                self._send_json(500, {"ok": False, "error": "hajiki_history_unavailable"})
+                return
+            self.state.hajiki_queue.append({"record": rec, "text": text})
+            position = len(self.state.hajiki_queue) + (1 if self.state.hajiki_active else 0)
+            start_worker = not self.state.hajiki_worker_running
+            if start_worker:
+                self.state.hajiki_worker_running = True
+        if position > 1:
+            self._set_chat_queued(contact_id, user_ts=str(rec.get("ts") or ""), queued_at=str(rec.get("ts") or ""),
+                                  queue_position=position - 1, source="cc-app:hajiki")
+        if start_worker:
+            threading.Thread(target=self._hajiki_worker, name="hajiki-worker", daemon=True).start()
+        self._send_json(200, {"ok": True, "contact_id": contact_id, "record": rec, "queued": True, "queue_position": position})
+
+    def _handle_hajiki_chat_stop(self, body: dict[str, Any]) -> None:
+        user_ts = str((body or {}).get("user_ts") or "").strip()
+        with self.state.hajiki_lock:
+            active = dict(self.state.hajiki_active)
+            cleared = 0
+            if (body or {}).get("clear_queued"):
+                cleared = len(self.state.hajiki_queue)
+                self.state.hajiki_queue.clear()
+        cancel = active.get("cancel_event")
+        if not active or not isinstance(cancel, threading.Event):
+            self._send_json(200, {"ok": True, "stopped": False, "already_finished": True, "cleared_queued": cleared})
+            return
+        if user_ts and user_ts != str(active.get("user_ts") or ""):
+            self._send_json(409, {"ok": False, "error": "stale_turn", "reason": "当前轮次与停止目标不一致。"})
+            return
+        cancel.set()
+        self._send_json(200, {"ok": True, "stopped": True, "user_ts": active.get("user_ts"), "cleared_queued": cleared})
+
+    def _handle_hajiki_restart(self, body: dict[str, Any]) -> None:
+        """POST /hajiki/restart — close pi on Tokyo; the next message starts it
+        fresh (re-reads hajiki.env and prompt/persona.md).  Refused while busy."""
+        client = self.state.hajiki_client
+        if client is None:
+            self._send_json(503, {"ok": False, "error": "hajiki_not_configured"})
+            return
+        with self.state.hajiki_lock:
+            busy = bool(self.state.hajiki_active) or bool(self.state.hajiki_queue)
+        if busy:
+            self._send_json(409, {"ok": False, "error": "hajiki_busy"})
+            return
+        client.close()
+        self._send_json(200, {"ok": True, "restarted": True})
+
+    def _hajiki_worker(self) -> None:
+        while True:
+            with self.state.hajiki_lock:
+                if not self.state.hajiki_queue:
+                    self.state.hajiki_worker_running = False
+                    return
+                item = self.state.hajiki_queue.popleft()
+                cancel_event = threading.Event()
+                self.state.hajiki_active = {"user_ts": str(item["record"].get("ts") or ""), "cancel_event": cancel_event}
+            try:
+                self._hajiki_process(item, cancel_event)
+            except Exception:
+                logger.exception("hajiki turn crashed")
+            finally:
+                with self.state.hajiki_lock:
+                    self.state.hajiki_active = {}
+
+    def _hajiki_finish(self, rec: dict[str, Any], text: str, source: str, *, failed: bool = False) -> None:
+        contact_id = "hajiki"
+        chat = self._chat_for_contact(contact_id)
+        user_ts = str(rec.get("ts") or "")
+        final_ts = ""
+        try:
+            final = chat.append(
+                role="assistant", text=text, source=source,
+                metadata={"hajiki_user_ts": user_ts, "turn_terminal": True, "turn_message_kind": "terminal_answer"},
+            )
+            final_ts = str(final.get("ts") or "")
+            self._publish_persisted_assistant_completion(contact_id, final)
+        except Exception:
+            logger.exception("hajiki assistant history append failed")
+        if failed:
+            self._set_chat_failed(contact_id, user_ts=user_ts, final_ts=final_ts, source=source)
+        else:
+            self._set_chat_completed(contact_id, user_ts=user_ts, final_ts=final_ts, source=source)
+        self._set_typing_for_contact(contact_id, {"is_typing": False, "since": None})
+
+    def _hajiki_process(self, item: dict[str, Any], cancel_event: threading.Event) -> None:
+        contact_id = "hajiki"
+        rec = item["record"]
+        user_ts = str(rec.get("ts") or "")
+        self._set_chat_generating(contact_id, user_ts=user_ts, queued_at=user_ts, source="cc-app:hajiki")
+        self._set_typing_for_contact(contact_id, {"is_typing": True, "since": user_ts, "transport": "pi-rpc"})
+        client = self.state.hajiki_client
+        if client is None:
+            self._hajiki_finish(rec, self._HAJIKI_NOT_CONFIGURED_TEXT, "hajiki:not-configured", failed=True)
+            return
+        started = time.monotonic()
+        last_published = [0.0]
+
+        def on_delta(current: str) -> None:
+            now = time.monotonic()
+            if now - last_published[0] >= 0.15:
+                last_published[0] = now
+                self._set_chat_draft(contact_id, current, source="cc-app:hajiki", user_ts=user_ts, queued_at=user_ts)
+
+        try:
+            # Argon thinks before it talks: generous turn budget.
+            answer = client.prompt(item["text"], on_delta=on_delta, cancel_event=cancel_event, timeout=900.0, ready_budget=300.0)
+            self._hajiki_finish(rec, answer.strip() or self._HAJIKI_EMPTY_TEXT, "hajiki:pi")
+        except PiRPCCancelled as exc:
+            partial = str(exc.partial or "").strip()
+            self._hajiki_finish(rec, f"{partial}\n\n（已停止）" if partial else "已停止这一句。", "hajiki:interrupted")
+        except PiRPCAuthRequired:
+            logger.warning("hajiki: Vertex credentials / model unavailable")
+            self._hajiki_finish(rec, self._HAJIKI_AUTH_TEXT, "hajiki:auth-required", failed=True)
+        except PiRPCBusy:
+            self._hajiki_finish(rec, self._HAJIKI_BUSY_TEXT, "hajiki:busy", failed=True)
+        except PiRPCError as exc:
+            logger.warning("hajiki turn failed: %s", str(exc)[:200])
+            client.close()
+            self._hajiki_finish(rec, self._HAJIKI_ERROR_TEXT, "hajiki:error", failed=True)
+        finally:
+            # timing only, never text
+            logger.info("hajiki turn: total_ms=%d", int((time.monotonic() - started) * 1000))
 
 
     # ── Kiro Crew kirocrew (2026-10-31): 小克 through the Crew gateway ───────
