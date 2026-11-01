@@ -7,10 +7,15 @@
      not-configured answers without touching Tokyo
   3. config: _hajiki_client_from_config builds the Tokyo launch only when
      hajiki_ssh_host is set
+  4. WeChat (企业微信「哈基米」1000009): WeChat turns strip the source prefix,
+     get the plain-text note and are mirrored to the outbox; app turns never are
 
 Never touches the live 8291 service or Tokyo.
 """
 import collections
+import json
+import os
+import tempfile
 import threading
 import types
 import unittest
@@ -18,6 +23,7 @@ from unittest.mock import patch
 
 import push
 from chat_history import ChatStreamBus
+import wecom_bridge
 from contacts import chat_contact_directory, default_contact_routes
 from pi_rpc import PiRPCAuthRequired, PiRPCCancelled, PiRPCError
 from push import PushHandler
@@ -123,6 +129,55 @@ class HajikiHandlerTest(unittest.TestCase):
         self.send(handler, {"text": "  "})
         self.assertEqual(handler.responses[-1][0], 400)
         self.assertEqual(chat.records, [])
+
+
+class HajikiWecomTest(unittest.TestCase):
+    handler = HajikiHandlerTest.handler
+    send = HajikiHandlerTest.send
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.outbox_dir = __import__("pathlib").Path(tmp.name)
+        old = os.environ.get(wecom_bridge.OUTBOX_DIR_ENV)
+        os.environ[wecom_bridge.OUTBOX_DIR_ENV] = str(self.outbox_dir)
+        self.addCleanup(lambda: os.environ.pop(wecom_bridge.OUTBOX_DIR_ENV, None) if old is None else os.environ.__setitem__(wecom_bridge.OUTBOX_DIR_ENV, old))
+
+    def outbox(self):
+        return [json.loads(p.read_text(encoding="utf-8")) for p in sorted(self.outbox_dir.glob("*.json"))]
+
+    def test_wecom_turn_mirrors_to_1000009(self) -> None:
+        client = FakeClient(answers=["喵！哈基米在！\n\n小南找我呀？"])
+        handler, chat = self.handler(client)
+        self.send(handler, wecom_bridge.inbound_body({"contact_id": "hajiki", "agent_id": "1000009", "msg_id": "h-1", "msg_type": "text", "text": "哈基米在吗"}))
+        self.assertEqual(handler.responses[-1][0], 200)
+        self.assertTrue(client.prompts[0].startswith(PushHandler._HAJIKI_WECOM_NOTE))
+        self.assertTrue(client.prompts[0].endswith("\n\n哈基米在吗"))
+        self.assertNotIn(wecom_bridge.USER_PREFIX, client.prompts[0])
+        items = self.outbox()
+        self.assertEqual(len(items), 1)
+        self.assertEqual((items[0]["contact_id"], items[0]["agent_id"], items[0]["text"]), ("hajiki", "1000009", "喵！哈基米在！\n\n小南找我呀？"))
+
+    def test_wecom_error_is_mirrored_too(self) -> None:
+        handler, chat = self.handler(FakeClient(failure=PiRPCError("boom")))
+        self.send(handler, wecom_bridge.inbound_body({"contact_id": "hajiki", "agent_id": "1000009", "msg_id": "h-2", "msg_type": "text", "text": "在吗"}))
+        self.assertEqual(self.outbox()[0]["text"], PushHandler._HAJIKI_ERROR_TEXT)
+
+    def test_app_turn_is_not_mirrored(self) -> None:
+        client = FakeClient()
+        handler, chat = self.handler(client)
+        self.send(handler, {"text": "在吗"})
+        self.assertEqual(client.prompts, ["在吗"])
+        self.assertEqual(self.outbox(), [])
+
+    def test_bridge_accepts_hajiki_text_only(self) -> None:
+        self.assertIn("hajiki", wecom_bridge.INBOUND_CONTACTS)
+        self.assertNotIn("hajiki", wecom_bridge.IMAGE_CONTACTS)
+        clean, error = wecom_bridge.parse_inbound({"contact_id": "hajiki", "agent_id": "1000009", "id": "1", "msg_type": "image",
+                                                   "text": "（发来一张图片）", "media": {"status": "ok", "path": "/x.jpg"}})
+        self.assertEqual(error, "")
+        self.assertNotIn("media", clean)
+        self.assertIn("wecom_hajiki_app", "\n".join(wecom_bridge.prompt_entry_lines("hajiki")))
 
 
 class RegistryTest(unittest.TestCase):

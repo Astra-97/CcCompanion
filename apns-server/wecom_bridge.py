@@ -1,4 +1,4 @@
-"""企业微信 ↔ CC Companion 联系人桥（2026-10-26：卡拉米 kimi、kairos；2026-10-28：Kiro；2026-10-29：哥哥写手 gege；2026-10-31：Kiro Crew kirocrew）。
+"""企业微信 ↔ CC Companion 联系人桥（2026-10-26：卡拉米 kimi、kairos；2026-10-28：Kiro；2026-10-29：哥哥写手 gege；2026-10-31：Kiro Crew kirocrew；2026-11-01：哈基米 hajiki）。
 
 入站：/root/wecom-channel 的回调服务按解密后的 AgentID 分流（WECOM_ROUTES），
 companion 路由的消息 POST 到本服务 ``/wecom/inbound``（X-Wecom-Webhook-Secret，
@@ -44,7 +44,9 @@ META_SOURCE = "wecom"
 # 哥哥写手 gege（2026-10-29）：钩子在 _gege_finish（命令回执与正文都走它）。
 # Kiro Crew kirocrew（2026-10-31，应用 1000008）：钩子在 _kirocrew_finish（模型回复）
 # 与 _kirocrew_reply_now（/status /model … 命令回执）。
-INBOUND_CONTACTS = frozenset({"kimi", "kairos", "kiro", "gege", "kirocrew"})
+# 哈基米 hajiki（2026-11-01，应用 1000009）：钩子在 _hajiki_finish；只收文字，
+# 微信图片等由回调服务转成一句文字说明（同 gege）。
+INBOUND_CONTACTS = frozenset({"kimi", "kairos", "kiro", "gege", "kirocrew", "hajiki"})
 # 微信图片作为真图片附件交给联系人的（其余联系人只收回调给的一句文字说明）。
 # 回调服务 lib/companion.mjs 的 IMAGE_CONTACTS 必须与此一致。
 # kairos（2026-10-30）：_handle_kairos_chat_send 把 stored_path 放进 task 的
@@ -60,6 +62,7 @@ _APP_LABEL = {
     "kiro": ("wecom_kiro_app", "小克"),
     "gege": ("wecom_gege_app", "哥哥写手"),
     "kirocrew": ("wecom_kirocrew_app", "Crew"),
+    "hajiki": ("wecom_hajiki_app", "哈基米"),
 }
 
 SECRET_FILE_ENV = "CC_COMPANION_WECOM_WEBHOOK_SECRET_FILE"

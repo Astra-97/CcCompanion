@@ -29514,6 +29514,12 @@ class PushHandler(BaseHTTPRequestHandler):
     _HAJIKI_BUSY_TEXT = "哈基米还在忙上一句，稍等一下再发嘛。"
     _HAJIKI_ERROR_TEXT = "哈基米卡住了……刚才那句没回出来，小南再发一次试试？"
     _HAJIKI_EMPTY_TEXT = "（哈基米这次什么都没说出来）"
+    # WeChat turns (企业微信「哈基米」应用 1000009): the reply also goes to her
+    # WeChat, which shows plain text; a blank line starts a new bubble.
+    _HAJIKI_WECOM_NOTE = (
+        "（这条是小南在个人微信里通过企业微信「哈基米」应用发给你的。你的回复会同时进 app 和她的微信："
+        "微信只显示纯文本，别用 Markdown；空一行 = 另起一个气泡，通常 1-4 个气泡。直接回她就好。）\n\n"
+    )
 
     def _handle_hajiki_chat_send(self, body: dict[str, Any]) -> None:
         """App message to 哈基米: commit to history, queue, 200 (text only)."""
@@ -29621,6 +29627,8 @@ class PushHandler(BaseHTTPRequestHandler):
             self._publish_persisted_assistant_completion(contact_id, final)
         except Exception:
             logger.exception("hajiki assistant history append failed")
+        # 企业微信「哈基米」应用 1000009 (2026-11-01)：只有微信来的这一轮才回微信。
+        self._mirror_reply_to_wecom(contact_id, rec, text, reply_ts=final_ts)
         if failed:
             self._set_chat_failed(contact_id, user_ts=user_ts, final_ts=final_ts, source=source)
         else:
@@ -29646,9 +29654,12 @@ class PushHandler(BaseHTTPRequestHandler):
                 last_published[0] = now
                 self._set_chat_draft(contact_id, current, source="cc-app:hajiki", user_ts=user_ts, queued_at=user_ts)
 
+        prompt_text = item["text"]
+        if wecom_bridge.origin(rec) is not None:
+            prompt_text = self._HAJIKI_WECOM_NOTE + wecom_bridge.strip_user_prefix(prompt_text).strip()
         try:
             # Argon thinks before it talks: generous turn budget.
-            answer = client.prompt(item["text"], on_delta=on_delta, cancel_event=cancel_event, timeout=900.0, ready_budget=300.0)
+            answer = client.prompt(prompt_text, on_delta=on_delta, cancel_event=cancel_event, timeout=900.0, ready_budget=300.0)
             self._hajiki_finish(rec, answer.strip() or self._HAJIKI_EMPTY_TEXT, "hajiki:pi")
         except PiRPCCancelled as exc:
             partial = str(exc.partial or "").strip()
