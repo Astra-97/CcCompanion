@@ -9514,6 +9514,14 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/notion/page/"):
             self._handle_notion_page_get()
             return
+        # --- 小克人格文件只读 (app 记忆库备份附带 persona-xiaoke.md) ---
+        # 人格原文比普通只读端点敏感: 只认 shared_secret, 不吃网页会话, fail-closed。
+        if request_path == "/persona/xiaoke":
+            if not self._native_pairing_auth_matches():
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            self._handle_persona_get()
+            return
         # --- Memory library proxy GET (read-only, stateless) ---
         if self.path.startswith("/memory/"):
             self._handle_memory_get()
@@ -28025,6 +28033,41 @@ class PushHandler(BaseHTTPRequestHandler):
             return None
         cls._memory_token_cache = m.group(1)
         return cls._memory_token_cache
+
+    # 小克人格 2026-11-01 从 CLAUDE.md 搬进 Claude Code 自定义输出风格; app 备份时
+    # 把它跟 memories.jsonl / messages.jsonl 一起覆盖写到 Documents。只读、固定路径。
+    _PERSONA_PATH = Path("/root/.claude/output-styles/xiaoke.md")
+    _PERSONA_MAX_BYTES = 512 * 1024
+
+    def _handle_persona_get(self) -> None:
+        """GET /persona/xiaoke — 返回人格 markdown 原文 (JSON 包一层, 带 sha256)。"""
+        path = self._PERSONA_PATH
+        try:
+            st = path.stat()
+            if not stat.S_ISREG(st.st_mode):
+                raise FileNotFoundError(str(path))
+            if st.st_size > self._PERSONA_MAX_BYTES:
+                self._send_json(413, {"error": "persona too large"})
+                return
+            data = path.read_bytes()
+            content = data.decode("utf-8")
+        except FileNotFoundError:
+            self._send_json(404, {"error": "persona not found"})
+            return
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning("persona read failed: %s", type(exc).__name__)
+            self._send_json(500, {"error": "persona unreadable"})
+            return
+        self._send_json(200, {
+            "ok": True,
+            "name": "xiaoke",
+            "filename": "persona-xiaoke.md",
+            "content": content,
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "updatedAt": datetime.fromtimestamp(st.st_mtime, timezone.utc)
+            .isoformat(timespec="seconds").replace("+00:00", "Z"),
+        })
 
     def _handle_memory_get(self):
         """GET /memory/* — read-only whitelist proxy to the memory library."""
