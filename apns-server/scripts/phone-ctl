@@ -20,12 +20,20 @@
   phone-ctl longpress X Y [毫秒]      长按
   phone-ctl text "你好" [--enter] [--mode auto|input|paste]
                                       输入文字 (ASCII 走 input text; 中文/换行走剪贴板+粘贴)
-  phone-ctl push <本地文件> [手机路径] [--overwrite]
-                                      传文件到手机 (默认 /sdcard/Download/; 以 / 结尾当目录)
+  phone-ctl push <本地文件> [手机路径] [--force]
+                                      传文件到手机 (走 App 默认 /sdcard/Download/小克/, Shizuku 默认 /sdcard/Download/;
+                                      以 / 结尾 (走 App 时已存在的目录也算) = 放进去用原文件名; 目录不存在就建;
+                                      同名默认不覆盖 (内容一样算成功), --force 才覆盖;
+                                      走 App ≤200MB, 写完触发媒体扫描, 音乐/相册 App 马上能看到)
                                       断点续传 + 大小/sha256 校验 + 失败自动重试 (手机端做)
-  phone-ctl pull <手机路径> [本地路径] 从手机拉文件回来 (≤128MB)
-  phone-ctl ls [手机路径]             列目录 (默认 /sdcard)
+  phone-ctl pull <手机路径> [本地路径] 从手机拉文件回来 (Shizuku ≤128MB; 走 App ≤200MB, 分块续传)
+  phone-ctl ls [手机路径] [-t | --sort name|mtime|size] [-n N]
+                                      列目录 (默认 /sdcard; -t 最新修改的在前; -n 只列前 N 项, 默认 200)
   phone-ctl stat <手机路径>           文件大小/时间
+  ls / stat / pull / push 加 --via app|shizuku 可强制走哪条 (默认 auto: Shizuku 就绪且开了
+  「文件」档就走 Shizuku, 否则走 App 的「手机文件」本地能力 —— 要 App v1.9.236+ 并在
+  「小克的本地能力」里开「手机文件（只读/拷出）」+ 给「所有文件访问权限」; Android/data、
+  Android/obb 系统不让读, 会如实报错)
   phone-ctl sh "<命令>" [--timeout 秒] 通用 shell (uid 2000; 手机端 Shell 档默认关闭)
   phone-ctl ui [--all] [--max N] [--windows]
                                       当前界面的节点 (文字/描述/id/坐标/可点) — 只在调用时读一次屏
@@ -35,7 +43,7 @@
 
 操控后端 (App v1.9.234+): Shizuku 不可用时自动改走 App 的无障碍服务 —— 点按/滑动/长按、
 home/back/recent/notification、open、shot (Android 11+)、app、text 照常用; ui / clicktext 只走无障碍;
-push / pull / ls / stat / sh 只能 Shizuku (无障碍模式下报「需要 Shizuku」)。status 会显示当前后端。
+sh 只能 Shizuku; ls / stat / pull / push 没 Shizuku 时自动走 App「手机文件」(见上)。status 会显示当前后端。
 
 「小克的本地能力」(App v1.9.233+, 不需要 Shizuku / 手机操控总开关; App 在后台开着
 「实时提醒」就能收到; 每项在 App → 设置 → 小克的本地能力 里单独开关):
@@ -149,12 +157,14 @@ def _request(method: str, path: str, body: dict | None = None, *, timeout: float
 
 
 LOCAL_ACTIONS = {"alarm", "timer", "show_alarms", "health", "calendar_sync", "ring", "ring_stop",
-                 "clip", "widget_refresh", "places"}
+                 "clip", "widget_refresh", "places", "file_ls", "file_stat", "file_pull", "file_push"}
 FEATURE_ZH = {
     "alarm": "设闹钟 / 计时器", "health": "健康数据", "calendar": "日历「小克日程」",
     "ring": "强提醒 / 找手机", "clip": "剪贴板", "widget": "桌面小部件",
-    "notifs": "通知转发", "places": "到达提醒",
+    "notifs": "通知转发", "places": "到达提醒", "files": "手机文件（只读/拷出）",
 }
+APP_PULL_MAX = 200 * 1024 * 1024
+APP_PUSH_DIR = "/sdcard/Download/小克/"
 
 
 def enqueue(action: str, args: dict | None = None, *, timeout_s: int | None = None) -> dict:
@@ -337,28 +347,81 @@ def cmd_shot(args) -> None:
     _out(args, {**r, "path": str(out)}, text)
 
 
-def cmd_push(args) -> None:
-    src = Path(args.local).expanduser().resolve()
-    if not src.is_file():
-        raise CtlError(f"本地文件不存在: {src}")
-    dest = args.dest or "/sdcard/Download/"
-    if dest.endswith("/"):
-        dest = dest + src.name
-    staged = _request("POST", "/phone/files", {"path": str(src)}, timeout=600)["file"]
-    total = staged["size"]
-    print(f"已挂出 {src.name} {_fmt_size(total)} sha256={staged['sha256'][:12]}… → {dest}", file=sys.stderr)
+def _file_backend(args) -> str:
+    """ls / stat / pull / push 走哪条: shizuku (手机操控 + Shizuku) 还是 app (本地能力「手机文件」)。"""
+    via = getattr(args, "via", None) or "auto"
+    if via != "auto":
+        return via
+    try:
+        device = _request("GET", "/phone/device")["device"]
+    except CtlError:
+        return "app"
+    if (device.get("online") and device.get("shizuku") == "ready"
+            and "files" in (device.get("caps") or [])):
+        return "shizuku"
+    return "app"
+
+
+def _download_blob(task_id: str, out: Path) -> tuple[int, str]:
+    """把任务的二进制结果流式落到 out (先写 .part 再改名), 返回 (字节数, sha256)。"""
+    import hashlib
+    base, secret = _config()
+    req = urllib.request.Request(f"{base}/phone/tasks/{task_id}/blob")
+    req.add_header("X-Auth-Token", secret)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(f".{out.name}.part")
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp, open(tmp, "wb") as fh:
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                digest.update(chunk)
+                size += len(chunk)
+        tmp.replace(out)
+    except urllib.error.HTTPError as e:
+        tmp.unlink(missing_ok=True)
+        raise CtlError(f"取回文件失败 (HTTP {e.code})") from None
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        raise CtlError(f"取回 / 落盘失败: {e}") from None
+    return size, digest.hexdigest()
+
+
+def _progress_printer(label: str, total_hint: int | None = None):
     started = time.monotonic()
 
     def show(progress: dict) -> None:
         done = progress.get("done", 0)
+        total = progress.get("total") or total_hint or 0
         pct = (done / total * 100) if total else 100
         speed = done / max(0.001, time.monotonic() - started)
-        print(f"\r  {pct:5.1f}%  {_fmt_size(done)}/{_fmt_size(total)}  {_fmt_size(int(speed))}/s   ",
+        print(f"\r  {label} {pct:5.1f}%  {_fmt_size(done)}/{_fmt_size(total)}  {_fmt_size(int(speed))}/s   ",
               end="", file=sys.stderr, flush=True)
+    return show
 
-    task = run_task("download", {"file_id": staged["file_id"], "dest": dest, "overwrite": args.overwrite},
-                    wait=args.wait if args.wait != 90 else 4 * 3600, timeout_s=args.timeout,
-                    on_progress=None if args.json else show)
+
+def cmd_push(args) -> None:
+    src = Path(args.local).expanduser().resolve()
+    if not src.is_file():
+        raise CtlError(f"本地文件不存在: {src}")
+    backend = _file_backend(args)
+    dest = args.dest or ("/sdcard/Download/" if backend == "shizuku" else APP_PUSH_DIR)
+    if dest.endswith("/"):
+        dest = dest + src.name
+    if backend == "app" and src.stat().st_size > APP_PULL_MAX:
+        raise CtlError(f"走 App 传文件上限 {APP_PULL_MAX // (1024 * 1024)}MB（这个 {_fmt_size(src.stat().st_size)}）")
+    staged = _request("POST", "/phone/files", {"path": str(src)}, timeout=600)["file"]
+    total = staged["size"]
+    print(f"已挂出 {src.name} {_fmt_size(total)} sha256={staged['sha256'][:12]}… → {dest}"
+          + ("（走 App）" if backend == "app" else ""), file=sys.stderr)
+    action = "file_push" if backend == "app" else "download"
+    task = run_task(action, {"file_id": staged["file_id"], "dest": dest, "overwrite": args.overwrite},
+                    wait=args.wait if args.wait is not None else 4 * 3600, timeout_s=args.timeout,
+                    on_progress=None if args.json else _progress_printer("", total))
     if not args.json:
         print(file=sys.stderr)
     r = ensure_done(task)
@@ -369,30 +432,71 @@ def cmd_push(args) -> None:
 
 
 def cmd_pull(args) -> None:
-    task = run_task("pull", {"path": args.remote}, wait=args.wait if args.wait != 90 else 1800)
+    backend = _file_backend(args)
+    wait = args.wait if args.wait is not None else (args.timeout or 3600) + 120
+    if backend == "app":
+        task = run_task("file_pull", {"path": args.remote, "max_bytes": APP_PULL_MAX}, wait=wait,
+                        timeout_s=args.timeout,
+                        on_progress=None if args.json else _progress_printer("上传"))
+        if not args.json:
+            print(file=sys.stderr)
+    else:
+        task = run_task("pull", {"path": args.remote}, wait=wait)
     r = ensure_done(task)
-    data, _ = _request("GET", f"/phone/tasks/{task['id']}/blob", raw=True, timeout=600)
     out = Path(args.local) if args.local else Path("/tmp") / Path(args.remote).name
     if out.is_dir():
         out = out / Path(args.remote).name
-    out.write_bytes(data)
-    _out(args, {**r, "local": str(out)}, f"{out}  {_fmt_size(len(data))}")
+    size, sha = _download_blob(task["id"], out)
+    expected = (task.get("blob") or {}).get("sha256") or r.get("sha256")
+    if r.get("sha256") and r["sha256"] != sha:
+        raise CtlError(f"sha256 和手机上算的不一致（手机 {r['sha256'][:12]}… / 本机 {sha[:12]}…），文件留在 {out}")
+    if expected and expected != sha:
+        raise CtlError(f"sha256 不一致（服务端 {expected[:12]}… / 本机 {sha[:12]}…），文件留在 {out}")
+    _out(args, {**r, "local": str(out), "sha256_local": sha, "via": backend},
+         f"{out}  {_fmt_size(size)}" + ("  sha256 校验通过" if r.get("sha256") else "")
+         + ("（走 App）" if backend == "app" else ""))
+
+
+def _sort_entries(entries: list[dict], sort: str) -> list[dict]:
+    if sort == "mtime":
+        return sorted(entries, key=lambda e: -(e.get("mtime") or 0))
+    if sort == "size":
+        return sorted(entries, key=lambda e: -(e.get("size") or 0))
+    return sorted(entries, key=lambda e: (e.get("name") or "").lower())
 
 
 def cmd_ls(args) -> None:
-    r = ensure_done(run_task("ls", {"path": args.path}, wait=args.wait))
+    sort = "mtime" if args.t else args.sort
+    backend = _file_backend(args)
+    if backend == "app":
+        r = ensure_done(run_task("file_ls", {"path": args.path, "limit": args.limit, "sort": sort}, wait=args.wait))
+        entries = r.get("entries") or []
+    else:
+        # Shizuku 那边不排序: 多拿一些再在本机排 + 截
+        r = ensure_done(run_task("ls", {"path": args.path, "limit": 5000 if sort != "name" else args.limit},
+                                 wait=args.wait))
+        entries = _sort_entries(r.get("entries") or [], sort)
+        if len(entries) > args.limit:
+            r["total"] = r.get("total") or len(entries)
+            r["truncated"] = True
+        entries = entries[: args.limit]
+        r["entries"] = entries
     rows = []
-    for e in r.get("entries") or []:
-        mtime = datetime.fromtimestamp((e.get("mtime") or 0) / 1000).strftime("%m-%d %H:%M")
+    for e in entries:
+        mtime = datetime.fromtimestamp((e.get("mtime") or 0) / 1000).strftime("%Y-%m-%d %H:%M")
         name = e.get("name", "") + ("/" if e.get("dir") else "")
         rows.append(f"{'' if e.get('dir') else _fmt_size(e.get('size')):>8}  {mtime}  {name}")
     if r.get("truncated"):
-        rows.append(f"…（只列了前 {len(r.get('entries') or [])} 项）")
-    _out(args, r, "\n".join(rows) or "(空)")
+        total = r.get("total")
+        rows.append(f"…（{'共 ' + str(total) + ' 项，' if total else ''}只列了前 {len(entries)} 项；-n 调大）")
+    if r.get("note"):
+        rows.append(f"注意: {r['note']}")
+    _out(args, {**r, "via": backend}, "\n".join(rows) or "(空)")
 
 
 def cmd_stat(args) -> None:
-    r = ensure_done(run_task("stat", {"path": args.path}, wait=args.wait))
+    backend = _file_backend(args)
+    r = ensure_done(run_task("file_stat" if backend == "app" else "stat", {"path": args.path}, wait=args.wait))
     if not r.get("exists"):
         _out(args, r, "不存在")
         return
@@ -791,13 +895,22 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("ms", type=int, nargs="?", default=800); s.set_defaults(fn=cmd_longpress)
     s = sub.add_parser("text", parents=[common]); s.add_argument("text"); s.add_argument("--enter", action="store_true")
     s.add_argument("--mode", choices=["auto", "input", "paste"], default="auto"); s.set_defaults(fn=cmd_text)
-    s = sub.add_parser("push", parents=[common]); s.add_argument("local"); s.add_argument("dest", nargs="?")
-    s.add_argument("--overwrite", action="store_true"); s.add_argument("--timeout", type=int, default=None)
+    via = argparse.ArgumentParser(add_help=False)
+    via.add_argument("--via", choices=["auto", "app", "shizuku"], default="auto",
+                     help="走 App「手机文件」还是 Shizuku（默认 auto）")
+    s = sub.add_parser("push", parents=[common, via]); s.add_argument("local"); s.add_argument("dest", nargs="?")
+    s.add_argument("--force", "--overwrite", dest="overwrite", action="store_true", help="同名文件覆盖")
+    s.add_argument("--timeout", type=int, default=None)
     s.set_defaults(fn=cmd_push)
-    s = sub.add_parser("pull", parents=[common]); s.add_argument("remote"); s.add_argument("local", nargs="?")
+    s = sub.add_parser("pull", parents=[common, via]); s.add_argument("remote"); s.add_argument("local", nargs="?")
+    s.add_argument("--timeout", type=int, default=None, help="走 App 时手机最多传多久（秒，默认 3600，上限 14400）")
     s.set_defaults(fn=cmd_pull)
-    s = sub.add_parser("ls", parents=[common]); s.add_argument("path", nargs="?", default="/sdcard"); s.set_defaults(fn=cmd_ls)
-    s = sub.add_parser("stat", parents=[common]); s.add_argument("path"); s.set_defaults(fn=cmd_stat)
+    s = sub.add_parser("ls", parents=[common, via]); s.add_argument("path", nargs="?", default="/sdcard")
+    s.add_argument("--sort", choices=["name", "mtime", "size"], default="name")
+    s.add_argument("-t", action="store_true", help="按修改时间, 最新在前 (= --sort mtime)")
+    s.add_argument("-n", "--limit", type=int, default=200, help="最多列几项 (1-5000)")
+    s.set_defaults(fn=cmd_ls)
+    s = sub.add_parser("stat", parents=[common, via]); s.add_argument("path"); s.set_defaults(fn=cmd_stat)
     s = sub.add_parser("sh", parents=[common]); s.add_argument("command"); s.add_argument("--timeout", type=int, default=30)
     s.set_defaults(fn=cmd_sh)
     s = sub.add_parser("ui", parents=[common]); s.add_argument("--all", action="store_true", help="连没文字的容器也列")

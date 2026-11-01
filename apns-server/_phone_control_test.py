@@ -678,9 +678,10 @@ class HttpTest(unittest.TestCase):
         r = self._cli("sh", "id")
         self.assertEqual(r.returncode, 1)
         self.assertIn("需要 Shizuku", r.stderr)
-        r = self._cli("ls")
+        r = self._cli("ls", "--via", "shizuku")
         self.assertEqual(r.returncode, 1)
         self.assertIn("需要 Shizuku", r.stderr)
+        self.assertIn("手机文件", r.stderr)  # 指路 App 的本地能力
 
     def test_cli_tier_disabled_message(self) -> None:
         phone = FakePhone(self.base, caps="status")

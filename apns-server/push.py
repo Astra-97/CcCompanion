@@ -31536,6 +31536,7 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
     #          (a11y = 无障碍服务状态 on/enabled/off, v1.9.234 起; Shizuku 不可用时 App 改走无障碍)
     #          POST /phone/tasks/<id>/result   {ok,result,error,message}
     #          POST /phone/tasks/<id>/blob     原始 body（截图 / 拉回的文件）
+    #          POST /phone/tasks/<id>/blob?offset=&total=   分块上传（v1.9.236 走 App 拉文件，每块 ≤16MB）
     #          POST /phone/tasks/<id>/progress {done,total} → {cancelled}
     #          GET  /phone/files/<file_id>     待下发文件，支持 Range 断点续传
     #   本机侧（另需 loopback 且非 cloudflared/nginx 转发）：
@@ -31776,6 +31777,43 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
                         length = int(self.headers.get("Content-Length", ""))
                     except (TypeError, ValueError):
                         length = -1
+                    qs = self._query_params()
+                    if "offset" in qs or "total" in qs:
+                        # v1.9.236 分块上传（走 App 拉文件，≤200MB；每块 ≤16MB）
+                        try:
+                            offset = int((qs.get("offset") or [""])[0])
+                            total = int((qs.get("total") or [""])[0])
+                        except ValueError:
+                            self.close_connection = True
+                            self._send_json(400, {"ok": False, "error": "bad_offset"})
+                            return
+                        if not 0 < length <= phone_control.MAX_BLOB_CHUNK_BYTES:
+                            self.close_connection = True
+                            self._send_json(413, {"ok": False, "error": "bad_length"})
+                            return
+                        # 手机网络半断时别让这条线程一直卡在读上（卡住期间这次上传一直 busy）
+                        conn = getattr(self, "connection", None)
+                        old_timeout = None
+                        try:
+                            old_timeout = conn.gettimeout() if conn is not None else None
+                            if conn is not None:
+                                conn.settimeout(60)
+                        except OSError:
+                            conn = None
+                        try:
+                            payload = hub.put_blob_chunk(task_id, self.rfile, length, offset, total,
+                                                         self.headers.get("Content-Type", ""))
+                        except phone_control.PhoneTaskError:
+                            self.close_connection = True
+                            raise
+                        finally:
+                            if conn is not None:
+                                try:
+                                    conn.settimeout(old_timeout)
+                                except OSError:
+                                    pass
+                        self._send_json(200, payload)
+                        return
                     if not 0 < length <= phone_control.MAX_BLOB_BYTES:
                         self.close_connection = True
                         self._send_json(413, {"ok": False, "error": "bad_length"})

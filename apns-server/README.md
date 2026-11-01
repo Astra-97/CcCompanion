@@ -182,7 +182,7 @@ App 收到后 `POST /phone/tasks/claim` 按 id 领 → 执行 → `/phone/tasks/
   闹钟在后台没悬浮窗权限时只能发「点一下确认」通知（结果 `state=awaiting_tap`，她点了以后
   `phone-ctl task` 能看到 `set_verified`）。HC 后台读取权限要 Android 14+ / 新版 HC。
 - 代码：`phone_control.py`（任务 / 校验）、`phone_local.py`（通知缓冲、地点去抖、日程→日历、小部件）、
-  `scripts/phone-ctl`；测试 `.venv/bin/python3 -m unittest _phone_local_test _phone_control_test`。
+  `scripts/phone-ctl`；测试 `.venv/bin/python3 -m unittest _phone_local_test _phone_control_test _phone_files_test`。
 
 ### 屏幕操作的无障碍后端（`phone-ctl`，2026-10-31，App v1.9.234+）
 
@@ -203,7 +203,8 @@ Shizuku 在她的 OPPO / ColorOS 上永远授权不了（shell 拿不到 `GRANT_
 | **`ui [--all] [--max N] [--windows]`**（新） | 精简节点 dump：`[下标] 类名 "文字" desc= id= @中心x,y` + click/edit/scroll/checked 标记；默认只列有字/可点的可见节点，`--windows` 连弹窗/通知栏一起 |
 | **`clicktext "文字" [--index N] [--exact]`**（新） | 按文字/描述找节点（先完全相等再包含，活动窗口优先，同一点击目标只算一个），`ACTION_CLICK` 它或最近的可点父节点，不行就按坐标点；N 从 0 数 |
 
-- 只能 Shizuku：`push` / `pull` / `ls` / `stat` / `sh` —— 无障碍模式下服务端直接 409「需要 Shizuku」。
+- 只能 Shizuku：`sh` —— 无障碍模式下服务端直接 409「需要 Shizuku」。`push` / `pull` / `ls` / `stat`
+  没 Shizuku 时由 phone-ctl 自动改走 App 的「手机文件」本地能力（见下一节）。
   `ui` / `clicktext` 只能无障碍（手机报无障碍没开时 409「需要无障碍服务」）。
 - `phone-ctl status` 多两行：`无障碍: 已开启 / 没开…`、`操控后端: shizuku | accessibility | none（原因）`。
   手机轮询带 `a11y=on|enabled|off`，`/phone/device` 给出 `backend` / `backend_reason`。
@@ -215,6 +216,23 @@ Shizuku 在她的 OPPO / ColorOS 上永远授权不了（shell 拿不到 `GRANT_
   服务里不写日志；密码框内容不读（dump 里只有 `password` 标记）；审计日志里 `clicktext` 的文字只记字数。
 
 ## Quick start
+
+### 手机文件（`phone-ctl ls / stat / pull / push`，2026-11-01，App v1.9.236+，不需要 Shizuku）
+
+App 申请「所有文件访问权限」（`MANAGE_EXTERNAL_STORAGE`），「小克的本地能力」里多一项
+「手机文件（只读/拷出）」（feature `files`）。Shizuku 不可用时 `phone-ctl` 自动把文件命令改投本地能力任务
+（`--via app|shizuku` 可强制；auto = Shizuku 就绪且开了「文件」档才走 Shizuku）：
+
+| 命令 | 本地能力 action | 说明 |
+|---|---|---|
+| `ls [路径] [-t \| --sort name\|mtime\|size] [-n N]` | `file_ls` | 名字 / 大小 / 修改时间 / 是否目录；手机端排序再截前 N 项（默认 200，≤5000），超了显示「共 X 项」 |
+| `stat <路径>` | `file_stat` | 存不存在、大小、时间 |
+| `pull <手机路径> [本地路径]` | `file_pull` | ≤200MB；手机 `POST /phone/tasks/<id>/blob?offset=&total=` 分块（默认 8MB/块，服务端每块 ≤16MB，躲 Cloudflare 单请求 100MB）；跳块 409 带 `received`，从那接着传；到齐服务端算 sha256，phone-ctl 流式落盘后再和手机算的比一次 |
+| `push <本地文件> [手机路径] [--force]` | `file_push` | ≤200MB；她指定的任意普通目录（Android/data、obb 除外），不给就放 `/sdcard/Download/小克/`；以 `/` 结尾或已存在的目录 = 放进去用原文件名，目录不存在就建；同名默认不覆盖（内容一样算成功），`--force` 才覆盖；写完触发 MediaScanner；同 `download` 走 outbox + Range 断点续传 + sha256 |
+
+- 范围：`/sdcard` = `/storage/emulated/0` 下；`Android/data`、`Android/obb` 系统不让读，如实报错。`sh` 仍只能 Shizuku。
+- 报错都是原话：开关关着（服务端按上报提前 403）/ 没给「所有文件访问权限」/ 路径不存在 / 不是文件 / 读不到 / 超 200MB。
+- 手机端文件任务单独排队（不和闹钟/强提醒抢同一把锁），领取同其它本地能力（实时提醒 SSE / 轮询 local=1）。
 
 ### 1. Deps
 

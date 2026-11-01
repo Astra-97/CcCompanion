@@ -17,6 +17,12 @@ v1.9.234 起手机端有第二个后端: Shizuku 不可用时自动改走 App �
 (点按/滑动/返回/Home/打开 App/截屏/前台 App/输入文字 + ui / clicktext); 文件 / Shell 仍只认
 Shizuku。手机轮询带 a11y=on|enabled|off, /phone/device 给出 backend = shizuku/accessibility/none。
 
+v1.9.236 起「手机文件」也是一项本地能力 (App 申请「所有文件访问权限」, 不需要 Shizuku):
+file_ls / file_stat / file_pull / file_push 走本地能力那条送达路; phone-ctl ls / stat / pull / push
+在 Shizuku 不可用时自动改投这几个。范围同 /sdcard (= /storage/emulated/0), Android/data、Android/obb
+除外; file_push 可写她指定的任意目录 (不存在就建, 同名默认不覆盖)。file_pull / file_push 上限 200MB, 手机分块上传 (POST /blob?offset=&total=, 每块 ≤16MB,
+Cloudflare 单请求 100MB 上限之内; 断了从服务端回报的 received 续传)。
+
 任务只存内存 (服务重启即清空); 二进制结果与待下发文件落 state 目录, 有 TTL 清理。
 """
 from __future__ import annotations
@@ -62,6 +68,7 @@ LOCAL_FEATURES: dict[str, str] = {
     "widget": "桌面小部件",
     "notifs": "通知转发",
     "places": "到达提醒",
+    "files": "手机文件（只读/拷出）",
 }
 # action → feature
 LOCAL_ACTION_FEATURE: dict[str, str] = {
@@ -75,6 +82,10 @@ LOCAL_ACTION_FEATURE: dict[str, str] = {
     "clip": "clip",
     "widget_refresh": "widget",
     "places": "places",
+    "file_ls": "files",
+    "file_stat": "files",
+    "file_pull": "files",
+    "file_push": "files",
 }
 # 只保留最新一条待领的 action (旧的 pending 直接 superseded)
 COALESCE_ACTIONS = frozenset({"calendar_sync", "widget_refresh"})
@@ -122,6 +133,11 @@ ACTIONS: dict[str, tuple[str, int, int]] = {
     "clip": ("local", 15, 60),
     "widget_refresh": ("local", 30, 120),
     "places": ("local", 15, 60),
+    # 手机文件 (App v1.9.236, 所有文件访问权限; 不需要 Shizuku)
+    "file_ls": ("local", 30, 120),
+    "file_stat": ("local", 20, 60),
+    "file_pull": ("local", 3600, 4 * 3600),
+    "file_push": ("local", 3600, 4 * 3600),
 }
 
 # ── 操控后端 (App v1.9.234) ──────────────────────────────────────────────────
@@ -144,8 +160,8 @@ A11Y_ZH = {
     "unsupported": "这台手机不支持",
 }
 NEEDS_SHIZUKU_MESSAGE = (
-    "需要 Shizuku：文件传输 / 列目录 / 拉文件 / Shell 只能走 Shizuku，"
-    "无障碍模式做不了（她的 ColorOS 上 Shizuku 授权不了）"
+    "需要 Shizuku：Shell 只能走 Shizuku（她的 ColorOS 上 Shizuku 授权不了）；"
+    "列目录 / 拉文件 / 传文件请用 App 的「手机文件」本地能力（phone-ctl ls/pull/push 会自动切过去）"
 )
 NEEDS_A11Y_MESSAGE = "需要无障碍服务：App → 设置 → 小克的本地能力 →「屏幕操作（无障碍）」去开"
 MAX_UI_NODES = 1000
@@ -196,6 +212,9 @@ KEYS: dict[str, int] = {
 }
 
 PHONE_PATH_ROOTS: tuple[str, ...] = ("/sdcard", "/storage/emulated/0")
+# file_push (走 App) 不许写的系统保护目录 (手机端同规则再校一次)
+PUSH_FORBIDDEN_DIRS: tuple[str, ...] = ("Android/data", "Android/obb")
+FILE_LS_SORTS = ("name", "mtime", "size")
 PKG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$")
 TASK_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 FILE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -219,22 +238,29 @@ MAX_TASKS = 300
 MAX_TEXT_CHARS = 2000
 MAX_SHELL_CHARS = 4000
 MAX_BLOB_BYTES = 128 * 1024 * 1024
+FILE_PULL_MAX_BYTES = 200 * 1024 * 1024  # 走 App 拉文件的上限
+MAX_BLOB_CHUNK_BYTES = 16 * 1024 * 1024  # 分块上传每块上限 (Cloudflare 单请求 100MB)
 MAX_STAGE_BYTES = 4 * 1024 * 1024 * 1024
 MAX_RESULT_JSON_BYTES = 2 * 1024 * 1024
-BLOB_ACTIONS = frozenset({"screenshot", "pull"})
+BLOB_ACTIONS = frozenset({"screenshot", "pull", "file_pull"})
+BLOB_LIMITS: dict[str, int] = {"file_pull": FILE_PULL_MAX_BYTES}
+# 带 outbox 文件下发的 action (手机按 /phone/files/<id> 断点续传下载)
+OUTBOX_ACTIONS = frozenset({"download", "file_push"})
 
 
 class PhoneTaskError(Exception):
     """可直接回给调用方的错误 (status, code, 中文说明)。"""
 
-    def __init__(self, status: int, code: str, message: str = "") -> None:
+    def __init__(self, status: int, code: str, message: str = "",
+                 extra: dict[str, Any] | None = None) -> None:
         super().__init__(message or code)
         self.status = status
         self.code = code
         self.message = message or code
+        self.extra = extra or {}
 
     def payload(self) -> dict[str, Any]:
-        return {"ok": False, "error": self.code, "message": self.message}
+        return {**self.extra, "ok": False, "error": self.code, "message": self.message}
 
 
 # ── 参数校验 (纯函数, 手机端 PhoneControlPolicy 同规则再校一次) ─────────────
@@ -260,6 +286,26 @@ def normalize_phone_path(raw: Any, *, allow_root: bool = True) -> str:
         if norm.startswith(root + "/"):
             return norm
     raise PhoneTaskError(400, "bad_path", "只允许 /sdcard/ 或 /storage/emulated/0/ 下的路径")
+
+
+def is_restricted_phone_path(path: str) -> bool:
+    """Android/data、Android/obb 及其下面 (系统不让第三方 App 读写)。path 须已规范化。"""
+    for root in PHONE_PATH_ROOTS:
+        if path == root or path.startswith(root + "/"):
+            rel = path[len(root):].strip("/").lower()
+            return any(rel == d.lower() or rel.startswith(d.lower() + "/") for d in PUSH_FORBIDDEN_DIRS)
+    return False
+
+
+def normalize_push_dest(raw: Any) -> str:
+    """file_push 的目标: /sdcard (= /storage/emulated/0) 下的具体路径, Android/data、Android/obb 除外。
+
+    目标是已存在的目录时手机端放进去 (用原文件名); 父目录不存在就建。
+    """
+    path = normalize_phone_path(raw, allow_root=False)
+    if is_restricted_phone_path(path):
+        raise PhoneTaskError(400, "bad_dest", "Android/data、Android/obb 是系统保护目录，写不进去")
+    return path
 
 
 def _int_arg(args: dict[str, Any], key: str, lo: int, hi: int, default: int | None = None) -> int:
@@ -511,6 +557,31 @@ def _validate_local(action: str, args: dict[str, Any]) -> dict[str, Any]:
         out["text"] = text
         out["notify"] = args.get("notify", True) is not False
         return out
+    if action == "file_ls":
+        out["path"] = normalize_phone_path(args.get("path", "/sdcard"), allow_root=True)
+        out["limit"] = _int_arg(args, "limit", 1, 5000, default=200)
+        sort = args.get("sort", "name")
+        if sort not in FILE_LS_SORTS:
+            raise PhoneTaskError(400, "bad_args", "sort 只能是 name / mtime / size")
+        out["sort"] = sort
+        return out
+    if action == "file_stat":
+        out["path"] = normalize_phone_path(args.get("path"), allow_root=True)
+        return out
+    if action == "file_pull":
+        out["path"] = normalize_phone_path(args.get("path"), allow_root=False)
+        out["max_bytes"] = _int_arg(args, "max_bytes", 1, FILE_PULL_MAX_BYTES, default=FILE_PULL_MAX_BYTES)
+        out["chunk_bytes"] = _int_arg(args, "chunk_bytes", 256 * 1024, MAX_BLOB_CHUNK_BYTES,
+                                      default=8 * 1024 * 1024)
+        return out
+    if action == "file_push":
+        file_id = args.get("file_id")
+        if not isinstance(file_id, str) or not FILE_ID_RE.match(file_id):
+            raise PhoneTaskError(400, "bad_file_id", "file_id 不合法（先 POST /phone/files 挂文件）")
+        out["file_id"] = file_id
+        out["dest"] = normalize_push_dest(args.get("dest"))
+        out["overwrite"] = bool(args.get("overwrite", False))
+        return out
     # show_alarms / ring_stop / widget_refresh / places: 无参数
     return out
 
@@ -619,10 +690,11 @@ class PhoneControlHub:
             task["message"] = message
         if result is not None:
             task["result"] = result
-        if task["action"] == "download":
+        if task["action"] in OUTBOX_ACTIONS:
             entry = self._outbox.get(task["args"].get("file_id", ""))
             if entry is not None:
                 entry["expires_at"] = min(entry["expires_at"], self._now() + OUTBOX_AFTER_DONE_S)
+        self._drop_upload(task)  # 没传完的分块上传随任务结束清掉
         self._audit(task)
         self._cond.notify_all()
 
@@ -658,6 +730,13 @@ class PhoneControlHub:
                 Path(blob["path"]).unlink()
             except OSError:
                 pass
+        self._drop_upload(task)
+
+    @staticmethod
+    def _drop_upload(task: dict[str, Any]) -> None:
+        upload = task.pop("upload", None)
+        if upload:
+            Path(upload["path"]).unlink(missing_ok=True)
 
     def sweep(self) -> None:
         """超时 / 过期清理; 每次进出队列时顺手跑。"""
@@ -734,7 +813,7 @@ class PhoneControlHub:
             elif (device["online"] and action in A11Y_ONLY_ACTIONS and device["accessibility"] is not None
                   and device["accessibility"] != "on"):
                 raise PhoneTaskError(409, "needs_accessibility", NEEDS_A11Y_MESSAGE)
-            if action == "download":
+            if action in OUTBOX_ACTIONS:
                 entry = self._outbox.get(clean["file_id"])
                 if entry is None:
                     raise PhoneTaskError(404, "file_not_found", "挂出的文件不存在或已过期")
@@ -742,6 +821,9 @@ class PhoneControlHub:
                 clean["size"] = entry["size"]
                 clean["sha256"] = entry["sha256"]
                 clean["name"] = entry["name"]
+                if action == "file_push" and entry["size"] > FILE_PULL_MAX_BYTES:
+                    raise PhoneTaskError(413, "too_large",
+                                         f"走 App 传文件上限 {FILE_PULL_MAX_BYTES // (1024 * 1024)}MB")
             live = sum(1 for t in self._tasks.values() if t["status"] not in TERMINAL)
             if live >= 50 or len(self._tasks) >= MAX_TASKS:
                 raise PhoneTaskError(429, "queue_full", "队列满了，等等手机先做完")
@@ -764,7 +846,7 @@ class PhoneControlHub:
                 "followup": [],
                 "claimed_via": None,
             }
-            if action == "download":
+            if action in OUTBOX_ACTIONS:
                 self._outbox[clean["file_id"]]["task_id"] = task_id
             self._tasks[task_id] = task
             self._cond.notify_all()
@@ -1134,6 +1216,102 @@ class PhoneControlHub:
                 "sha256": digest.hexdigest(),
             }
             return {"ok": True, "size": length, "sha256": task["blob"]["sha256"]}
+
+    def put_blob_chunk(self, task_id: str, stream: BinaryIO, length: int, offset: int, total: int,
+                       content_type: str) -> dict[str, Any]:
+        """分块上传 (App v1.9.236 拉文件): POST /blob?offset=&total=, 每块 ≤16MB, 按顺序。
+
+        offset 必须 ≤ 已收到的字节数 (小于 = 上一块重传, 截掉重写); 大于就 409 带 received,
+        手机从 received 接着传。最后一块到齐时算 sha256、转成正式 blob。
+        """
+        if not 0 < length <= MAX_BLOB_CHUNK_BYTES:
+            raise PhoneTaskError(413, "bad_length", f"每块 1 字节到 {MAX_BLOB_CHUNK_BYTES // (1024 * 1024)}MB")
+        with self._cond:
+            task = self._claimed(task_id)
+            if task["action"] not in BLOB_ACTIONS:
+                raise PhoneTaskError(400, "blob_not_expected", "这个任务没有二进制结果")
+            limit = BLOB_LIMITS.get(task["action"], MAX_BLOB_BYTES)
+            if not 0 < total <= limit:
+                raise PhoneTaskError(413, "too_large", f"文件 {total} 字节，超过上限 {limit // (1024 * 1024)}MB")
+            if offset < 0 or offset + length > total:
+                raise PhoneTaskError(400, "bad_offset", "offset / 长度超出文件大小")
+            upload = task.get("upload")
+            if upload is not None and upload["busy"]:
+                raise PhoneTaskError(409, "upload_busy", "上一块还在写", {"received": upload["received"]})
+            if upload is None or upload["total"] != total:
+                if offset != 0:
+                    raise PhoneTaskError(409, "upload_offset_mismatch", "服务端还没有这次上传，从 0 开始",
+                                         {"received": 0})
+                self._drop_upload(task)
+                upload = {"path": str(self.blob_dir / f".{task_id}.{secrets.token_hex(4)}.part"), "total": total,
+                          "received": 0, "busy": False}
+                task["upload"] = upload
+            if offset > upload["received"]:
+                raise PhoneTaskError(409, "upload_offset_mismatch", f"服务端只收到 {upload['received']} 字节",
+                                     {"received": upload["received"]})
+            upload["busy"] = True
+            upload["received"] = offset  # 下面先截到 offset 再写: 写坏了也只剩前 offset 字节
+        part = Path(upload["path"])
+        complete = False
+        try:
+            remaining = length
+            with open(part, "r+b" if part.exists() else "wb") as fout:
+                fout.seek(offset)
+                fout.truncate(offset)
+                while remaining > 0:
+                    chunk = stream.read(min(remaining, 256 * 1024))
+                    if not chunk:
+                        break
+                    fout.write(chunk)
+                    remaining -= len(chunk)
+                if remaining:
+                    fout.truncate(offset)
+                    raise PhoneTaskError(400, "short_body", "上传中断，这一块不完整", {"received": offset})
+            with self._cond:
+                task = self._claimed(task_id)
+                if task.get("upload") is not upload:
+                    raise PhoneTaskError(409, "upload_reset", "上传被重置了", {"received": 0})
+                upload["received"] = offset + length
+                task["progress"] = {"done": upload["received"], "total": total, "at": self._now()}
+                self._cond.notify_all()
+                complete = upload["received"] == total
+                if not complete:
+                    return {"ok": True, "received": upload["received"], "total": total, "complete": False}
+            digest = hashlib.sha256()
+            with open(part, "rb") as fin:
+                while True:
+                    chunk = fin.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            ctype = (content_type or "application/octet-stream").split(";")[0].strip()[:100]
+            with self._cond:
+                task = self._claimed(task_id)
+                if task.get("upload") is not upload:
+                    raise PhoneTaskError(409, "upload_reset", "上传被重置了", {"received": 0})
+                blob = task.pop("blob", None)
+                if blob:
+                    Path(blob["path"]).unlink(missing_ok=True)
+                final = self.blob_dir / f"{task_id}.bin"
+                part.replace(final)
+                task.pop("upload", None)
+                task["blob"] = {
+                    "path": str(final),
+                    "size": total,
+                    "content_type": ctype or "application/octet-stream",
+                    "sha256": digest.hexdigest(),
+                }
+                return {"ok": True, "received": total, "total": total, "complete": True,
+                        "sha256": task["blob"]["sha256"]}
+        except OSError as exc:
+            raise PhoneTaskError(500, "blob_save_failed", str(exc), {"received": offset}) from exc
+        finally:
+            with self._cond:
+                upload["busy"] = False
+                if self._tasks.get(task_id, {}).get("upload") is not upload:
+                    # 任务结束 / 被重置: 收尾时把残留的分块文件删掉 (转正的不在这条路径上)
+                    if not complete or part.exists():
+                        part.unlink(missing_ok=True)
 
     def submit_result(self, task_id: str, body: dict[str, Any]) -> dict[str, Any]:
         with self._cond:
