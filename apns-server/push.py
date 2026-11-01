@@ -9514,13 +9514,16 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/notion/page/"):
             self._handle_notion_page_get()
             return
-        # --- 小克人格文件只读 (app 记忆库备份附带 persona-xiaoke.md) ---
-        # 人格原文比普通只读端点敏感: 只认 shared_secret, 不吃网页会话, fail-closed。
-        if request_path == "/persona/xiaoke":
+        # --- app 记忆库备份的附带文件 (白名单见 phone-backup-files.json) ---
+        # 人格 / 恢复说明书比普通只读端点敏感: 只认 shared_secret, 不吃网页会话, fail-closed。
+        if request_path in ("/phone-backup/files", "/phone-backup/file"):
             if not self._native_pairing_auth_matches():
                 self._send_json(401, {"error": "unauthorized"})
                 return
-            self._handle_persona_get()
+            if request_path == "/phone-backup/files":
+                self._handle_phone_backup_list()
+            else:
+                self._handle_phone_backup_file()
             return
         # --- Memory library proxy GET (read-only, stateless) ---
         if self.path.startswith("/memory/"):
@@ -28034,40 +28037,63 @@ class PushHandler(BaseHTTPRequestHandler):
         cls._memory_token_cache = m.group(1)
         return cls._memory_token_cache
 
-    # 小克人格 2026-11-01 从 CLAUDE.md 搬进 Claude Code 自定义输出风格; app 备份时
-    # 把它跟 memories.jsonl / messages.jsonl 一起覆盖写到 Documents。只读、固定路径。
-    _PERSONA_PATH = Path("/root/.claude/output-styles/xiaoke.md")
-    _PERSONA_MAX_BYTES = 512 * 1024
+    # App 记忆库备份每轮附带的文件 (小克人格 / 恢复说明书…)。白名单在
+    # phone-backup-files.json, 每次请求重读; 客户端只能按 name 取, 不接受路径。
+    _PHONE_BACKUP_CONFIG_PATH: Path | None = None  # 测试注入; None = 模块默认路径
 
-    def _handle_persona_get(self) -> None:
-        """GET /persona/xiaoke — 返回人格 markdown 原文 (JSON 包一层, 带 sha256)。"""
-        path = self._PERSONA_PATH
+    def _handle_phone_backup_list(self) -> None:
+        """GET /phone-backup/files — 清单: [{name, available, bytes, sha256, updatedAt}]。"""
+        import phone_backup_files as pbf
+
+        entries = pbf.load_entries(self._PHONE_BACKUP_CONFIG_PATH)
+        self._send_json(200, {"ok": True, "files": [pbf.describe(e) for e in entries]})
+
+    def _handle_phone_backup_file(self) -> None:
+        """GET /phone-backup/file?name=<清单里的 name> — 原样字节 (octet-stream)。"""
+        from urllib.parse import parse_qs, urlparse
+        import phone_backup_files as pbf
+
+        qs = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+        names = qs.get("name") or []
+        if len(names) != 1 or set(qs) != {"name"}:
+            self._send_json(400, {"error": "exactly one name required"})
+            return
+        entry = pbf.find_entry(names[0], self._PHONE_BACKUP_CONFIG_PATH)
+        if entry is None:
+            self._send_json(404, {"error": "not found"})
+            return
         try:
-            st = path.stat()
-            if not stat.S_ISREG(st.st_mode):
-                raise FileNotFoundError(str(path))
-            if st.st_size > self._PERSONA_MAX_BYTES:
-                self._send_json(413, {"error": "persona too large"})
-                return
-            data = path.read_bytes()
-            content = data.decode("utf-8")
+            data, mtime = pbf.read_entry(entry)
         except FileNotFoundError:
-            self._send_json(404, {"error": "persona not found"})
+            self._send_json(404, {"error": "not found"})
             return
-        except (OSError, UnicodeDecodeError) as exc:
-            logger.warning("persona read failed: %s", type(exc).__name__)
-            self._send_json(500, {"error": "persona unreadable"})
+        except ValueError:
+            self._send_json(413, {"error": "file too large"})
             return
-        self._send_json(200, {
-            "ok": True,
-            "name": "xiaoke",
-            "filename": "persona-xiaoke.md",
-            "content": content,
-            "bytes": len(data),
-            "sha256": hashlib.sha256(data).hexdigest(),
-            "updatedAt": datetime.fromtimestamp(st.st_mtime, timezone.utc)
-            .isoformat(timespec="seconds").replace("+00:00", "Z"),
-        })
+        except OSError as exc:
+            logger.warning("phone-backup read failed name=%s err=%s", entry.name, type(exc).__name__)
+            self._send_json(500, {"error": "unreadable"})
+            return
+        self._send_phone_backup_bytes(entry.name, data, mtime)
+
+    def _send_phone_backup_bytes(self, name: str, data: bytes, mtime: float) -> None:
+        import phone_backup_files as pbf
+
+        self.send_response(200)
+        for header, value in (
+            ("Content-Type", "application/octet-stream"),
+            ("Content-Length", str(len(data))),
+            ("X-Backup-File-Name", name),
+            ("X-Backup-File-Sha256", hashlib.sha256(data).hexdigest()),
+            ("X-Backup-File-Updated-At", pbf.iso_utc(mtime)),
+            ("Cache-Control", "no-store"),
+            ("Pragma", "no-cache"),
+            ("X-Content-Type-Options", "nosniff"),
+            ("Referrer-Policy", "no-referrer"),
+        ):
+            self.send_header(header, value)
+        self.end_headers()
+        self.wfile.write(data)
 
     def _handle_memory_get(self):
         """GET /memory/* — read-only whitelist proxy to the memory library."""
