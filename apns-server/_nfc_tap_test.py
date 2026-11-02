@@ -9,7 +9,7 @@
   6. 私聊胶囊: role=assistant + mihome_event, 文案; test 不冒泡, 去重不冒泡
   7. 页面: 200 HTML, intent URL, 无外部资源, 门口版文案
 
-设备调用全部 mock, 绝不真调米家; 不碰线上 8291 服务。
+设备调用全部 mock (回家 + 出门两套 runner), 绝不真调米家; 不碰线上 8291 服务。
 """
 import io
 import json
@@ -32,6 +32,14 @@ OK_RESULT = {
     "dry_run": False,
     "curtain": {"ok": True, "detail": "close sent"},
     "light": {"ok": True, "already_on": False, "detail": "on"},
+}
+
+LEAVE_OK_RESULT = {
+    "dry_run": False,
+    "humidifier": {"ok": True, "already_off": False, "detail": "off"},
+    "curtain": {"ok": True, "detail": "open sent"},
+    "light": {"ok": True, "already_off": False, "detail": "off"},
+    "ac": {"ok": True, "already_off": False, "detail": "off"},
 }
 
 
@@ -87,6 +95,15 @@ class NfcTapBase(unittest.TestCase):
             return {**self.home_result, "dry_run": dry_run}
 
         self._patch_cls("_nfc_run_home_devices", staticmethod(fake_home))
+        # 出门模式设备 (2026-11-02) 同样全 mock，绝不真调米家。
+        self.leave_calls = []
+        self.leave_result = json.loads(json.dumps(LEAVE_OK_RESULT))
+
+        def fake_leave(*, dry_run):
+            self.leave_calls.append(dry_run)
+            return {**self.leave_result, "dry_run": dry_run}
+
+        self._patch_cls("_nfc_run_leave_devices", staticmethod(fake_leave))
         self.channel_calls = []
         self.tmux_calls = []
         self.bubbles = []

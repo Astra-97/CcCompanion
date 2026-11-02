@@ -30849,6 +30849,8 @@ class PushHandler(BaseHTTPRequestHandler):
     _NFC_TAP_ASYNC = True  # tests flip this to deliver inline
     _NFC_HOME_CMD = ("/root/mihome/venv/bin/python", "/root/mihome/home_arrive.py")
     _NFC_HOME_TIMEOUT = 90
+    _NFC_LEAVE_CMD = ("/root/mihome/venv/bin/python", "/root/mihome/home_leave.py")
+    _NFC_LEAVE_TIMEOUT = 150  # 四台设备，每台最多 2 次读写确认
     _NFC_HINT = "（她手机正在打开 CC Companion，用 companion reply contact_id=xiaoke 跟她打招呼）"
     # 捏螃蟹吱一声 (2026-10-28)：summon tag 碰卡通过 20s 门后，服务端直接从预录片段里
     # 随机挑一条小克语音气泡发到私聊（不经模型、不调 ElevenLabs）。clips.json 每次现读，
@@ -31029,6 +31031,79 @@ class PushHandler(BaseHTTPRequestHandler):
                 }
         return out
 
+    # 出门模式设备 (2026-11-02 方小南定)：关加湿器、拉开卧室窗帘、关卧室吸顶灯、关主卧空调插座。
+    # 男朋友屋/次卧设备和风扇一律不碰；08:28 加湿器兜底 + 08:30 leaving-check 仍是安全网。
+    # (key, 名字, 成功说法, 失败动作, 有无 already_off)
+    _NFC_LEAVE_PARTS = (
+        ("humidifier", "加湿器", "加湿器已关", "关闭", True),
+        ("curtain", "窗帘", "窗帘已拉开", "拉开", False),
+        ("light", "灯", "灯已关", "关闭", True),
+        ("ac", "主卧空调插座", "主卧空调插座已关", "关闭", True),
+    )
+
+    @classmethod
+    def _nfc_run_leave_devices(cls, *, dry_run: bool) -> dict[str, Any]:
+        """Run /root/mihome/home_leave.py; always returns a normalized dict."""
+        cmd = list(cls._NFC_LEAVE_CMD) + (["--dry-run"] if dry_run else [])
+
+        def failed(detail: str) -> dict[str, Any]:
+            out: dict[str, Any] = {"dry_run": dry_run}
+            for key, _name, _ok, _verb, has_already in cls._NFC_LEAVE_PARTS:
+                out[key] = {"ok": False, "detail": detail, **({"already_off": False} if has_already else {})}
+            return out
+
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=cls._NFC_LEAVE_TIMEOUT,
+                env={**os.environ, "HOME": "/root"}, cwd="/root/mihome",
+            )
+        except subprocess.TimeoutExpired:
+            return failed("超时")
+        except Exception as exc:
+            return failed(f"{type(exc).__name__}")
+        lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip().startswith("{")]
+        try:
+            data = json.loads(lines[-1]) if lines else None
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            return failed(f"脚本无结果 rc={proc.returncode}")
+        out = failed("无结果")
+        out["dry_run"] = bool(data.get("dry_run", dry_run))
+        for key, _name, _ok, _verb, has_already in cls._NFC_LEAVE_PARTS:
+            item = data.get(key)
+            if isinstance(item, dict):
+                out[key] = {
+                    "ok": bool(item.get("ok")),
+                    "detail": str(item.get("detail") or "")[:120],
+                    **({"already_off": bool(item.get("already_off"))} if has_already else {}),
+                }
+        return out
+
+    @classmethod
+    def _nfc_leave_failed(cls, result: dict[str, Any]) -> list[str]:
+        return [name for key, name, *_ in cls._NFC_LEAVE_PARTS if not (result.get(key) or {}).get("ok")]
+
+    @classmethod
+    def _nfc_leave_summary(cls, result: dict[str, Any]) -> str:
+        """「加湿器已关、窗帘已拉开、灯已关、主卧空调插座已关」；失败逐个点名（宁误报不漏报）。"""
+        parts = []
+        for key, name, ok_text, verb, _has_already in cls._NFC_LEAVE_PARTS:
+            item = result.get(key) or {}
+            if item.get("ok") and item.get("already_off"):
+                parts.append(f"{name}本来就关着")
+            elif item.get("ok"):
+                parts.append(ok_text)
+            else:
+                parts.append(f"{name}{verb}失败（{item.get('detail') or '未知'}）")
+        text = "、".join(parts)
+        failed = cls._nfc_leave_failed(result)
+        if failed:
+            text += f"——{'、'.join(failed)}要手动处理一下"
+        if result.get("dry_run"):
+            text += "（dry-run，没真动设备）"
+        return text
+
     @staticmethod
     def _nfc_home_summary(result: dict[str, Any]) -> str:
         cur = result.get("curtain") or {}
@@ -31098,7 +31173,10 @@ class PushHandler(BaseHTTPRequestHandler):
             name = profile.get("name") or "门口螃蟹"
             tag = f"[NFC·{name}·出门{'·测试' if test else ''}]"
             who = "（测试，不是方小南碰的，不用回她）" if test else cls._NFC_LEAVE_HINT
-            return f"{tag} {hhmm} 方小南贴了一下{name}，出门上班了{who}"
+            body = f"：{cls._nfc_leave_summary(home_result)}" if home_result is not None else ""
+            if home_result is not None and not test and cls._nfc_leave_failed(home_result):
+                who += "（有设备没处理成功，提醒她手动关一下）"
+            return f"{tag} {hhmm} 方小南贴了一下{name}，出门上班了{body}{who}"
         if profile.get("action") == "home":
             name = profile.get("name") or "门口螃蟹"
             tag = f"[NFC·{name}·回家{'·测试' if test else ''}]"
@@ -31153,7 +31231,8 @@ class PushHandler(BaseHTTPRequestHandler):
             # 出门模式：nfc_action 仍是 home（向后兼容），另加 leave=true。
             meta["leave"] = bool(profile.get("leave"))
             if home_result is not None:
-                meta["home_result"] = home_result
+                # 出门模式的设备结果放 leave_result（四台设备，字段与回家模式不同）。
+                meta["leave_result" if profile.get("leave") else "home_result"] = home_result
         return {
             "message_id": f"{'pet' if is_pet else 'nfc'}:{tag_id}:{int(time.time() * 1000)}",
             "contact_id": cls._NFC_TAP_CONTACT,
@@ -31168,10 +31247,15 @@ class PushHandler(BaseHTTPRequestHandler):
     ) -> None:
         """小克私聊系统胶囊（同 sun-bubble：role=assistant + mihome_event 渲染开关）。"""
         text = profile.get("bubble") or f"方小南捏了捏🤏{profile.get('location') or '床头'}的🦀"
-        if home_result is not None:
-            text += self._nfc_home_bubble_suffix(home_result)
+        severity = "info"
         if profile.get("action") == "home" and profile.get("leave"):
             text = "方小南出门了🚪"
+            if home_result is not None:
+                text += f" · {self._nfc_leave_summary(home_result)}"
+                if self._nfc_leave_failed(home_result):
+                    severity = "warn"
+        elif home_result is not None:
+            text += self._nfc_home_bubble_suffix(home_result)
         is_pet = profile.get("kind") == "pet"
         if is_pet and profile.get("hammer"):
             text = "方小南抡起爆锤🔨砸晕了屏幕上的🦀"
@@ -31185,7 +31269,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 source="pet-tap" if is_pet else "nfc-tap",
                 metadata={
                     "mihome_event": True,
-                    "severity": "info",
+                    "severity": severity,
                     "items": [{"device": profile.get("name") or "螃蟹挂件", "change": "tap", "human": text}],
                     "device_event": {
                         "kind": "pet_tap" if is_pet else "nfc_tap",
@@ -31323,8 +31407,11 @@ class PushHandler(BaseHTTPRequestHandler):
         def run() -> None:
             try:
                 home_result = None
-                # 出门模式绝不动设备（窗帘/灯都不碰）。
-                if profile.get("action") == "home" and night and not profile.get("leave"):
+                if profile.get("action") == "home" and profile.get("leave"):
+                    # 出门模式 (2026-11-02)：关加湿器/拉开窗帘/关灯/关主卧空调插座（test 只 dry-run）。
+                    home_result = self._nfc_run_leave_devices(dry_run=test)
+                    logger.info("nfc leave devices tag=%s result=%s", tag_id, home_result)
+                elif profile.get("action") == "home" and night:
                     home_result = self._nfc_run_home_devices(dry_run=test)
                     logger.info("nfc home devices tag=%s result=%s", tag_id, home_result)
                 if not test:
@@ -32114,7 +32201,8 @@ border:1px solid var(--btn-bd);color:var(--btn-ink);text-decoration:none;font-si
 
         k 决定是哪个 tag（床头=summon 叫小克；门口=home 回家模式）。错/缺 → 404
         且不通知。每个 tag 20s 内只处理首次碰卡：给小克会话发 channel 通知、
-        私聊冒系统胶囊（test 不冒），home 且天黑时异步关窗帘开灯（test 只 dry-run）。
+        私聊冒系统胶囊（test 不冒），home 且天黑时异步关窗帘开灯；home 且工作日早上
+        （出门模式）异步关加湿器/拉开窗帘/关灯/关主卧空调插座（test 都只 dry-run）。
         f=1 是 intent 失败后的回落页：不再自动跳、不通知、不动设备。
         """
         qs = self._query_params()

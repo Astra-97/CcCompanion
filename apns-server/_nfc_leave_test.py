@@ -6,22 +6,29 @@
   3. 门口 tag 端到端 (真实判定 + 固定时钟):
      普通工作日早上 → 出门; 周末早上 → 原逻辑; 调休补班周六早上 → 出门;
      节假日里的工作日早上 → 原逻辑; 工作日晚上 → 原「欢迎回家」关窗帘开灯
-  4. 出门模式: 不动设备、胶囊「方小南出门了🚪」、页面「路上小心 / 我陪你去上班」、
-     通知「[NFC·门口螃蟹·出门] HH:MM 方小南贴了一下门口螃蟹，出门上班了」、metadata leave=true
-     且 nfc_action 仍是 home; test=1 带测试标记不冒胶囊; 床头 tag 不受影响
+  4. 出门模式 (2026-11-02 起动设备): 跑出门设备 runner（关加湿器/拉开窗帘/关灯/关主卧空调插座），
+     不跑回家 runner; 胶囊「方小南出门了🚪 · 加湿器已关、窗帘已拉开、灯已关、主卧空调插座已关」、
+     页面「路上小心 / 我陪你去上班」、通知「[NFC·门口螃蟹·出门] HH:MM 方小南贴了一下门口螃蟹，
+     出门上班了：<设备小结>」、metadata leave=true + leave_result 且 nfc_action 仍是 home;
+     test=1 只 dry-run、带测试标记不冒胶囊; 床头 tag 不受影响
+  5. 出门设备小结: 本来就关着 / 失败逐个点名 + 「要手动处理一下」+ 胶囊 severity=warn
+  6. 出门 runner: 子进程输出解析/垃圾输出/缺二进制; 真 home_leave.py --dry-run（零 API 调用）
 
-全部 mock, 不碰线上 8291 服务、不动米家。
+全部 mock, 不碰线上 8291 服务、不动米家（真脚本只跑 --dry-run）。
 """
+import json
+import os
 import unittest
 from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 import cn_workday
 from push import PushHandler
-from _nfc_tap_test import BEDSIDE, DOOR, NfcTapBase
+from _nfc_tap_test import BEDSIDE, DOOR, LEAVE_OK_RESULT, NfcTapBase
 
 BJ = ZoneInfo("Asia/Shanghai")
 ORIG_LEAVE = PushHandler.__dict__["_nfc_is_leave_time"]
+LEAVE_SUMMARY = "加湿器已关、窗帘已拉开、灯已关、主卧空调插座已关"
 
 
 def bj(y, m, d, hh, mm=0) -> datetime:
@@ -95,18 +102,23 @@ class DoorLeaveEndToEndTest(NfcTapBase):
         self.night = False
 
     def assert_leave(self, h) -> None:
-        self.assertEqual(self.home_calls, [])  # 不动任何设备
+        self.assertEqual(self.home_calls, [])  # 回家那套（关窗帘开灯）绝不跑
+        self.assertEqual(self.leave_calls, [False])  # 出门那套真跑一次
         call = self.channel_calls[0]
         meta = call["metadata"]
         self.assertEqual((meta["nfc_tag"], meta["nfc_action"]), ("door", "home"))
         self.assertIs(meta["leave"], True)
         self.assertIs(meta["night"], False)
+        self.assertEqual(meta["leave_result"]["ac"]["ok"], True)
+        self.assertNotIn("home_result", meta)
         self.assertRegex(
             call["text"],
-            r"^\[NFC·门口螃蟹·出门\] \d{2}:\d{2} 方小南贴了一下门口螃蟹，出门上班了"
+            r"^\[NFC·门口螃蟹·出门\] \d{2}:\d{2} 方小南贴了一下门口螃蟹，出门上班了："
+            + LEAVE_SUMMARY +
             r"（她出门上班了，用 companion reply contact_id=xiaoke 跟她说路上小心）$",
         )
-        self.assertEqual([rec["text"] for _, rec in self.bubbles], ["方小南出门了🚪"])
+        self.assertEqual([rec["text"] for _, rec in self.bubbles], [f"方小南出门了🚪 · {LEAVE_SUMMARY}"])
+        self.assertEqual(self.bubbles[0][1]["metadata"]["severity"], "info")
         body = self.body(h)
         self.assertIn("路上小心", body)
         self.assertIn("我陪你去上班", body)
@@ -115,6 +127,8 @@ class DoorLeaveEndToEndTest(NfcTapBase):
     def assert_home_original(self, h, *, night: bool) -> None:
         meta = self.channel_calls[0]["metadata"]
         self.assertIs(meta["leave"], False)
+        self.assertEqual(self.leave_calls, [])  # 非出门不跑出门设备
+        self.assertNotIn("leave_result", meta)
         self.assertIn("·回家]", self.channel_calls[0]["text"])
         self.assertIn("欢迎回家", self.body(h))
         self.assertNotIn("路上小心", self.body(h))
@@ -155,13 +169,16 @@ class DoorLeaveEndToEndTest(NfcTapBase):
     def test_test_flag_marks_and_skips_bubble(self) -> None:
         h = self.tap(f"?k={DOOR}&test=1")
         self.assertEqual(self.home_calls, [])
+        self.assertEqual(self.leave_calls, [True])  # test 只 dry-run
         self.assertEqual(self.bubbles, [])
         self.assertRegex(self.channel_calls[0]["text"], r"^\[NFC·门口螃蟹·出门·测试\] \d{2}:\d{2} ")
+        self.assertIn(LEAVE_SUMMARY + "（dry-run，没真动设备）", self.channel_calls[0]["text"])
         self.assertIn("不用回她", self.channel_calls[0]["text"])
         self.assertIn("路上小心", self.body(h))
 
     def test_bedside_unaffected_on_workday_morning(self) -> None:
         h = self.tap(f"?k={BEDSIDE}")
+        self.assertEqual((self.home_calls, self.leave_calls), ([], []))
         meta = self.channel_calls[0]["metadata"]
         self.assertEqual(meta["nfc_action"], "summon")
         self.assertNotIn("leave", meta)
@@ -171,8 +188,83 @@ class DoorLeaveEndToEndTest(NfcTapBase):
         self.tap(f"?k={DOOR}")
         h = self.tap(f"?k={DOOR}")
         self.assertEqual(len(self.channel_calls), 1)
+        self.assertEqual(self.leave_calls, [False])  # 去重窗口内不重复动设备
         self.assertIn("路上小心", self.body(h))
         self.assertIn("我已经知道啦，在呢", self.body(h))
+
+    def test_leave_already_off_and_failures_named(self) -> None:
+        self.leave_result["light"] = {"ok": True, "already_off": True, "detail": "already off, untouched"}
+        self.leave_result["curtain"] = {"ok": False, "detail": "离线"}
+        self.leave_result["ac"] = {"ok": False, "already_off": False, "detail": "off not confirmed"}
+        self.tap(f"?k={DOOR}")
+        expected = ("加湿器已关、窗帘拉开失败（离线）、灯本来就关着、主卧空调插座关闭失败（off not confirmed）"
+                    "——窗帘、主卧空调插座要手动处理一下")
+        text = self.channel_calls[0]["text"]
+        self.assertIn(f"出门上班了：{expected}", text)
+        self.assertIn("有设备没处理成功，提醒她手动关一下", text)
+        _, rec = self.bubbles[0]
+        self.assertEqual(rec["text"], f"方小南出门了🚪 · {expected}")
+        self.assertEqual(rec["metadata"]["severity"], "warn")
+
+
+class LeaveSummaryTest(unittest.TestCase):
+    def test_all_ok(self) -> None:
+        self.assertEqual(PushHandler._nfc_leave_summary(LEAVE_OK_RESULT), LEAVE_SUMMARY)
+
+    def test_all_already_off(self) -> None:
+        res = json.loads(json.dumps(LEAVE_OK_RESULT))
+        for k in ("humidifier", "light", "ac"):
+            res[k]["already_off"] = True
+        self.assertEqual(
+            PushHandler._nfc_leave_summary(res),
+            "加湿器本来就关着、窗帘已拉开、灯本来就关着、主卧空调插座本来就关着",
+        )
+
+    def test_missing_part_counts_as_failure(self) -> None:
+        res = {k: v for k, v in LEAVE_OK_RESULT.items() if k != "humidifier"}
+        out = PushHandler._nfc_leave_summary(res)
+        self.assertTrue(out.startswith("加湿器关闭失败（未知）"))
+        self.assertTrue(out.endswith("——加湿器要手动处理一下"))
+
+
+class NfcLeaveRunnerTest(unittest.TestCase):
+    """Exercise the real subprocess runner with harmless stand-in commands."""
+
+    def run_with(self, cmd):
+        old = PushHandler._NFC_LEAVE_CMD
+        PushHandler._NFC_LEAVE_CMD = cmd
+        self.addCleanup(setattr, PushHandler, "_NFC_LEAVE_CMD", old)
+        return PushHandler._nfc_run_leave_devices(dry_run=True)
+
+    def test_garbage_output_is_failure(self) -> None:
+        out = self.run_with(("/bin/echo", "not json"))
+        for k in ("humidifier", "curtain", "light", "ac"):
+            self.assertFalse(out[k]["ok"], k)
+            self.assertIn("脚本无结果", out[k]["detail"])
+
+    def test_json_output_is_parsed(self) -> None:
+        line = json.dumps({**LEAVE_OK_RESULT, "dry_run": True,
+                           "ac": {"ok": False, "already_off": False, "detail": "y"}})
+        out = self.run_with(("python3", "-c", f"print({line!r})"))
+        self.assertTrue(out["humidifier"]["ok"])
+        self.assertTrue(out["curtain"]["ok"])
+        self.assertNotIn("already_off", out["curtain"])
+        self.assertFalse(out["ac"]["ok"])
+        self.assertEqual(out["ac"]["detail"], "y")
+
+    def test_missing_binary_is_failure(self) -> None:
+        out = self.run_with(("/nonexistent/python-xyz",))
+        self.assertFalse(out["ac"]["ok"])
+
+    @unittest.skipUnless(os.path.exists(PushHandler._NFC_LEAVE_CMD[0])
+                         and os.path.exists(PushHandler._NFC_LEAVE_CMD[1]), "mihome venv/script absent")
+    def test_real_script_dry_run_makes_no_calls(self) -> None:
+        # --dry-run 在 home_leave.py 里于 import mijiaAPI 之前就返回，零 API 调用。
+        out = PushHandler._nfc_run_leave_devices(dry_run=True)
+        self.assertIs(out["dry_run"], True)
+        for k in ("humidifier", "curtain", "light", "ac"):
+            self.assertEqual(out[k]["ok"], True, k)
+            self.assertEqual(out[k]["detail"], "dry-run", k)
 
 
 if __name__ == "__main__":
